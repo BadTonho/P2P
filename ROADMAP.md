@@ -12,7 +12,7 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 - Salas limitadas a duas pessoas na primeira versão: você e um amigo.
 - Sem câmera e sem chat de texto.
 - Conexão P2P: áudio e tela devem ir diretamente entre os computadores quando a rede permitir.
-- Servidor de sinalização rodando no notebook; ele ajuda os participantes a iniciar a conexão, sem repassar a mídia no modo P2P direto.
+- O servidor de sinalização atual é um programa separado e pode rodar em qualquer PC; não precisa ficar preso ao notebook. Integrar a hospedagem ao cliente continua como ideia futura.
 - TURN continua opcional. Se for usado como alternativa, retransmite a mídia e deixa de ser uma conexão direta.
 
 ## Etapas
@@ -51,11 +51,22 @@ Implementar testes locais e independentes para o microfone e a tela:
 
 **Concluída quando:** o aplicativo confirmar que consegue captar áudio e imagem e encerrar a captura corretamente.
 
-### Etapa 4 — Criar o servidor de sinalização no notebook
+### Etapa 4 — Criar o servidor de sinalização na rede local
 
 Criar salas e permitir que os participantes troquem as informações usadas para negociar uma conexão WebRTC. O servidor não deve receber nem encaminhar áudio ou tela na conexão direta.
 
 **Concluída quando:** dois aplicativos na mesma rede conseguirem entrar na sala e trocar as informações iniciais de conexão.
+
+**Implementado até agora:** o servidor Rust é um programa separado, escuta na porta 9000 e pode ser executado em qualquer computador acessível aos clientes. Os clientes informam o endereço do servidor em Configurações > Conexão. O teste local com dois clientes passou; ainda falta validar a conexão entre computadores físicos na rede.
+
+### Ideia em aberto — Hospedar a sinalização no computador de quem cria a sala
+
+- O aplicativo poderia iniciar um servidor temporário no PC de quem cria a sala, sem exigir que o notebook esteja ligado ou que exista hospedagem externa.
+- Um amigo poderia conectar ao IP do anfitrião na rede local ou no Radmin VPN e entrar usando o código da sala. O Radmin fornece a rede virtual; o servidor do aplicativo ainda coordena a sala e os sinais.
+- Se o anfitrião sair, a sala perde o servidor. Uma possibilidade é transferir a hospedagem para o participante que continuar conectado; essa transferência ainda precisa ser projetada e implementada.
+- Sem nenhum participante online, a sala não pode continuar acessível automaticamente sem um serviço sempre ligado em algum lugar ou sem troca manual dos dados de conexão.
+
+**Estado:** proposta registrada; ainda não é uma função do aplicativo e a estratégia de transferência de anfitrião continua em aberto.
 
 ### Etapa 5 — Fazer a chamada P2P de voz na rede local
 
