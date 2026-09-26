@@ -13,7 +13,7 @@ use audio_capture::MicrophoneTest;
 use control_mesh::{ControlEvent, ControlMesh, QueueEntry};
 use eframe::egui;
 use screen_capture::{PendingScreenCapture, ScreenCapture};
-use screen_sharing::{ScreenShareEvent, ScreenShareSession};
+use screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
 use signaling_client::{SignalingClient, SignalingEvent};
 use signaling_protocol::{ParticipantInfo, SignalKind};
 
@@ -79,6 +79,7 @@ struct ClientUi {
     screen_share_status: Option<String>,
     remote_screen_texture: Option<egui::TextureHandle>,
     remote_screen_sequence: u64,
+    screen_share_metrics: ScreenShareMetrics,
 }
 
 #[derive(Clone, Default)]
@@ -342,6 +343,7 @@ impl ClientUi {
         ui.group(|ui| {
             ui.heading("Prévia local da tela");
             ui.label("A prévia fica na memória. A tela só é enviada diretamente ao amigo depois que você iniciar o compartilhamento.");
+            ui.small("O vídeo P2P usa UDP 9002. Os dois PCs precisam permitir o aplicativo ou essa porta no firewall do Windows, na rede privada.");
 
             if self.screen_capture.is_some() {
                 ui.label("Captura de tela ativa.");
@@ -391,13 +393,35 @@ impl ClientUi {
                     }
                 }
                 ScreenShareRole::Sending { .. } => {
-                    ui.label("Você está compartilhando a tela diretamente com seu amigo.");
+                    ui.label(if self.screen_share_metrics.p2p_connected {
+                        "Conexão P2P estabelecida; transmitindo a tela."
+                    } else {
+                        "Pedido aceito; negociando a conexão P2P da tela."
+                    });
+                    ui.small(format!(
+                        "H.264: {} quadros codificados, {} quadros enviados.",
+                        self.screen_share_metrics.encoded_frames,
+                        self.screen_share_metrics.sent_frames
+                    ));
                     if ui.button("Parar compartilhamento").clicked() {
                         self.stop_screen_share(true);
                     }
                 }
                 ScreenShareRole::Receiving { .. } => {
-                    ui.label("Seu amigo está compartilhando a tela diretamente com você.");
+                    ui.label(if self.screen_share_metrics.p2p_connected {
+                        "Conexão P2P estabelecida; aguardando ou recebendo vídeo."
+                    } else {
+                        "Pedido aceito; negociando a conexão P2P da tela."
+                    });
+                    ui.small(format!(
+                        "Vídeo: {} pacotes recebidos, {} quadros decodificados, {} erros H.264.",
+                        self.screen_share_metrics.received_packets,
+                        self.screen_share_metrics.decoded_frames,
+                        self.screen_share_metrics.decode_errors
+                    ));
+                    if let Some(error) = &self.screen_share_metrics.last_decode_error {
+                        ui.small(format!("Último erro H.264: {error}"));
+                    }
                     if ui.button("Parar de receber a tela").clicked() {
                         self.stop_screen_share(true);
                     }
@@ -728,6 +752,7 @@ impl ClientUi {
         {
             return;
         }
+        self.screen_share_metrics = ScreenShareMetrics::default();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -824,6 +849,7 @@ impl ClientUi {
                 match ScreenShareSession::new(context.clone()) {
                     Ok(session) => {
                         self.screen_share_session = Some(session);
+                        self.screen_share_metrics = ScreenShareMetrics::default();
                         self.screen_share_role = ScreenShareRole::Receiving {
                             request_id: request.request_id.clone(),
                         };
@@ -931,6 +957,9 @@ impl ClientUi {
     }
 
     fn refresh_screen_share(&mut self, context: &egui::Context) {
+        if let Some(session) = self.screen_share_session.as_ref() {
+            self.screen_share_metrics = session.metrics();
+        }
         let events = self
             .screen_share_session
             .as_ref()
@@ -983,6 +1012,10 @@ impl ClientUi {
                         image,
                         egui::TextureOptions::LINEAR,
                     ));
+                }
+                if self.remote_screen_sequence == 0 {
+                    self.screen_share_status =
+                        Some("Primeiro quadro da tela recebido e decodificado.".to_owned());
                 }
                 self.remote_screen_sequence = frame.sequence;
             }

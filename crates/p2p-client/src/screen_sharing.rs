@@ -44,8 +44,53 @@ const VIDEO_PAYLOAD_TYPE: PayloadType = 102;
 const VIDEO_CLOCK_RATE: u32 = 90_000;
 const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 30);
 const MAX_FRAME_QUEUE_DELAY: Duration = Duration::from_millis(200);
+const MEDIA_UDP_PORT: u16 = 9002;
+const PEER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
+const FIRST_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 
 type RemoteFrameStore = Arc<Mutex<Option<Arc<PreviewFrame>>>>;
+
+#[derive(Clone, Debug, Default)]
+pub struct ScreenShareMetrics {
+    pub p2p_connected: bool,
+    pub encoded_frames: u64,
+    pub sent_frames: u64,
+    pub received_packets: u64,
+    pub decoded_frames: u64,
+    pub decode_errors: u64,
+    pub last_decode_error: Option<String>,
+}
+
+#[derive(Default)]
+struct SharedMetrics {
+    p2p_connected: AtomicBool,
+    encoded_frames: AtomicU64,
+    sent_frames: AtomicU64,
+    received_packets: AtomicU64,
+    decoded_frames: AtomicU64,
+    decode_errors: AtomicU64,
+    last_decode_error: Mutex<Option<String>>,
+    connected_at: Mutex<Option<Instant>>,
+}
+
+impl SharedMetrics {
+    fn snapshot(&self) -> ScreenShareMetrics {
+        ScreenShareMetrics {
+            p2p_connected: self.p2p_connected.load(Ordering::Relaxed),
+            encoded_frames: self.encoded_frames.load(Ordering::Relaxed),
+            sent_frames: self.sent_frames.load(Ordering::Relaxed),
+            received_packets: self.received_packets.load(Ordering::Relaxed),
+            decoded_frames: self.decoded_frames.load(Ordering::Relaxed),
+            decode_errors: self.decode_errors.load(Ordering::Relaxed),
+            last_decode_error: self
+                .last_decode_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum ScreenShareEvent {
@@ -65,12 +110,13 @@ pub struct ScreenShareSession {
     commands: mpsc::UnboundedSender<Command>,
     events: std_mpsc::Receiver<ScreenShareEvent>,
     remote_frame: RemoteFrameStore,
+    metrics: Arc<SharedMetrics>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl ScreenShareSession {
     pub fn new(context: egui::Context) -> Result<Self, String> {
-        Self::with_udp_address(context, "0.0.0.0:0".to_owned())
+        Self::with_udp_address(context, format!("0.0.0.0:{MEDIA_UDP_PORT}"))
     }
 
     #[cfg(test)]
@@ -82,7 +128,9 @@ impl ScreenShareSession {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = std_mpsc::channel();
         let remote_frame = Arc::new(Mutex::new(None));
+        let metrics = Arc::new(SharedMetrics::default());
         let worker_remote_frame = Arc::clone(&remote_frame);
+        let worker_metrics = Arc::clone(&metrics);
         let worker = thread::Builder::new()
             .name("p2p-screen-share".to_owned())
             .spawn(move || {
@@ -105,6 +153,7 @@ impl ScreenShareSession {
                     context,
                     worker_remote_frame,
                     udp_address,
+                    worker_metrics,
                 ));
             })
             .map_err(|error| format!("Não foi possível iniciar a sessão de tela: {error}"))?;
@@ -113,6 +162,7 @@ impl ScreenShareSession {
             commands: commands_tx,
             events: events_rx,
             remote_frame,
+            metrics,
             worker: Some(worker),
         })
     }
@@ -140,6 +190,10 @@ impl ScreenShareSession {
             .clone()
     }
 
+    pub fn metrics(&self) -> ScreenShareMetrics {
+        self.metrics.snapshot()
+    }
+
     pub fn stop(mut self) {
         let _ = self.commands.send(Command::Stop);
         if let Some(worker) = self.worker.take() {
@@ -158,6 +212,10 @@ struct PeerSession {
     connection: Arc<dyn PeerConnection>,
     pending_ice: Vec<RTCIceCandidateInit>,
     remote_description_set: bool,
+    started_at: Instant,
+    expects_inbound_video: bool,
+    no_video_notice_sent: bool,
+    metrics: Arc<SharedMetrics>,
     encoder_stop: Option<Arc<AtomicBool>>,
     encoder_task: Option<TokioJoinHandle<Result<(), String>>>,
     sample_writer_task: Option<TokioJoinHandle<()>>,
@@ -169,6 +227,7 @@ struct PeerEvents {
     context: egui::Context,
     remote_frame: RemoteFrameStore,
     remote_frame_sequence: Arc<AtomicU64>,
+    metrics: Arc<SharedMetrics>,
 }
 
 #[async_trait::async_trait]
@@ -200,16 +259,80 @@ impl PeerConnectionEventHandler for PeerEvents {
         self.context.request_repaint();
     }
 
+    async fn on_ice_connection_state_change(
+        &self,
+        state: webrtc::peer_connection::RTCIceConnectionState,
+    ) {
+        let status = match state {
+            webrtc::peer_connection::RTCIceConnectionState::New => {
+                "ICE aguardando candidatos do outro computador.".to_owned()
+            }
+            webrtc::peer_connection::RTCIceConnectionState::Checking => {
+                "ICE verificando caminhos UDP entre os computadores…".to_owned()
+            }
+            webrtc::peer_connection::RTCIceConnectionState::Connected
+            | webrtc::peer_connection::RTCIceConnectionState::Completed => {
+                "ICE encontrou um caminho UDP; finalizando a conexão WebRTC…".to_owned()
+            }
+            webrtc::peer_connection::RTCIceConnectionState::Disconnected => {
+                self.metrics.p2p_connected.store(false, Ordering::Relaxed);
+                *self
+                    .metrics
+                    .connected_at
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                "Conexão ICE interrompida; aguardando recuperação…".to_owned()
+            }
+            webrtc::peer_connection::RTCIceConnectionState::Failed => {
+                self.metrics.p2p_connected.store(false, Ordering::Relaxed);
+                *self
+                    .metrics
+                    .connected_at
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                let _ = self.events.send(ScreenShareEvent::Error(format!(
+                    "O ICE não encontrou um caminho UDP. Confira se o firewall dos dois PCs permite o aplicativo ou UDP {MEDIA_UDP_PORT} na rede privada."
+                )));
+                self.context.request_repaint();
+                return;
+            }
+            webrtc::peer_connection::RTCIceConnectionState::Closed => {
+                self.metrics.p2p_connected.store(false, Ordering::Relaxed);
+                *self
+                    .metrics
+                    .connected_at
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                "Conexão ICE encerrada.".to_owned()
+            }
+            _ => format!("Estado ICE: {state:?}."),
+        };
+        let _ = self.events.send(ScreenShareEvent::State(status));
+        self.context.request_repaint();
+    }
+
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         match state {
             RTCPeerConnectionState::Connected => {
+                self.metrics.p2p_connected.store(true, Ordering::Relaxed);
+                let mut connected_at = self
+                    .metrics
+                    .connected_at
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                connected_at.get_or_insert_with(Instant::now);
                 let _ = self.events.send(ScreenShareEvent::State(
-                    "Conexão P2P estabelecida.".to_owned(),
+                    "Conexão WebRTC P2P estabelecida; aguardando os quadros de vídeo.".to_owned(),
                 ));
             }
-            RTCPeerConnectionState::Failed
-            | RTCPeerConnectionState::Disconnected
-            | RTCPeerConnectionState::Closed => {
+            RTCPeerConnectionState::Failed => {}
+            RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Closed => {
+                self.metrics.p2p_connected.store(false, Ordering::Relaxed);
+                *self
+                    .metrics
+                    .connected_at
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 let _ = self.events.send(ScreenShareEvent::ConnectionClosed);
             }
             _ => {
@@ -226,6 +349,7 @@ impl PeerConnectionEventHandler for PeerEvents {
         let context = self.context.clone();
         let remote_frame = Arc::clone(&self.remote_frame);
         let sequence = Arc::clone(&self.remote_frame_sequence);
+        let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
             let mut decoder = match Decoder::new() {
                 Ok(decoder) => decoder,
@@ -242,6 +366,7 @@ impl PeerConnectionEventHandler for PeerEvents {
             while let Some(event) = track.poll().await {
                 match event {
                     TrackRemoteEvent::OnRtpPacket(packet) => {
+                        metrics.received_packets.fetch_add(1, Ordering::Relaxed);
                         builder.push(Instant::now(), packet);
                         while let Some(sample) = builder.pop(Instant::now()) {
                             match decoder.decode(&sample.data) {
@@ -252,6 +377,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                     }
                                     let mut rgba = vec![0; yuv.rgba8_len()];
                                     yuv.write_rgba8(&mut rgba);
+                                    metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
                                     let next_sequence =
                                         sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                                     *remote_frame
@@ -268,7 +394,15 @@ impl PeerConnectionEventHandler for PeerEvents {
                                 Ok(None) => {}
                                 // Um pacote perdido pode invalidar um quadro; quadros-chave periódicos
                                 // permitem que a decodificação se recupere automaticamente.
-                                Err(_error) => {}
+                                Err(error) => {
+                                    metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                                    *metrics
+                                        .last_decode_error
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(error.to_string());
+                                    context.request_repaint();
+                                }
                             }
                         }
                     }
@@ -286,12 +420,67 @@ async fn run_session(
     context: egui::Context,
     remote_frame: RemoteFrameStore,
     udp_address: String,
+    metrics: Arc<SharedMetrics>,
 ) {
-    let mut active_peer = None;
+    let mut active_peer: Option<PeerSession> = None;
     let mut ice_before_peer = Vec::new();
     let remote_frame_sequence = Arc::new(AtomicU64::new(0));
+    let mut connection_check = tokio::time::interval(CONNECTION_CHECK_INTERVAL);
+    connection_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    while let Some(command) = commands.recv().await {
+    loop {
+        tokio::select! {
+            _ = connection_check.tick() => {
+                let Some(peer) = active_peer.as_mut() else {
+                    continue;
+                };
+                if !peer.metrics.p2p_connected.load(Ordering::Relaxed)
+                    && peer.started_at.elapsed() >= PEER_CONNECTION_TIMEOUT
+                {
+                    let _ = events.send(ScreenShareEvent::Error(format!(
+                        "A conexão P2P não foi estabelecida em 20 segundos. Confira se os dois PCs permitem UDP {MEDIA_UDP_PORT} no firewall do Windows (perfil de rede privada)."
+                    )));
+                    if let Some(peer) = active_peer.take() {
+                        close_peer(peer).await;
+                    }
+                    continue;
+                }
+
+                if peer.expects_inbound_video && !peer.no_video_notice_sent {
+                    let connected_at = *peer.metrics.connected_at
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if connected_at.is_some_and(|time| {
+                        time.elapsed() >= FIRST_VIDEO_FRAME_TIMEOUT
+                            && peer.metrics.decoded_frames.load(Ordering::Relaxed) == 0
+                    }) {
+                        let packets = peer.metrics.received_packets.load(Ordering::Relaxed);
+                        let decode_errors = peer.metrics.decode_errors.load(Ordering::Relaxed);
+                        let message = if packets == 0 {
+                            format!(
+                                "P2P conectado, mas nenhum pacote de vídeo chegou em 5 segundos. Confirme que o emissor está enviando e que UDP {MEDIA_UDP_PORT} está permitido no firewall dos dois PCs."
+                            )
+                        } else if decode_errors > 0 {
+                            let detail = peer.metrics.last_decode_error
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone()
+                                .unwrap_or_else(|| "erro de decodificação H.264".to_owned());
+                            format!(
+                                "P2P conectado e {packets} pacotes chegaram, mas não foi possível decodificar a tela ({decode_errors} erros): {detail}"
+                            )
+                        } else {
+                            format!(
+                                "P2P conectado e {packets} pacotes chegaram, mas nenhum quadro H.264 completo foi decodificado."
+                            )
+                        };
+                        let _ = events.send(ScreenShareEvent::State(message));
+                        peer.no_video_notice_sent = true;
+                    }
+                }
+            }
+            command = commands.recv() => {
+                let Some(command) = command else { break };
         match command {
             Command::StartSending(source) => {
                 if active_peer.is_some() {
@@ -306,6 +495,7 @@ async fn run_session(
                     context.clone(),
                     Arc::clone(&remote_frame),
                     Arc::clone(&remote_frame_sequence),
+                    Arc::clone(&metrics),
                     &udp_address,
                 )
                 .await
@@ -330,6 +520,7 @@ async fn run_session(
                         context.clone(),
                         Arc::clone(&remote_frame),
                         Arc::clone(&remote_frame_sequence),
+                        Arc::clone(&metrics),
                         &udp_address,
                     )
                     .await
@@ -402,6 +593,8 @@ async fn run_session(
             },
             Command::Stop => break,
         }
+            }
+        }
     }
 
     if let Some(peer) = active_peer {
@@ -414,6 +607,7 @@ async fn create_peer(
     context: egui::Context,
     remote_frame: RemoteFrameStore,
     remote_frame_sequence: Arc<AtomicU64>,
+    metrics: Arc<SharedMetrics>,
     udp_address: &str,
 ) -> Result<Arc<dyn PeerConnection>, String> {
     let video_codec = RTCRtpCodecParameters {
@@ -439,6 +633,7 @@ async fn create_peer(
         context,
         remote_frame,
         remote_frame_sequence,
+        metrics,
     });
     let connection = PeerConnectionBuilder::new()
         .with_configuration(RTCConfigurationBuilder::new().build())
@@ -449,7 +644,15 @@ async fn create_peer(
         .with_udp_addrs(vec![udp_address.to_owned()])
         .build()
         .await
-        .map_err(|error| format!("Não foi possível criar a conexão WebRTC P2P: {error}"))?;
+        .map_err(|error| {
+            if udp_address.ends_with(&format!(":{MEDIA_UDP_PORT}")) {
+                format!(
+                    "Não foi possível abrir UDP {MEDIA_UDP_PORT} para o compartilhamento. Verifique se a porta está livre e permita o aplicativo ou UDP {MEDIA_UDP_PORT} no firewall do Windows: {error}"
+                )
+            } else {
+                format!("Não foi possível criar a conexão WebRTC P2P: {error}")
+            }
+        })?;
     Ok(Arc::new(connection))
 }
 
@@ -459,6 +662,7 @@ async fn create_sender(
     context: egui::Context,
     remote_frame: RemoteFrameStore,
     remote_frame_sequence: Arc<AtomicU64>,
+    metrics: Arc<SharedMetrics>,
     udp_address: &str,
 ) -> Result<PeerSession, String> {
     let connection = create_peer(
@@ -466,6 +670,7 @@ async fn create_sender(
         context,
         remote_frame,
         remote_frame_sequence,
+        Arc::clone(&metrics),
         udp_address,
     )
     .await?;
@@ -528,8 +733,9 @@ async fn create_sender(
     let encoder_stop = Arc::new(AtomicBool::new(false));
     let encoder_stop_worker = Arc::clone(&encoder_stop);
     let encoder_events = events.clone();
+    let encoder_metrics = Arc::clone(&metrics);
     let encoder_task = tokio::task::spawn_blocking(move || {
-        match encode_latest_frames(source, sample_tx, encoder_stop_worker) {
+        match encode_latest_frames(source, sample_tx, encoder_stop_worker, encoder_metrics) {
             Ok(()) => Ok(()),
             Err(error) => {
                 let _ = encoder_events.send(ScreenShareEvent::Error(error.clone()));
@@ -539,6 +745,7 @@ async fn create_sender(
     });
     let writer_track = Arc::clone(&track);
     let writer_events = events.clone();
+    let writer_metrics = Arc::clone(&metrics);
     let sample_writer_task = tokio::spawn(async move {
         let Some(ssrc) = writer_track.ssrcs().await.first().copied() else {
             let _ = writer_events.send(ScreenShareEvent::Error(
@@ -565,6 +772,8 @@ async fn create_sender(
                     "Falha ao enviar um quadro H.264 pela conexão P2P: {error}"
                 )));
                 break;
+            } else {
+                writer_metrics.sent_frames.fetch_add(1, Ordering::Relaxed);
             }
         }
     });
@@ -576,6 +785,10 @@ async fn create_sender(
         connection,
         pending_ice: Vec::new(),
         remote_description_set: false,
+        started_at: Instant::now(),
+        expects_inbound_video: false,
+        no_video_notice_sent: false,
+        metrics,
         encoder_stop: Some(encoder_stop),
         encoder_task: Some(encoder_task),
         sample_writer_task: Some(sample_writer_task),
@@ -588,6 +801,7 @@ async fn create_receiver(
     context: egui::Context,
     remote_frame: RemoteFrameStore,
     remote_frame_sequence: Arc<AtomicU64>,
+    metrics: Arc<SharedMetrics>,
     udp_address: &str,
 ) -> Result<PeerSession, String> {
     let connection = create_peer(
@@ -595,6 +809,7 @@ async fn create_receiver(
         context,
         remote_frame,
         remote_frame_sequence,
+        Arc::clone(&metrics),
         udp_address,
     )
     .await?;
@@ -631,6 +846,10 @@ async fn create_receiver(
         connection,
         pending_ice: Vec::new(),
         remote_description_set: true,
+        started_at: Instant::now(),
+        expects_inbound_video: true,
+        no_video_notice_sent: false,
+        metrics,
         encoder_stop: None,
         encoder_task: None,
         sample_writer_task: None,
@@ -665,6 +884,7 @@ fn encode_latest_frames(
     source: LatestFrame,
     samples: watch::Sender<Option<(u64, Vec<u8>)>>,
     stop: Arc<AtomicBool>,
+    metrics: Arc<SharedMetrics>,
 ) -> Result<(), String> {
     let encoder_config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(4_000_000))
@@ -697,6 +917,7 @@ fn encode_latest_frames(
         last_sequence = Some(frame.sequence);
         let encoded = encode_frame(&mut encoder, &frame)?;
         if !encoded.is_empty() {
+            metrics.encoded_frames.fetch_add(1, Ordering::Relaxed);
             samples.send_replace(Some((frame.sequence, encoded)));
         }
         if next_frame < Instant::now() {
