@@ -9,6 +9,8 @@ pub enum ClientMessage {
     },
     CreateRoomIdentified {
         participant: ParticipantInfo,
+        #[serde(default)]
+        room_mode: RoomMode,
     },
     JoinRoomIdentified {
         code: String,
@@ -78,7 +80,17 @@ pub enum ServerMessage {
     RoomRoster {
         participants: Vec<ParticipantInfo>,
         leader_id: String,
+        #[serde(default)]
+        room_mode: RoomMode,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomMode {
+    #[default]
+    Local,
+    InternetTest,
 }
 
 /// Informações de presença usadas pela interface e pela malha de controle.

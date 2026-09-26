@@ -10,7 +10,7 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 - egui/eframe para a interface gráfica.
 - Compartilhamento de tela como recurso principal. Chamada de voz fica como etapa opcional no final do roadmap.
 - Prioridade de mídia: implementar e validar a transmissão de tela antes de qualquer trabalho opcional de voz.
-- Salas de sinalização e fila de sucessão para até oito participantes. O compartilhamento em grupo e a chamada de voz ficam para etapas posteriores; voz não é requisito para usar o compartilhamento de tela.
+- Salas locais/Radmin de sinalização e fila de sucessão para até oito participantes. O modo Internet de teste controlado fica limitado a duas pessoas e termina quando o anfitrião sai; não tem sucessão. O compartilhamento em grupo e a chamada de voz ficam para etapas posteriores; voz não é requisito para usar o compartilhamento de tela.
 - Sem câmera e sem chat de texto.
 - Conexão P2P: a tela deve ir diretamente entre os computadores quando a rede permitir. Se a etapa opcional de voz for feita, o áudio também seguirá diretamente quando a rede permitir.
 - O aplicativo inicia um servidor de sinalização integrado no PC do anfitrião, na porta 9000. O executável separado do servidor permanece disponível para desenvolvimento.
@@ -81,11 +81,19 @@ Usar o servidor da sala apenas para trocar pedido, oferta, resposta, candidatos 
 
 **Ainda falta validar:** fechar a janela capturada, testar o encerramento da sessão e confirmar que o servidor nunca recebe quadros de vídeo. Também falta validar com firewall e adaptadores que as pessoas realmente usarão. O teste inverso pode ser feito depois com outro computador mais potente.
 
-### Etapa 6 — Conectar participantes em casas diferentes
+### Etapa 6 — Conectar participantes em casas diferentes (teste controlado)
 
-Deixar o servidor integrado do anfitrião acessível pela internet e testar o estabelecimento de conexões diretas para o compartilhamento de tela com ICE/STUN. Verificar as configurações do roteador e se o provedor permite conexões de entrada.
+Adicionar um modo de sala **Internet (teste)** separado de **Rede local / Radmin**. O modo local mantém até oito participantes e a sucessão atual. O modo Internet admite somente duas pessoas, não inicia a malha TCP 9001 e encerra a sala quando o anfitrião sai ou perde a conexão.
 
-**Concluída quando:** participantes em redes diferentes conseguirem compartilhar a tela diretamente, sem o servidor de sinalização retransmitir imagens.
+Em Configurações > Conexão, informar manualmente um IPv4 público ou nome DDNS do anfitrião. O aplicativo monta ws://endereço:9000; não consulta automaticamente o IP público. Para receber conexões, encaminhar TCP 9000 no roteador ao PC anfitrião e liberar a porta no firewall. CGNAT sem entrada pública não é contornado.
+
+Configurar uma única URI stun: (inicialmente stun:stun.l.google.com:19302) para os dois lados da conexão WebRTC. STUN ajuda a procurar um caminho UDP direto, mas não garante que toda combinação de NAT funcione. A mídia usa UDP 9002 e não passa pelo servidor de sinalização. Não há TURN nem retransmissão de vídeo. A tentativa P2P aguarda até 30 segundos e mostra contagens de candidatos ICE públicos via STUN para ajudar no diagnóstico.
+
+**Aviso desta etapa:** a sinalização usa ws:// sem criptografia ou autenticação; o modo serve apenas para testes controlados com pessoas conhecidas. Antes da distribuição regular, preparar wss:// e proteção de acesso.
+
+**Implementado:** seleção entre modo local/Radmin e teste Internet; limite de duas pessoas aplicado pelo servidor e anunciado aos clientes; endereço IPv4/DDNS manual com porta 9000 fixa e botão de cópia; URI STUN editável e validada, aplicada à conexão WebRTC de envio e recepção; sem malha ou sucessão no modo Internet; diagnóstico separado de sinalização TCP 9000 e ICE/mídia UDP 9002; aviso de segurança e ausência de TURN.
+
+**Concluída quando:** dois PCs em redes residenciais diferentes entrarem pelo endereço público e código, e compartilharem a tela diretamente. Ainda falta validar encaminhamento TCP 9000, CGNAT, firewall UDP 9002 e estabelecimento ICE entre duas casas. Também falta confirmar manualmente que a tela não passa pelo servidor.
 
 ### Etapa 7 — Decidir o tratamento de redes que bloqueiam P2P
 

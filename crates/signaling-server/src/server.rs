@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use signaling_protocol::{ClientMessage, ParticipantInfo, ServerMessage};
+use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::sleep;
@@ -54,6 +54,7 @@ struct Room {
     members: Vec<ParticipantInfo>,
     leader_connection_id: ConnectionId,
     pending_transfer: Option<PendingTransfer>,
+    room_mode: RoomMode,
 }
 
 impl RoomRegistry {
@@ -61,6 +62,15 @@ impl RoomRegistry {
         &mut self,
         connection_id: ConnectionId,
         sender: Outgoing,
+    ) -> Result<String, String> {
+        self.create_room_with_mode(connection_id, sender, RoomMode::Local)
+    }
+
+    fn create_room_with_mode(
+        &mut self,
+        connection_id: ConnectionId,
+        sender: Outgoing,
+        room_mode: RoomMode,
     ) -> Result<String, String> {
         if self.connection_rooms.contains_key(&connection_id) {
             return Err("Este cliente ja esta em uma sala.".to_owned());
@@ -80,6 +90,7 @@ impl RoomRegistry {
                 members: vec![default_participant(connection_id, 1)],
                 leader_connection_id: connection_id,
                 pending_transfer: None,
+                room_mode,
             },
         );
         self.connection_rooms.insert(connection_id, code.clone());
@@ -110,8 +121,17 @@ impl RoomRegistry {
         let Some(room) = self.rooms.get_mut(code) else {
             return Err("A sala nao existe ou ja foi encerrada.".to_owned());
         };
-        if room.participants.len() >= MAX_ROOM_PARTICIPANTS {
-            return Err("A sala ja atingiu o limite de 8 participantes.".to_owned());
+        let capacity = match room.room_mode {
+            RoomMode::Local => MAX_ROOM_PARTICIPANTS,
+            RoomMode::InternetTest => 2,
+        };
+        if room.participants.len() >= capacity {
+            return Err(match room.room_mode {
+                RoomMode::Local => "A sala ja atingiu o limite de 8 participantes.".to_owned(),
+                RoomMode::InternetTest => {
+                    "Esta sala de teste pela internet aceita somente duas pessoas.".to_owned()
+                }
+            });
         }
 
         let existing_peers = room
@@ -152,8 +172,9 @@ impl RoomRegistry {
         connection_id: ConnectionId,
         sender: Outgoing,
         participant: ParticipantInfo,
+        room_mode: RoomMode,
     ) -> Result<(), String> {
-        self.create_room(connection_id, sender)?;
+        self.create_room_with_mode(connection_id, sender, room_mode)?;
         self.identify_participant(connection_id, participant)
     }
 
@@ -178,8 +199,17 @@ impl RoomRegistry {
         if is_already_connected {
             return Err("Este participante ja esta conectado a sala.".to_owned());
         }
-        if !is_known_member && room.members.len() >= MAX_ROOM_PARTICIPANTS {
-            return Err("A sala ja atingiu o limite de 8 participantes.".to_owned());
+        let capacity = match room.room_mode {
+            RoomMode::Local => MAX_ROOM_PARTICIPANTS,
+            RoomMode::InternetTest => 2,
+        };
+        if !is_known_member && room.members.len() >= capacity {
+            return Err(match room.room_mode {
+                RoomMode::Local => "A sala ja atingiu o limite de 8 participantes.".to_owned(),
+                RoomMode::InternetTest => {
+                    "Esta sala de teste pela internet aceita somente duas pessoas.".to_owned()
+                }
+            });
         }
         self.join_room(connection_id, code, sender)?;
         self.identify_participant(connection_id, participant)
@@ -196,6 +226,7 @@ impl RoomRegistry {
         let Some(room) = self.rooms.get(&code) else {
             return Err("A sala foi encerrada.".to_owned());
         };
+        let internet_test = room.room_mode == RoomMode::InternetTest;
         if room.participants.iter().any(|(other_id, _)| {
             *other_id != connection_id
                 && self
@@ -216,6 +247,10 @@ impl RoomRegistry {
             participant.order
         };
         participant.display_name = format!("Participante {}", participant.order);
+        if internet_test {
+            participant.may_host = false;
+            participant.control_address.clear();
+        }
         self.participant_info.insert(connection_id, participant);
         if let Some(room) = self.rooms.get_mut(&code) {
             let previous_id = existing.as_ref().map(|known| known.id.as_str());
@@ -254,6 +289,7 @@ impl RoomRegistry {
         let message = OutboundMessage::Protocol(ServerMessage::RoomRoster {
             participants,
             leader_id,
+            room_mode: room.room_mode,
         });
         for (_, sender) in &room.participants {
             let _ = sender.send(match &message {
@@ -270,6 +306,9 @@ impl RoomRegistry {
         let Some(room) = self.rooms.get_mut(&code) else {
             return Err("A sala foi encerrada.".to_owned());
         };
+        if room.room_mode == RoomMode::InternetTest {
+            return Err("A sucessao de anfitriao esta desativada no modo Internet.".to_owned());
+        }
         if room.participants.len() != 2 {
             return Err("Ainda nao ha outro participante para assumir a sala.".to_owned());
         }
@@ -349,6 +388,7 @@ impl RoomRegistry {
                 members,
                 leader_connection_id: connection_id,
                 pending_transfer: None,
+                room_mode: RoomMode::Local,
             },
         );
         self.connection_rooms.insert(connection_id, code.to_owned());
@@ -693,10 +733,15 @@ async fn handle_client_message(
             .await
             .create_room(connection_id, outgoing.clone())
             .map(|_| ()),
-        ClientMessage::CreateRoomIdentified { participant } => rooms
-            .lock()
-            .await
-            .create_room_identified(connection_id, outgoing.clone(), participant),
+        ClientMessage::CreateRoomIdentified {
+            participant,
+            room_mode,
+        } => rooms.lock().await.create_room_identified(
+            connection_id,
+            outgoing.clone(),
+            participant,
+            room_mode,
+        ),
         ClientMessage::JoinRoom { code } => {
             rooms
                 .lock()
@@ -800,7 +845,7 @@ mod tests {
     use tokio_tungstenite::{WebSocketStream, connect_async};
 
     use super::{OutboundMessage, RoomRegistry, TransferReservation, handle_connection, serve};
-    use signaling_protocol::{ClientMessage, ParticipantInfo, ServerMessage, SignalKind};
+    use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage, SignalKind};
 
     fn server_message(receiver: &mut mpsc::UnboundedReceiver<OutboundMessage>) -> ServerMessage {
         match receiver.try_recv().expect("expected a server message") {
@@ -840,6 +885,82 @@ mod tests {
     }
 
     #[test]
+    fn internet_test_rooms_limit_to_two_disable_handoff_and_hide_control_addresses() {
+        let mut registry = RoomRegistry::default();
+        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+        let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
+        let code = registry
+            .create_room_with_mode(1, host_tx, RoomMode::InternetTest)
+            .unwrap();
+        let _ = server_message(&mut host_rx); // RoomCreated
+        registry
+            .identify_participant(
+                1,
+                ParticipantInfo {
+                    id: "host-id".to_owned(),
+                    display_name: "ignored".to_owned(),
+                    order: 0,
+                    may_host: true,
+                    control_address: "192.168.1.2:9001".to_owned(),
+                },
+            )
+            .unwrap();
+        let ServerMessage::RoomRoster {
+            participants,
+            room_mode,
+            ..
+        } = server_message(&mut host_rx)
+        else {
+            panic!("expected internet room roster")
+        };
+        assert_eq!(room_mode, RoomMode::InternetTest);
+        assert!(!participants[0].may_host);
+        assert!(participants[0].control_address.is_empty());
+
+        registry
+            .join_room_identified(
+                2,
+                &code,
+                guest_tx,
+                ParticipantInfo {
+                    id: "guest-id".to_owned(),
+                    display_name: "ignored".to_owned(),
+                    order: 0,
+                    may_host: true,
+                    control_address: "192.168.1.3:9001".to_owned(),
+                },
+            )
+            .unwrap();
+        let _ = server_message(&mut guest_rx); // RoomJoined
+        let _ = server_message(&mut host_rx); // PeerJoined
+        for receiver in [&mut host_rx, &mut guest_rx] {
+            let ServerMessage::RoomRoster {
+                participants,
+                room_mode,
+                ..
+            } = server_message(receiver)
+            else {
+                panic!("expected updated internet room roster")
+            };
+            assert_eq!(room_mode, RoomMode::InternetTest);
+            assert_eq!(participants.len(), 2);
+            assert!(participants.iter().all(|participant| {
+                !participant.may_host && participant.control_address.is_empty()
+            }));
+        }
+
+        let (third_tx, _third_rx) = mpsc::unbounded_channel();
+        let error = registry.join_room(3, &code, third_tx).unwrap_err();
+        assert!(error.contains("duas pessoas"));
+        assert!(
+            registry
+                .request_host_transfer(1)
+                .unwrap_err()
+                .contains("desativada")
+        );
+    }
+
+    #[test]
     fn roster_keeps_join_order_and_host_permission() {
         let mut registry = RoomRegistry::default();
         let (host_tx, mut host_rx) = mpsc::unbounded_channel();
@@ -861,6 +982,7 @@ mod tests {
         let ServerMessage::RoomRoster {
             participants,
             leader_id,
+            ..
         } = server_message(&mut host_rx)
         else {
             panic!("expected a participant roster")
@@ -887,6 +1009,7 @@ mod tests {
         let ServerMessage::RoomRoster {
             participants,
             leader_id,
+            ..
         } = server_message(&mut host_rx)
         else {
             panic!("expected updated roster")
@@ -967,6 +1090,7 @@ mod tests {
         let ServerMessage::RoomRoster {
             participants,
             leader_id,
+            ..
         } = server_message(&mut candidate_rx)
         else {
             panic!("expected the restored participant roster")
@@ -1005,6 +1129,7 @@ mod tests {
         let ServerMessage::RoomRoster {
             participants,
             leader_id,
+            ..
         } = server_message(&mut host_rx)
         else {
             panic!("expected the roster after the old host reconnects")

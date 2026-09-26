@@ -14,9 +14,9 @@ use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
 use rtc::interceptor::Registry;
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
-use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
 use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MediaEngine};
+use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceServer};
 use rtc::peer_connection::transport::RTCIceCandidateInit;
 use rtc::rtp::codec::h264::H264Packet;
 use rtc::rtp::packet::Packet as RtpPacket;
@@ -50,16 +50,41 @@ const MAX_RTP_FRAME_AGE: Duration = Duration::from_millis(200);
 const MAX_PENDING_RTP_FRAMES: usize = 8;
 const MEDIA_UDP_PORT: u16 = 9002;
 const PEER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
+const INTERNET_PEER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const FIRST_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 
 type RemoteFrameStore = Arc<Mutex<Option<Arc<PreviewFrame>>>>;
+
+pub fn validate_stun_uri(input: &str) -> Result<String, String> {
+    let uri = input.trim();
+    if !uri.starts_with("stun:")
+        || uri.len() <= "stun:".len()
+        || uri.chars().any(char::is_whitespace)
+        || uri.contains(',')
+    {
+        return Err(
+            "Informe uma única URI STUN no formato stun:servidor:porta. TURN não é permitido nesta etapa."
+                .to_owned(),
+        );
+    }
+    let server = RTCIceServer {
+        urls: vec![uri.to_owned()],
+        ..Default::default()
+    };
+    server
+        .urls()
+        .map_err(|error| format!("A URI STUN não é válida: {error}"))?;
+    Ok(uri.to_owned())
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ScreenShareMetrics {
     pub p2p_connected: bool,
     pub local_ice_candidates: u64,
     pub remote_ice_candidates: u64,
+    pub local_srflx_candidates: u64,
+    pub remote_srflx_candidates: u64,
     pub encoded_frames: u64,
     pub sent_frames: u64,
     pub received_packets: u64,
@@ -74,6 +99,8 @@ struct SharedMetrics {
     p2p_connected: AtomicBool,
     local_ice_candidates: AtomicU64,
     remote_ice_candidates: AtomicU64,
+    local_srflx_candidates: AtomicU64,
+    remote_srflx_candidates: AtomicU64,
     encoded_frames: AtomicU64,
     sent_frames: AtomicU64,
     received_packets: AtomicU64,
@@ -118,6 +145,8 @@ impl SharedMetrics {
             p2p_connected: self.p2p_connected.load(Ordering::Relaxed),
             local_ice_candidates: self.local_ice_candidates.load(Ordering::Relaxed),
             remote_ice_candidates: self.remote_ice_candidates.load(Ordering::Relaxed),
+            local_srflx_candidates: self.local_srflx_candidates.load(Ordering::Relaxed),
+            remote_srflx_candidates: self.remote_srflx_candidates.load(Ordering::Relaxed),
             encoded_frames: self.encoded_frames.load(Ordering::Relaxed),
             sent_frames: self.sent_frames.load(Ordering::Relaxed),
             received_packets: self.received_packets.load(Ordering::Relaxed),
@@ -599,16 +628,23 @@ pub struct ScreenShareSession {
 }
 
 impl ScreenShareSession {
-    pub fn new(context: egui::Context) -> Result<Self, String> {
-        Self::with_udp_address(context, format!("0.0.0.0:{MEDIA_UDP_PORT}"))
+    pub fn new(context: egui::Context, stun_server: Option<String>) -> Result<Self, String> {
+        if let Some(server) = stun_server.as_deref() {
+            validate_stun_uri(server)?;
+        }
+        Self::with_udp_address(context, format!("0.0.0.0:{MEDIA_UDP_PORT}"), stun_server)
     }
 
     #[cfg(test)]
     fn new_loopback(context: egui::Context) -> Result<Self, String> {
-        Self::with_udp_address(context, "127.0.0.1:0".to_owned())
+        Self::with_udp_address(context, "127.0.0.1:0".to_owned(), None)
     }
 
-    fn with_udp_address(context: egui::Context, udp_address: String) -> Result<Self, String> {
+    fn with_udp_address(
+        context: egui::Context,
+        udp_address: String,
+        stun_server: Option<String>,
+    ) -> Result<Self, String> {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = std_mpsc::channel();
         let remote_frame = Arc::new(Mutex::new(None));
@@ -637,6 +673,7 @@ impl ScreenShareSession {
                     context,
                     worker_remote_frame,
                     udp_address,
+                    stun_server,
                     worker_metrics,
                 ));
             })
@@ -712,6 +749,7 @@ struct PeerEvents {
     remote_frame: RemoteFrameStore,
     remote_frame_sequence: Arc<AtomicU64>,
     metrics: Arc<SharedMetrics>,
+    stun_server: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -723,6 +761,11 @@ impl PeerConnectionEventHandler for PeerEvents {
         self.metrics
             .local_ice_candidates
             .fetch_add(1, Ordering::Relaxed);
+        if event.candidate.typ == rtc::peer_connection::transport::RTCIceCandidateType::Srflx {
+            self.metrics
+                .local_srflx_candidates
+                .fetch_add(1, Ordering::Relaxed);
+        }
         match event.candidate.to_json() {
             Ok(candidate) => match serde_json::to_string(&candidate) {
                 Ok(payload) => {
@@ -777,9 +820,18 @@ impl PeerConnectionEventHandler for PeerEvents {
                     .connected_at
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                let _ = self.events.send(ScreenShareEvent::Error(format!(
-                    "O ICE não encontrou um caminho UDP. Confira se o firewall dos dois PCs permite o aplicativo ou UDP {MEDIA_UDP_PORT} na rede privada."
-                )));
+                let message = if let Some(stun_server) = &self.stun_server {
+                    let local = self.metrics.local_srflx_candidates.load(Ordering::Relaxed);
+                    let remote = self.metrics.remote_srflx_candidates.load(Ordering::Relaxed);
+                    format!(
+                        "O ICE não encontrou um caminho direto pela internet. Candidatos públicos via STUN: {local} locais e {remote} recebidos do amigo. Confira a URI {stun_server}, o firewall e UDP {MEDIA_UDP_PORT}; esta etapa não usa TURN."
+                    )
+                } else {
+                    format!(
+                        "O ICE não encontrou um caminho UDP. Confira se o firewall dos dois PCs permite o aplicativo ou UDP {MEDIA_UDP_PORT} na rede privada."
+                    )
+                };
+                let _ = self.events.send(ScreenShareEvent::Error(message));
                 self.context.request_repaint();
                 return;
             }
@@ -899,6 +951,7 @@ async fn run_session(
     context: egui::Context,
     remote_frame: RemoteFrameStore,
     udp_address: String,
+    stun_server: Option<String>,
     metrics: Arc<SharedMetrics>,
 ) {
     let mut active_peer: Option<PeerSession> = None;
@@ -913,12 +966,26 @@ async fn run_session(
                 let Some(peer) = active_peer.as_mut() else {
                     continue;
                 };
+                let connection_timeout = if stun_server.is_some() {
+                    INTERNET_PEER_CONNECTION_TIMEOUT
+                } else {
+                    PEER_CONNECTION_TIMEOUT
+                };
                 if !peer.metrics.p2p_connected.load(Ordering::Relaxed)
-                    && peer.started_at.elapsed() >= PEER_CONNECTION_TIMEOUT
+                    && peer.started_at.elapsed() >= connection_timeout
                 {
-                    let _ = events.send(ScreenShareEvent::Error(format!(
-                        "A conexão P2P não foi estabelecida em 20 segundos. Confira se os dois PCs permitem UDP {MEDIA_UDP_PORT} no firewall do Windows (perfil de rede privada)."
-                    )));
+                    let message = if let Some(stun_server) = &stun_server {
+                        let local = peer.metrics.local_srflx_candidates.load(Ordering::Relaxed);
+                        let remote = peer.metrics.remote_srflx_candidates.load(Ordering::Relaxed);
+                        format!(
+                            "A conexão P2P não foi estabelecida em {connection_timeout:?}. Candidatos públicos via STUN: {local} locais e {remote} recebidos do amigo. Confira a URI {stun_server}, as regras de NAT e o firewall/UDP {MEDIA_UDP_PORT} dos dois PCs. Não há TURN nem retransmissão nesta etapa."
+                        )
+                    } else {
+                        format!(
+                            "A conexão P2P não foi estabelecida em {connection_timeout:?}. Confira se os dois PCs permitem UDP {MEDIA_UDP_PORT} no firewall do Windows (perfil de rede privada)."
+                        )
+                    };
+                    let _ = events.send(ScreenShareEvent::Error(message));
                     if let Some(peer) = active_peer.take() {
                         close_peer(peer).await;
                     }
@@ -976,6 +1043,7 @@ async fn run_session(
                     Arc::clone(&remote_frame_sequence),
                     Arc::clone(&metrics),
                     &udp_address,
+                    stun_server.as_deref(),
                 )
                 .await
                 {
@@ -1001,6 +1069,7 @@ async fn run_session(
                         Arc::clone(&remote_frame_sequence),
                         Arc::clone(&metrics),
                         &udp_address,
+                        stun_server.as_deref(),
                     )
                     .await
                     {
@@ -1048,6 +1117,11 @@ async fn run_session(
                             metrics
                                 .remote_ice_candidates
                                 .fetch_add(1, Ordering::Relaxed);
+                            if candidate.candidate.contains(" typ srflx ") {
+                                metrics
+                                    .remote_srflx_candidates
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             if let Some(peer) = active_peer.as_mut() {
                                 if peer.remote_description_set {
                                     if let Err(error) =
@@ -1091,6 +1165,7 @@ async fn create_peer(
     remote_frame_sequence: Arc<AtomicU64>,
     metrics: Arc<SharedMetrics>,
     udp_address: &str,
+    stun_server: Option<&str>,
 ) -> Result<Arc<dyn PeerConnection>, String> {
     let video_codec = RTCRtpCodecParameters {
         rtp_codec: RTCRtpCodec {
@@ -1116,9 +1191,18 @@ async fn create_peer(
         remote_frame,
         remote_frame_sequence,
         metrics,
+        stun_server: stun_server.map(str::to_owned),
     });
+    let mut configuration = RTCConfigurationBuilder::new();
+    if let Some(stun_server) = stun_server {
+        let validated_stun = validate_stun_uri(stun_server)?;
+        configuration = configuration.with_ice_servers(vec![RTCIceServer {
+            urls: vec![validated_stun],
+            ..Default::default()
+        }]);
+    }
     let connection = PeerConnectionBuilder::new()
-        .with_configuration(RTCConfigurationBuilder::new().build())
+        .with_configuration(configuration.build())
         .with_media_engine(media_engine)
         .with_interceptor_registry(interceptors)
         .with_handler(handler)
@@ -1146,6 +1230,7 @@ async fn create_sender(
     remote_frame_sequence: Arc<AtomicU64>,
     metrics: Arc<SharedMetrics>,
     udp_address: &str,
+    stun_server: Option<&str>,
 ) -> Result<PeerSession, String> {
     let connection = create_peer(
         events,
@@ -1154,6 +1239,7 @@ async fn create_sender(
         remote_frame_sequence,
         Arc::clone(&metrics),
         udp_address,
+        stun_server,
     )
     .await?;
     let codec = RTCRtpCodec {
@@ -1285,6 +1371,7 @@ async fn create_receiver(
     remote_frame_sequence: Arc<AtomicU64>,
     metrics: Arc<SharedMetrics>,
     udp_address: &str,
+    stun_server: Option<&str>,
 ) -> Result<PeerSession, String> {
     let connection = create_peer(
         events,
@@ -1293,6 +1380,7 @@ async fn create_receiver(
         remote_frame_sequence,
         Arc::clone(&metrics),
         udp_address,
+        stun_server,
     )
     .await?;
     let offer =
@@ -1469,8 +1557,19 @@ mod tests {
 
     use super::{
         Encoder, FRAME_DURATION, LatestFrame, PreviewFrame, ScreenShareEvent, ScreenShareSession,
-        encode_frame,
+        encode_frame, validate_stun_uri,
     };
+
+    #[test]
+    fn stun_uri_accepts_one_stun_server_and_rejects_turn_or_invalid_values() {
+        assert_eq!(
+            validate_stun_uri("stun:stun.l.google.com:19302").unwrap(),
+            "stun:stun.l.google.com:19302"
+        );
+        assert!(validate_stun_uri("turn:relay.example:3478").is_err());
+        assert!(validate_stun_uri("stun:one.example:3478,stun:two.example:3478").is_err());
+        assert!(validate_stun_uri("not-a-stun-uri").is_err());
+    }
 
     #[test]
     fn rgba_frame_can_be_encoded_and_decoded_as_h264() {

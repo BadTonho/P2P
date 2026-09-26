@@ -15,7 +15,7 @@ use eframe::egui;
 use screen_capture::{PendingScreenCapture, ScreenCapture};
 use screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
 use signaling_client::{SignalingClient, SignalingEvent};
-use signaling_protocol::{ParticipantInfo, SignalKind};
+use signaling_protocol::{ParticipantInfo, RoomMode, SignalKind};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsCategory {
@@ -32,6 +32,9 @@ struct ClientUi {
     settings_open: bool,
     settings_category: SettingsCategory,
     server_url: String,
+    stun_server_url: String,
+    create_room_mode: RoomMode,
+    room_mode: RoomMode,
     connecting: bool,
     connection_status: Option<String>,
     connection_error: Option<String>,
@@ -139,7 +142,7 @@ impl ClientUi {
                 ui.vertical(|ui| {
                     ui.add_space(16.0);
                     ui.heading("P2P - Voz e tela");
-                    ui.label("Sinalização local e compartilhamento de tela P2P, sem áudio");
+                    ui.label("Salas locais ou teste pela internet; compartilhamento de tela P2P, sem áudio");
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -180,15 +183,43 @@ impl ClientUi {
             self.refresh_host_addresses();
         }
 
-        ui.group(|ui| {
-            ui.heading("Rede de controle da sala");
-            ui.label("Todos os participantes mantêm uma conexão direta de controle pela porta TCP 9001.");
-            ui.small("Permita a porta 9001 no firewall do Windows e escolha um IPv4 que seus amigos consigam alcançar (LAN ou Radmin).");
-            self.show_control_address_picker(ui);
-            ui.checkbox(&mut self.may_host, "Permitir que este computador seja escolhido para hospedar futuramente");
-            ui.small("Opcional: isso não impede entrar na sala nem compartilhar a tela. Só permite que este PC assuma a hospedagem se o anfitrião sair.");
-            ui.small("Para a sucessão funcionar, a malha TCP 9001 também precisa conectar entre os participantes.");
+        ui.horizontal(|ui| {
+            ui.heading("Modo ao criar:");
+            ui.selectable_value(
+                &mut self.create_room_mode,
+                RoomMode::Local,
+                "Rede local / Radmin",
+            );
+            ui.selectable_value(
+                &mut self.create_room_mode,
+                RoomMode::InternetTest,
+                "Internet (teste)",
+            );
         });
+
+        if self.create_room_mode == RoomMode::Local {
+            ui.group(|ui| {
+                ui.heading("Rede de controle da sala");
+                ui.label("Todos os participantes mantêm uma conexão direta de controle pela porta TCP 9001.");
+                ui.small("Permita a porta 9001 no firewall do Windows e escolha um IPv4 que seus amigos consigam alcançar (LAN ou Radmin).");
+                self.show_control_address_picker(ui);
+                ui.checkbox(&mut self.may_host, "Permitir que este computador seja escolhido para hospedar futuramente");
+                ui.small("Opcional: isso não impede entrar na sala nem compartilhar a tela. Só permite que este PC assuma a hospedagem se o anfitrião sair.");
+                ui.small("Para a sucessão funcionar, a malha TCP 9001 também precisa conectar entre os participantes.");
+            });
+        } else {
+            ui.group(|ui| {
+                ui.heading("Teste controlado pela internet");
+                ui.label("A sala aceitará somente você e mais uma pessoa. O anfitrião precisa permanecer online; não há sucessão pela internet.");
+                ui.small("O anfitrião encaminha TCP 9000 no roteador para este PC e permite a porta no firewall do Windows. CGNAT pode impedir conexões de entrada.");
+                ui.small("A mídia tenta uma conexão UDP P2P na porta 9002 com STUN. Não há TURN nem retransmissão de vídeo.");
+                ui.colored_label(
+                    egui::Color32::from_rgb(190, 95, 35),
+                    "A sinalização usa ws:// sem criptografia ou autenticação. Use apenas testes controlados com pessoas conhecidas; não use para distribuição regular.",
+                );
+                ui.small("Configure o IPv4 público ou nome DDNS e a URI STUN em Configurações > Conexão antes de criar a sala.");
+            });
+        }
         ui.add_space(12.0);
 
         ui.group(|ui| {
@@ -238,7 +269,7 @@ impl ClientUi {
         if let Some(error) = &self.connection_error {
             ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
         }
-        ui.small("Para entrar, informe em Configurações > Conexão o endereço IP que o anfitrião compartilhou.");
+        ui.small("Para entrar, informe em Configurações > Conexão o IPv4 ou nome DDNS compartilhado pelo anfitrião.");
     }
 
     fn show_room(&mut self, ui: &mut egui::Ui) {
@@ -268,7 +299,11 @@ impl ClientUi {
             }
             if !self.participants.is_empty() {
                 ui.separator();
-                ui.heading("Participantes e fila de sucessão");
+                ui.heading(if self.room_mode == RoomMode::InternetTest {
+                    "Participantes da sala de teste"
+                } else {
+                    "Participantes e fila de sucessão"
+                });
                 let mut participants = self.participants.clone();
                 participants.sort_by_key(|participant| participant.order);
                 for participant in &participants {
@@ -276,7 +311,9 @@ impl ClientUi {
                         "{} — ordem {}, {}",
                         participant.display_name,
                         participant.order,
-                        if participant.id == self.current_leader_id {
+                        if self.room_mode == RoomMode::InternetTest {
+                            "sucessão desativada no modo Internet"
+                        } else if participant.id == self.current_leader_id {
                             "anfitrião atual"
                         } else if participant.may_host {
                             "autorizado a hospedar"
@@ -285,13 +322,15 @@ impl ClientUi {
                         }
                     ));
                 }
-                if participants.iter().all(|participant| !participant.may_host) {
+                if self.room_mode == RoomMode::InternetTest {
+                    ui.small("Esta sala aceita duas pessoas e termina quando o anfitrião sai ou perde a conexão.");
+                } else if participants.iter().all(|participant| !participant.may_host) {
                     ui.small("Ninguém autorizou a hospedagem automática. Isso não bloqueia a entrada; só significa que a sala termina se o anfitrião sair.");
                 } else {
                     ui.small("A fila será ordenada pela estabilidade dos canais diretos.");
                 }
             }
-            if !self.control_queue.is_empty() {
+            if self.room_mode == RoomMode::Local && !self.control_queue.is_empty() {
                 ui.separator();
                 ui.label("Fila atual (perda, jitter e latência dos enlaces)");
                 let mut queue = self.control_queue.clone();
@@ -314,8 +353,10 @@ impl ClientUi {
                     ));
                 }
             }
-            if let Some(status) = &self.control_status {
+            if self.room_mode == RoomMode::Local {
+                if let Some(status) = &self.control_status {
                 ui.small(status);
+                }
             }
             if self.peer_connected {
                 ui.label("Seu amigo está conectado.");
@@ -330,7 +371,25 @@ impl ClientUi {
             } else {
                 ui.label("Aguardando seu amigo entrar na sala…");
             }
-            if self.hosting_locally {
+            if self.hosting_locally && self.room_mode == RoomMode::InternetTest {
+                ui.separator();
+                ui.heading("Endereço para seu amigo");
+                match signaling_ws_url(&self.server_url) {
+                    Ok(url) => {
+                        ui.label(&url);
+                        if ui.button("Copiar endereço do servidor").clicked() {
+                            ui.ctx().copy_text(url);
+                        }
+                    }
+                    Err(_) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(190, 55, 55),
+                            "Configure o IPv4 público ou DDNS em Configurações > Conexão.",
+                        );
+                    }
+                }
+                ui.small("O roteador precisa encaminhar TCP 9000 para este PC; libere também o aplicativo no firewall.");
+            } else if self.hosting_locally {
                 ui.separator();
                 ui.heading("Endereço para seu amigo");
                 ui.label("Escolha o adaptador que seu amigo consegue alcançar, como sua rede local ou Radmin VPN.");
@@ -346,8 +405,15 @@ impl ClientUi {
         ui.group(|ui| {
             ui.heading("Prévia local da tela");
             ui.label("A prévia fica na memória. A tela só é enviada diretamente ao amigo depois que você iniciar o compartilhamento.");
-            ui.small("O vídeo P2P usa UDP 9002. Os dois PCs precisam permitir o aplicativo ou essa porta no firewall do Windows, na rede privada.");
-            ui.small("Nesta etapa, os PCs precisam estar na mesma rede local ou na mesma Radmin VPN. Conexões entre redes diferentes pela internet ainda não estão disponíveis.");
+            if self.room_mode == RoomMode::InternetTest {
+                ui.small("O vídeo P2P usa UDP 9002. Os dois PCs precisam permitir o aplicativo ou essa porta no firewall do perfil de rede em uso.");
+                ui.small("Teste controlado: a sinalização usa ws:// sem criptografia nem autenticação. Somente duas pessoas; sem TURN ou retransmissão. O anfitrião precisa permanecer online.");
+                ui.small(format!("STUN configurado: {}", self.stun_server_url));
+                ui.small("O operador do STUN pode ver o IP público de quem consulta; ele não recebe os quadros da tela.");
+            } else {
+                ui.small("O vídeo P2P usa UDP 9002. Os dois PCs precisam permitir o aplicativo ou essa porta no firewall do Windows, na rede privada.");
+                ui.small("Nesta etapa, os PCs precisam estar na mesma rede local ou na mesma Radmin VPN. Conexões entre redes diferentes pela internet ainda não estão disponíveis.");
+            }
 
             if self.screen_capture.is_some() {
                 ui.label("Captura de tela ativa.");
@@ -447,9 +513,11 @@ impl ClientUi {
                 || self.screen_share_status.is_some()
             {
                 ui.small(format!(
-                    "Última tentativa ICE: {} candidatos locais enviados, {} recebidos do amigo.",
+                    "Última tentativa ICE: {} candidatos locais ({} públicos via STUN), {} recebidos do amigo ({} públicos via STUN).",
                     self.screen_share_metrics.local_ice_candidates,
-                    self.screen_share_metrics.remote_ice_candidates
+                    self.screen_share_metrics.local_srflx_candidates,
+                    self.screen_share_metrics.remote_ice_candidates,
+                    self.screen_share_metrics.remote_srflx_candidates
                 ));
             }
         });
@@ -458,11 +526,21 @@ impl ClientUi {
         if ui
             .add_enabled(
                 self.screen_picker.is_none() && self.outgoing_transfer.is_none(),
-                egui::Button::new(if self.hosting_locally && self.peer_connected {
-                    "Sair e transferir automaticamente"
-                } else {
-                    "Sair da sala"
-                }),
+                egui::Button::new(
+                    if self.hosting_locally
+                        && self.peer_connected
+                        && self.room_mode == RoomMode::Local
+                    {
+                        "Sair e transferir automaticamente"
+                    } else if self.hosting_locally
+                        && self.peer_connected
+                        && self.room_mode == RoomMode::InternetTest
+                    {
+                        "Encerrar sala e sair"
+                    } else {
+                        "Sair da sala"
+                    },
+                ),
             )
             .clicked()
         {
@@ -470,6 +548,7 @@ impl ClientUi {
         }
 
         if self.hosting_locally
+            && self.room_mode == RoomMode::Local
             && ui
                 .add_enabled(
                     !self.ending_room_explicitly,
@@ -514,16 +593,47 @@ impl ClientUi {
 
     fn show_connection_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Conexão");
-        ui.label("Endereço WebSocket do computador do anfitrião.");
+        ui.label("Endereço IPv4 ou nome DDNS do anfitrião (a porta é sempre 9000):");
         ui.add(
             egui::TextEdit::singleline(&mut self.server_url)
-                .hint_text("ws://192.168.1.10:9000")
-                .desired_width(300.0),
+                .hint_text("IP público ou minha-sala.ddns.net")
+                .desired_width(340.0),
         );
-        ui.small("O endereço fica somente na memória enquanto este aplicativo estiver aberto.");
-        ui.small("Use o endereço ws://IP:9000 que o anfitrião compartilhou.");
-        ui.small("No Radmin VPN, ambos precisam estar conectados à mesma rede virtual. O anfitrião precisa permitir a porta 9000 no firewall.");
-        ui.small("Criar uma sala inicia o servidor neste computador; não é necessário manter um notebook separado ligado.");
+        match signaling_ws_url(&self.server_url) {
+            Ok(url) => {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Endereço para conectar: {url}"));
+                    if ui.button("Copiar endereço").clicked() {
+                        ui.ctx().copy_text(url);
+                    }
+                });
+            }
+            Err(error) if !self.server_url.trim().is_empty() => {
+                ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+            }
+            Err(_) => {}
+        }
+        ui.small("No modo Internet, configure aqui o IPv4 público ou nome DDNS deste PC para copiar e enviar ao amigo. Não há detecção automática do IP público.");
+        ui.small("No modo Rede local/Radmin, informe o IPv4 da rede local ou VPN que o anfitrião compartilhou.");
+        ui.small("Os valores ficam somente na memória enquanto o aplicativo estiver aberto.");
+        ui.colored_label(
+            egui::Color32::from_rgb(190, 95, 35),
+            "Esta versão usa ws:// sem criptografia nem autenticação. No modo Internet, faça somente testes controlados com pessoas conhecidas; wss:// e proteção de acesso ficam para antes da distribuição.",
+        );
+        ui.separator();
+        ui.heading("STUN para conexão direta de mídia");
+        ui.label("Uma única URI stun:; não use endereço turn: nesta etapa.");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.stun_server_url)
+                .hint_text("stun:stun.l.google.com:19302")
+                .desired_width(340.0),
+        );
+        if let Err(error) = screen_sharing::validate_stun_uri(&self.stun_server_url) {
+            ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+        }
+        ui.small("STUN ajuda os PCs a tentar encontrar um caminho UDP direto; não retransmite vídeo e não funciona em todas as redes.");
+        ui.small("O servidor integrado continua apenas na sinalização TCP 9000. Para receber pela internet, encaminhe essa porta no roteador e permita o app no firewall.");
+        ui.small("Não é necessário manter um notebook separado ligado.");
     }
 
     fn show_audio_settings(&mut self, ui: &mut egui::Ui) {
@@ -772,6 +882,12 @@ impl ClientUi {
         {
             return;
         }
+        if self.room_mode == RoomMode::InternetTest {
+            if let Err(error) = screen_sharing::validate_stun_uri(&self.stun_server_url) {
+                self.screen_share_status = Some(error);
+                return;
+            }
+        }
         self.screen_share_metrics = ScreenShareMetrics::default();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -866,7 +982,7 @@ impl ClientUi {
                     }
                 }
 
-                match ScreenShareSession::new(context.clone()) {
+                match ScreenShareSession::new(context.clone(), self.stun_server_for_room()) {
                     Ok(session) => {
                         self.screen_share_session = Some(session);
                         self.screen_share_metrics = ScreenShareMetrics::default();
@@ -912,7 +1028,7 @@ impl ClientUi {
                     );
                     return;
                 };
-                match ScreenShareSession::new(context.clone()) {
+                match ScreenShareSession::new(context.clone(), self.stun_server_for_room()) {
                     Ok(session) => {
                         if let Err(error) = session.start_sending(source) {
                             session.stop();
@@ -1066,6 +1182,10 @@ impl ClientUi {
         }
     }
 
+    fn stun_server_for_room(&self) -> Option<String> {
+        (self.room_mode == RoomMode::InternetTest).then(|| self.stun_server_url.trim().to_owned())
+    }
+
     fn enter_room(&mut self, code: String) {
         self.room_code = Some(code);
         self.code_copied = false;
@@ -1080,7 +1200,20 @@ impl ClientUi {
         if self.signaling.is_some() || self.connecting {
             return;
         }
+        if self.create_room_mode == RoomMode::InternetTest {
+            if let Err(error) = signaling_ws_url(&self.server_url) {
+                self.connection_error = Some(format!(
+                    "Configure um IPv4 público ou nome DDNS válido em Configurações > Conexão: {error}"
+                ));
+                return;
+            }
+            if let Err(error) = screen_sharing::validate_stun_uri(&self.stun_server_url) {
+                self.connection_error = Some(error);
+                return;
+            }
+        }
         self.refresh_host_addresses();
+        self.room_mode = self.create_room_mode;
         self.connection_error = None;
         self.connection_status = Some("Iniciando servidor de sala neste computador…".to_owned());
         self.connecting = true;
@@ -1091,7 +1224,7 @@ impl ClientUi {
         self.hosting_locally = false;
 
         let participant = self.local_participant_info();
-        match SignalingClient::start_host_with_participant(participant) {
+        match SignalingClient::start_host_with_participant(participant, self.room_mode) {
             Ok(client) => self.signaling = Some(client),
             Err(error) => {
                 self.connecting = false;
@@ -1106,6 +1239,16 @@ impl ClientUi {
         if self.signaling.is_some() || self.connecting {
             return;
         }
+        let server_url = match signaling_ws_url(&self.server_url) {
+            Ok(url) => url,
+            Err(error) => {
+                self.connection_error = Some(format!(
+                    "Informe o IPv4 ou nome DDNS do anfitrião em Configurações > Conexão: {error}"
+                ));
+                return;
+            }
+        };
+        self.room_mode = RoomMode::Local;
         self.connection_error = None;
         self.connection_status = Some("Conectando ao anfitrião…".to_owned());
         self.connecting = true;
@@ -1116,11 +1259,7 @@ impl ClientUi {
         self.room_code = None;
 
         let participant = self.local_participant_info();
-        match SignalingClient::join_with_participant(
-            self.server_url.trim().to_owned(),
-            code,
-            participant,
-        ) {
+        match SignalingClient::join_with_participant(server_url, code, participant) {
             Ok(client) => self.signaling = Some(client),
             Err(error) => {
                 self.connecting = false;
@@ -1138,11 +1277,14 @@ impl ClientUi {
                 .as_nanos();
             self.participant_id = format!("{}-{nonce:x}", std::process::id());
         }
-        let control_address = self
-            .host_addresses
-            .get(self.selected_host_address)
-            .map(|address| format!("{}:9001", address.ipv4))
-            .unwrap_or_default();
+        let control_address = if self.room_mode == RoomMode::InternetTest {
+            String::new()
+        } else {
+            self.host_addresses
+                .get(self.selected_host_address)
+                .map(|address| format!("{}:9001", address.ipv4))
+                .unwrap_or_default()
+        };
         let order = self
             .participants
             .iter()
@@ -1152,12 +1294,18 @@ impl ClientUi {
             id: self.participant_id.clone(),
             display_name: "Participante".to_owned(),
             order,
-            may_host: self.may_host,
+            may_host: self.room_mode == RoomMode::Local && self.may_host,
             control_address,
         }
     }
 
-    fn update_room_roster(&mut self, participants: Vec<ParticipantInfo>, leader_id: String) {
+    fn update_room_roster(
+        &mut self,
+        participants: Vec<ParticipantInfo>,
+        leader_id: String,
+        room_mode: RoomMode,
+    ) {
+        self.room_mode = room_mode;
         self.participants = participants;
         self.current_leader_id = leader_id.clone();
         if self.participants.len() != 2 && !matches!(&self.screen_share_role, ScreenShareRole::Idle)
@@ -1167,6 +1315,15 @@ impl ClientUi {
                 "O compartilhamento foi encerrado porque esta sala não tem exatamente duas pessoas."
                     .to_owned(),
             );
+        }
+        if self.room_mode == RoomMode::InternetTest {
+            self.control_mesh = None;
+            self.control_queue.clear();
+            self.control_status = Some(
+                "Malha TCP 9001 e sucessão automática desativadas nesta sala de Internet."
+                    .to_owned(),
+            );
+            return;
         }
         let Some(local) = self
             .participants
@@ -1545,7 +1702,9 @@ impl ClientUi {
                     self.connection_status = Some("Você entrou na sala do anfitrião.".to_owned());
                     self.enter_room(code);
                 }
-                SignalingEvent::RoomAdopted(_) => {}
+                SignalingEvent::RoomAdopted(_) => {
+                    self.room_mode = RoomMode::Local;
+                }
                 SignalingEvent::PeerJoined => {
                     self.connecting = false;
                     self.peer_connected = true;
@@ -1567,8 +1726,9 @@ impl ClientUi {
                 SignalingEvent::RoomRoster {
                     participants,
                     leader_id,
+                    room_mode,
                 } => {
-                    self.update_room_roster(participants, leader_id);
+                    self.update_room_roster(participants, leader_id, room_mode);
                 }
                 SignalingEvent::HostTransferPending { code, token } => {
                     self.outgoing_transfer = Some((code, token));
@@ -1745,7 +1905,12 @@ impl ClientUi {
 
     fn request_leave(&mut self, context: &egui::Context) {
         self.stop_screen_share(true);
-        if self.hosting_locally && self.peer_connected {
+        if self.hosting_locally && self.peer_connected && self.room_mode == RoomMode::InternetTest {
+            self.leave_room();
+            self.connection_status = Some(
+                "Sala de Internet encerrada; o anfitrião saiu e ela não terá sucessor.".to_owned(),
+            );
+        } else if self.hosting_locally && self.peer_connected {
             if let Some(mesh) = self
                 .control_mesh
                 .as_ref()
@@ -1982,6 +2147,7 @@ impl ClientUi {
         self.room_code = None;
         self.participants.clear();
         self.current_leader_id.clear();
+        self.room_mode = RoomMode::Local;
         self.control_queue.clear();
         self.control_mesh = None;
         self.pending_election_epoch = None;
@@ -2048,6 +2214,60 @@ fn enumerate_host_addresses() -> Result<Vec<HostAddress>, String> {
     }
 }
 
+fn signaling_ws_url(input: &str) -> Result<String, String> {
+    let value = input.trim();
+    if value.is_empty() {
+        return Err("O endereço do anfitrião está vazio.".to_owned());
+    }
+    let address = if let Some(address) = value.strip_prefix("ws://") {
+        address
+    } else if value.contains("://") {
+        return Err("Use ws://; wss:// ainda não está disponível nesta etapa.".to_owned());
+    } else {
+        value
+    };
+
+    let address = address.trim_end_matches('/');
+    if address.contains('/') || address.contains('?') || address.contains('#') {
+        return Err("Informe somente o IPv4 ou nome do anfitrião, sem caminho.".to_owned());
+    }
+
+    let host = match address.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => {
+            if port != "9000" {
+                return Err("A porta do servidor é fixa em 9000.".to_owned());
+            }
+            host
+        }
+        Some(_) => {
+            return Err(
+                "IPv6 não está disponível nesta etapa; informe um IPv4 ou nome DDNS.".to_owned(),
+            );
+        }
+        None => address,
+    };
+
+    if host.parse::<Ipv4Addr>().is_err() {
+        if host.len() > 253 || host.is_empty() || !host.is_ascii() {
+            return Err("Informe um IPv4 ou nome DDNS válido.".to_owned());
+        }
+        let valid_name = host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+        if !valid_name {
+            return Err("Informe um IPv4 ou nome DDNS válido.".to_owned());
+        }
+    }
+
+    Ok(format!("ws://{host}:9000"))
+}
+
 fn signaling_address_for_control(control_address: &str) -> String {
     control_address
         .strip_suffix(":9001")
@@ -2071,6 +2291,7 @@ fn main() -> eframe::Result {
     let mut app = ClientUi::default();
     app.monitor_gain_db = 6.0;
     app.microphone_level_dbfs = -60.0;
+    app.stun_server_url = "stun:stun.l.google.com:19302".to_owned();
 
     eframe::run_ui_native(
         "P2P - Voz e tela",
@@ -2079,4 +2300,29 @@ fn main() -> eframe::Result {
             egui::CentralPanel::default().show(ui, |ui| app.show(ui));
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signaling_ws_url;
+
+    #[test]
+    fn signaling_address_accepts_ipv4_or_ddns_with_fixed_port() {
+        assert_eq!(
+            signaling_ws_url("203.0.113.10").unwrap(),
+            "ws://203.0.113.10:9000"
+        );
+        assert_eq!(
+            signaling_ws_url("ws://my-room.ddns.net:9000").unwrap(),
+            "ws://my-room.ddns.net:9000"
+        );
+    }
+
+    #[test]
+    fn signaling_address_rejects_tls_ipv6_wrong_port_and_paths() {
+        assert!(signaling_ws_url("wss://my-room.ddns.net").is_err());
+        assert!(signaling_ws_url("2001:db8::1").is_err());
+        assert!(signaling_ws_url("192.0.2.10:9001").is_err());
+        assert!(signaling_ws_url("192.0.2.10/room").is_err());
+    }
 }

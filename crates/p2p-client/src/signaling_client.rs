@@ -3,7 +3,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use signaling_protocol::{ClientMessage, ParticipantInfo, ServerMessage, SignalKind};
+use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage, SignalKind};
 use signaling_server::TransferReservation;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -41,6 +41,7 @@ pub enum SignalingEvent {
     RoomRoster {
         participants: Vec<ParticipantInfo>,
         leader_id: String,
+        room_mode: RoomMode,
     },
     HostTransferPending {
         code: String,
@@ -79,11 +80,15 @@ pub struct SignalingClient {
 }
 
 impl SignalingClient {
-    pub fn start_host_with_participant(participant: ParticipantInfo) -> Result<Self, String> {
+    pub fn start_host_with_participant(
+        participant: ParticipantInfo,
+        room_mode: RoomMode,
+    ) -> Result<Self, String> {
         Self::start_worker(
             LOCAL_CLIENT_URL.to_owned(),
             ClientMessage::CreateRoomIdentified {
                 participant: participant.clone(),
+                room_mode,
             },
             Some(None),
             LOCAL_SERVER_ADDRESS.to_owned(),
@@ -302,14 +307,14 @@ async fn run_client(
         Ok(Ok((websocket, _response))) => websocket,
         Ok(Err(error)) => {
             let _ = events.send(SignalingEvent::Error(format!(
-                "Nao foi possivel conectar ao servidor: {error}"
+                "Nao foi possivel chegar ao servidor de sinalizacao TCP 9000. Confira o endereco, o encaminhamento da porta no roteador e o firewall do anfitriao: {error}"
             )));
             stop_local_server(server_shutdown, server_task).await;
             return;
         }
         Err(_) => {
             let _ = events.send(SignalingEvent::Error(
-                "A conexao expirou. Confira o IP, a porta e o firewall.".to_owned(),
+                "A conexao ao servidor de sinalizacao TCP 9000 expirou. Confira o endereco, o encaminhamento da porta no roteador e o firewall do anfitriao.".to_owned(),
             ));
             stop_local_server(server_shutdown, server_task).await;
             return;
@@ -378,8 +383,8 @@ async fn run_client(
                             Ok(ServerMessage::Signal { kind, payload }) => {
                                 let _ = events.send(SignalingEvent::Signal { kind, payload });
                             }
-                            Ok(ServerMessage::RoomRoster { participants, leader_id }) => {
-                                let _ = events.send(SignalingEvent::RoomRoster { participants, leader_id });
+                            Ok(ServerMessage::RoomRoster { participants, leader_id, room_mode }) => {
+                                let _ = events.send(SignalingEvent::RoomRoster { participants, leader_id, room_mode });
                             }
                             Ok(ServerMessage::RoomLeft) => break,
                             Ok(ServerMessage::Error { message }) => {
