@@ -6,6 +6,11 @@ pub enum ClientMessage {
     CreateRoom,
     JoinRoom { code: String },
     LeaveRoom,
+    RequestHostTransfer,
+    CancelHostTransfer { token: String },
+    AdoptTransferredRoom { code: String, token: String },
+    ConfirmHostTransfer { code: String, token: String },
+    RejectHostTransfer { token: String },
     Signal { kind: SignalKind, payload: String },
 }
 
@@ -17,6 +22,11 @@ pub enum ServerMessage {
     RoomLeft,
     PeerJoined,
     PeerLeft,
+    HostTransferPending { code: String, token: String },
+    HostTransferRequested { code: String, token: String },
+    RoomAdopted { code: String },
+    HostTransferComplete { code: String },
+    HostTransferCanceled { message: String },
     Signal { kind: SignalKind, payload: String },
     Error { message: String },
 }

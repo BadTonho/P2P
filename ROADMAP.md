@@ -4,7 +4,7 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 
 ## Escopo atual
 
-- O desenvolvimento será feito no seu PC principal; o notebook será usado apenas nas etapas que precisarem dele, como executar o servidor de sinalização.
+- O desenvolvimento e a hospedagem de uma sala serão feitos no PC de quem cria a sala. Não é necessário manter um notebook separado ligado.
 - Aplicativo instalado primeiro no Windows.
 - Rust como linguagem principal.
 - egui/eframe para a interface gráfica.
@@ -12,7 +12,9 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 - Salas limitadas a duas pessoas na primeira versão: você e um amigo.
 - Sem câmera e sem chat de texto.
 - Conexão P2P: áudio e tela devem ir diretamente entre os computadores quando a rede permitir.
-- O servidor de sinalização atual é um programa separado e pode rodar em qualquer PC; não precisa ficar preso ao notebook. Integrar a hospedagem ao cliente continua como ideia futura.
+- O aplicativo inicia um servidor de sinalização integrado no PC do anfitrião, na porta 9000. O executável separado do servidor permanece disponível para desenvolvimento.
+- Se o anfitrião sair normalmente, o outro participante pode aceitar e assumir a hospedagem. Se o PC anfitrião cair abruptamente, a sala termina.
+- Radmin VPN e o ingresso dos participantes na mesma rede virtual são configurados fora do aplicativo.
 - TURN continua opcional. Se for usado como alternativa, retransmite a mídia e deixa de ser uma conexão direta.
 
 ## Etapas
@@ -51,22 +53,15 @@ Implementar testes locais e independentes para o microfone e a tela:
 
 **Concluída quando:** o aplicativo confirmar que consegue captar áudio e imagem e encerrar a captura corretamente.
 
-### Etapa 4 — Criar o servidor de sinalização na rede local
+### Etapa 4 — Sinalização integrada e transferência de anfitrião
 
-Criar salas e permitir que os participantes troquem as informações usadas para negociar uma conexão WebRTC. O servidor não deve receber nem encaminhar áudio ou tela na conexão direta.
+Ao criar uma sala, iniciar o servidor de sinalização no PC do anfitrião. Os participantes trocam as informações usadas para negociar uma conexão WebRTC; o servidor não recebe nem encaminha áudio ou tela. Listar os IPv4 ativos para o anfitrião compartilhar o endereço local ou do Radmin VPN. Permitir que o participante assuma a hospedagem quando o anfitrião sair normalmente.
 
-**Concluída quando:** dois aplicativos na mesma rede conseguirem entrar na sala e trocar as informações iniciais de conexão.
+**Concluída quando:** dois aplicativos em computadores diferentes entrarem na sala, trocarem sinais e concluírem a transferência de anfitrião pela rede local ou pelo Radmin VPN.
 
-**Implementado até agora:** o servidor Rust é um programa separado, escuta na porta 9000 e pode ser executado em qualquer computador acessível aos clientes. Os clientes informam o endereço do servidor em Configurações > Conexão. O teste local com dois clientes passou; ainda falta validar a conexão entre computadores físicos na rede.
+**Implementado:** o cliente inicia o servidor integrado ao criar sala, mostra os adaptadores ativos com IPv4 e permite copiar `ws://IP:9000`. A transferência pede aceite, inicia o servidor no outro PC com o mesmo código e só então encerra o servidor anterior. Recusa, cancelamento ou timeout mantém a sala original ativa. O teste automatizado cobre porta ocupada, recusa, timeout e handoff entre servidores locais.
 
-### Ideia em aberto — Hospedar a sinalização no computador de quem cria a sala
-
-- O aplicativo poderia iniciar um servidor temporário no PC de quem cria a sala, sem exigir que o notebook esteja ligado ou que exista hospedagem externa.
-- Um amigo poderia conectar ao IP do anfitrião na rede local ou no Radmin VPN e entrar usando o código da sala. O Radmin fornece a rede virtual; o servidor do aplicativo ainda coordena a sala e os sinais.
-- Se o anfitrião sair, a sala perde o servidor. Uma possibilidade é transferir a hospedagem para o participante que continuar conectado; essa transferência ainda precisa ser projetada e implementada.
-- Sem nenhum participante online, a sala não pode continuar acessível automaticamente sem um serviço sempre ligado em algum lugar ou sem troca manual dos dados de conexão.
-
-**Estado:** proposta registrada; ainda não é uma função do aplicativo e a estratégia de transferência de anfitrião continua em aberto.
+**Falta validar manualmente:** entrada e transferência entre dois computadores físicos usando LAN e Radmin VPN.
 
 ### Etapa 5 — Fazer a chamada P2P de voz na rede local
 
@@ -82,7 +77,7 @@ Enviar a captura da tela diretamente ao outro participante e permitir parar o co
 
 ### Etapa 7 — Conectar participantes em casas diferentes
 
-Deixar o servidor de sinalização do notebook acessível pela internet e testar o estabelecimento de conexões diretas com ICE/STUN. Verificar as configurações do roteador e se o provedor permite conexões de entrada.
+Deixar o servidor integrado do anfitrião acessível pela internet e testar o estabelecimento de conexões diretas com ICE/STUN. Verificar as configurações do roteador e se o provedor permite conexões de entrada.
 
 **Concluída quando:** dois participantes em redes diferentes conseguirem estabelecer voz e tela diretamente, sem o servidor de sinalização retransmitir mídia.
 
@@ -94,9 +89,9 @@ Se a conexão direta falhar em algumas redes, decidir entre manter o requisito e
 
 ### Etapa 9 — Preparar o uso e o instalador
 
-Tratar encerramento de chamadas, desconexões, acesso às salas e estados de captura. Gerar o instalador do aplicativo cliente e preparar a execução do servidor no notebook.
+Tratar encerramento de chamadas, desconexões, acesso às salas e estados de captura. Gerar o instalador do aplicativo cliente e documentar o compartilhamento do endereço de rede e do código da sala.
 
-**Concluída quando:** for possível instalar o cliente em outro computador e seguir os passos para conectar-se ao servidor do notebook.
+**Concluída quando:** for possível instalar o cliente em outro computador e seguir os passos para conectar-se ao PC anfitrião.
 
 ## Como pedir a próxima etapa
 
