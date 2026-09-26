@@ -67,9 +67,17 @@ Ao criar uma sala, iniciar o servidor de sinalização no PC do anfitrião, na p
 
 ### Etapa 5 — Compartilhar a tela por P2P na rede local
 
-Enviar a captura da tela diretamente aos participantes usando WebRTC e permitir iniciar e parar o compartilhamento; o grupo planejado comporta até oito pessoas. A primeira validação será entre duas pessoas na mesma rede local.
+Compartilhar a captura da tela diretamente com o outro participante usando WebRTC. Esta primeira versão funciona somente quando há exatamente duas pessoas na sala; salas maiores mostram que o compartilhamento ainda não está disponível para grupos. Qualquer uma das duas pessoas pode iniciar a transmissão. Se ambas pedirem ao mesmo tempo, prevalece a pessoa que entrou primeiro na sala.
+
+Codificar e decodificar vídeo H.264 com OpenH264 incluído no aplicativo. Preparar quadros com até 1280×720, preservando a proporção, e limitar o envio a 30 quadros por segundo. A captura mantém o quadro mais recente; codificação e decodificação rodam fora da interface. O seletor do Windows escolhe a tela ou janela, e a prévia local permanece separada do envio.
+
+Usar o servidor da sala apenas para trocar pedido, oferta, resposta, candidatos ICE e encerramento da sessão. Os quadros seguem diretamente entre os dois PCs; nesta etapa não há STUN ou TURN. Se a captura escolhida fechar, o usuário parar, sair da sala ou perder a conexão, encerrar a sessão WebRTC.
 
 **Concluída quando:** o outro participante receber a tela e ela parar quando o usuário encerrar o compartilhamento ou sair da sala, sem o servidor de sinalização encaminhar imagens.
+
+**Implementado:** captura de até 1280×720, codificação H.264 com OpenH264 incluído, envio WebRTC de até 30 fps, decodificação da tela remota, negociação por oferta/resposta e ICE, controle para pedir/aceitar/recusar/encerrar compartilhamento, desempate pela ordem de entrada quando há pedidos simultâneos, parada ao encerrar a captura ou perder a conexão. Salas com mais de duas pessoas não podem iniciar o compartilhamento.
+
+**Falta validar manualmente:** iniciar nos dois sentidos entre dois PCs na mesma LAN, conferir o seletor cancelado, fechar a janela capturada, testar o encerramento da sessão e confirmar que o servidor nunca recebe quadros de vídeo. Também falta validar com firewall e adaptadores que as pessoas realmente usarão.
 
 ### Etapa 6 — Fazer a chamada P2P de voz na rede local
 

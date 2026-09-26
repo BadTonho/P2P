@@ -151,6 +151,10 @@ pub enum SignalKind {
     Offer,
     Answer,
     IceCandidate,
+    ScreenShareRequest,
+    ScreenShareAccept,
+    ScreenShareBusy,
+    ScreenShareStopped,
 }
 
 #[cfg(test)]
@@ -175,6 +179,15 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ServerMessage>(&json).unwrap(),
             response
+        );
+
+        let stopped = ClientMessage::Signal {
+            kind: SignalKind::ScreenShareStopped,
+            payload: "share-request-1".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_string(&stopped).unwrap(),
+            r#"{"type":"signal","kind":"screen_share_stopped","payload":"share-request-1"}"#
         );
     }
 }

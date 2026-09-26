@@ -64,6 +64,7 @@ pub enum SignalingEvent {
 enum ClientCommand {
     SendDiagnostic,
     AcknowledgeDiagnostic,
+    SendSignal { kind: SignalKind, payload: String },
     RequestHostTransfer,
     CancelHostTransfer { token: String },
     ConfirmHostTransfer { code: String, token: String },
@@ -215,6 +216,12 @@ impl SignalingClient {
     pub fn acknowledge_diagnostic(&self) -> Result<(), String> {
         self.commands
             .send(ClientCommand::AcknowledgeDiagnostic)
+            .map_err(|_| "A conexao com o servidor foi encerrada.".to_owned())
+    }
+
+    pub fn send_signal(&self, kind: SignalKind, payload: String) -> Result<(), String> {
+        self.commands
+            .send(ClientCommand::SendSignal { kind, payload })
             .map_err(|_| "A conexao com o servidor foi encerrada.".to_owned())
     }
 
@@ -414,6 +421,13 @@ async fn run_client(
                     }
                     Some(ClientCommand::AcknowledgeDiagnostic) => {
                         if let Err(error) = send_signal(&mut writer, SignalKind::Diagnostic, DIAGNOSTIC_ACK_PAYLOAD).await {
+                            let _ = events.send(SignalingEvent::Error(error));
+                            failed = true;
+                            break;
+                        }
+                    }
+                    Some(ClientCommand::SendSignal { kind, payload }) => {
+                        if let Err(error) = send_signal(&mut writer, kind, &payload).await {
                             let _ = events.send(SignalingEvent::Error(error));
                             failed = true;
                             break;

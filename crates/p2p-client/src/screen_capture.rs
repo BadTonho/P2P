@@ -17,14 +17,18 @@ use windows_capture::settings::{
     GraphicsCaptureItemType, MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
-const MAX_PREVIEW_WIDTH: u32 = 640;
-const MAX_PREVIEW_HEIGHT: u32 = 360;
+const MAX_FRAME_WIDTH: u32 = 1280;
+const MAX_FRAME_HEIGHT: u32 = 720;
 
+#[derive(Clone)]
 pub struct PreviewFrame {
+    pub sequence: u64,
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
 }
+
+pub type LatestFrame = Arc<Mutex<Option<Arc<PreviewFrame>>>>;
 
 type HandlerError = Box<dyn Error + Send + Sync>;
 type Control = CaptureControl<ScreenFrameHandler, HandlerError>;
@@ -32,7 +36,7 @@ type PickResult = Result<Option<windows_capture::GraphicsCaptureItem>, String>;
 
 pub struct ScreenCapture {
     control: Option<Control>,
-    latest_frame: Arc<Mutex<Option<PreviewFrame>>>,
+    latest_frame: LatestFrame,
     source_closed: Arc<AtomicBool>,
     picker_owner: Option<PickerThreadOwner>,
 }
@@ -190,11 +194,15 @@ impl ScreenCapture {
         })
     }
 
-    pub fn take_latest_frame(&self) -> Option<PreviewFrame> {
+    pub fn latest_frame(&self) -> Option<Arc<PreviewFrame>> {
         self.latest_frame
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+            .clone()
+    }
+
+    pub fn frame_source(&self) -> LatestFrame {
+        Arc::clone(&self.latest_frame)
     }
 
     pub fn source_closed(&self) -> bool {
@@ -241,7 +249,7 @@ impl Drop for ScreenCapture {
 struct HandlerFlags {
     _size: (i32, i32),
     context: egui::Context,
-    latest_frame: Arc<Mutex<Option<PreviewFrame>>>,
+    latest_frame: LatestFrame,
     source_closed: Arc<AtomicBool>,
 }
 
@@ -264,9 +272,10 @@ impl TryInto<GraphicsCaptureItemType> for PickerItemForThread {
 
 struct ScreenFrameHandler {
     context: egui::Context,
-    latest_frame: Arc<Mutex<Option<PreviewFrame>>>,
+    latest_frame: LatestFrame,
     source_closed: Arc<AtomicBool>,
     scratch: Vec<u8>,
+    sequence: u64,
 }
 
 impl GraphicsCaptureApiHandler for ScreenFrameHandler {
@@ -279,6 +288,7 @@ impl GraphicsCaptureApiHandler for ScreenFrameHandler {
             latest_frame: context.flags.latest_frame,
             source_closed: context.flags.source_closed,
             scratch: Vec::new(),
+            sequence: 0,
         })
     }
 
@@ -295,11 +305,12 @@ impl GraphicsCaptureApiHandler for ScreenFrameHandler {
 
         let frame_buffer = frame.buffer()?;
         let rgba = frame_buffer.as_nopadding_buffer(&mut self.scratch);
-        let preview = downsample_rgba(rgba, width, height);
+        self.sequence = self.sequence.wrapping_add(1);
+        let preview = downsample_rgba(rgba, width, height, self.sequence);
         *self
             .latest_frame
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(preview);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(preview));
         self.context.request_repaint();
         Ok(())
     }
@@ -311,12 +322,8 @@ impl GraphicsCaptureApiHandler for ScreenFrameHandler {
     }
 }
 
-fn downsample_rgba(bytes: &[u8], width: u32, height: u32) -> PreviewFrame {
-    let scale = (MAX_PREVIEW_WIDTH as f32 / width as f32)
-        .min(MAX_PREVIEW_HEIGHT as f32 / height as f32)
-        .min(1.0);
-    let out_width = ((width as f32 * scale).round() as u32).max(1);
-    let out_height = ((height as f32 * scale).round() as u32).max(1);
+fn downsample_rgba(bytes: &[u8], width: u32, height: u32, sequence: u64) -> PreviewFrame {
+    let (out_width, out_height) = scaled_dimensions(width, height);
     let mut rgba = Vec::with_capacity((out_width * out_height * 4) as usize);
 
     for y in 0..out_height {
@@ -333,8 +340,43 @@ fn downsample_rgba(bytes: &[u8], width: u32, height: u32) -> PreviewFrame {
     }
 
     PreviewFrame {
+        sequence,
         width: out_width,
         height: out_height,
         rgba,
+    }
+}
+
+fn scaled_dimensions(width: u32, height: u32) -> (u32, u32) {
+    let scale = (MAX_FRAME_WIDTH as f32 / width as f32)
+        .min(MAX_FRAME_HEIGHT as f32 / height as f32)
+        .min(1.0);
+    (
+        even_dimension((width as f32 * scale).round() as u32),
+        even_dimension((height as f32 * scale).round() as u32),
+    )
+}
+
+fn even_dimension(value: u32) -> u32 {
+    value.max(2) & !1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scaled_dimensions;
+
+    #[test]
+    fn capture_frames_fit_the_720p_h264_limit() {
+        assert_eq!(scaled_dimensions(3840, 2160), (1280, 720));
+        assert_eq!(scaled_dimensions(2560, 1080), (1280, 540));
+    }
+
+    #[test]
+    fn capture_dimensions_are_even_for_h264() {
+        let (width, height) = scaled_dimensions(1365, 767);
+        assert_eq!(width % 2, 0);
+        assert_eq!(height % 2, 0);
+        assert!(width <= 1280);
+        assert!(height <= 720);
     }
 }

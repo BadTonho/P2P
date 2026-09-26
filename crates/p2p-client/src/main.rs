@@ -3,6 +3,7 @@
 mod audio_capture;
 mod control_mesh;
 mod screen_capture;
+mod screen_sharing;
 mod signaling_client;
 
 use std::net::Ipv4Addr;
@@ -12,6 +13,7 @@ use audio_capture::MicrophoneTest;
 use control_mesh::{ControlEvent, ControlMesh, QueueEntry};
 use eframe::egui;
 use screen_capture::{PendingScreenCapture, ScreenCapture};
+use screen_sharing::{ScreenShareEvent, ScreenShareSession};
 use signaling_client::{SignalingClient, SignalingEvent};
 use signaling_protocol::{ParticipantInfo, SignalKind};
 
@@ -72,6 +74,32 @@ struct ClientUi {
     screen_picker: Option<PendingScreenCapture>,
     screen_texture: Option<egui::TextureHandle>,
     screen_status: Option<String>,
+    screen_share_session: Option<ScreenShareSession>,
+    screen_share_role: ScreenShareRole,
+    screen_share_status: Option<String>,
+    remote_screen_texture: Option<egui::TextureHandle>,
+    remote_screen_sequence: u64,
+}
+
+#[derive(Clone, Default)]
+enum ScreenShareRole {
+    #[default]
+    Idle,
+    Requesting {
+        request_id: String,
+    },
+    Sending {
+        request_id: String,
+    },
+    Receiving {
+        request_id: String,
+    },
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ScreenShareRequest {
+    request_id: String,
+    participant_id: String,
 }
 
 #[derive(Clone)]
@@ -86,6 +114,7 @@ impl ClientUi {
         if self.microphone.is_some()
             || self.screen_capture.is_some()
             || self.screen_picker.is_some()
+            || self.screen_share_session.is_some()
             || self.connecting
             || self.signaling.is_some()
             || self.control_mesh.is_some()
@@ -95,6 +124,7 @@ impl ClientUi {
         self.refresh_microphone();
         self.refresh_screen(ui.ctx());
         self.refresh_signaling(ui.ctx());
+        self.refresh_screen_share(ui.ctx());
         self.refresh_control_mesh(ui.ctx());
         self.handle_window_close(ui.ctx());
 
@@ -107,7 +137,7 @@ impl ClientUi {
                 ui.vertical(|ui| {
                     ui.add_space(16.0);
                     ui.heading("P2P - Voz e tela");
-                    ui.label("Sinalização na rede local — sem áudio ou tela transmitidos");
+                    ui.label("Sinalização local e compartilhamento de tela P2P, sem áudio");
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -311,7 +341,7 @@ impl ClientUi {
 
         ui.group(|ui| {
             ui.heading("Prévia local da tela");
-            ui.label("A imagem fica apenas na memória deste aplicativo. Ela não é salva nem transmitida.");
+            ui.label("A prévia fica na memória. A tela só é enviada diretamente ao amigo depois que você iniciar o compartilhamento.");
 
             if self.screen_capture.is_some() {
                 ui.label("Captura de tela ativa.");
@@ -331,6 +361,55 @@ impl ClientUi {
 
             if let Some(status) = &self.screen_status {
                 ui.label(status);
+            }
+
+            match self.screen_share_role.clone() {
+                ScreenShareRole::Idle => {
+                    let allowed = self.participants.len() == 2
+                        && self.peer_connected
+                        && self.screen_capture.is_some()
+                        && self.screen_share_session.is_none();
+                    if ui
+                        .add_enabled(allowed, egui::Button::new("Compartilhar tela com meu amigo"))
+                        .clicked()
+                    {
+                        self.request_screen_share(ui.ctx());
+                    }
+                    if self.participants.len() > 2 {
+                        ui.small("O compartilhamento de tela está limitado a salas de duas pessoas nesta etapa.");
+                    } else if self.screen_capture.is_none() {
+                        ui.small("Selecione uma tela ou janela para habilitar o compartilhamento.");
+                    } else if !self.peer_connected {
+                        ui.small("Aguardando o outro participante entrar na sala.");
+                    }
+                }
+                ScreenShareRole::Requesting { .. } => {
+                    ui.label("Pedido de compartilhamento enviado; aguardando resposta do amigo.");
+                    if ui.button("Cancelar pedido").clicked() {
+                        self.stop_screen_share(true);
+                        self.screen_share_status = Some("Pedido de compartilhamento cancelado.".to_owned());
+                    }
+                }
+                ScreenShareRole::Sending { .. } => {
+                    ui.label("Você está compartilhando a tela diretamente com seu amigo.");
+                    if ui.button("Parar compartilhamento").clicked() {
+                        self.stop_screen_share(true);
+                    }
+                }
+                ScreenShareRole::Receiving { .. } => {
+                    ui.label("Seu amigo está compartilhando a tela diretamente com você.");
+                    if ui.button("Parar de receber a tela").clicked() {
+                        self.stop_screen_share(true);
+                    }
+                    if let Some(texture) = &self.remote_screen_texture {
+                        ui.add(egui::Image::new((texture.id(), texture.size_vec2())).max_width(640.0));
+                    } else {
+                        ui.label("Aguardando o primeiro quadro da tela remota…");
+                    }
+                }
+            }
+            if let Some(status) = &self.screen_share_status {
+                ui.small(status);
             }
         });
 
@@ -591,7 +670,7 @@ impl ClientUi {
             return;
         };
 
-        if let Some(frame) = capture.take_latest_frame() {
+        if let Some(frame) = capture.latest_frame() {
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
                 &frame.rgba,
@@ -608,6 +687,7 @@ impl ClientUi {
         }
 
         if capture.source_closed() {
+            self.stop_screen_share(true);
             self.stop_screen_capture();
             self.screen_status =
                 Some("A tela ou janela escolhida foi fechada; a captura terminou.".to_owned());
@@ -615,6 +695,7 @@ impl ClientUi {
         }
 
         if let Some(result) = capture.poll_finished() {
+            self.stop_screen_share(true);
             self.screen_capture = None;
             self.screen_texture = None;
             self.screen_status = Some(match result {
@@ -625,6 +706,7 @@ impl ClientUi {
     }
 
     fn stop_screen_capture(&mut self) {
+        self.stop_screen_share(true);
         let result = self
             .screen_capture
             .take()
@@ -638,12 +720,306 @@ impl ClientUi {
         });
     }
 
+    fn request_screen_share(&mut self, context: &egui::Context) {
+        if self.participants.len() != 2
+            || !self.peer_connected
+            || self.screen_capture.is_none()
+            || !matches!(&self.screen_share_role, ScreenShareRole::Idle)
+        {
+            return;
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let request_id = format!("{}-{nonce:x}", self.participant_id);
+        let request = ScreenShareRequest {
+            request_id: request_id.clone(),
+            participant_id: self.participant_id.clone(),
+        };
+        let payload = match serde_json::to_string(&request) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.screen_share_status =
+                    Some(format!("Não foi possível preparar o pedido: {error}"));
+                return;
+            }
+        };
+        let result = self
+            .signaling
+            .as_ref()
+            .ok_or_else(|| "A sala não está conectada ao servidor de sinalização.".to_owned())
+            .and_then(|signaling| signaling.send_signal(SignalKind::ScreenShareRequest, payload));
+        match result {
+            Ok(()) => {
+                self.screen_share_role = ScreenShareRole::Requesting { request_id };
+                self.screen_share_status =
+                    Some("Pedido enviado; a transmissão começa quando o amigo aceitar.".to_owned());
+                context.request_repaint();
+            }
+            Err(error) => self.screen_share_status = Some(error),
+        }
+    }
+
+    fn handle_screen_share_signal(
+        &mut self,
+        kind: SignalKind,
+        payload: String,
+        context: &egui::Context,
+    ) {
+        match kind {
+            SignalKind::ScreenShareRequest => {
+                let request: ScreenShareRequest = match serde_json::from_str(&payload) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        self.screen_share_status =
+                            Some(format!("Pedido de compartilhamento inválido: {error}"));
+                        return;
+                    }
+                };
+                let remote_order = self
+                    .participants
+                    .iter()
+                    .find(|participant| participant.id == request.participant_id);
+                let Some(remote_order) = remote_order.map(|participant| participant.order) else {
+                    return;
+                };
+                if self.participants.len() != 2 {
+                    let _ = self
+                        .send_screen_share_signal(SignalKind::ScreenShareBusy, request.request_id);
+                    self.screen_share_status =
+                        Some("O compartilhamento ainda está limitado a duas pessoas.".to_owned());
+                    return;
+                }
+
+                let local_order = self
+                    .participants
+                    .iter()
+                    .find(|participant| participant.id == self.participant_id)
+                    .map(|participant| participant.order)
+                    .unwrap_or(u8::MAX);
+                match self.screen_share_role.clone() {
+                    ScreenShareRole::Requesting { .. } if local_order < remote_order => {
+                        // Quando os dois pedem ao mesmo tempo, vence quem entrou primeiro.
+                        let _ = self.send_screen_share_signal(
+                            SignalKind::ScreenShareBusy,
+                            request.request_id,
+                        );
+                        return;
+                    }
+                    ScreenShareRole::Requesting { .. } if local_order > remote_order => {
+                        // O pedido de quem entrou antes vence; aceitamos e descartamos o nosso.
+                        self.screen_share_role = ScreenShareRole::Idle;
+                    }
+                    ScreenShareRole::Idle if self.screen_share_session.is_none() => {}
+                    _ => {
+                        let _ = self.send_screen_share_signal(
+                            SignalKind::ScreenShareBusy,
+                            request.request_id,
+                        );
+                        return;
+                    }
+                }
+
+                match ScreenShareSession::new(context.clone()) {
+                    Ok(session) => {
+                        self.screen_share_session = Some(session);
+                        self.screen_share_role = ScreenShareRole::Receiving {
+                            request_id: request.request_id.clone(),
+                        };
+                        self.screen_share_status =
+                            Some("Aceitando a tela do amigo; preparando a conexão P2P…".to_owned());
+                        if let Err(error) = self.send_screen_share_signal(
+                            SignalKind::ScreenShareAccept,
+                            request.request_id,
+                        ) {
+                            self.stop_screen_share(false);
+                            self.screen_share_status = Some(error);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = self.send_screen_share_signal(
+                            SignalKind::ScreenShareBusy,
+                            request.request_id,
+                        );
+                        self.screen_share_status = Some(error);
+                    }
+                }
+            }
+            SignalKind::ScreenShareAccept => {
+                let Some(request_id) = (match self.screen_share_role.clone() {
+                    ScreenShareRole::Requesting { request_id } if request_id == payload => {
+                        Some(request_id)
+                    }
+                    _ => None,
+                }) else {
+                    return;
+                };
+                let Some(source) = self
+                    .screen_capture
+                    .as_ref()
+                    .map(ScreenCapture::frame_source)
+                else {
+                    self.screen_share_role = ScreenShareRole::Idle;
+                    self.screen_share_status = Some(
+                        "A captura local terminou antes do início do compartilhamento.".to_owned(),
+                    );
+                    return;
+                };
+                match ScreenShareSession::new(context.clone()) {
+                    Ok(session) => {
+                        if let Err(error) = session.start_sending(source) {
+                            session.stop();
+                            self.screen_share_role = ScreenShareRole::Idle;
+                            self.screen_share_status = Some(error);
+                            return;
+                        }
+                        self.screen_share_session = Some(session);
+                        self.screen_share_role = ScreenShareRole::Sending { request_id };
+                        self.screen_share_status =
+                            Some("Iniciando a codificação e a conexão direta…".to_owned());
+                    }
+                    Err(error) => {
+                        self.screen_share_role = ScreenShareRole::Idle;
+                        self.screen_share_status = Some(error);
+                    }
+                }
+            }
+            SignalKind::ScreenShareBusy => {
+                if matches!(
+                    &self.screen_share_role,
+                    ScreenShareRole::Requesting { request_id } if request_id == &payload
+                ) {
+                    self.screen_share_role = ScreenShareRole::Idle;
+                    self.screen_share_status = Some(
+                        "O amigo já está compartilhando ou não pode receber outra solicitação agora."
+                            .to_owned(),
+                    );
+                }
+            }
+            SignalKind::ScreenShareStopped => {
+                let request_id = payload;
+                let active_request = match &self.screen_share_role {
+                    ScreenShareRole::Requesting { request_id }
+                    | ScreenShareRole::Sending { request_id }
+                    | ScreenShareRole::Receiving { request_id } => Some(request_id),
+                    ScreenShareRole::Idle => None,
+                };
+                if active_request.is_some_and(|active| active == &request_id) {
+                    self.stop_screen_share(false);
+                    self.screen_share_status =
+                        Some("O compartilhamento de tela foi encerrado.".to_owned());
+                }
+            }
+            SignalKind::Offer | SignalKind::Answer | SignalKind::IceCandidate => {
+                if let Some(session) = &self.screen_share_session {
+                    if let Err(error) = session.handle_signal(kind, payload) {
+                        self.stop_screen_share(true);
+                        self.screen_share_status = Some(error);
+                    }
+                }
+            }
+            SignalKind::Diagnostic => {}
+        }
+    }
+
+    fn send_screen_share_signal(&self, kind: SignalKind, payload: String) -> Result<(), String> {
+        self.signaling
+            .as_ref()
+            .ok_or_else(|| "A conexão de sinalização não está disponível.".to_owned())?
+            .send_signal(kind, payload)
+    }
+
+    fn refresh_screen_share(&mut self, context: &egui::Context) {
+        let events = self
+            .screen_share_session
+            .as_ref()
+            .map(|session| std::iter::from_fn(|| session.try_recv()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut stop_session = false;
+        for event in events {
+            match event {
+                ScreenShareEvent::Signal { kind, payload } => {
+                    let result = self.send_screen_share_signal(kind, payload);
+                    if let Err(error) = result {
+                        self.screen_share_status = Some(error);
+                        stop_session = true;
+                    }
+                }
+                ScreenShareEvent::State(status) => self.screen_share_status = Some(status),
+                ScreenShareEvent::Error(error) => {
+                    self.screen_share_status = Some(error);
+                    stop_session = true;
+                }
+                ScreenShareEvent::ConnectionClosed => {
+                    self.screen_share_status =
+                        Some("A conexão P2P de tela foi encerrada ou perdida.".to_owned());
+                    stop_session = true;
+                }
+            }
+        }
+        if stop_session {
+            let status = self.screen_share_status.clone();
+            self.stop_screen_share(true);
+            self.screen_share_status = status;
+            return;
+        }
+
+        let remote_frame = self
+            .screen_share_session
+            .as_ref()
+            .and_then(ScreenShareSession::latest_remote_frame);
+        if let Some(frame) = remote_frame {
+            if self.remote_screen_sequence != frame.sequence {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [frame.width as usize, frame.height as usize],
+                    &frame.rgba,
+                );
+                if let Some(texture) = self.remote_screen_texture.as_mut() {
+                    texture.set(image, egui::TextureOptions::LINEAR);
+                } else {
+                    self.remote_screen_texture = Some(context.load_texture(
+                        "remote-screen",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                self.remote_screen_sequence = frame.sequence;
+            }
+        }
+    }
+
+    fn stop_screen_share(&mut self, announce: bool) {
+        let request_id = match &self.screen_share_role {
+            ScreenShareRole::Requesting { request_id }
+            | ScreenShareRole::Sending { request_id }
+            | ScreenShareRole::Receiving { request_id } => Some(request_id.clone()),
+            ScreenShareRole::Idle => None,
+        };
+        let was_active = request_id.is_some();
+        if announce {
+            if let Some(request_id) = request_id {
+                let _ = self.send_screen_share_signal(SignalKind::ScreenShareStopped, request_id);
+            }
+        }
+        if let Some(session) = self.screen_share_session.take() {
+            session.stop();
+        }
+        self.screen_share_role = ScreenShareRole::Idle;
+        self.remote_screen_texture = None;
+        self.remote_screen_sequence = 0;
+        if was_active {
+            self.screen_share_status = Some("Compartilhamento de tela encerrado.".to_owned());
+        }
+    }
+
     fn enter_room(&mut self, code: String) {
         self.room_code = Some(code);
         self.code_copied = false;
         self.microphone_error = None;
         self.connection_error = None;
         self.screen_status = None;
+        self.screen_share_status = None;
     }
 
     fn start_hosting(&mut self) {
@@ -731,6 +1107,14 @@ impl ClientUi {
         self.peer_connected = participants.len() > 1;
         self.participants = participants;
         self.current_leader_id = leader_id.clone();
+        if self.participants.len() != 2 && !matches!(&self.screen_share_role, ScreenShareRole::Idle)
+        {
+            self.stop_screen_share(true);
+            self.screen_share_status = Some(
+                "O compartilhamento foi encerrado porque esta sala não tem exatamente duas pessoas."
+                    .to_owned(),
+            );
+        }
         let Some(local) = self
             .participants
             .iter()
@@ -1105,6 +1489,7 @@ impl ClientUi {
                     self.connection_status = Some("Seu amigo entrou na sala.".to_owned());
                 }
                 SignalingEvent::PeerLeft => {
+                    self.stop_screen_share(false);
                     self.peer_connected = false;
                     self.connection_status =
                         Some("Seu amigo desconectou; a sala aguarda outra conexão.".to_owned());
@@ -1212,8 +1597,21 @@ impl ClientUi {
                     }
                     _ => {}
                 },
-                SignalingEvent::Signal { .. } => {
-                    self.connection_status = Some("Sinal de conexão recebido.".to_owned());
+                SignalingEvent::Signal { kind, payload } => {
+                    if matches!(
+                        kind,
+                        SignalKind::Offer
+                            | SignalKind::Answer
+                            | SignalKind::IceCandidate
+                            | SignalKind::ScreenShareRequest
+                            | SignalKind::ScreenShareAccept
+                            | SignalKind::ScreenShareBusy
+                            | SignalKind::ScreenShareStopped
+                    ) {
+                        self.handle_screen_share_signal(kind, payload, context);
+                    } else {
+                        self.connection_status = Some("Sinal de conexão recebido.".to_owned());
+                    }
                 }
                 SignalingEvent::Error(error) => {
                     if self.control_mesh.is_some() && self.room_code.is_some() {
@@ -1260,6 +1658,7 @@ impl ClientUi {
         }
 
         if disconnect {
+            self.stop_screen_share(false);
             self.signaling = None;
             self.pending_signaling = None;
             self.screen_picker = None;
@@ -1271,6 +1670,7 @@ impl ClientUi {
     }
 
     fn request_leave(&mut self, context: &egui::Context) {
+        self.stop_screen_share(true);
         if self.hosting_locally && self.participants.len() > 1 {
             if let Some(mesh) = self
                 .control_mesh
@@ -1476,6 +1876,7 @@ impl ClientUi {
 
     fn leave_room(&mut self) {
         self.stop_microphone();
+        self.stop_screen_share(true);
         self.screen_picker = None;
         if let Some(mut capture) = self.screen_capture.take() {
             let _ = capture.stop();
@@ -1493,6 +1894,7 @@ impl ClientUi {
         self.code_copied = false;
         self.microphone_error = None;
         self.screen_status = None;
+        self.screen_share_status = None;
         self.pending_signaling = None;
         self.signaling = None;
         self.pending_room_adopted = false;
@@ -1558,6 +1960,7 @@ fn signaling_address_for_control(control_address: &str) -> String {
 impl Drop for ClientUi {
     fn drop(&mut self) {
         self.stop_microphone();
+        self.stop_screen_share(true);
         self.screen_picker = None;
         if let Some(mut capture) = self.screen_capture.take() {
             let _ = capture.stop();
