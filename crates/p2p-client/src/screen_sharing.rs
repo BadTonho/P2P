@@ -62,6 +62,7 @@ pub struct ScreenShareMetrics {
     pub decoded_frames: u64,
     pub decode_errors: u64,
     pub last_decode_error: Option<String>,
+    pub h264_diagnostics: String,
 }
 
 #[derive(Default)]
@@ -76,10 +77,37 @@ struct SharedMetrics {
     decode_errors: AtomicU64,
     last_decode_error: Mutex<Option<String>>,
     connected_at: Mutex<Option<Instant>>,
+    h264_flow: Mutex<H264FlowDiagnostics>,
+}
+
+#[derive(Default)]
+struct H264FlowDiagnostics {
+    encoded_sps: u64,
+    encoded_pps: u64,
+    encoded_idr: u64,
+    received_sps: u64,
+    received_pps: u64,
+    received_idr: u64,
+    received_single_nals: u64,
+    received_stap_a: u64,
+    received_fu_a_start: u64,
+    received_fu_a_end: u64,
+    sequence_gaps: u64,
+    out_of_order_packets: u64,
+    assembled_access_units: u64,
+    assembled_with_sps: u64,
+    assembled_with_pps: u64,
+    assembled_with_idr: u64,
+    last_encoded_nals: String,
+    last_access_unit: String,
 }
 
 impl SharedMetrics {
     fn snapshot(&self) -> ScreenShareMetrics {
+        let h264_flow = self
+            .h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         ScreenShareMetrics {
             p2p_connected: self.p2p_connected.load(Ordering::Relaxed),
             local_ice_candidates: self.local_ice_candidates.load(Ordering::Relaxed),
@@ -94,8 +122,204 @@ impl SharedMetrics {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
+            h264_diagnostics: format!(
+                "Codificado: SPS/PPS/IDR {}/{}/{} ({}); RTP: SPS/PPS/IDR {}/{}/{}, single/STAP-A/FU-A início/fim {}/{}/{}/{}, lacunas/reordenação {}/{}; quadros montados: {} (com SPS/PPS/IDR {}/{}/{}); último quadro: {}.",
+                h264_flow.encoded_sps,
+                h264_flow.encoded_pps,
+                h264_flow.encoded_idr,
+                h264_flow.last_encoded_nals,
+                h264_flow.received_sps,
+                h264_flow.received_pps,
+                h264_flow.received_idr,
+                h264_flow.received_single_nals,
+                h264_flow.received_stap_a,
+                h264_flow.received_fu_a_start,
+                h264_flow.received_fu_a_end,
+                h264_flow.sequence_gaps,
+                h264_flow.out_of_order_packets,
+                h264_flow.assembled_access_units,
+                h264_flow.assembled_with_sps,
+                h264_flow.assembled_with_pps,
+                h264_flow.assembled_with_idr,
+                h264_flow.last_access_unit,
+            ),
         }
     }
+
+    fn record_encoded_access_unit(&self, data: &[u8]) {
+        let nals = annex_b_nal_types(data);
+        let mut flow = self
+            .h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for nal_type in &nals {
+            match nal_type {
+                7 => flow.encoded_sps += 1,
+                8 => flow.encoded_pps += 1,
+                5 => flow.encoded_idr += 1,
+                _ => {}
+            }
+        }
+        flow.last_encoded_nals = describe_nal_types(&nals, data.len());
+    }
+
+    fn record_received_packet(
+        &self,
+        packet: &rtc::rtp::packet::Packet,
+        previous_sequence: &mut Option<u16>,
+    ) {
+        let payload = &packet.payload;
+        let packet_type = payload.first().map(|byte| byte & 0x1f);
+        let nals = rtp_payload_nal_types(payload);
+        let mut flow = self
+            .h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(previous) = *previous_sequence {
+            let distance = packet.header.sequence_number.wrapping_sub(previous);
+            if (2..0x8000).contains(&distance) {
+                flow.sequence_gaps += u64::from(distance - 1);
+                *previous_sequence = Some(packet.header.sequence_number);
+            } else if distance == 0 || distance >= 0x8000 {
+                flow.out_of_order_packets += 1;
+            } else {
+                *previous_sequence = Some(packet.header.sequence_number);
+            }
+        } else {
+            *previous_sequence = Some(packet.header.sequence_number);
+        }
+
+        match packet_type {
+            Some(24) => flow.received_stap_a += 1,
+            Some(28) if payload.len() >= 2 && payload[1] & 0x80 != 0 => {
+                flow.received_fu_a_start += 1;
+            }
+            Some(28) if payload.len() >= 2 && payload[1] & 0x40 != 0 => {
+                flow.received_fu_a_end += 1;
+            }
+            Some(1..=23) => flow.received_single_nals += 1,
+            _ => {}
+        }
+        for nal_type in nals {
+            match nal_type {
+                7 => flow.received_sps += 1,
+                8 => flow.received_pps += 1,
+                5 => flow.received_idr += 1,
+                _ => {}
+            }
+        }
+    }
+
+    fn record_assembled_access_unit(&self, data: &[u8]) -> String {
+        let nals = annex_b_nal_types(data);
+        let description = describe_nal_types(&nals, data.len());
+        let mut flow = self
+            .h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        flow.assembled_access_units += 1;
+        let contains_sps = nals.contains(&7);
+        let contains_pps = nals.contains(&8);
+        let contains_idr = nals.contains(&5);
+        if contains_sps {
+            flow.assembled_with_sps += 1;
+        }
+        if contains_pps {
+            flow.assembled_with_pps += 1;
+        }
+        if contains_idr {
+            flow.assembled_with_idr += 1;
+        }
+        flow.last_access_unit = description.clone();
+        description
+    }
+}
+
+fn annex_b_nal_types(data: &[u8]) -> Vec<u8> {
+    fn next_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
+        let mut index = from;
+        while index + 3 <= data.len() {
+            if index + 4 <= data.len() && data[index..index + 4] == [0, 0, 0, 1] {
+                return Some((index, 4));
+            }
+            if data[index..index + 3] == [0, 0, 1] {
+                return Some((index, 3));
+            }
+            index += 1;
+        }
+        None
+    }
+
+    let Some((start, start_code_len)) = next_start_code(data, 0) else {
+        return Vec::new();
+    };
+    let mut nal_start = start + start_code_len;
+    let mut nal_types = Vec::new();
+
+    while nal_start < data.len() {
+        if let Some((next_start, next_start_code_len)) = next_start_code(data, nal_start) {
+            if next_start > nal_start {
+                nal_types.push(data[nal_start] & 0x1f);
+            }
+            nal_start = next_start + next_start_code_len;
+        } else {
+            nal_types.push(data[nal_start] & 0x1f);
+            break;
+        }
+    }
+    nal_types
+}
+
+fn rtp_payload_nal_types(payload: &[u8]) -> Vec<u8> {
+    let Some(header) = payload.first() else {
+        return Vec::new();
+    };
+    match header & 0x1f {
+        1..=23 => vec![header & 0x1f],
+        24 => {
+            let mut types = Vec::new();
+            let mut offset = 1;
+            while offset + 2 <= payload.len() {
+                let nal_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+                if nal_len == 0 || offset + nal_len > payload.len() {
+                    return vec![24];
+                }
+                types.push(payload[offset] & 0x1f);
+                offset += nal_len;
+            }
+            if offset != payload.len() || types.is_empty() {
+                vec![24]
+            } else {
+                types
+            }
+        }
+        28 if payload.len() >= 2 && payload[1] & 0x80 != 0 => {
+            vec![payload[1] & 0x1f]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn describe_nal_types(nal_types: &[u8], byte_len: usize) -> String {
+    if nal_types.is_empty() {
+        return format!("sem início Annex-B, {byte_len} bytes");
+    }
+    let names = nal_types
+        .iter()
+        .map(|nal_type| match nal_type {
+            1 => "1(slice)".to_owned(),
+            5 => "5(IDR)".to_owned(),
+            6 => "6(SEI)".to_owned(),
+            7 => "7(SPS)".to_owned(),
+            8 => "8(PPS)".to_owned(),
+            9 => "9(AUD)".to_owned(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{byte_len} bytes, NAL [{names}]")
 }
 
 #[derive(Debug)]
@@ -371,13 +595,17 @@ impl PeerConnectionEventHandler for PeerEvents {
             };
             let mut builder = SampleBuilder::new(30, H264Packet::default(), VIDEO_CLOCK_RATE)
                 .with_max_time_delay(MAX_FRAME_QUEUE_DELAY);
+            let mut previous_sequence = None;
 
             while let Some(event) = track.poll().await {
                 match event {
                     TrackRemoteEvent::OnRtpPacket(packet) => {
                         metrics.received_packets.fetch_add(1, Ordering::Relaxed);
+                        metrics.record_received_packet(&packet, &mut previous_sequence);
                         builder.push(Instant::now(), packet);
                         while let Some(sample) = builder.pop(Instant::now()) {
+                            let sample_diagnostics =
+                                metrics.record_assembled_access_unit(&sample.data);
                             match decoder.decode(&sample.data) {
                                 Ok(Some(yuv)) => {
                                     let (width, height) = yuv.dimensions();
@@ -405,11 +633,18 @@ impl PeerConnectionEventHandler for PeerEvents {
                                 // permitem que a decodificação se recupere automaticamente.
                                 Err(error) => {
                                     metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                                    let detail = if error.native_code() & 0x10 != 0 {
+                                        format!(
+                                            "{error} (dsNoParamSets: o decodificador não encontrou o SPS/PPS necessário; quadro montado: {sample_diagnostics})"
+                                        )
+                                    } else {
+                                        format!("{error}; quadro montado: {sample_diagnostics}")
+                                    };
                                     *metrics
                                         .last_decode_error
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                        Some(error.to_string());
+                                        Some(detail);
                                     context.request_repaint();
                                 }
                             }
@@ -938,6 +1173,7 @@ fn encode_latest_frames(
         last_sequence = Some(frame.sequence);
         let encoded = encode_frame(&mut encoder, &frame)?;
         if !encoded.is_empty() {
+            metrics.record_encoded_access_unit(&encoded);
             metrics.encoded_frames.fetch_add(1, Ordering::Relaxed);
             samples
                 .blocking_send(encoded)

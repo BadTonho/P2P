@@ -407,6 +407,7 @@ impl ClientUi {
                         self.screen_share_metrics.encoded_frames,
                         self.screen_share_metrics.sent_frames
                     ));
+                    ui.small(&self.screen_share_metrics.h264_diagnostics);
                     if ui.button("Parar compartilhamento").clicked() {
                         self.stop_screen_share(true);
                     }
@@ -426,6 +427,7 @@ impl ClientUi {
                     if let Some(error) = &self.screen_share_metrics.last_decode_error {
                         ui.small(format!("Último erro H.264: {error}"));
                     }
+                    ui.small(&self.screen_share_metrics.h264_diagnostics);
                     if ui.button("Parar de receber a tela").clicked() {
                         self.stop_screen_share(true);
                     }
