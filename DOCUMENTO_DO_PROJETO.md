@@ -18,15 +18,11 @@ O primeiro protótipo deve permitir:
 
 O aplicativo deve pedir permissão antes de transmitir a tela e mostrar claramente quando o compartilhamento estiver ativo.
 
-## Linguagens e ferramentas recomendadas
+## Linguagem escolhida
 
-- **JavaScript** para a lógica do aplicativo e a comunicação entre participantes.
-- **HTML** para estruturar as telas.
-- **CSS** para definir a aparência.
-- **Electron** para empacotar o projeto como um aplicativo de computador instalável no Windows.
-- **WebRTC** para a comunicação em tempo real. WebRTC é uma tecnologia de comunicação, não uma linguagem.
-
-Essa é a proposta inicial para reduzir a quantidade de tecnologias que precisamos aprender. O Electron usa JavaScript, HTML e CSS e oferece recursos para capturar a tela do computador. A escolha da forma de conexão entre casas diferentes continua pendente.
+- **Rust** será a linguagem principal do projeto, incluindo o aplicativo e o servidor hospedado no notebook.
+- **egui e eframe** serão usados para montar a interface do aplicativo em Rust, sem precisar criar a interface em HTML, CSS ou JavaScript.
+- **WebRTC** poderá ser usado para a comunicação em tempo real. WebRTC é uma tecnologia de comunicação, não uma linguagem.
 
 ## Etapas de desenvolvimento
 
