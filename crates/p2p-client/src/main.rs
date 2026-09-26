@@ -27,6 +27,7 @@ struct ClientUi {
     microphone: Option<MicrophoneTest>,
     microphone_level: f32,
     microphone_error: Option<String>,
+    microphone_monitor_error: Option<String>,
     screen_capture: Option<ScreenCapture>,
     screen_texture: Option<egui::TextureHandle>,
     screen_status: Option<String>,
@@ -192,14 +193,22 @@ impl ClientUi {
         ui.add_space(8.0);
         ui.group(|ui| {
             ui.heading("Teste do microfone");
-            ui.label("As amostras são usadas só para medir o nível e descartadas; não há gravação nem reprodução.");
+            ui.label("Durante o teste, sua voz é reproduzida ao vivo na saída padrão do Windows. O áudio não é gravado nem transmitido.");
+            ui.small("Use fones de ouvido para evitar que o som dos alto-falantes volte ao microfone.");
 
             if let Some(error) = &self.microphone_error {
                 ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
             }
+            if let Some(error) = &self.microphone_monitor_error {
+                ui.colored_label(egui::Color32::from_rgb(190, 95, 35), error);
+            }
 
             if self.microphone.is_some() {
-                ui.label("Captura do microfone ativa.");
+                if self.microphone_monitor_error.is_none() {
+                    ui.label("Medidor e retorno ao vivo ativos.");
+                } else {
+                    ui.label("Medidor ativo; o retorno de áudio está indisponível.");
+                }
                 ui.add(
                     egui::ProgressBar::new(self.microphone_level)
                         .text(format!("Nível: {:.0}%", self.microphone_level * 100.0)),
@@ -240,6 +249,7 @@ impl ClientUi {
 
     fn start_microphone(&mut self) {
         self.microphone_error = None;
+        self.microphone_monitor_error = None;
         self.microphone_level = 0.0;
         match MicrophoneTest::start() {
             Ok(test) => self.microphone = Some(test),
@@ -253,12 +263,22 @@ impl ClientUi {
     }
 
     fn refresh_microphone(&mut self) {
-        let Some(microphone) = self.microphone.as_ref() else {
+        let Some(microphone) = self.microphone.as_mut() else {
             return;
         };
 
-        self.microphone_level = microphone.level();
-        if let Some(error) = microphone.take_error() {
+        let level = microphone.level();
+        let microphone_error = microphone.take_microphone_error();
+        let monitor_error = microphone.take_monitor_error();
+        if monitor_error.is_some() {
+            microphone.stop_monitoring();
+        }
+
+        self.microphone_level = level;
+        if let Some(error) = monitor_error {
+            self.microphone_monitor_error = Some(error);
+        }
+        if let Some(error) = microphone_error {
             self.microphone = None;
             self.microphone_level = 0.0;
             self.microphone_error = Some(error);

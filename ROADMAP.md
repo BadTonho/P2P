@@ -42,12 +42,12 @@ Criar a tela da sala com nome ou código, estado da conexão e controles para in
 Implementar testes locais e independentes para o microfone e a tela:
 
 - Disponibilizar Configurações na tela inicial e na sala, com categorias laterais. Áudio é a primeira categoria.
-- Em Configurações > Áudio, capturar o microfone padrão do Windows e exibir um medidor de nível. Descartar as amostras sem gravar, reproduzir ou transmitir áudio.
+- Em Configurações > Áudio, capturar o microfone padrão do Windows, exibir um medidor e reproduzir a voz localmente na saída padrão. Usar uma fila curta em memória; não gravar nem transmitir áudio. Orientar o uso de fones para evitar eco.
 - Na sala, abrir o seletor do Windows para escolher uma tela ou janela e exibir uma prévia atualizada. Manter só o quadro mais recente na memória, sem salvar imagens.
 - Parar o teste do microfone ao sair de Áudio e parar a prévia da tela ao abrir Configurações. Sair da sala ou fechar o aplicativo também libera as capturas.
 - Mostrar instruções para conferir as permissões de microfone nas configurações do Windows. O aplicativo não altera essas permissões.
 
-**Estado:** implementação feita e compilação concluída. Falta conferir manualmente o medidor com um microfone e o seletor/prévia de tela neste PC.
+**Estado:** implementação e compilação concluídas. O medidor foi confirmado com o microfone; falta conferir manualmente o retorno de áudio e o seletor/prévia de tela neste PC.
 
 **Concluída quando:** o aplicativo confirmar que consegue captar áudio e imagem e encerrar a captura corretamente.
 
