@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use rtrb::{Consumer, Producer, RingBuffer};
 
 const MAX_MONITOR_BUFFER_MS: usize = 100;
+const PRIME_MONITOR_BUFFER_MS: usize = 20;
 
 pub struct MicrophoneTest {
     _input_stream: cpal::Stream,
@@ -12,6 +14,8 @@ pub struct MicrophoneTest {
     level: Arc<AtomicU32>,
     microphone_error: Arc<Mutex<Option<String>>>,
     monitor_error: Arc<Mutex<Option<String>>>,
+    audio_warning: Arc<AtomicBool>,
+    monitor_queue_enabled: Arc<AtomicBool>,
 }
 
 impl MicrophoneTest {
@@ -33,7 +37,10 @@ impl MicrophoneTest {
         let level = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let microphone_error = Arc::new(Mutex::new(None));
         let queue_capacity = ((input_rate as usize * MAX_MONITOR_BUFFER_MS) / 1000).max(1);
-        let audio_queue = Arc::new(Mutex::new(BoundedAudioQueue::new(queue_capacity)));
+        let (producer, consumer) = RingBuffer::<f32>::new(queue_capacity);
+        let overflow_pending = Arc::new(AtomicBool::new(false));
+        let audio_warning = Arc::new(AtomicBool::new(false));
+        let monitor_queue_enabled = Arc::new(AtomicBool::new(true));
 
         let input_stream = match input_sample_format {
             cpal::SampleFormat::I8 => build_input_stream::<i8>(
@@ -42,7 +49,10 @@ impl MicrophoneTest {
                 input_channels,
                 &level,
                 &microphone_error,
-                &audio_queue,
+                producer,
+                &overflow_pending,
+                &audio_warning,
+                &monitor_queue_enabled,
             ),
             cpal::SampleFormat::I16 => build_input_stream::<i16>(
                 &input_device,
@@ -50,7 +60,10 @@ impl MicrophoneTest {
                 input_channels,
                 &level,
                 &microphone_error,
-                &audio_queue,
+                producer,
+                &overflow_pending,
+                &audio_warning,
+                &monitor_queue_enabled,
             ),
             cpal::SampleFormat::I24 => build_input_stream::<cpal::I24>(
                 &input_device,
@@ -58,7 +71,10 @@ impl MicrophoneTest {
                 input_channels,
                 &level,
                 &microphone_error,
-                &audio_queue,
+                producer,
+                &overflow_pending,
+                &audio_warning,
+                &monitor_queue_enabled,
             ),
             cpal::SampleFormat::I32 => build_input_stream::<i32>(
                 &input_device,
@@ -66,7 +82,10 @@ impl MicrophoneTest {
                 input_channels,
                 &level,
                 &microphone_error,
-                &audio_queue,
+                producer,
+                &overflow_pending,
+                &audio_warning,
+                &monitor_queue_enabled,
             ),
             cpal::SampleFormat::I64 => build_input_stream::<i64>(
                 &input_device,
@@ -74,7 +93,10 @@ impl MicrophoneTest {
                 input_channels,
                 &level,
                 &microphone_error,
-                &audio_queue,
+                producer,
+                &overflow_pending,
+                &audio_warning,
+                &monitor_queue_enabled,
             ),
             cpal::SampleFormat::U8 => build_input_stream::<u8>(
                 &input_device,
@@ -82,7 +104,10 @@ impl MicrophoneTest {
                 input_channels,
                 &level,
                 &microphone_error,
-                &audio_queue,
+                producer,
+                &overflow_pending,
+                &audio_warning,
+                &monitor_queue_enabled,
             ),
             cpal::SampleFormat::U16 => build_input_stream::<u16>(
                 &input_device,
@@ -90,7 +115,10 @@ impl MicrophoneTest {
                 input_channels,
                 &level,
                 &microphone_error,
-                &audio_queue,
+                producer,
+                &overflow_pending,
+                &audio_warning,
+                &monitor_queue_enabled,
             ),
             cpal::SampleFormat::U24 => build_input_stream::<cpal::U24>(
                 &input_device,
@@ -98,7 +126,10 @@ impl MicrophoneTest {
                 input_channels,
                 &level,
                 &microphone_error,
-                &audio_queue,
+                producer,
+                &overflow_pending,
+                &audio_warning,
+                &monitor_queue_enabled,
             ),
             cpal::SampleFormat::U32 => build_input_stream::<u32>(
                 &input_device,
@@ -106,7 +137,10 @@ impl MicrophoneTest {
                 input_channels,
                 &level,
                 &microphone_error,
-                &audio_queue,
+                producer,
+                &overflow_pending,
+                &audio_warning,
+                &monitor_queue_enabled,
             ),
             cpal::SampleFormat::U64 => build_input_stream::<u64>(
                 &input_device,
@@ -114,7 +148,10 @@ impl MicrophoneTest {
                 input_channels,
                 &level,
                 &microphone_error,
-                &audio_queue,
+                producer,
+                &overflow_pending,
+                &audio_warning,
+                &monitor_queue_enabled,
             ),
             cpal::SampleFormat::F32 => build_input_stream::<f32>(
                 &input_device,
@@ -122,7 +159,10 @@ impl MicrophoneTest {
                 input_channels,
                 &level,
                 &microphone_error,
-                &audio_queue,
+                producer,
+                &overflow_pending,
+                &audio_warning,
+                &monitor_queue_enabled,
             ),
             cpal::SampleFormat::F64 => build_input_stream::<f64>(
                 &input_device,
@@ -130,7 +170,10 @@ impl MicrophoneTest {
                 input_channels,
                 &level,
                 &microphone_error,
-                &audio_queue,
+                producer,
+                &overflow_pending,
+                &audio_warning,
+                &monitor_queue_enabled,
             ),
             _ => Err("O formato de áudio do microfone não é compatível com o medidor.".to_owned()),
         }?;
@@ -159,7 +202,10 @@ impl MicrophoneTest {
                             output_config,
                             output_channels,
                             input_rate,
-                            &audio_queue,
+                            consumer,
+                            &overflow_pending,
+                            &audio_warning,
+                            &monitor_queue_enabled,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::I16 => build_output_stream::<i16>(
@@ -167,7 +213,10 @@ impl MicrophoneTest {
                             output_config,
                             output_channels,
                             input_rate,
-                            &audio_queue,
+                            consumer,
+                            &overflow_pending,
+                            &audio_warning,
+                            &monitor_queue_enabled,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::I24 => build_output_stream::<cpal::I24>(
@@ -175,7 +224,10 @@ impl MicrophoneTest {
                             output_config,
                             output_channels,
                             input_rate,
-                            &audio_queue,
+                            consumer,
+                            &overflow_pending,
+                            &audio_warning,
+                            &monitor_queue_enabled,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::I32 => build_output_stream::<i32>(
@@ -183,7 +235,10 @@ impl MicrophoneTest {
                             output_config,
                             output_channels,
                             input_rate,
-                            &audio_queue,
+                            consumer,
+                            &overflow_pending,
+                            &audio_warning,
+                            &monitor_queue_enabled,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::I64 => build_output_stream::<i64>(
@@ -191,7 +246,10 @@ impl MicrophoneTest {
                             output_config,
                             output_channels,
                             input_rate,
-                            &audio_queue,
+                            consumer,
+                            &overflow_pending,
+                            &audio_warning,
+                            &monitor_queue_enabled,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::U8 => build_output_stream::<u8>(
@@ -199,7 +257,10 @@ impl MicrophoneTest {
                             output_config,
                             output_channels,
                             input_rate,
-                            &audio_queue,
+                            consumer,
+                            &overflow_pending,
+                            &audio_warning,
+                            &monitor_queue_enabled,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::U16 => build_output_stream::<u16>(
@@ -207,7 +268,10 @@ impl MicrophoneTest {
                             output_config,
                             output_channels,
                             input_rate,
-                            &audio_queue,
+                            consumer,
+                            &overflow_pending,
+                            &audio_warning,
+                            &monitor_queue_enabled,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::U24 => build_output_stream::<cpal::U24>(
@@ -215,7 +279,10 @@ impl MicrophoneTest {
                             output_config,
                             output_channels,
                             input_rate,
-                            &audio_queue,
+                            consumer,
+                            &overflow_pending,
+                            &audio_warning,
+                            &monitor_queue_enabled,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::U32 => build_output_stream::<u32>(
@@ -223,7 +290,10 @@ impl MicrophoneTest {
                             output_config,
                             output_channels,
                             input_rate,
-                            &audio_queue,
+                            consumer,
+                            &overflow_pending,
+                            &audio_warning,
+                            &monitor_queue_enabled,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::U64 => build_output_stream::<u64>(
@@ -231,7 +301,10 @@ impl MicrophoneTest {
                             output_config,
                             output_channels,
                             input_rate,
-                            &audio_queue,
+                            consumer,
+                            &overflow_pending,
+                            &audio_warning,
+                            &monitor_queue_enabled,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::F32 => build_output_stream::<f32>(
@@ -239,7 +312,10 @@ impl MicrophoneTest {
                             output_config,
                             output_channels,
                             input_rate,
-                            &audio_queue,
+                            consumer,
+                            &overflow_pending,
+                            &audio_warning,
+                            &monitor_queue_enabled,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::F64 => build_output_stream::<f64>(
@@ -247,7 +323,10 @@ impl MicrophoneTest {
                             output_config,
                             output_channels,
                             input_rate,
-                            &audio_queue,
+                            consumer,
+                            &overflow_pending,
+                            &audio_warning,
+                            &monitor_queue_enabled,
                             &monitor_error,
                         ),
                         _ => Err("O formato de áudio da saída padrão não é compatível com o monitoramento.".to_owned()),
@@ -285,6 +364,10 @@ impl MicrophoneTest {
             }
         }
 
+        if monitor_stream.is_none() {
+            monitor_queue_enabled.store(false, Ordering::Release);
+        }
+
         if let Some(error) = monitor_start_error {
             *monitor_error
                 .lock()
@@ -297,6 +380,8 @@ impl MicrophoneTest {
             level,
             microphone_error,
             monitor_error,
+            audio_warning,
+            monitor_queue_enabled,
         })
     }
 
@@ -312,7 +397,12 @@ impl MicrophoneTest {
         take_shared_error(&self.monitor_error)
     }
 
+    pub fn take_audio_warning(&self) -> bool {
+        self.audio_warning.swap(false, Ordering::AcqRel)
+    }
+
     pub fn stop_monitoring(&mut self) {
+        self.monitor_queue_enabled.store(false, Ordering::Release);
         self.monitor_stream = None;
     }
 }
@@ -323,7 +413,10 @@ fn build_input_stream<T>(
     channels: usize,
     level: &Arc<AtomicU32>,
     microphone_error: &Arc<Mutex<Option<String>>>,
-    audio_queue: &Arc<Mutex<BoundedAudioQueue>>,
+    mut producer: Producer<f32>,
+    overflow_pending: &Arc<AtomicBool>,
+    audio_warning: &Arc<AtomicBool>,
+    monitor_queue_enabled: &Arc<AtomicBool>,
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample,
@@ -331,7 +424,9 @@ where
 {
     let level = Arc::clone(level);
     let callback_error = Arc::clone(microphone_error);
-    let audio_queue = Arc::clone(audio_queue);
+    let overflow_pending = Arc::clone(overflow_pending);
+    let audio_warning = Arc::clone(audio_warning);
+    let monitor_queue_enabled = Arc::clone(monitor_queue_enabled);
     let channels = channels.max(1);
     let mut mono_samples = Vec::new();
     device
@@ -360,11 +455,12 @@ where
                     mono_samples.push(mono / frame.len() as f32);
                 }
 
-                // Do conversion and level measurement before taking the queue lock.
-                // The output callback also reads this queue, so keep the critical
-                // section limited to a bulk transfer.
-                if let Ok(mut queue) = audio_queue.try_lock() {
-                    queue.push_slice(&mono_samples);
+                if monitor_queue_enabled.load(Ordering::Acquire) {
+                    let (_, remainder) = producer.push_partial_slice(&mono_samples);
+                    if !remainder.is_empty() {
+                        overflow_pending.store(true, Ordering::Release);
+                        audio_warning.store(true, Ordering::Release);
+                    }
                 }
 
                 if sample_count > 0 {
@@ -392,14 +488,19 @@ fn build_output_stream<T>(
     config: cpal::StreamConfig,
     channels: usize,
     input_rate: u32,
-    audio_queue: &Arc<Mutex<BoundedAudioQueue>>,
+    mut consumer: Consumer<f32>,
+    overflow_pending: &Arc<AtomicBool>,
+    audio_warning: &Arc<AtomicBool>,
+    monitor_queue_enabled: &Arc<AtomicBool>,
     monitor_error: &Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
-    let audio_queue = Arc::clone(audio_queue);
+    let overflow_pending = Arc::clone(overflow_pending);
+    let audio_warning = Arc::clone(audio_warning);
     let callback_error = Arc::clone(monitor_error);
+    let callback_queue_enabled = Arc::clone(monitor_queue_enabled);
     let channels = channels.max(1);
     let output_rate = config.sample_rate.max(1);
     let mut resampler = LinearResampler::new(input_rate as f64 / output_rate as f64);
@@ -408,24 +509,39 @@ where
         .build_output_stream::<T, _, _>(
             config,
             move |output, _info| {
+                if overflow_pending.swap(false, Ordering::AcqRel) {
+                    let stale_samples = consumer.slots();
+                    for _ in 0..stale_samples {
+                        let _ = consumer.pop();
+                    }
+                    resampler.reset();
+                }
+
                 let output_frames = output.len().div_ceil(channels);
+                let startup_buffer_samples =
+                    (input_rate as usize * PRIME_MONITOR_BUFFER_MS / 1000).max(1);
+                if !resampler.primed && consumer.slots() < startup_buffer_samples {
+                    output.fill(<T as cpal::Sample>::from_sample(0.0_f32));
+                    return;
+                }
+
                 let required_source_samples = (output_frames as f64
                     * resampler.source_samples_per_output_sample)
                     .ceil() as usize
                     + 4;
-
-                // Move a whole callback's worth of source samples at once, then
-                // resample without holding the mutex for every output frame.
-                if let Ok(mut queue) = audio_queue.try_lock() {
-                    resampler.refill(&mut queue, required_source_samples);
-                }
+                resampler.refill(&mut consumer, required_source_samples);
 
                 for frame in output.chunks_mut(channels) {
-                    let sample = resampler.next_sample().clamp(-1.0, 1.0);
+                    let next_sample = resampler.next_sample();
+                    if next_sample.is_none() && resampler.has_produced {
+                        audio_warning.store(true, Ordering::Release);
+                    }
+                    let sample = next_sample.unwrap_or(0.0).clamp(-1.0, 1.0);
                     frame.fill(<T as cpal::Sample>::from_sample(sample));
                 }
             },
             move |stream_error| {
+                callback_queue_enabled.store(false, Ordering::Release);
                 *callback_error
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -436,48 +552,14 @@ where
         .map_err(|error| format!("Não foi possível abrir a saída padrão do Windows: {error}"))
 }
 
-struct BoundedAudioQueue {
-    samples: VecDeque<f32>,
-    capacity: usize,
-}
-
-impl BoundedAudioQueue {
-    fn new(capacity: usize) -> Self {
-        Self {
-            samples: VecDeque::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    fn push_slice(&mut self, incoming: &[f32]) {
-        if incoming.len() >= self.capacity {
-            self.samples.clear();
-            self.samples
-                .extend(incoming[incoming.len() - self.capacity..].iter().copied());
-            return;
-        }
-
-        let overflow = self
-            .samples
-            .len()
-            .saturating_add(incoming.len())
-            .saturating_sub(self.capacity);
-        self.samples.drain(..overflow);
-        self.samples.extend(incoming.iter().copied());
-    }
-
-    fn pop_into(&mut self, destination: &mut VecDeque<f32>, count: usize) {
-        let count = count.min(self.samples.len());
-        destination.extend(self.samples.drain(..count));
-    }
-}
-
 struct LinearResampler {
     source_samples_per_output_sample: f64,
     source_position: f64,
     current: Option<f32>,
     next: Option<f32>,
     source_samples: VecDeque<f32>,
+    has_produced: bool,
+    primed: bool,
 }
 
 impl LinearResampler {
@@ -488,15 +570,22 @@ impl LinearResampler {
             current: None,
             next: None,
             source_samples: VecDeque::with_capacity(4096),
+            has_produced: false,
+            primed: false,
         }
     }
 
-    fn refill(&mut self, queue: &mut BoundedAudioQueue, target_len: usize) {
+    fn refill(&mut self, consumer: &mut Consumer<f32>, target_len: usize) {
         let buffered_samples = self.source_samples.len()
             + usize::from(self.current.is_some())
             + usize::from(self.next.is_some());
         let missing = target_len.saturating_sub(buffered_samples);
-        queue.pop_into(&mut self.source_samples, missing);
+        for _ in 0..missing {
+            let Ok(sample) = consumer.pop() else {
+                break;
+            };
+            self.source_samples.push_back(sample);
+        }
     }
 
     fn reset(&mut self) {
@@ -504,9 +593,10 @@ impl LinearResampler {
         self.current = None;
         self.next = None;
         self.source_samples.clear();
+        self.primed = false;
     }
 
-    fn next_sample(&mut self) -> f32 {
+    fn next_sample(&mut self) -> Option<f32> {
         if self.current.is_none() {
             self.current = self.source_samples.pop_front();
         }
@@ -516,7 +606,7 @@ impl LinearResampler {
 
         let (Some(current), Some(next)) = (self.current, self.next) else {
             self.reset();
-            return 0.0;
+            return None;
         };
 
         let output = current + (next - current) * self.source_position as f32;
@@ -532,7 +622,9 @@ impl LinearResampler {
             }
         }
 
-        output
+        self.has_produced = true;
+        self.primed = true;
+        Some(output)
     }
 }
 

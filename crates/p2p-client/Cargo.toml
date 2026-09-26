@@ -8,4 +8,5 @@ rust-version.workspace = true
 [dependencies]
 cpal = "0.18.2"
 eframe = "0.36.2"
+rtrb = "0.4"
 windows-capture = "2.0.1"
