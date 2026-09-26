@@ -8,11 +8,11 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 - Aplicativo instalado primeiro no Windows.
 - Rust como linguagem principal.
 - egui/eframe para a interface gráfica.
-- Chamada de voz e compartilhamento de tela.
-- Prioridade de mídia: implementar a transmissão de tela antes da chamada de voz.
-- Salas de sinalização e fila de sucessão para até oito participantes. Voz e tela em grupo serão implementadas nas etapas WebRTC posteriores.
+- Compartilhamento de tela como recurso principal. Chamada de voz fica como etapa opcional no final do roadmap.
+- Prioridade de mídia: implementar e validar a transmissão de tela antes de qualquer trabalho opcional de voz.
+- Salas de sinalização e fila de sucessão para até oito participantes. O compartilhamento em grupo e a chamada de voz ficam para etapas posteriores; voz não é requisito para usar o compartilhamento de tela.
 - Sem câmera e sem chat de texto.
-- Conexão P2P: áudio e tela devem ir diretamente entre os computadores quando a rede permitir.
+- Conexão P2P: a tela deve ir diretamente entre os computadores quando a rede permitir. Se a etapa opcional de voz for feita, o áudio também seguirá diretamente quando a rede permitir.
 - O aplicativo inicia um servidor de sinalização integrado no PC do anfitrião, na porta 9000. O executável separado do servidor permanece disponível para desenvolvimento.
 - A sala mantém uma malha direta de controle na porta TCP 9001. Se o anfitrião sair ou ficar instável, o aplicativo elege automaticamente um sucessor elegível e reconecta os participantes ao mesmo código.
 - A fila considera a pior conexão de cada candidato: perda de pulsos, jitter e latência; a ordem de entrada desempata. O anfitrião afastado por instabilidade pode voltar à fila após 30 segundos com perda abaixo de 5%.
@@ -23,7 +23,7 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 
 ### Etapa 0 — Fechar o escopo da primeira versão ✅ Concluída
 
-O protótipo atual admite até oito participantes na sala de sinalização. A chamada de voz e o compartilhamento de tela em grupo ficam para as etapas WebRTC; não haverá câmera ou chat de texto. A mídia continuará priorizando conexão P2P direta.
+O protótipo atual admite até oito participantes na sala de sinalização. O compartilhamento de tela é o recurso principal; chamada de voz é opcional e fica no final do roadmap. Não haverá câmera ou chat de texto. A mídia continuará priorizando conexão P2P direta.
 
 TURN permanece como decisão futura. Se for habilitado como alternativa, retransmitirá áudio e tela quando a conexão P2P direta falhar.
 
@@ -79,30 +79,30 @@ Usar o servidor da sala apenas para trocar pedido, oferta, resposta, candidatos 
 
 **Falta validar manualmente:** iniciar nos dois sentidos entre dois PCs na mesma LAN, conferir o seletor cancelado, fechar a janela capturada, testar o encerramento da sessão e confirmar que o servidor nunca recebe quadros de vídeo. Também falta validar com firewall e adaptadores que as pessoas realmente usarão.
 
-### Etapa 6 — Fazer a chamada P2P de voz na rede local
+### Etapa 6 — Conectar participantes em casas diferentes
 
-Transmitir voz diretamente entre participantes na mesma rede local usando WebRTC, com suporte de grupo planejado para até oito participantes.
+Deixar o servidor integrado do anfitrião acessível pela internet e testar o estabelecimento de conexões diretas para o compartilhamento de tela com ICE/STUN. Verificar as configurações do roteador e se o provedor permite conexões de entrada.
 
-**Concluída quando:** os participantes da sala conseguirem falar e ouvir, e o servidor de sinalização não estiver encaminhando o áudio.
+**Concluída quando:** participantes em redes diferentes conseguirem compartilhar a tela diretamente, sem o servidor de sinalização retransmitir imagens.
 
-### Etapa 7 — Conectar participantes em casas diferentes
+### Etapa 7 — Decidir o tratamento de redes que bloqueiam P2P
 
-Deixar o servidor integrado do anfitrião acessível pela internet e testar o estabelecimento de conexões diretas com ICE/STUN. Verificar as configurações do roteador e se o provedor permite conexões de entrada.
-
-**Concluída quando:** participantes em redes diferentes conseguirem estabelecer voz e tela diretamente, sem o servidor de sinalização retransmitir mídia.
-
-### Etapa 8 — Decidir o tratamento de redes que bloqueiam P2P
-
-Se a conexão direta falhar em algumas redes, decidir entre manter o requisito estrito de P2P — e informar que a chamada não pode ser estabelecida — ou adicionar TURN como alternativa. TURN retransmite voz e tela e exige mais banda no servidor.
+Se a conexão direta falhar em algumas redes, decidir entre manter o requisito estrito de P2P — e informar que o compartilhamento não pode ser estabelecido — ou adicionar TURN como alternativa. TURN retransmite a tela e exige mais banda no servidor.
 
 **Concluída quando:** a decisão sobre TURN estiver tomada e o aplicativo informar claramente quando a conexão é direta ou retransmitida.
 
-### Etapa 9 — Preparar o uso e o instalador
+### Etapa 8 — Preparar o uso e o instalador
 
-Tratar encerramento de chamadas, desconexões, acesso às salas e estados de captura. Gerar o instalador do aplicativo cliente e documentar o compartilhamento do endereço de rede e do código da sala.
+Tratar encerramento do compartilhamento, desconexões, acesso às salas e estados de captura. Gerar o instalador do aplicativo cliente e documentar o compartilhamento do endereço de rede e do código da sala.
 
-**Concluída quando:** for possível instalar o cliente em outro computador e seguir os passos para conectar-se ao PC anfitrião.
+**Concluída quando:** for possível instalar o cliente em outro computador e seguir os passos para conectar-se ao PC anfitrião e compartilhar a tela.
+
+### Etapa 9 (opcional) — Fazer chamadas P2P de voz
+
+Se a chamada de voz for desejada depois que o compartilhamento de tela estiver pronto, transmitir voz diretamente entre participantes usando WebRTC. O suporte de grupo para até oito participantes também será opcional e poderá ser feito nesta etapa.
+
+**Concluída quando:** os participantes conseguirem falar e ouvir sem o servidor de sinalização encaminhar o áudio. Esta etapa pode ser pulada sem impedir o uso do compartilhamento de tela.
 
 ## Como pedir a próxima etapa
 
-Use o número e o nome da etapa, por exemplo: **“Vamos fazer a etapa 1 — Preparar o projeto Rust.”**
+Use o número e o nome da etapa, por exemplo: **“Vamos fazer a etapa 1 — Preparar o projeto Rust.”** A chamada de voz está na etapa opcional final e pode ser ignorada.
