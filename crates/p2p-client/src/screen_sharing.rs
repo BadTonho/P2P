@@ -25,7 +25,7 @@ use rtc::rtp_transceiver::rtp_sender::{
     RtpCodecKind,
 };
 use signaling_protocol::SignalKind;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio::time::timeout;
 use webrtc::media_stream::Track;
@@ -729,7 +729,10 @@ async fn create_sender(
         })
         .map_err(|_| "A interface encerrou a sessão de tela.".to_owned())?;
 
-    let (sample_tx, sample_rx) = watch::channel(None::<(u64, Vec<u8>)>);
+    // Preserve the order of encoded H.264 frames: P-frames depend on earlier frames.
+    // The source capture already keeps only its newest raw frame, so a tiny bounded queue
+    // limits latency without replacing encoded reference frames.
+    let (sample_tx, sample_rx) = mpsc::channel::<Vec<u8>>(1);
     let encoder_stop = Arc::new(AtomicBool::new(false));
     let encoder_stop_worker = Arc::clone(&encoder_stop);
     let encoder_events = events.clone();
@@ -753,11 +756,8 @@ async fn create_sender(
             ));
             return;
         };
-        let mut samples = sample_rx;
-        while samples.changed().await.is_ok() {
-            let Some((_, data)) = samples.borrow_and_update().clone() else {
-                continue;
-            };
+        let mut sample_rx = sample_rx;
+        while let Some(data) = sample_rx.recv().await {
             let sample = Sample {
                 data: Bytes::from(data),
                 duration: FRAME_DURATION,
@@ -882,7 +882,7 @@ async fn close_peer(mut peer: PeerSession) {
 
 fn encode_latest_frames(
     source: LatestFrame,
-    samples: watch::Sender<Option<(u64, Vec<u8>)>>,
+    samples: mpsc::Sender<Vec<u8>>,
     stop: Arc<AtomicBool>,
     metrics: Arc<SharedMetrics>,
 ) -> Result<(), String> {
@@ -918,7 +918,9 @@ fn encode_latest_frames(
         let encoded = encode_frame(&mut encoder, &frame)?;
         if !encoded.is_empty() {
             metrics.encoded_frames.fetch_add(1, Ordering::Relaxed);
-            samples.send_replace(Some((frame.sequence, encoded)));
+            samples
+                .blocking_send(encoded)
+                .map_err(|_| "O envio de vídeo foi encerrado.".to_owned())?;
         }
         if next_frame < Instant::now() {
             next_frame = Instant::now() + FRAME_DURATION;
