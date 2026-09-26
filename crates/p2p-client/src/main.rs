@@ -11,11 +11,19 @@ use screen_capture::ScreenCapture;
 
 const DEMO_ROOM_CODE: &str = "DEMO-0001";
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SettingsCategory {
+    #[default]
+    Audio,
+}
+
 #[derive(Default)]
 struct ClientUi {
     room_code: Option<String>,
     join_code: String,
     code_copied: bool,
+    settings_open: bool,
+    settings_category: SettingsCategory,
     microphone: Option<MicrophoneTest>,
     microphone_level: f32,
     microphone_error: Option<String>,
@@ -33,15 +41,37 @@ impl ClientUi {
         self.refresh_screen(ui.ctx());
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(16.0);
-                ui.heading("P2P - Voz e tela");
-                ui.label("Demonstração local — sem conexão ou transmissão");
+            let mut open_settings = false;
+            let mut close_settings = false;
+            let settings_open = self.settings_open;
+
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.add_space(16.0);
+                    ui.heading("P2P - Voz e tela");
+                    ui.label("Demonstração local — sem conexão ou transmissão");
+                });
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if settings_open {
+                        close_settings = ui.button("Voltar").clicked();
+                    } else {
+                        open_settings = ui.button("Configurações").clicked();
+                    }
+                });
             });
 
             ui.add_space(20.0);
 
-            if self.room_code.is_some() {
+            if open_settings {
+                self.open_settings();
+            } else if close_settings {
+                self.close_settings();
+            }
+
+            if self.settings_open {
+                self.show_settings(ui);
+            } else if self.room_code.is_some() {
                 self.show_room(ui);
             } else {
                 self.show_home(ui);
@@ -105,32 +135,6 @@ impl ClientUi {
         ui.add_space(12.0);
 
         ui.group(|ui| {
-            ui.heading("Teste local do microfone");
-            ui.label("As amostras são usadas só para medir o nível e descartadas; não há gravação nem reprodução.");
-
-            if let Some(error) = &self.microphone_error {
-                ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
-            }
-
-            if self.microphone.is_some() {
-                ui.label("Captura do microfone ativa.");
-                ui.add(
-                    egui::ProgressBar::new(self.microphone_level)
-                        .text(format!("Nível: {:.0}%", self.microphone_level * 100.0)),
-                );
-                if ui.button("Parar teste do microfone").clicked() {
-                    self.stop_microphone();
-                }
-            } else if ui.button("Testar microfone").clicked() {
-                self.start_microphone();
-            }
-
-            ui.small("Se o acesso estiver bloqueado: Configurações > Privacidade e segurança > Microfone (no Windows 10, Privacidade > Microfone) > permitir acesso a aplicativos de área de trabalho.");
-        });
-
-        ui.add_space(12.0);
-
-        ui.group(|ui| {
             ui.heading("Prévia local da tela");
             ui.label("A imagem fica apenas na memória deste aplicativo. Ela não é salva nem transmitida.");
 
@@ -157,6 +161,81 @@ impl ClientUi {
         if ui.button("Sair da sala").clicked() {
             self.leave_room();
         }
+    }
+
+    fn show_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Configurações do aplicativo");
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_min_width(130.0);
+                ui.heading("Categorias");
+                let selected = self.settings_category == SettingsCategory::Audio;
+                if ui.selectable_label(selected, "Áudio").clicked() {
+                    self.select_settings_category(SettingsCategory::Audio);
+                }
+            });
+
+            ui.separator();
+
+            ui.vertical(|ui| match self.settings_category {
+                SettingsCategory::Audio => self.show_audio_settings(ui),
+            });
+        });
+    }
+
+    fn show_audio_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Áudio");
+        ui.label("Teste o microfone padrão do Windows sem entrar em uma sala.");
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.heading("Teste do microfone");
+            ui.label("As amostras são usadas só para medir o nível e descartadas; não há gravação nem reprodução.");
+
+            if let Some(error) = &self.microphone_error {
+                ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+            }
+
+            if self.microphone.is_some() {
+                ui.label("Captura do microfone ativa.");
+                ui.add(
+                    egui::ProgressBar::new(self.microphone_level)
+                        .text(format!("Nível: {:.0}%", self.microphone_level * 100.0)),
+                );
+                if ui.button("Parar teste do microfone").clicked() {
+                    self.stop_microphone();
+                }
+            } else if ui.button("Testar microfone").clicked() {
+                self.start_microphone();
+            }
+
+            ui.small("Se o acesso estiver bloqueado: Configurações > Privacidade e segurança > Microfone (no Windows 10, Privacidade > Microfone) > permitir acesso a aplicativos de área de trabalho.");
+        });
+    }
+
+    fn open_settings(&mut self) {
+        if self.room_code.is_some() && self.screen_capture.is_some() {
+            self.stop_screen_capture();
+        }
+        self.settings_category = SettingsCategory::Audio;
+        self.settings_open = true;
+    }
+
+    fn close_settings(&mut self) {
+        if self.settings_category == SettingsCategory::Audio {
+            self.stop_microphone();
+        }
+        self.settings_open = false;
+    }
+
+    fn select_settings_category(&mut self, category: SettingsCategory) {
+        if self.settings_category == SettingsCategory::Audio && category != SettingsCategory::Audio
+        {
+            self.stop_microphone();
+        }
+        self.settings_category = category;
     }
 
     fn start_microphone(&mut self) {

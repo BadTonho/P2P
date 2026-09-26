@@ -39,11 +39,12 @@ Criar a tela da sala com nome ou código, estado da conexão e controles para in
 
 ### Etapa 3 — Testar microfone e captura de tela no próprio computador
 
-Implementar testes locais e independentes para o microfone e a tela dentro da sala de demonstração:
+Implementar testes locais e independentes para o microfone e a tela:
 
-- Capturar o microfone padrão do Windows e exibir um medidor de nível. Descartar as amostras sem gravar, reproduzir ou transmitir áudio.
-- Abrir o seletor do Windows para escolher uma tela ou janela e exibir uma prévia atualizada. Manter só o quadro mais recente na memória, sem salvar imagens.
-- Permitir parar cada captura separadamente; sair da sala ou fechar o aplicativo libera os recursos.
+- Disponibilizar Configurações na tela inicial e na sala, com categorias laterais. Áudio é a primeira categoria.
+- Em Configurações > Áudio, capturar o microfone padrão do Windows e exibir um medidor de nível. Descartar as amostras sem gravar, reproduzir ou transmitir áudio.
+- Na sala, abrir o seletor do Windows para escolher uma tela ou janela e exibir uma prévia atualizada. Manter só o quadro mais recente na memória, sem salvar imagens.
+- Parar o teste do microfone ao sair de Áudio e parar a prévia da tela ao abrir Configurações. Sair da sala ou fechar o aplicativo também libera as capturas.
 - Mostrar instruções para conferir as permissões de microfone nas configurações do Windows. O aplicativo não altera essas permissões.
 
 **Estado:** implementação feita e compilação concluída. Falta conferir manualmente o medidor com um microfone e o seletor/prévia de tela neste PC.
