@@ -8,6 +8,7 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 - Rust como linguagem principal.
 - egui/eframe para a interface gráfica.
 - Chamada de voz e compartilhamento de tela.
+- Salas limitadas a duas pessoas na primeira versão: você e um amigo.
 - Sem câmera e sem chat de texto.
 - Conexão P2P: áudio e tela devem ir diretamente entre os computadores quando a rede permitir.
 - Servidor de sinalização rodando no notebook; ele ajuda os participantes a iniciar a conexão, sem repassar a mídia no modo P2P direto.
@@ -15,11 +16,13 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 
 ## Etapas
 
-### Etapa 0 — Fechar o escopo da primeira versão
+### Etapa 0 — Fechar o escopo da primeira versão ✅ Concluída
 
-Decidir quantas pessoas poderão participar de uma sala. Uma chamada entre duas pessoas é mais simples; chamadas em grupo exigem mais conexões P2P.
+Limite definido: duas pessoas por sala — você e um amigo. A primeira versão terá chamada de voz e compartilhamento de tela, sem câmera ou chat de texto, priorizando conexão P2P direta.
 
-**Concluída quando:** o limite de participantes estiver definido.
+TURN permanece como decisão futura. Se for habilitado como alternativa, retransmitirá áudio e tela quando a conexão P2P direta falhar.
+
+**Concluída quando:** limite e recursos da primeira versão estiverem definidos. ✅
 
 ### Etapa 1 — Preparar o projeto Rust
 
