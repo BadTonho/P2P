@@ -185,6 +185,7 @@ impl ClientUi {
             ui.small("Permita a porta 9001 no firewall do Windows e escolha um IPv4 que seus amigos consigam alcançar (LAN ou Radmin).");
             self.show_control_address_picker(ui);
             ui.checkbox(&mut self.may_host, "Permitir que este computador seja escolhido para hospedar futuramente");
+            ui.small("Para a sala continuar se o anfitrião sair, um dos outros participantes precisa marcar esta opção e conectar a malha TCP 9001.");
         });
         ui.add_space(12.0);
 
@@ -1280,10 +1281,15 @@ impl ClientUi {
                 }
                 ControlEvent::RoomEnded => {
                     let should_close = self.close_after_transfer;
+                    let has_authorized_successor = self.participants.iter().any(|participant| {
+                        participant.id != self.current_leader_id && participant.may_host
+                    });
                     self.leave_room();
-                    self.connection_status = Some(
-                        "A sala foi encerrada porque não havia sucessor disponível.".to_owned(),
-                    );
+                    self.connection_status = Some(if has_authorized_successor {
+                        "A sala foi encerrada porque o participante autorizado não conseguiu assumir a hospedagem. Confira a conexão direta pela porta TCP 9001 e se a porta TCP 9000 está livre no computador escolhido.".to_owned()
+                    } else {
+                        "A sala foi encerrada porque nenhum participante restante autorizou a hospedagem. Para manter a sala ativa, marque essa opção antes de entrar na próxima vez.".to_owned()
+                    });
                     if should_close {
                         self.allow_window_close = true;
                         context.send_viewport_cmd(egui::ViewportCommand::Close);

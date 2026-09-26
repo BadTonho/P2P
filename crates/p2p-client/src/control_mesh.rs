@@ -416,7 +416,12 @@ async fn run_mesh(
                         fail_current_candidate(&state, &events, epoch).await;
                     }
                     Some(Command::EndRoom) => {
-                        let epoch = state.lock().await.epoch;
+                        let epoch = {
+                            let mut state = state.lock().await;
+                            state.epoch = state.epoch.saturating_add(1);
+                            state.election = None;
+                            state.epoch
+                        };
                         broadcast(&state, ControlMessage::EndRoom { epoch }).await;
                         let _ = events.send(ControlEvent::RoomEnded);
                     }
@@ -615,8 +620,27 @@ where
                             }
                         }
                     }
-                    ControlMessage::EndRoom { .. } => {
-                        let _ = events.send(ControlEvent::RoomEnded);
+                    ControlMessage::EndRoom { epoch } => {
+                        let should_end = {
+                            let mut state = state.lock().await;
+                            let election_still_has_candidates = state
+                                .election
+                                .as_ref()
+                                .is_some_and(|election| {
+                                    election.epoch >= epoch
+                                        && election.candidates.get(election.index).is_some()
+                                });
+                            if epoch < state.epoch || election_still_has_candidates {
+                                false
+                            } else {
+                                state.epoch = epoch;
+                                state.election = None;
+                                true
+                            }
+                        };
+                        if should_end {
+                            let _ = events.send(ControlEvent::RoomEnded);
+                        }
                     }
                     ControlMessage::Hello { .. } => {}
                 }
@@ -958,21 +982,27 @@ async fn initiate_election(
                 let (metrics, eligible) = if participant.id == state.local.id {
                     (own, local_eligible)
                 } else {
-                    state
+                    let recent_status = state
                         .remote_status
                         .get(&participant.id)
                         .filter(|(_, _, seen)| now.duration_since(*seen) < HOST_TIMEOUT)
-                        .map(|(metrics, eligible, _)| (*metrics, participant.may_host && *eligible))
-                        .unwrap_or((
+                        .map(|(metrics, eligible, _)| (*metrics, *eligible));
+                    match recent_status {
+                        Some((metrics, eligible)) => (metrics, participant.may_host && eligible),
+                        None => (
                             Metrics {
-                                loss_percent: 0.0,
+                                // A newly joined participant may not have sent its first health
+                                // status yet. Keep it as a fallback candidate; its attempt to
+                                // open the signaling server will either succeed or time out.
+                                loss_percent: 100.0,
                                 jitter_ms: 0.0,
                                 latency_ms: 0.0,
                                 samples: 0,
                                 consecutive_losses: 0,
                             },
-                            false,
-                        ))
+                            participant.may_host && !participant.control_address.is_empty(),
+                        ),
+                    }
                 };
                 QueueEntry {
                     participant: participant.clone(),
@@ -1000,14 +1030,6 @@ async fn initiate_election(
         });
         (epoch, candidates, state.leader_id.clone(), departing_id)
     };
-    if candidates.is_empty() {
-        state.lock().await.election = None;
-        if end_if_no_candidate {
-            broadcast(state, ControlMessage::EndRoom { epoch }).await;
-            let _ = events.send(ControlEvent::RoomEnded);
-        }
-        return;
-    }
     if orderly {
         broadcast(
             state,
@@ -1017,6 +1039,14 @@ async fn initiate_election(
             },
         )
         .await;
+    }
+    if candidates.is_empty() {
+        state.lock().await.election = None;
+        if end_if_no_candidate {
+            broadcast(state, ControlMessage::EndRoom { epoch }).await;
+            let _ = events.send(ControlEvent::RoomEnded);
+        }
+        return;
     }
     broadcast(
         state,
