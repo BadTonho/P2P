@@ -904,7 +904,7 @@ fn encode_latest_frames(
         .usage_type(UsageType::ScreenContentRealTime)
         .adaptive_quantization(false)
         .background_detection(false)
-        .intra_frame_period(IntraFramePeriod::from_num_frames(60));
+        .intra_frame_period(IntraFramePeriod::from_num_frames(30));
     let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), encoder_config)
         .map_err(|error| format!("Não foi possível iniciar o codificador H.264: {error}"))?;
     let mut last_sequence = None;
@@ -916,6 +916,15 @@ fn encode_latest_frames(
             thread::sleep(wait);
         }
         next_frame += FRAME_DURATION;
+
+        // Do not consume the encoder's first IDR/SPS/PPS while ICE/DTLS is still
+        // negotiating. RTP packets written before the peer is connected can be
+        // discarded; starting with a P-frame then leaves the receiver without
+        // the parameter sets needed to decode the stream.
+        if !metrics.p2p_connected.load(Ordering::Relaxed) {
+            continue;
+        }
+
         let frame = source
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
