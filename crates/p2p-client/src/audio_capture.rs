@@ -333,6 +333,7 @@ where
     let callback_error = Arc::clone(microphone_error);
     let audio_queue = Arc::clone(audio_queue);
     let channels = channels.max(1);
+    let mut mono_samples = Vec::new();
     device
         .build_input_stream::<T, _, _>(
             config,
@@ -343,23 +344,27 @@ where
 
                 let mut sum_squares = 0.0_f32;
                 let mut sample_count = 0_usize;
-                if let Some(mut queue) = audio_queue.try_lock().ok() {
-                    for frame in samples.chunks(channels) {
-                        let mut mono = 0.0_f32;
-                        for sample in frame {
-                            let sample = <f32 as cpal::Sample>::from_sample(*sample);
-                            mono += sample;
-                            sum_squares += sample * sample;
-                            sample_count += 1;
-                        }
-                        queue.push(mono / frame.len() as f32);
-                    }
-                } else {
-                    for sample in samples {
+                mono_samples.clear();
+                let frame_count = samples.len().div_ceil(channels);
+                if mono_samples.capacity() < frame_count {
+                    mono_samples.reserve(frame_count);
+                }
+                for frame in samples.chunks(channels) {
+                    let mut mono = 0.0_f32;
+                    for sample in frame {
                         let sample = <f32 as cpal::Sample>::from_sample(*sample);
+                        mono += sample;
                         sum_squares += sample * sample;
                         sample_count += 1;
                     }
+                    mono_samples.push(mono / frame.len() as f32);
+                }
+
+                // Do conversion and level measurement before taking the queue lock.
+                // The output callback also reads this queue, so keep the critical
+                // section limited to a bulk transfer.
+                if let Ok(mut queue) = audio_queue.try_lock() {
+                    queue.push_slice(&mono_samples);
                 }
 
                 if sample_count > 0 {
@@ -403,14 +408,20 @@ where
         .build_output_stream::<T, _, _>(
             config,
             move |output, _info| {
-                let Some(mut queue) = audio_queue.try_lock().ok() else {
-                    output.fill(<T as cpal::Sample>::from_sample(0.0_f32));
-                    resampler.reset();
-                    return;
-                };
+                let output_frames = output.len().div_ceil(channels);
+                let required_source_samples = (output_frames as f64
+                    * resampler.source_samples_per_output_sample)
+                    .ceil() as usize
+                    + 4;
+
+                // Move a whole callback's worth of source samples at once, then
+                // resample without holding the mutex for every output frame.
+                if let Ok(mut queue) = audio_queue.try_lock() {
+                    resampler.refill(&mut queue, required_source_samples);
+                }
 
                 for frame in output.chunks_mut(channels) {
-                    let sample = resampler.next_sample(&mut queue).clamp(-1.0, 1.0);
+                    let sample = resampler.next_sample().clamp(-1.0, 1.0);
                     frame.fill(<T as cpal::Sample>::from_sample(sample));
                 }
             },
@@ -438,15 +449,26 @@ impl BoundedAudioQueue {
         }
     }
 
-    fn push(&mut self, sample: f32) {
-        if self.samples.len() == self.capacity {
-            self.samples.pop_front();
+    fn push_slice(&mut self, incoming: &[f32]) {
+        if incoming.len() >= self.capacity {
+            self.samples.clear();
+            self.samples
+                .extend(incoming[incoming.len() - self.capacity..].iter().copied());
+            return;
         }
-        self.samples.push_back(sample);
+
+        let overflow = self
+            .samples
+            .len()
+            .saturating_add(incoming.len())
+            .saturating_sub(self.capacity);
+        self.samples.drain(..overflow);
+        self.samples.extend(incoming.iter().copied());
     }
 
-    fn pop(&mut self) -> Option<f32> {
-        self.samples.pop_front()
+    fn pop_into(&mut self, destination: &mut VecDeque<f32>, count: usize) {
+        let count = count.min(self.samples.len());
+        destination.extend(self.samples.drain(..count));
     }
 }
 
@@ -455,6 +477,7 @@ struct LinearResampler {
     source_position: f64,
     current: Option<f32>,
     next: Option<f32>,
+    source_samples: VecDeque<f32>,
 }
 
 impl LinearResampler {
@@ -464,21 +487,31 @@ impl LinearResampler {
             source_position: 0.0,
             current: None,
             next: None,
+            source_samples: VecDeque::with_capacity(4096),
         }
+    }
+
+    fn refill(&mut self, queue: &mut BoundedAudioQueue, target_len: usize) {
+        let buffered_samples = self.source_samples.len()
+            + usize::from(self.current.is_some())
+            + usize::from(self.next.is_some());
+        let missing = target_len.saturating_sub(buffered_samples);
+        queue.pop_into(&mut self.source_samples, missing);
     }
 
     fn reset(&mut self) {
         self.source_position = 0.0;
         self.current = None;
         self.next = None;
+        self.source_samples.clear();
     }
 
-    fn next_sample(&mut self, queue: &mut BoundedAudioQueue) -> f32 {
+    fn next_sample(&mut self) -> f32 {
         if self.current.is_none() {
-            self.current = queue.pop();
+            self.current = self.source_samples.pop_front();
         }
         if self.next.is_none() {
-            self.next = queue.pop();
+            self.next = self.source_samples.pop_front();
         }
 
         let (Some(current), Some(next)) = (self.current, self.next) else {
@@ -492,7 +525,7 @@ impl LinearResampler {
         while self.source_position >= 1.0 {
             self.source_position -= 1.0;
             self.current = self.next;
-            self.next = queue.pop();
+            self.next = self.source_samples.pop_front();
             if self.next.is_none() {
                 self.reset();
                 break;
