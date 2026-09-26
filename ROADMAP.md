@@ -4,6 +4,7 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 
 ## Escopo atual
 
+- O desenvolvimento será feito no seu PC principal; o notebook será usado apenas nas etapas que precisarem dele, como executar o servidor de sinalização.
 - Aplicativo instalado primeiro no Windows.
 - Rust como linguagem principal.
 - egui/eframe para a interface gráfica.
@@ -26,7 +27,7 @@ TURN permanece como decisão futura. Se for habilitado como alternativa, retrans
 
 ### Etapa 1 — Preparar o projeto Rust
 
-Verificar as ferramentas do notebook, organizar os projetos do aplicativo e do servidor e abrir uma janela mínima com egui/eframe.
+Verificar as ferramentas deste PC, onde o projeto será desenvolvido, organizar os projetos do aplicativo e do servidor e abrir uma janela mínima com egui/eframe.
 
 **Concluída quando:** o aplicativo compilar e abrir no Windows.
 
