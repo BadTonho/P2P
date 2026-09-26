@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
@@ -12,13 +13,14 @@ use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePe
 use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
 use rtc::interceptor::Registry;
 use rtc::media::Sample;
-use rtc::media::io::sample_builder::SampleBuilder;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
 use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MediaEngine};
 use rtc::peer_connection::transport::RTCIceCandidateInit;
 use rtc::rtp::codec::h264::H264Packet;
+use rtc::rtp::packet::Packet as RtpPacket;
+use rtc::rtp::packetizer::Depacketizer;
 use rtc::rtp_transceiver::PayloadType;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
@@ -43,7 +45,9 @@ use crate::screen_capture::{LatestFrame, PreviewFrame};
 const VIDEO_PAYLOAD_TYPE: PayloadType = 102;
 const VIDEO_CLOCK_RATE: u32 = 90_000;
 const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 30);
-const MAX_FRAME_QUEUE_DELAY: Duration = Duration::from_millis(200);
+const RTP_REORDER_DELAY: Duration = Duration::from_millis(40);
+const MAX_RTP_FRAME_AGE: Duration = Duration::from_millis(200);
+const MAX_PENDING_RTP_FRAMES: usize = 8;
 const MEDIA_UDP_PORT: u16 = 9002;
 const PEER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const FIRST_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
@@ -98,8 +102,10 @@ struct H264FlowDiagnostics {
     assembled_with_sps: u64,
     assembled_with_pps: u64,
     assembled_with_idr: u64,
+    assembly_errors: u64,
     last_encoded_nals: String,
     last_access_unit: String,
+    last_assembly_error: Option<String>,
 }
 
 impl SharedMetrics {
@@ -123,7 +129,7 @@ impl SharedMetrics {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
             h264_diagnostics: format!(
-                "Codificado: SPS/PPS/IDR {}/{}/{} ({}); RTP: SPS/PPS/IDR {}/{}/{}, single/STAP-A/FU-A início/fim {}/{}/{}/{}, lacunas/reordenação {}/{}; quadros montados: {} (com SPS/PPS/IDR {}/{}/{}); último quadro: {}.",
+                "Codificado: SPS/PPS/IDR {}/{}/{} ({}); RTP: SPS/PPS/IDR {}/{}/{}, single/STAP-A/FU-A início/fim {}/{}/{}/{}, lacunas/reordenação {}/{}; quadros montados: {} (com SPS/PPS/IDR {}/{}/{}), erros de montagem {}; último quadro: {}{}.",
                 h264_flow.encoded_sps,
                 h264_flow.encoded_pps,
                 h264_flow.encoded_idr,
@@ -141,7 +147,13 @@ impl SharedMetrics {
                 h264_flow.assembled_with_sps,
                 h264_flow.assembled_with_pps,
                 h264_flow.assembled_with_idr,
+                h264_flow.assembly_errors,
                 h264_flow.last_access_unit,
+                h264_flow
+                    .last_assembly_error
+                    .as_ref()
+                    .map(|error| format!("; último erro de montagem: {error}"))
+                    .unwrap_or_default(),
             ),
         }
     }
@@ -233,6 +245,248 @@ impl SharedMetrics {
         }
         flow.last_access_unit = description.clone();
         description
+    }
+
+    fn record_assembly_error(&self, error: String) {
+        let mut flow = self
+            .h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        flow.assembly_errors += 1;
+        flow.last_assembly_error = Some(error);
+    }
+}
+
+#[derive(Default)]
+struct H264AccessUnitAssembler {
+    frames: HashMap<u32, PendingRtpFrame>,
+}
+
+struct PendingRtpFrame {
+    packets: Vec<RtpPacket>,
+    first_received: Instant,
+    marker_seen: bool,
+}
+
+impl H264AccessUnitAssembler {
+    fn push(&mut self, packet: RtpPacket) -> Option<String> {
+        let timestamp = packet.header.timestamp;
+        let now = Instant::now();
+        let mut evicted = None;
+        if !self.frames.contains_key(&timestamp) && self.frames.len() >= MAX_PENDING_RTP_FRAMES {
+            if let Some(oldest_timestamp) = self
+                .frames
+                .iter()
+                .min_by_key(|(_, frame)| frame.first_received)
+                .map(|(timestamp, _)| *timestamp)
+            {
+                self.frames.remove(&oldest_timestamp);
+                evicted = Some("limite de quadros RTP pendentes excedido".to_owned());
+            }
+        }
+
+        let frame = self
+            .frames
+            .entry(timestamp)
+            .or_insert_with(|| PendingRtpFrame {
+                packets: Vec::new(),
+                first_received: now,
+                marker_seen: false,
+            });
+        frame.marker_seen |= packet.header.marker;
+        frame.packets.push(packet);
+        evicted
+    }
+
+    fn take_ready(&mut self, now: Instant) -> Vec<Result<Vec<u8>, String>> {
+        let mut ready_timestamps = self
+            .frames
+            .iter()
+            .filter_map(|(timestamp, frame)| {
+                let age = now.saturating_duration_since(frame.first_received);
+                (age >= RTP_REORDER_DELAY && frame.marker_seen || age >= MAX_RTP_FRAME_AGE)
+                    .then_some(*timestamp)
+            })
+            .collect::<Vec<_>>();
+        ready_timestamps.sort_by(|left, right| {
+            if left == right {
+                std::cmp::Ordering::Equal
+            } else if (left.wrapping_sub(*right) as i32) < 0 {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        });
+
+        ready_timestamps
+            .into_iter()
+            .filter_map(|timestamp| self.frames.remove(&timestamp))
+            .map(|frame| {
+                if !frame.marker_seen {
+                    return Err("quadro RTP expirou sem marcador de fim".to_owned());
+                }
+                assemble_h264_access_unit(frame.packets)
+            })
+            .collect()
+    }
+}
+
+fn assemble_h264_access_unit(mut packets: Vec<RtpPacket>) -> Result<Vec<u8>, String> {
+    if packets.is_empty() {
+        return Err("quadro RTP sem pacotes".to_owned());
+    }
+
+    let first_sequence = packets
+        .iter()
+        .map(|packet| packet.header.sequence_number)
+        .reduce(|current, candidate| {
+            let distance = current.wrapping_sub(candidate);
+            if distance > 0 && distance < 0x8000 {
+                candidate
+            } else {
+                current
+            }
+        })
+        .unwrap_or_default();
+    packets.sort_by_key(|packet| packet.header.sequence_number.wrapping_sub(first_sequence));
+    packets.dedup_by_key(|packet| packet.header.sequence_number);
+
+    if !packets.last().is_some_and(|packet| packet.header.marker) {
+        return Err("marcador RTP não está no último pacote do quadro".to_owned());
+    }
+    if packets.first().is_some_and(|packet| {
+        let Some(header) = packet.payload.first() else {
+            return true;
+        };
+        if header & 0x1f == 28 {
+            packet
+                .payload
+                .get(1)
+                .is_none_or(|fu_header| fu_header & 0x80 == 0)
+        } else {
+            false
+        }
+    }) {
+        return Err("o quadro começa no meio de um fragmento FU-A".to_owned());
+    }
+
+    for pair in packets.windows(2) {
+        if pair[1].header.sequence_number != pair[0].header.sequence_number.wrapping_add(1) {
+            return Err("há pacote(s) RTP ausente(s) dentro do quadro".to_owned());
+        }
+    }
+
+    let mut depacketizer = H264Packet::default();
+    let mut output = Vec::new();
+    let mut active_fragment: Option<u8> = None;
+    for packet in packets {
+        let payload = &packet.payload;
+        let Some(header) = payload.first() else {
+            return Err("pacote RTP H.264 vazio".to_owned());
+        };
+        let packet_type = header & 0x1f;
+        if packet_type == 28 {
+            let Some(fu_header) = payload.get(1) else {
+                return Err("cabeçalho FU-A incompleto".to_owned());
+            };
+            let nal_type = fu_header & 0x1f;
+            let starts_nal = fu_header & 0x80 != 0;
+            let ends_nal = fu_header & 0x40 != 0;
+            if starts_nal {
+                if active_fragment.is_some() {
+                    return Err("um fragmento FU-A começou antes do anterior terminar".to_owned());
+                }
+                active_fragment = Some(nal_type);
+            } else if active_fragment != Some(nal_type) {
+                return Err("fragmento FU-A sem início correspondente".to_owned());
+            }
+            if ends_nal {
+                active_fragment = None;
+            }
+        } else if active_fragment.is_some() {
+            return Err("NAL H.264 interrompeu um fragmento FU-A".to_owned());
+        }
+
+        if packet_type == 24 {
+            validate_stap_a(payload)?;
+        }
+
+        let depacketized = depacketizer
+            .depacketize(payload)
+            .map_err(|error| format!("depacketização H.264 falhou: {error}"))?;
+        output.extend_from_slice(&depacketized);
+    }
+    if active_fragment.is_some() {
+        return Err("quadro terminou antes do fim do fragmento FU-A".to_owned());
+    }
+    if output.is_empty() {
+        return Err("quadro RTP não produziu dados H.264".to_owned());
+    }
+    Ok(output)
+}
+
+fn validate_stap_a(payload: &[u8]) -> Result<(), String> {
+    let mut offset = 1;
+    while offset < payload.len() {
+        if offset + 2 > payload.len() {
+            return Err("cabeçalho STAP-A incompleto".to_owned());
+        }
+        let nal_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+        if nal_len == 0 || offset + nal_len > payload.len() {
+            return Err("tamanho de NAL inválido dentro do STAP-A".to_owned());
+        }
+        offset += nal_len;
+    }
+    Ok(())
+}
+
+fn decode_h264_access_unit(
+    access_unit: &[u8],
+    decoder: &mut Decoder,
+    context: &egui::Context,
+    remote_frame: &RemoteFrameStore,
+    sequence: &AtomicU64,
+    metrics: &SharedMetrics,
+) {
+    let sample_diagnostics = metrics.record_assembled_access_unit(access_unit);
+    match decoder.decode(access_unit) {
+        Ok(Some(yuv)) => {
+            let (width, height) = yuv.dimensions();
+            if width == 0 || height == 0 {
+                return;
+            }
+            let mut rgba = vec![0; yuv.rgba8_len()];
+            yuv.write_rgba8(&mut rgba);
+            metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
+            let next_sequence = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            *remote_frame
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Arc::new(PreviewFrame {
+                    sequence: next_sequence,
+                    width: width as u32,
+                    height: height as u32,
+                    rgba,
+                }));
+            context.request_repaint();
+        }
+        Ok(None) => {}
+        Err(error) => {
+            metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+            let detail = if error.native_code() & 0x10 != 0 {
+                format!(
+                    "{error} (dsNoParamSets: SPS/PPS ausentes ou incompatíveis; quadro: {sample_diagnostics})"
+                )
+            } else {
+                format!("{error}; quadro: {sample_diagnostics}")
+            };
+            *metrics
+                .last_decode_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail);
+            context.request_repaint();
+        }
     }
 }
 
@@ -588,70 +842,51 @@ impl PeerConnectionEventHandler for PeerEvents {
                 Ok(decoder) => decoder,
                 Err(error) => {
                     let _ = events.send(ScreenShareEvent::Error(format!(
-                        "Não foi possível iniciar o decodificador H.264: {error}"
+                        "Nao foi possivel iniciar o decodificador H.264: {error}"
                     )));
                     return;
                 }
             };
-            let mut builder = SampleBuilder::new(30, H264Packet::default(), VIDEO_CLOCK_RATE)
-                .with_max_time_delay(MAX_FRAME_QUEUE_DELAY);
+            let mut assembler = H264AccessUnitAssembler::default();
             let mut previous_sequence = None;
+            let mut flush_pending = tokio::time::interval(Duration::from_millis(10));
+            flush_pending.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            while let Some(event) = track.poll().await {
-                match event {
-                    TrackRemoteEvent::OnRtpPacket(packet) => {
-                        metrics.received_packets.fetch_add(1, Ordering::Relaxed);
-                        metrics.record_received_packet(&packet, &mut previous_sequence);
-                        builder.push(Instant::now(), packet);
-                        while let Some(sample) = builder.pop(Instant::now()) {
-                            let sample_diagnostics =
-                                metrics.record_assembled_access_unit(&sample.data);
-                            match decoder.decode(&sample.data) {
-                                Ok(Some(yuv)) => {
-                                    let (width, height) = yuv.dimensions();
-                                    if width == 0 || height == 0 {
-                                        continue;
-                                    }
-                                    let mut rgba = vec![0; yuv.rgba8_len()];
-                                    yuv.write_rgba8(&mut rgba);
-                                    metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
-                                    let next_sequence =
-                                        sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                                    *remote_frame
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                        Some(Arc::new(PreviewFrame {
-                                            sequence: next_sequence,
-                                            width: width as u32,
-                                            height: height as u32,
-                                            rgba,
-                                        }));
-                                    context.request_repaint();
-                                }
-                                Ok(None) => {}
-                                // Um pacote perdido pode invalidar um quadro; quadros-chave periódicos
-                                // permitem que a decodificação se recupere automaticamente.
-                                Err(error) => {
-                                    metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-                                    let detail = if error.native_code() & 0x10 != 0 {
-                                        format!(
-                                            "{error} (dsNoParamSets: o decodificador não encontrou o SPS/PPS necessário; quadro montado: {sample_diagnostics})"
-                                        )
-                                    } else {
-                                        format!("{error}; quadro montado: {sample_diagnostics}")
-                                    };
-                                    *metrics
-                                        .last_decode_error
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                        Some(detail);
+            loop {
+                tokio::select! {
+                    _ = flush_pending.tick() => {}
+                    event = track.poll() => {
+                        let Some(event) = event else { break };
+                        match event {
+                            TrackRemoteEvent::OnRtpPacket(packet) => {
+                                metrics.received_packets.fetch_add(1, Ordering::Relaxed);
+                                metrics.record_received_packet(&packet, &mut previous_sequence);
+                                if let Some(error) = assembler.push(packet) {
+                                    metrics.record_assembly_error(error);
                                     context.request_repaint();
                                 }
                             }
+                            TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnEnding => break,
+                            _ => {}
                         }
                     }
-                    TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnEnding => break,
-                    _ => {}
+                }
+
+                for result in assembler.take_ready(Instant::now()) {
+                    match result {
+                        Ok(access_unit) => decode_h264_access_unit(
+                            &access_unit,
+                            &mut decoder,
+                            &context,
+                            &remote_frame,
+                            &sequence,
+                            &metrics,
+                        ),
+                        Err(error) => {
+                            metrics.record_assembly_error(error);
+                            context.request_repaint();
+                        }
+                    }
                 }
             }
         });
