@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use audio_capture::MicrophoneTest;
 use eframe::egui;
-use screen_capture::ScreenCapture;
+use screen_capture::{PendingScreenCapture, ScreenCapture};
 
 const DEMO_ROOM_CODE: &str = "DEMO-0001";
 
@@ -33,13 +33,17 @@ struct ClientUi {
     microphone_audio_warning: bool,
     microphone_clipping_warning: bool,
     screen_capture: Option<ScreenCapture>,
+    screen_picker: Option<PendingScreenCapture>,
     screen_texture: Option<egui::TextureHandle>,
     screen_status: Option<String>,
 }
 
 impl ClientUi {
     fn show(&mut self, ui: &mut egui::Ui) {
-        if self.microphone.is_some() || self.screen_capture.is_some() {
+        if self.microphone.is_some()
+            || self.screen_capture.is_some()
+            || self.screen_picker.is_some()
+        {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         self.refresh_microphone();
@@ -61,7 +65,12 @@ impl ClientUi {
                     if settings_open {
                         close_settings = ui.button("Voltar").clicked();
                     } else {
-                        open_settings = ui.button("Configurações").clicked();
+                        open_settings = ui
+                            .add_enabled(
+                                self.screen_picker.is_none(),
+                                egui::Button::new("Configurações"),
+                            )
+                            .clicked();
                     }
                 });
             });
@@ -153,6 +162,8 @@ impl ClientUi {
                 } else {
                     ui.label("Aguardando o primeiro quadro…");
                 }
+            } else if self.screen_picker.is_some() {
+                ui.label("Aguardando o seletor do Windows...");
             } else if ui.button("Selecionar tela ou janela").clicked() {
                 self.select_screen(ui.ctx());
             }
@@ -163,7 +174,13 @@ impl ClientUi {
         });
 
         ui.add_space(12.0);
-        if ui.button("Sair da sala").clicked() {
+        if ui
+            .add_enabled(
+                self.screen_picker.is_none(),
+                egui::Button::new("Sair da sala"),
+            )
+            .clicked()
+        {
             self.leave_room();
         }
     }
@@ -332,25 +349,48 @@ impl ClientUi {
         }
     }
 
-    fn select_screen(&mut self, context: &egui::Context) {
+    fn select_screen(&mut self, _context: &egui::Context) {
         self.screen_status = None;
-        match ScreenCapture::pick_and_start(context.clone()) {
-            Ok(Some(capture)) => {
-                self.screen_capture = Some(capture);
+        match PendingScreenCapture::begin() {
+            Ok(picker) => {
+                self.screen_picker = Some(picker);
                 self.screen_status =
-                    Some("A prévia será atualizada enquanto a captura estiver ativa.".to_owned());
-            }
-            Ok(None) => {
-                self.screen_status =
-                    Some("Seleção cancelada; a captura permaneceu desligada.".to_owned());
+                    Some("Selecione uma tela ou janela no seletor do Windows.".to_owned());
             }
             Err(error) => {
-                self.screen_status = Some(format!("Não foi possível iniciar a captura: {error}"));
+                self.screen_status = Some(format!("Não foi possível abrir o seletor: {error}"));
             }
         }
     }
-
     fn refresh_screen(&mut self, context: &egui::Context) {
+        let picker_result = if self.settings_open {
+            self.screen_picker = None;
+            None
+        } else {
+            self.screen_picker
+                .as_mut()
+                .and_then(|picker| picker.poll(context.clone()))
+        };
+        if let Some(result) = picker_result {
+            self.screen_picker = None;
+            match result {
+                Ok(Some(capture)) => {
+                    self.screen_capture = Some(capture);
+                    self.screen_status =
+                        Some("A prévia atualiza enquanto a captura estiver ativa.".to_owned());
+                }
+                Ok(None) => {
+                    self.screen_status =
+                        Some("Seleção cancelada; a captura permaneceu desligada.".to_owned());
+                }
+                Err(error) => {
+                    self.screen_status = Some(format!(
+                        "Não foi possível iniciar a captura da tela: {error}"
+                    ));
+                }
+            }
+        }
+
         let Some(capture) = self.screen_capture.as_mut() else {
             return;
         };
@@ -411,6 +451,7 @@ impl ClientUi {
 
     fn leave_room(&mut self) {
         self.stop_microphone();
+        self.screen_picker = None;
         if let Some(mut capture) = self.screen_capture.take() {
             let _ = capture.stop();
         }
@@ -426,6 +467,7 @@ impl ClientUi {
 impl Drop for ClientUi {
     fn drop(&mut self) {
         self.stop_microphone();
+        self.screen_picker = None;
         if let Some(mut capture) = self.screen_capture.take() {
             let _ = capture.stop();
         }
