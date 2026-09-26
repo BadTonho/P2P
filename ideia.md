@@ -1,0 +1,1 @@
+se o anfitriao estiver com instabilidade passar automaticamente pro proximo da fila, e se a estabilidade dele melhorar ele pode entrar na fila novamente
