@@ -1,9 +1,9 @@
 use std::sync::mpsc as std_mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use signaling_protocol::{ClientMessage, ServerMessage, SignalKind};
+use signaling_protocol::{ClientMessage, ParticipantInfo, ServerMessage, SignalKind};
 use signaling_server::TransferReservation;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -17,6 +17,20 @@ const LOCAL_CLIENT_URL: &str = "ws://127.0.0.1:9000";
 const DIAGNOSTIC_PAYLOAD: &str = "diagnostic-ping-v1";
 const DIAGNOSTIC_ACK_PAYLOAD: &str = "diagnostic-pong-v1";
 
+fn default_participant() -> ParticipantInfo {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    ParticipantInfo {
+        id: format!("{}-{nonce:x}", std::process::id()),
+        display_name: "Participante".to_owned(),
+        order: 0,
+        may_host: false,
+        control_address: String::new(),
+    }
+}
+
 #[derive(Debug)]
 pub enum SignalingEvent {
     RoomCreated(String),
@@ -24,12 +38,25 @@ pub enum SignalingEvent {
     RoomAdopted(String),
     PeerJoined,
     PeerLeft,
-    HostTransferPending { code: String, token: String },
-    HostTransferRequested { code: String, token: String },
+    RoomRoster {
+        participants: Vec<ParticipantInfo>,
+        leader_id: String,
+    },
+    HostTransferPending {
+        code: String,
+        token: String,
+    },
+    HostTransferRequested {
+        code: String,
+        token: String,
+    },
     HostTransferComplete(String),
     HostTransferCanceled(String),
     ServerError(String),
-    Signal { kind: SignalKind, payload: String },
+    Signal {
+        kind: SignalKind,
+        payload: String,
+    },
     Error(String),
     Disconnected,
 }
@@ -51,25 +78,43 @@ pub struct SignalingClient {
 }
 
 impl SignalingClient {
-    pub fn start_host() -> Result<Self, String> {
-        Self::start_host_at(LOCAL_SERVER_ADDRESS)
+    pub fn start_host_with_participant(participant: ParticipantInfo) -> Result<Self, String> {
+        Self::start_worker(
+            LOCAL_CLIENT_URL.to_owned(),
+            ClientMessage::CreateRoomIdentified {
+                participant: participant.clone(),
+            },
+            Some(None),
+            LOCAL_SERVER_ADDRESS.to_owned(),
+            participant,
+        )
     }
 
+    #[cfg(test)]
     fn start_host_at(listen_address: &str) -> Result<Self, String> {
         Self::start_worker(
             LOCAL_CLIENT_URL.to_owned(),
             ClientMessage::CreateRoom,
             Some(None),
             listen_address.to_owned(),
+            default_participant(),
         )
     }
 
-    pub fn join(server_url: String, code: String) -> Result<Self, String> {
+    pub fn join_with_participant(
+        server_url: String,
+        code: String,
+        participant: ParticipantInfo,
+    ) -> Result<Self, String> {
         Self::start_worker(
             server_url,
-            ClientMessage::JoinRoom { code },
+            ClientMessage::JoinRoomIdentified {
+                code,
+                participant: participant.clone(),
+            },
             None,
             LOCAL_SERVER_ADDRESS.to_owned(),
+            participant,
         )
     }
 
@@ -80,8 +125,41 @@ impl SignalingClient {
                 code: code.clone(),
                 token: token.clone(),
             },
-            Some(Some(TransferReservation { code, token })),
+            Some(Some(TransferReservation {
+                code,
+                token,
+                participants: Vec::new(),
+            })),
             LOCAL_SERVER_ADDRESS.to_owned(),
+            default_participant(),
+        )
+    }
+
+    pub fn start_elected_host(
+        code: String,
+        participant: ParticipantInfo,
+        participants: Vec<ParticipantInfo>,
+    ) -> Result<Self, String> {
+        let token = format!(
+            "election-{:x}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        Self::start_worker(
+            LOCAL_CLIENT_URL.to_owned(),
+            ClientMessage::AdoptTransferredRoom {
+                code: code.clone(),
+                token: token.clone(),
+            },
+            Some(Some(TransferReservation {
+                code,
+                token,
+                participants,
+            })),
+            LOCAL_SERVER_ADDRESS.to_owned(),
+            participant,
         )
     }
 
@@ -90,6 +168,7 @@ impl SignalingClient {
         initial_message: ClientMessage,
         local_server: Option<Option<TransferReservation>>,
         local_server_address: String,
+        participant: ParticipantInfo,
     ) -> Result<Self, String> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = std_mpsc::channel();
@@ -113,6 +192,7 @@ impl SignalingClient {
                     initial_message,
                     local_server,
                     local_server_address,
+                    participant,
                     command_rx,
                     event_tx,
                 ));
@@ -178,6 +258,7 @@ async fn run_client(
     initial_message: ClientMessage,
     local_server: Option<Option<TransferReservation>>,
     local_server_address: String,
+    participant: ParticipantInfo,
     mut commands: mpsc::UnboundedReceiver<ClientCommand>,
     events: std_mpsc::Sender<SignalingEvent>,
 ) {
@@ -256,12 +337,15 @@ async fn run_client(
                     Some(Ok(WebSocketMessage::Text(text))) => {
                         match serde_json::from_str::<ServerMessage>(text.as_str()) {
                             Ok(ServerMessage::RoomCreated { code }) => {
+                                let _ = send_client_message(&mut writer, ClientMessage::IdentifyParticipant { participant: participant.clone() }).await;
                                 let _ = events.send(SignalingEvent::RoomCreated(code));
                             }
                             Ok(ServerMessage::RoomJoined { code }) => {
+                                let _ = send_client_message(&mut writer, ClientMessage::IdentifyParticipant { participant: participant.clone() }).await;
                                 let _ = events.send(SignalingEvent::RoomJoined(code));
                             }
                             Ok(ServerMessage::RoomAdopted { code }) => {
+                                let _ = send_client_message(&mut writer, ClientMessage::IdentifyParticipant { participant: participant.clone() }).await;
                                 let _ = events.send(SignalingEvent::RoomAdopted(code));
                             }
                             Ok(ServerMessage::PeerJoined) => {
@@ -286,6 +370,9 @@ async fn run_client(
                             }
                             Ok(ServerMessage::Signal { kind, payload }) => {
                                 let _ = events.send(SignalingEvent::Signal { kind, payload });
+                            }
+                            Ok(ServerMessage::RoomRoster { participants, leader_id }) => {
+                                let _ = events.send(SignalingEvent::RoomRoster { participants, leader_id });
                             }
                             Ok(ServerMessage::RoomLeft) => break,
                             Ok(ServerMessage::Error { message }) => {

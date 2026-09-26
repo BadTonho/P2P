@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use signaling_protocol::{ClientMessage, ServerMessage};
+use signaling_protocol::{ClientMessage, ParticipantInfo, ServerMessage};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::sleep;
@@ -14,6 +14,7 @@ use tokio_tungstenite::{WebSocketStream, accept_async};
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const HOST_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_ROOM_PARTICIPANTS: usize = 8;
 
 type ConnectionId = u64;
 type Outgoing = mpsc::UnboundedSender<OutboundMessage>;
@@ -23,6 +24,7 @@ type SharedRooms = Arc<Mutex<RoomRegistry>>;
 pub struct TransferReservation {
     pub code: String,
     pub token: String,
+    pub participants: Vec<ParticipantInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,12 +44,15 @@ enum OutboundMessage {
 struct RoomRegistry {
     rooms: HashMap<String, Room>,
     connection_rooms: HashMap<ConnectionId, String>,
+    participant_info: HashMap<ConnectionId, ParticipantInfo>,
     transfer_reservation: Option<TransferReservation>,
 }
 
 #[derive(Default)]
 struct Room {
     participants: Vec<(ConnectionId, Outgoing)>,
+    members: Vec<ParticipantInfo>,
+    leader_connection_id: ConnectionId,
     pending_transfer: Option<PendingTransfer>,
 }
 
@@ -72,10 +77,14 @@ impl RoomRegistry {
             code.clone(),
             Room {
                 participants: vec![(connection_id, sender.clone())],
+                members: vec![default_participant(connection_id, 1)],
+                leader_connection_id: connection_id,
                 pending_transfer: None,
             },
         );
         self.connection_rooms.insert(connection_id, code.clone());
+        self.participant_info
+            .insert(connection_id, default_participant(connection_id, 1));
         if sender
             .send(OutboundMessage::Protocol(ServerMessage::RoomCreated {
                 code: code.clone(),
@@ -101,13 +110,27 @@ impl RoomRegistry {
         let Some(room) = self.rooms.get_mut(code) else {
             return Err("A sala nao existe ou ja foi encerrada.".to_owned());
         };
-        if room.participants.len() >= 2 {
-            return Err("A sala ja esta cheia.".to_owned());
+        if room.participants.len() >= MAX_ROOM_PARTICIPANTS {
+            return Err("A sala ja atingiu o limite de 8 participantes.".to_owned());
         }
 
-        let existing_peer = room.participants.first().map(|(_, peer)| peer.clone());
+        let existing_peers = room
+            .participants
+            .iter()
+            .map(|(_, peer)| peer.clone())
+            .collect::<Vec<_>>();
+        let order = room
+            .members
+            .iter()
+            .map(|participant| participant.order)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         room.participants.push((connection_id, sender.clone()));
         self.connection_rooms.insert(connection_id, code.to_owned());
+        let participant = default_participant(connection_id, order);
+        room.members.push(participant.clone());
+        self.participant_info.insert(connection_id, participant);
 
         if sender
             .send(OutboundMessage::Protocol(ServerMessage::RoomJoined {
@@ -118,10 +141,126 @@ impl RoomRegistry {
             self.leave_room(connection_id);
             return Err("Nao foi possivel confirmar a entrada na sala.".to_owned());
         }
-        if let Some(peer) = existing_peer {
+        for peer in existing_peers {
             let _ = peer.send(OutboundMessage::Protocol(ServerMessage::PeerJoined));
         }
         Ok(())
+    }
+
+    fn create_room_identified(
+        &mut self,
+        connection_id: ConnectionId,
+        sender: Outgoing,
+        participant: ParticipantInfo,
+    ) -> Result<(), String> {
+        self.create_room(connection_id, sender)?;
+        self.identify_participant(connection_id, participant)
+    }
+
+    fn join_room_identified(
+        &mut self,
+        connection_id: ConnectionId,
+        code: &str,
+        sender: Outgoing,
+        participant: ParticipantInfo,
+    ) -> Result<(), String> {
+        let Some(room) = self.rooms.get(code) else {
+            return Err("A sala nao existe ou ja foi encerrada.".to_owned());
+        };
+        let is_known_member = room.members.iter().any(|known| known.id == participant.id);
+        let is_already_connected = room.participants.iter().any(|(other_id, _)| {
+            *other_id != connection_id
+                && self
+                    .participant_info
+                    .get(other_id)
+                    .is_some_and(|known| known.id == participant.id)
+        });
+        if is_already_connected {
+            return Err("Este participante ja esta conectado a sala.".to_owned());
+        }
+        if !is_known_member && room.members.len() >= MAX_ROOM_PARTICIPANTS {
+            return Err("A sala ja atingiu o limite de 8 participantes.".to_owned());
+        }
+        self.join_room(connection_id, code, sender)?;
+        self.identify_participant(connection_id, participant)
+    }
+
+    fn identify_participant(
+        &mut self,
+        connection_id: ConnectionId,
+        mut participant: ParticipantInfo,
+    ) -> Result<(), String> {
+        let Some(code) = self.connection_rooms.get(&connection_id).cloned() else {
+            return Err("Entre em uma sala antes de informar sua identidade.".to_owned());
+        };
+        let Some(room) = self.rooms.get(&code) else {
+            return Err("A sala foi encerrada.".to_owned());
+        };
+        if room.participants.iter().any(|(other_id, _)| {
+            *other_id != connection_id
+                && self
+                    .participant_info
+                    .get(other_id)
+                    .is_some_and(|known| known.id == participant.id)
+        }) {
+            return Err("Essa identidade ja esta sendo usada na sala.".to_owned());
+        }
+        let existing = self.participant_info.get(&connection_id).cloned();
+        let existing_order = self
+            .participant_info
+            .get(&connection_id)
+            .map_or(1, |known| known.order);
+        participant.order = if participant.order == 0 {
+            existing_order
+        } else {
+            participant.order
+        };
+        participant.display_name = format!("Participante {}", participant.order);
+        self.participant_info.insert(connection_id, participant);
+        if let Some(room) = self.rooms.get_mut(&code) {
+            let previous_id = existing.as_ref().map(|known| known.id.as_str());
+            room.members.retain(|known| {
+                known.id != self.participant_info[&connection_id].id
+                    && previous_id != Some(known.id.as_str())
+            });
+            room.members
+                .push(self.participant_info[&connection_id].clone());
+            room.members.sort_by_key(|known| known.order);
+        }
+        self.broadcast_roster(&code);
+        Ok(())
+    }
+
+    fn broadcast_roster(&self, code: &str) {
+        let Some(room) = self.rooms.get(code) else {
+            return;
+        };
+        let mut participants = room.members.clone();
+        for (id, _) in &room.participants {
+            if let Some(active) = self.participant_info.get(id) {
+                if let Some(known) = participants.iter_mut().find(|known| known.id == active.id) {
+                    *known = active.clone();
+                } else {
+                    participants.push(active.clone());
+                }
+            }
+        }
+        participants.sort_by_key(|participant| participant.order);
+        let leader_id = self
+            .participant_info
+            .get(&room.leader_connection_id)
+            .map(|participant| participant.id.clone())
+            .unwrap_or_default();
+        let message = OutboundMessage::Protocol(ServerMessage::RoomRoster {
+            participants,
+            leader_id,
+        });
+        for (_, sender) in &room.participants {
+            let _ = sender.send(match &message {
+                OutboundMessage::Protocol(message) => OutboundMessage::Protocol(message.clone()),
+                OutboundMessage::Control(message) => OutboundMessage::Control(message.clone()),
+            });
+        }
     }
 
     fn request_host_transfer(&mut self, host_id: ConnectionId) -> Result<PendingTransfer, String> {
@@ -198,15 +337,23 @@ impl RoomRegistry {
             return Err("O codigo da sala ja esta em uso neste servidor.".to_owned());
         }
 
+        let mut members = reservation.participants.clone();
         self.transfer_reservation = None;
+        let host_placeholder = default_participant(connection_id, 1);
+        members.retain(|member| member.id != host_placeholder.id);
+        members.push(host_placeholder.clone());
         self.rooms.insert(
             code.to_owned(),
             Room {
                 participants: vec![(connection_id, sender.clone())],
+                members,
+                leader_connection_id: connection_id,
                 pending_transfer: None,
             },
         );
         self.connection_rooms.insert(connection_id, code.to_owned());
+        self.participant_info
+            .insert(connection_id, host_placeholder);
         if sender
             .send(OutboundMessage::Protocol(ServerMessage::RoomAdopted {
                 code: code.to_owned(),
@@ -363,23 +510,18 @@ impl RoomRegistry {
             self.connection_rooms.remove(&connection_id);
             return Err("A sala foi encerrada.".to_owned());
         };
-        let peer = room
+        let peers = room
             .participants
             .iter()
-            .find(|(peer_id, _)| *peer_id != connection_id)
-            .map(|(peer_id, sender)| (*peer_id, sender.clone()));
-        let Some((peer_id, peer)) = peer else {
+            .filter(|(peer_id, _)| *peer_id != connection_id)
+            .map(|(_, sender)| sender.clone())
+            .collect::<Vec<_>>();
+        if peers.is_empty() {
             return Err("Aguardando o outro participante entrar na sala.".to_owned());
-        };
-        if peer
-            .send(OutboundMessage::Protocol(ServerMessage::Signal {
-                kind,
-                payload,
-            }))
-            .is_err()
-        {
-            self.leave_room(peer_id);
-            return Err("O outro participante desconectou.".to_owned());
+        }
+        let message = ServerMessage::Signal { kind, payload };
+        for peer in peers {
+            let _ = peer.send(OutboundMessage::Protocol(message.clone()));
         }
         Ok(())
     }
@@ -388,9 +530,13 @@ impl RoomRegistry {
         let Some(code) = self.connection_rooms.remove(&connection_id) else {
             return false;
         };
+        let departing = self.participant_info.remove(&connection_id);
 
         let mut remove_room = false;
         if let Some(room) = self.rooms.get_mut(&code) {
+            if let Some(departing) = &departing {
+                room.members.retain(|member| member.id != departing.id);
+            }
             if room.pending_transfer.take().is_some() {
                 let message = ServerMessage::HostTransferCanceled {
                     message: "A transferencia foi cancelada porque um participante desconectou."
@@ -411,8 +557,20 @@ impl RoomRegistry {
         }
         if remove_room {
             self.rooms.remove(&code);
+        } else {
+            self.broadcast_roster(&code);
         }
         true
+    }
+}
+
+fn default_participant(connection_id: ConnectionId, order: u8) -> ParticipantInfo {
+    ParticipantInfo {
+        id: format!("participant-{connection_id}"),
+        display_name: format!("Participante {order}"),
+        order,
+        may_host: false,
+        control_address: String::new(),
     }
 }
 
@@ -535,18 +693,30 @@ async fn handle_client_message(
             .await
             .create_room(connection_id, outgoing.clone())
             .map(|_| ()),
+        ClientMessage::CreateRoomIdentified { participant } => rooms
+            .lock()
+            .await
+            .create_room_identified(connection_id, outgoing.clone(), participant),
         ClientMessage::JoinRoom { code } => {
             rooms
                 .lock()
                 .await
                 .join_room(connection_id, &code, outgoing.clone())
         }
+        ClientMessage::JoinRoomIdentified { code, participant } => rooms
+            .lock()
+            .await
+            .join_room_identified(connection_id, &code, outgoing.clone(), participant),
         ClientMessage::Signal { kind, payload } => {
             rooms
                 .lock()
                 .await
                 .forward_signal(connection_id, kind, payload)
         }
+        ClientMessage::IdentifyParticipant { participant } => rooms
+            .lock()
+            .await
+            .identify_participant(connection_id, participant),
         ClientMessage::LeaveRoom => {
             rooms.lock().await.leave_room(connection_id);
             send_message(outgoing, ServerMessage::RoomLeft);
@@ -630,7 +800,7 @@ mod tests {
     use tokio_tungstenite::{WebSocketStream, connect_async};
 
     use super::{OutboundMessage, RoomRegistry, TransferReservation, handle_connection, serve};
-    use signaling_protocol::{ClientMessage, ServerMessage, SignalKind};
+    use signaling_protocol::{ClientMessage, ParticipantInfo, ServerMessage, SignalKind};
 
     fn server_message(receiver: &mut mpsc::UnboundedReceiver<OutboundMessage>) -> ServerMessage {
         match receiver.try_recv().expect("expected a server message") {
@@ -640,11 +810,9 @@ mod tests {
     }
 
     #[test]
-    fn rooms_have_two_slots_and_notify_both_participants() {
+    fn rooms_have_eight_slots_and_reject_the_ninth_participant() {
         let mut registry = RoomRegistry::default();
         let (first_tx, mut first_rx) = mpsc::unbounded_channel();
-        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
-        let (third_tx, _third_rx) = mpsc::unbounded_channel();
 
         let code = registry.create_room(1, first_tx).unwrap();
         assert_eq!(code.len(), 8);
@@ -653,13 +821,209 @@ mod tests {
             ServerMessage::RoomCreated { code: code.clone() }
         );
 
-        registry.join_room(2, &code, second_tx).unwrap();
-        assert_eq!(server_message(&mut first_rx), ServerMessage::PeerJoined);
-        assert_eq!(
-            server_message(&mut second_rx),
-            ServerMessage::RoomJoined { code: code.clone() }
+        for id in 2..=8 {
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            registry.join_room(id, &code, sender).unwrap();
+            assert_eq!(
+                server_message(&mut receiver),
+                ServerMessage::RoomJoined { code: code.clone() }
+            );
+        }
+        let (ninth_tx, _ninth_rx) = mpsc::unbounded_channel();
+        assert!(
+            registry
+                .join_room(9, &code, ninth_tx)
+                .unwrap_err()
+                .contains("8")
         );
-        assert!(registry.join_room(3, &code, third_tx).is_err());
+        assert_eq!(registry.rooms.get(&code).unwrap().participants.len(), 8);
+    }
+
+    #[test]
+    fn roster_keeps_join_order_and_host_permission() {
+        let mut registry = RoomRegistry::default();
+        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+        let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
+        let code = registry.create_room(1, host_tx).unwrap();
+        let _ = server_message(&mut host_rx);
+        registry
+            .identify_participant(
+                1,
+                ParticipantInfo {
+                    id: "host-id".to_owned(),
+                    display_name: "ignored".to_owned(),
+                    order: 0,
+                    may_host: true,
+                    control_address: "192.168.1.2:9001".to_owned(),
+                },
+            )
+            .unwrap();
+        let ServerMessage::RoomRoster {
+            participants,
+            leader_id,
+        } = server_message(&mut host_rx)
+        else {
+            panic!("expected a participant roster")
+        };
+        assert_eq!(leader_id, "host-id");
+        assert_eq!(participants[0].order, 1);
+        assert!(participants[0].may_host);
+
+        registry.join_room(2, &code, guest_tx).unwrap();
+        let _ = server_message(&mut guest_rx);
+        let _ = server_message(&mut host_rx);
+        registry
+            .identify_participant(
+                2,
+                ParticipantInfo {
+                    id: "guest-id".to_owned(),
+                    display_name: "ignored".to_owned(),
+                    order: 0,
+                    may_host: false,
+                    control_address: "192.168.1.3:9001".to_owned(),
+                },
+            )
+            .unwrap();
+        let ServerMessage::RoomRoster {
+            participants,
+            leader_id,
+        } = server_message(&mut host_rx)
+        else {
+            panic!("expected updated roster")
+        };
+        assert_eq!(leader_id, "host-id");
+        assert_eq!(
+            participants
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["host-id", "guest-id"]
+        );
+        assert_eq!(
+            participants
+                .iter()
+                .map(|item| item.order)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(!participants[1].may_host);
+    }
+
+    #[test]
+    fn election_adoption_preserves_roster_and_allows_existing_members_to_rejoin() {
+        let original_members = vec![
+            ParticipantInfo {
+                id: "host-id".to_owned(),
+                display_name: "Participante 1".to_owned(),
+                order: 1,
+                may_host: true,
+                control_address: "192.168.1.2:9001".to_owned(),
+            },
+            ParticipantInfo {
+                id: "candidate-id".to_owned(),
+                display_name: "Participante 2".to_owned(),
+                order: 2,
+                may_host: true,
+                control_address: "192.168.1.3:9001".to_owned(),
+            },
+            ParticipantInfo {
+                id: "guest-id".to_owned(),
+                display_name: "Participante 3".to_owned(),
+                order: 3,
+                may_host: false,
+                control_address: "192.168.1.4:9001".to_owned(),
+            },
+        ];
+        let mut registry = RoomRegistry {
+            transfer_reservation: Some(TransferReservation {
+                code: "SAMECODE".to_owned(),
+                token: "election-token".to_owned(),
+                participants: original_members,
+            }),
+            ..RoomRegistry::default()
+        };
+        let (candidate_tx, mut candidate_rx) = mpsc::unbounded_channel();
+        registry
+            .adopt_transferred_room(10, "SAMECODE", "election-token", candidate_tx)
+            .unwrap();
+        assert_eq!(
+            server_message(&mut candidate_rx),
+            ServerMessage::RoomAdopted {
+                code: "SAMECODE".to_owned()
+            }
+        );
+        registry
+            .identify_participant(
+                10,
+                ParticipantInfo {
+                    id: "candidate-id".to_owned(),
+                    display_name: "Participante 2".to_owned(),
+                    order: 2,
+                    may_host: true,
+                    control_address: "192.168.1.3:9001".to_owned(),
+                },
+            )
+            .unwrap();
+        let ServerMessage::RoomRoster {
+            participants,
+            leader_id,
+        } = server_message(&mut candidate_rx)
+        else {
+            panic!("expected the restored participant roster")
+        };
+        assert_eq!(leader_id, "candidate-id");
+        assert_eq!(
+            participants
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["host-id", "candidate-id", "guest-id"]
+        );
+
+        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+        registry
+            .join_room_identified(
+                11,
+                "SAMECODE",
+                host_tx,
+                ParticipantInfo {
+                    id: "host-id".to_owned(),
+                    display_name: "Participante 1".to_owned(),
+                    order: 1,
+                    may_host: true,
+                    control_address: "192.168.1.2:9001".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            server_message(&mut host_rx),
+            ServerMessage::RoomJoined {
+                code: "SAMECODE".to_owned()
+            }
+        );
+        let _ = server_message(&mut candidate_rx); // PeerJoined
+        let ServerMessage::RoomRoster {
+            participants,
+            leader_id,
+        } = server_message(&mut host_rx)
+        else {
+            panic!("expected the roster after the old host reconnects")
+        };
+        assert_eq!(leader_id, "candidate-id");
+        assert_eq!(
+            participants
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["host-id", "candidate-id", "guest-id"]
+        );
+        assert_eq!(
+            participants
+                .iter()
+                .map(|item| item.order)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
     }
 
     #[test]
@@ -838,6 +1202,7 @@ mod tests {
         let (new_url, stop_new, new_server) = start_test_server(Some(TransferReservation {
             code: code.clone(),
             token: token.clone(),
+            participants: Vec::new(),
         }))
         .await;
         let (mut new_host, _) = connect_async(&new_url).await.unwrap();
@@ -943,11 +1308,18 @@ mod tests {
 
         let (mut third, _) = connect_async(&url).await.unwrap();
         send_client_message(&mut third, ClientMessage::JoinRoom { code: code.clone() }).await;
-        assert!(matches!(
+        assert_eq!(
             receive_server_message(&mut third).await,
-            ServerMessage::Error { message } if message.contains("cheia")
-        ));
-        third.close(None).await.unwrap();
+            ServerMessage::RoomJoined { code: code.clone() }
+        );
+        assert_eq!(
+            receive_server_message(&mut first).await,
+            ServerMessage::PeerJoined
+        );
+        assert_eq!(
+            receive_server_message(&mut second).await,
+            ServerMessage::PeerJoined
+        );
 
         let (mut invalid, _) = connect_async(&url).await.unwrap();
         send_client_message(
@@ -978,6 +1350,13 @@ mod tests {
                 payload: "diagnostic-ping-v1".to_owned(),
             }
         );
+        assert_eq!(
+            receive_server_message(&mut third).await,
+            ServerMessage::Signal {
+                kind: SignalKind::Diagnostic,
+                payload: "diagnostic-ping-v1".to_owned(),
+            }
+        );
         send_client_message(
             &mut second,
             ClientMessage::Signal {
@@ -988,6 +1367,13 @@ mod tests {
         .await;
         assert_eq!(
             receive_server_message(&mut first).await,
+            ServerMessage::Signal {
+                kind: SignalKind::Diagnostic,
+                payload: "diagnostic-pong-v1".to_owned(),
+            }
+        );
+        assert_eq!(
+            receive_server_message(&mut third).await,
             ServerMessage::Signal {
                 kind: SignalKind::Diagnostic,
                 payload: "diagnostic-pong-v1".to_owned(),

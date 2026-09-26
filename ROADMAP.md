@@ -9,11 +9,12 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 - Rust como linguagem principal.
 - egui/eframe para a interface gráfica.
 - Chamada de voz e compartilhamento de tela.
-- Salas limitadas a duas pessoas na primeira versão: você e um amigo.
+- Salas de sinalização e fila de sucessão para até oito participantes. Voz e tela em grupo serão implementadas nas etapas WebRTC posteriores.
 - Sem câmera e sem chat de texto.
 - Conexão P2P: áudio e tela devem ir diretamente entre os computadores quando a rede permitir.
 - O aplicativo inicia um servidor de sinalização integrado no PC do anfitrião, na porta 9000. O executável separado do servidor permanece disponível para desenvolvimento.
-- Se o anfitrião sair normalmente, o outro participante pode aceitar e assumir a hospedagem. Se o PC anfitrião cair abruptamente, a sala termina.
+- A sala mantém uma malha direta de controle na porta TCP 9001. Se o anfitrião sair ou ficar instável, o aplicativo elege automaticamente um sucessor elegível e reconecta os participantes ao mesmo código.
+- A fila considera a pior conexão de cada candidato: perda de pulsos, jitter e latência; a ordem de entrada desempata. O anfitrião afastado por instabilidade pode voltar à fila após 30 segundos com perda abaixo de 5%.
 - Radmin VPN e o ingresso dos participantes na mesma rede virtual são configurados fora do aplicativo.
 - TURN continua opcional. Se for usado como alternativa, retransmite a mídia e deixa de ser uma conexão direta.
 
@@ -21,7 +22,7 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 
 ### Etapa 0 — Fechar o escopo da primeira versão ✅ Concluída
 
-Limite definido: duas pessoas por sala — você e um amigo. A primeira versão terá chamada de voz e compartilhamento de tela, sem câmera ou chat de texto, priorizando conexão P2P direta.
+O protótipo atual admite até oito participantes na sala de sinalização. A chamada de voz e o compartilhamento de tela em grupo ficam para as etapas WebRTC; não haverá câmera ou chat de texto. A mídia continuará priorizando conexão P2P direta.
 
 TURN permanece como decisão futura. Se for habilitado como alternativa, retransmitirá áudio e tela quando a conexão P2P direta falhar.
 
@@ -53,33 +54,33 @@ Implementar testes locais e independentes para o microfone e a tela:
 
 **Concluída quando:** o aplicativo confirmar que consegue captar áudio e imagem e encerrar a captura corretamente.
 
-### Etapa 4 — Sinalização integrada e transferência de anfitrião
+### Etapa 4 — Sinalização integrada, fila de sucessão e eleição de anfitrião
 
-Ao criar uma sala, iniciar o servidor de sinalização no PC do anfitrião. Os participantes trocam as informações usadas para negociar uma conexão WebRTC; o servidor não recebe nem encaminha áudio ou tela. Listar os IPv4 ativos para o anfitrião compartilhar o endereço local ou do Radmin VPN. Permitir que o participante assuma a hospedagem quando o anfitrião sair normalmente.
+Ao criar uma sala, iniciar o servidor de sinalização no PC do anfitrião, na porta 9000. Admitir até oito participantes e mostrar a ordem de entrada, a autorização para hospedar e a fila baseada na pior conexão direta de cada candidato. Cada cliente abre também a porta TCP 9001 para controle direto; todos precisam permitir essa porta no firewall. Se o anfitrião sair, ficar instável ou cair, eleger automaticamente o próximo candidato e tentar o seguinte se a porta 9000 não abrir ou o servidor não ficar pronto em 10 segundos. Manter o código e as identidades; reconectar os participantes ao novo servidor. Uma partição de rede pode criar anfitriões duplicados temporariamente, que serão reconciliados quando a malha voltar.
 
-**Concluída quando:** dois aplicativos em computadores diferentes entrarem na sala, trocarem sinais e concluírem a transferência de anfitrião pela rede local ou pelo Radmin VPN.
+**Concluída quando:** até oito participantes puderem entrar, consultar a fila, eleger e trocar o anfitrião automaticamente e manter o código da sala em LAN ou Radmin VPN.
 
-**Implementado:** o cliente inicia o servidor integrado ao criar sala, mostra os adaptadores ativos com IPv4 e permite copiar `ws://IP:9000`. A transferência pede aceite, inicia o servidor no outro PC com o mesmo código e só então encerra o servidor anterior. Recusa, cancelamento ou timeout mantém a sala original ativa. O teste automatizado cobre porta ocupada, recusa, timeout e handoff entre servidores locais.
+**Implementado:** limite de oito participantes; identidade e ordem preservadas durante a troca; autorização para hospedar; lista e fila na interface; pulsos WebSocket diretos a cada segundo na porta 9001, medidos em janela móvel de 30 segundos; ordenação por perda, jitter, latência e ordem de entrada; eleição automática quando o anfitrião tem pelo menos cinco amostras com perda de 20% ou mais, ou perde cinco pulsos seguidos; queda do anfitrião detectada em cinco segundos; tentativa de 10 segundos por sucessor; o anfitrião afastado por instabilidade só volta após 30 segundos com perda abaixo de 5%; ação para encerrar a sala. O servidor de sinalização segue na porta 9000 e não encaminha mídia.
 
-**Falta validar manualmente:** entrada e transferência entre dois computadores físicos usando LAN e Radmin VPN.
+**Falta validar manualmente:** fila e eleição em dois ou mais computadores físicos usando LAN e Radmin VPN, incluindo falha abrupta, bloqueio da porta 9000 e reconciliação após partição.
 
 ### Etapa 5 — Fazer a chamada P2P de voz na rede local
 
-Conectar dois computadores na mesma rede Wi-Fi e transmitir o áudio diretamente entre eles usando WebRTC.
+Transmitir voz diretamente entre participantes na mesma rede local usando WebRTC, com suporte de grupo planejado para até oito participantes.
 
-**Concluída quando:** ambos conseguirem falar e ouvir, e o servidor de sinalização não estiver encaminhando o áudio.
+**Concluída quando:** os participantes da sala conseguirem falar e ouvir, e o servidor de sinalização não estiver encaminhando o áudio.
 
 ### Etapa 6 — Compartilhar a tela por P2P na rede local
 
-Enviar a captura da tela diretamente ao outro participante e permitir parar o compartilhamento.
+Enviar a captura da tela diretamente aos participantes e permitir parar o compartilhamento; o grupo planejado comporta até oito pessoas.
 
-**Concluída quando:** o outro computador receber a tela e ela parar quando o usuário encerrar o compartilhamento ou a chamada.
+**Concluída quando:** os outros participantes receberem a tela e ela parar quando o usuário encerrar o compartilhamento ou a chamada.
 
 ### Etapa 7 — Conectar participantes em casas diferentes
 
 Deixar o servidor integrado do anfitrião acessível pela internet e testar o estabelecimento de conexões diretas com ICE/STUN. Verificar as configurações do roteador e se o provedor permite conexões de entrada.
 
-**Concluída quando:** dois participantes em redes diferentes conseguirem estabelecer voz e tela diretamente, sem o servidor de sinalização retransmitir mídia.
+**Concluída quando:** participantes em redes diferentes conseguirem estabelecer voz e tela diretamente, sem o servidor de sinalização retransmitir mídia.
 
 ### Etapa 8 — Decidir o tratamento de redes que bloqueiam P2P
 

@@ -8,8 +8,9 @@ Criar um aplicativo instalado no computador para fazer chamadas de voz e compart
 
 O primeiro protótipo deve permitir:
 
-- informar um nome de exibição;
-- criar ou entrar em uma sala privada;
+- criar ou entrar em uma sala privada com até oito participantes;
+- mostrar a ordem de entrada e a fila de sucessão do anfitrião;
+- permitir que cada pessoa autorize ou não este computador a assumir a hospedagem;
 - iniciar e encerrar uma chamada de voz;
 - iniciar e parar o compartilhamento da tela;
 - encerrar a chamada.
@@ -28,11 +29,15 @@ Não haverá câmera nem chat de texto na primeira versão.
 
 O objetivo é usar conexão ponto a ponto (P2P): quando a conexão direta funcionar, o áudio e a tela irão do computador de quem compartilha diretamente para os computadores dos amigos.
 
-Ao criar uma sala, o aplicativo inicia um servidor de **sinalização** no PC do anfitrião, na porta 9000. O servidor ajuda os participantes a se encontrarem e troca as informações necessárias para iniciar a conexão. Ele não encaminha áudio nem tela quando o P2P direto funciona. O anfitrião compartilha o endereço `ws://IP:9000` e o código da sala; o convidado informa ambos no aplicativo.
+Ao criar uma sala, o aplicativo inicia um servidor de **sinalização** no PC do anfitrião, na porta 9000. O servidor ajuda os participantes a se encontrarem e troca as informações necessárias para iniciar a conexão. Ele não encaminha áudio nem tela. O anfitrião compartilha o endereço `ws://IP:9000` e o código da sala; os convidados informam ambos no aplicativo. O limite atual da sala é oito participantes; voz e tela para grupos ficam para as etapas WebRTC posteriores.
 
 O aplicativo lista os adaptadores ativos e seus IPv4 para escolher entre a rede local e uma rede virtual, como Radmin VPN. O Radmin e a entrada dos participantes na mesma rede virtual são configurados fora do aplicativo. O anfitrião pode precisar liberar a porta 9000 no firewall do Windows.
 
-Se o anfitrião quiser sair com o outro participante conectado, o aplicativo solicita que ele aceite assumir a hospedagem. O novo anfitrião inicia o servidor no próprio PC com o mesmo código; o servidor anterior só encerra depois da confirmação. Se a transferência for recusada ou falhar, o anfitrião original permanece na sala e pode tentar novamente ou encerrá-la. Uma queda abrupta do PC anfitrião encerra a sala. Sem nenhum participante online, a sala não fica acessível automaticamente.
+Todos os participantes mantêm uma malha direta WebSocket de controle pela porta TCP 9001, separada da sinalização em 9000. O aplicativo mostra o endereço local ou do Radmin VPN e informa que todos precisam permitir conexões de entrada nessa porta no firewall. Esse canal transporta apenas estado da sala, eleições, pulsos e métricas de saúde; não transporta áudio ou tela.
+
+Ao sair normalmente, o anfitrião inicia uma eleição automática. Se ele ficar instável, a eleição começa quando a pior conexão dele tiver pelo menos cinco amostras e perda de 20% ou mais, ou após cinco pulsos consecutivos sem resposta. Se o anfitrião cair, os participantes iniciam a eleição após cinco segundos sem sinais. A fila compara a pior conexão de cada candidato pela perda de pulsos, depois jitter e latência; a ordem de entrada desempata. O novo anfitrião tenta abrir a porta 9000; se falhar ou não ficar pronto em dez segundos, o aplicativo tenta o próximo.
+
+A sala mantém o código, a identidade e a ordem dos participantes que reconectarem. O anfitrião afastado por instabilidade continua participante, mas só volta a ser candidato após 30 segundos com perda abaixo de 5%. Se a rede se dividir, podem surgir salas duplicadas temporariamente; quando os canais diretos voltarem, os participantes escolhem um líder de modo determinístico e reconectam a ele. Também há uma ação para encerrar a sala sem sucessor. Se não houver candidato elegível online, a sala termina.
 
 O WebRTC usa mecanismos de rede como ICE e STUN para tentar encontrar um caminho direto entre computadores que estão atrás de roteadores. A sinalização e o envio de mídia são partes diferentes da conexão.
 
@@ -54,7 +59,7 @@ A primeira prova será feita entre computadores na mesma rede Wi-Fi ou Radmin VP
 2. Criar a janela e os controles com egui/eframe.
 3. Testar uma chamada de voz entre dois computadores na mesma rede.
 4. Adicionar a captura e a transmissão direta da tela.
-5. Integrar o servidor de sinalização Rust ao aplicativo e testar a transferência de anfitrião.
+5. Integrar sinalização, malha direta de controle, fila e eleição automática para até oito participantes.
 6. Testar conexões P2P entre redes diferentes.
 7. Avaliar TURN se a conexão direta falhar em algumas redes.
 8. Gerar o instalador do aplicativo.
@@ -69,7 +74,6 @@ A primeira prova será feita entre computadores na mesma rede Wi-Fi ou Radmin VP
 
 ## Pontos a decidir depois
 
-- A sala será entre duas pessoas ou poderá incluir vários amigos?
 - Será implementado TURN como alternativa para redes que bloqueiam P2P direto?
 - Como será feito o acesso externo ao servidor integrado caso o roteador ou o provedor bloqueie conexões de entrada?
 

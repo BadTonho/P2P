@@ -1,17 +1,19 @@
 #![windows_subsystem = "windows"]
 
 mod audio_capture;
+mod control_mesh;
 mod screen_capture;
 mod signaling_client;
 
 use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use audio_capture::MicrophoneTest;
+use control_mesh::{ControlEvent, ControlMesh, QueueEntry};
 use eframe::egui;
 use screen_capture::{PendingScreenCapture, ScreenCapture};
 use signaling_client::{SignalingClient, SignalingEvent};
-use signaling_protocol::SignalKind;
+use signaling_protocol::{ParticipantInfo, SignalKind};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsCategory {
@@ -44,6 +46,18 @@ struct ClientUi {
     host_addresses: Vec<HostAddress>,
     host_addresses_error: Option<String>,
     selected_host_address: usize,
+    addresses_loaded: bool,
+    participant_id: String,
+    may_host: bool,
+    participants: Vec<ParticipantInfo>,
+    current_leader_id: String,
+    control_mesh: Option<ControlMesh>,
+    control_queue: Vec<QueueEntry>,
+    control_status: Option<String>,
+    control_mesh_failed: bool,
+    pending_election_epoch: Option<u64>,
+    pending_election_reconnect: bool,
+    leave_after_handoff: bool,
     peer_connected: bool,
     diagnostic_status: Option<String>,
     microphone: Option<MicrophoneTest>,
@@ -74,12 +88,14 @@ impl ClientUi {
             || self.screen_picker.is_some()
             || self.connecting
             || self.signaling.is_some()
+            || self.control_mesh.is_some()
         {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         self.refresh_microphone();
         self.refresh_screen(ui.ctx());
         self.refresh_signaling(ui.ctx());
+        self.refresh_control_mesh(ui.ctx());
         self.handle_window_close(ui.ctx());
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -128,6 +144,19 @@ impl ClientUi {
     }
 
     fn show_home(&mut self, ui: &mut egui::Ui) {
+        if !self.addresses_loaded {
+            self.refresh_host_addresses();
+        }
+
+        ui.group(|ui| {
+            ui.heading("Rede de controle da sala");
+            ui.label("Todos os participantes mantêm uma conexão direta de controle pela porta TCP 9001.");
+            ui.small("Permita a porta 9001 no firewall do Windows e escolha um IPv4 que seus amigos consigam alcançar (LAN ou Radmin).");
+            self.show_control_address_picker(ui);
+            ui.checkbox(&mut self.may_host, "Permitir que este computador seja escolhido para hospedar futuramente");
+        });
+        ui.add_space(12.0);
+
         ui.group(|ui| {
             ui.heading("Criar uma sala");
             ui.label(
@@ -203,6 +232,57 @@ impl ClientUi {
             if let Some(error) = &self.connection_error {
                 ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
             }
+            if !self.participants.is_empty() {
+                ui.separator();
+                ui.heading("Participantes e fila de sucessão");
+                let mut participants = self.participants.clone();
+                participants.sort_by_key(|participant| participant.order);
+                for participant in &participants {
+                    ui.label(format!(
+                        "{} — ordem {}, {}",
+                        participant.display_name,
+                        participant.order,
+                        if participant.id == self.current_leader_id {
+                            "anfitrião atual"
+                        } else if participant.may_host {
+                            "autorizado a hospedar"
+                        } else {
+                            "não autorizado a assumir"
+                        }
+                    ));
+                }
+                if participants.iter().all(|participant| !participant.may_host) {
+                    ui.small("Nenhum participante autorizou a hospedagem automática; sem sucessor elegível, a sala termina.");
+                } else {
+                    ui.small("A fila será ordenada pela estabilidade dos canais diretos.");
+                }
+            }
+            if !self.control_queue.is_empty() {
+                ui.separator();
+                ui.label("Fila atual (perda, jitter e latência dos enlaces)");
+                let mut queue = self.control_queue.clone();
+                queue.sort_by(|left, right| {
+                    right.eligible.cmp(&left.eligible)
+                        .then_with(|| left.loss_percent.total_cmp(&right.loss_percent))
+                        .then_with(|| left.jitter_ms.total_cmp(&right.jitter_ms))
+                        .then_with(|| left.latency_ms.total_cmp(&right.latency_ms))
+                        .then_with(|| left.participant.order.cmp(&right.participant.order))
+                });
+                for (index, candidate) in queue.iter().enumerate() {
+                    ui.label(format!(
+                        "{}. {} — perda {:.1}%, jitter {:.1} ms, latência {:.1} ms{}",
+                        index + 1,
+                        candidate.participant.display_name,
+                        candidate.loss_percent,
+                        candidate.jitter_ms,
+                        candidate.latency_ms,
+                        if candidate.eligible { "" } else { " (inelegível)" }
+                    ));
+                }
+            }
+            if let Some(status) = &self.control_status {
+                ui.small(status);
+            }
             if self.peer_connected {
                 ui.label("Seu amigo está conectado.");
                 if ui.button("Testar sinalização").clicked() {
@@ -258,8 +338,8 @@ impl ClientUi {
         if ui
             .add_enabled(
                 self.screen_picker.is_none() && self.outgoing_transfer.is_none(),
-                egui::Button::new(if self.hosting_locally && self.peer_connected {
-                    "Transferir hospedagem e sair"
+                egui::Button::new(if self.hosting_locally && self.participants.len() > 1 {
+                    "Sair e transferir automaticamente"
                 } else {
                     "Sair da sala"
                 }),
@@ -267,6 +347,18 @@ impl ClientUi {
             .clicked()
         {
             self.request_leave(ui.ctx());
+        }
+
+        if self.hosting_locally && ui.button("Encerrar sala sem sucessor").clicked() {
+            if let Some(mesh) = self
+                .control_mesh
+                .as_ref()
+                .filter(|_| !self.control_mesh_failed)
+            {
+                mesh.end_room();
+            } else {
+                self.leave_room();
+            }
         }
     }
 
@@ -568,7 +660,8 @@ impl ClientUi {
         self.room_code = None;
         self.hosting_locally = false;
 
-        match SignalingClient::start_host() {
+        let participant = self.local_participant_info();
+        match SignalingClient::start_host_with_participant(participant) {
             Ok(client) => self.signaling = Some(client),
             Err(error) => {
                 self.connecting = false;
@@ -592,7 +685,12 @@ impl ClientUi {
         self.diagnostic_status = None;
         self.room_code = None;
 
-        match SignalingClient::join(self.server_url.trim().to_owned(), code) {
+        let participant = self.local_participant_info();
+        match SignalingClient::join_with_participant(
+            self.server_url.trim().to_owned(),
+            code,
+            participant,
+        ) {
             Ok(client) => self.signaling = Some(client),
             Err(error) => {
                 self.connecting = false;
@@ -602,7 +700,184 @@ impl ClientUi {
         }
     }
 
+    fn local_participant_info(&mut self) -> ParticipantInfo {
+        if self.participant_id.is_empty() {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            self.participant_id = format!("{}-{nonce:x}", std::process::id());
+        }
+        let control_address = self
+            .host_addresses
+            .get(self.selected_host_address)
+            .map(|address| format!("{}:9001", address.ipv4))
+            .unwrap_or_default();
+        let order = self
+            .participants
+            .iter()
+            .find(|participant| participant.id == self.participant_id)
+            .map_or(0, |participant| participant.order);
+        ParticipantInfo {
+            id: self.participant_id.clone(),
+            display_name: "Participante".to_owned(),
+            order,
+            may_host: self.may_host,
+            control_address,
+        }
+    }
+
+    fn update_room_roster(&mut self, participants: Vec<ParticipantInfo>, leader_id: String) {
+        self.peer_connected = participants.len() > 1;
+        self.participants = participants;
+        self.current_leader_id = leader_id.clone();
+        let Some(local) = self
+            .participants
+            .iter()
+            .find(|participant| participant.id == self.participant_id)
+            .cloned()
+        else {
+            return;
+        };
+        let code = self.room_code.clone().unwrap_or_default();
+        let leader_address = self
+            .participants
+            .iter()
+            .find(|participant| participant.id == leader_id)
+            .map(|participant| signaling_address_for_control(&participant.control_address))
+            .unwrap_or_default();
+        if let Some(mesh) = &self.control_mesh {
+            mesh.update_roster(self.participants.clone(), leader_id, leader_address);
+        } else if !code.is_empty() {
+            match ControlMesh::start(local, code, leader_id.clone(), leader_address.clone()) {
+                Ok(mesh) => {
+                    mesh.update_roster(self.participants.clone(), leader_id, leader_address);
+                    self.control_mesh = Some(mesh);
+                    self.control_mesh_failed = false;
+                    self.control_status =
+                        Some("Conectando a malha direta na porta 9001…".to_owned());
+                }
+                Err(error) => self.control_status = Some(error),
+            }
+        }
+    }
+
+    fn refresh_control_mesh(&mut self, context: &egui::Context) {
+        let pending = self
+            .control_mesh
+            .as_ref()
+            .map(|mesh| std::iter::from_fn(|| mesh.try_recv()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for event in pending {
+            match event {
+                ControlEvent::Ready => {
+                    self.control_mesh_failed = false;
+                    self.control_status = Some("Canal de controle ativo na porta 9001.".to_owned());
+                }
+                ControlEvent::Error(error) => {
+                    self.control_mesh_failed = true;
+                    self.control_status = Some(error);
+                }
+                ControlEvent::QueueUpdated(queue) => self.control_queue = queue,
+                ControlEvent::LinksUpdated { connected, total } => {
+                    self.control_status = Some(if total == 0 {
+                        "Canal de controle ativo; aguardando outros participantes.".to_owned()
+                    } else if connected < total {
+                        format!(
+                            "Malha direta parcial ({connected}/{total}). Confira o IPv4 escolhido e permita a porta 9001 no firewall de todos."
+                        )
+                    } else {
+                        format!(
+                            "Malha direta completa ({connected}/{total} participantes conectados)."
+                        )
+                    });
+                }
+                ControlEvent::HostUnstable { loss_percent } => {
+                    self.control_status = Some(format!(
+                        "Anfitrião instável ({loss_percent:.1}% de perda). Elegendo o próximo participante elegível…"
+                    ));
+                }
+                ControlEvent::BecomeHost {
+                    code,
+                    epoch,
+                    participants,
+                } => {
+                    let participant = self.local_participant_info();
+                    match SignalingClient::start_elected_host(code, participant, participants) {
+                        Ok(client) => {
+                            self.pending_signaling = Some(client);
+                            self.pending_election_epoch = Some(epoch);
+                            self.pending_election_reconnect = false;
+                            self.control_status = Some("Você foi escolhido para assumir; iniciando o servidor na porta 9000…".to_owned());
+                        }
+                        Err(error) => {
+                            self.control_status =
+                                Some(format!("Não foi possível iniciar o servidor: {error}"));
+                            if let Some(mesh) = &self.control_mesh {
+                                mesh.candidate_failed(epoch);
+                            }
+                        }
+                    }
+                }
+                ControlEvent::LeaderChanged {
+                    participant_id,
+                    address,
+                    epoch,
+                } => {
+                    self.current_leader_id = participant_id.clone();
+                    if participant_id == self.participant_id {
+                        self.hosting_locally = true;
+                        self.control_status =
+                            Some("Este computador está hospedando a sala.".to_owned());
+                        continue;
+                    }
+                    if self.leave_after_handoff {
+                        let should_close = self.close_after_transfer;
+                        self.leave_room();
+                        self.connection_status =
+                            Some("A hospedagem foi transferida; você saiu da sala.".to_owned());
+                        if should_close {
+                            self.allow_window_close = true;
+                            context.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        continue;
+                    }
+                    let code = self.room_code.clone().unwrap_or_default();
+                    let participant = self.local_participant_info();
+                    match SignalingClient::join_with_participant(address, code, participant) {
+                        Ok(client) => {
+                            self.pending_signaling = Some(client);
+                            self.pending_election_epoch = Some(epoch);
+                            self.pending_election_reconnect = true;
+                            self.hosting_locally = false;
+                            self.connection_status = Some(
+                                "A sala mudou de anfitrião; reconectando ao novo servidor…"
+                                    .to_owned(),
+                            );
+                        }
+                        Err(error) => {
+                            self.control_status =
+                                Some(format!("Falha ao reconectar ao novo anfitrião: {error}"))
+                        }
+                    }
+                }
+                ControlEvent::RoomEnded => {
+                    let should_close = self.close_after_transfer;
+                    self.leave_room();
+                    self.connection_status = Some(
+                        "A sala foi encerrada porque não havia sucessor disponível.".to_owned(),
+                    );
+                    if should_close {
+                        self.allow_window_close = true;
+                        context.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+    }
+
     fn refresh_host_addresses(&mut self) {
+        self.addresses_loaded = true;
         match enumerate_host_addresses() {
             Ok(addresses) => {
                 self.host_addresses = addresses;
@@ -615,6 +890,37 @@ impl ClientUi {
                 self.host_addresses.clear();
                 self.host_addresses_error = Some(error);
             }
+        }
+    }
+
+    fn show_control_address_picker(&mut self, ui: &mut egui::Ui) {
+        if !self.host_addresses.is_empty() {
+            self.selected_host_address = self
+                .selected_host_address
+                .min(self.host_addresses.len().saturating_sub(1));
+            let selected = &self.host_addresses[self.selected_host_address];
+            egui::ComboBox::from_id_salt("control-ip-address")
+                .selected_text(format!("{} — {}", selected.adapter, selected.ipv4))
+                .show_ui(ui, |ui| {
+                    for (index, address) in self.host_addresses.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut self.selected_host_address,
+                            index,
+                            format!("{} — {}", address.adapter, address.ipv4),
+                        );
+                    }
+                });
+            ui.monospace(format!(
+                "ws://{}:9001",
+                self.host_addresses[self.selected_host_address].ipv4
+            ));
+        } else if let Some(error) = &self.host_addresses_error {
+            ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+        } else {
+            ui.label("Nenhum IPv4 ativo disponível para a conexão direta de controle.");
+        }
+        if ui.button("Atualizar adaptadores de controle").clicked() {
+            self.refresh_host_addresses();
         }
     }
 
@@ -655,6 +961,12 @@ impl ClientUi {
         }
     }
 
+    fn selected_signaling_address(&self) -> Option<String> {
+        self.host_addresses
+            .get(self.selected_host_address)
+            .map(|address| format!("ws://{}:9000", address.ipv4))
+    }
+
     fn refresh_signaling(&mut self, context: &egui::Context) {
         let pending_events = self
             .pending_signaling
@@ -664,6 +976,31 @@ impl ClientUi {
         for event in pending_events {
             match event {
                 SignalingEvent::RoomAdopted(code) => {
+                    if let Some(epoch) = self.pending_election_epoch.take() {
+                        self.pending_room_adopted = true;
+                        self.signaling = self.pending_signaling.take();
+                        self.pending_election_reconnect = false;
+                        self.hosting_locally = true;
+                        self.peer_connected = self.participants.len() > 1;
+                        self.enter_room(code);
+                        if let Some(address) = self.selected_signaling_address() {
+                            if let Some(mesh) = &self.control_mesh {
+                                mesh.publish_leader(address, epoch);
+                            }
+                            self.control_status = Some(
+                                "Servidor pronto; anunciando o novo anfitrião aos participantes."
+                                    .to_owned(),
+                            );
+                        } else {
+                            self.control_status = Some(
+                                "Servidor iniciado, mas nenhum IPv4 pode ser anunciado.".to_owned(),
+                            );
+                            if let Some(mesh) = &self.control_mesh {
+                                mesh.candidate_failed(epoch);
+                            }
+                        }
+                        continue;
+                    }
                     self.pending_room_adopted = true;
                     if let (Some(signaling), Some((_, token))) =
                         (&self.signaling, &self.incoming_transfer)
@@ -679,7 +1016,32 @@ impl ClientUi {
                         }
                     }
                 }
+                SignalingEvent::RoomJoined(code) if self.pending_election_reconnect => {
+                    self.signaling = self.pending_signaling.take();
+                    self.pending_election_reconnect = false;
+                    self.pending_election_epoch = None;
+                    self.pending_room_adopted = false;
+                    self.hosting_locally = false;
+                    self.enter_room(code);
+                    self.connection_status = Some(
+                        "Reconectado ao novo anfitrião; a identidade e a ordem foram mantidas."
+                            .to_owned(),
+                    );
+                }
                 SignalingEvent::Error(error) | SignalingEvent::ServerError(error) => {
+                    if let Some(epoch) = self.pending_election_epoch.take() {
+                        if !self.pending_election_reconnect {
+                            if let Some(mesh) = &self.control_mesh {
+                                mesh.candidate_failed(epoch);
+                            }
+                        }
+                        self.pending_signaling = None;
+                        self.pending_election_reconnect = false;
+                        self.control_status = Some(format!(
+                            "A tentativa de mudança de anfitrião falhou: {error}"
+                        ));
+                        continue;
+                    }
                     if let (Some(signaling), Some((_, token))) =
                         (&self.signaling, &self.incoming_transfer)
                     {
@@ -691,6 +1053,19 @@ impl ClientUi {
                         Some(format!("Não foi possível assumir a hospedagem: {error}"));
                 }
                 SignalingEvent::Disconnected => {
+                    if let Some(epoch) = self.pending_election_epoch.take() {
+                        if !self.pending_election_reconnect {
+                            if let Some(mesh) = &self.control_mesh {
+                                mesh.candidate_failed(epoch);
+                            }
+                        }
+                        self.pending_signaling = None;
+                        self.pending_election_reconnect = false;
+                        self.control_status = Some(
+                            "A tentativa de mudança de anfitrião foi desconectada.".to_owned(),
+                        );
+                        continue;
+                    }
                     self.pending_signaling = None;
                     self.pending_room_adopted = false;
                     self.handoff_error =
@@ -740,6 +1115,12 @@ impl ClientUi {
                             "O outro participante desconectou antes da transferência.".to_owned(),
                         );
                     }
+                }
+                SignalingEvent::RoomRoster {
+                    participants,
+                    leader_id,
+                } => {
+                    self.update_room_roster(participants, leader_id);
                 }
                 SignalingEvent::HostTransferPending { code, token } => {
                     self.outgoing_transfer = Some((code, token));
@@ -835,6 +1216,14 @@ impl ClientUi {
                     self.connection_status = Some("Sinal de conexão recebido.".to_owned());
                 }
                 SignalingEvent::Error(error) => {
+                    if self.control_mesh.is_some() && self.room_code.is_some() {
+                        self.connecting = false;
+                        self.starting_host = false;
+                        self.signaling = None;
+                        self.connection_status = Some("Servidor de sinalização desconectado; mantendo os canais diretos para eleger outro anfitrião.".to_owned());
+                        self.connection_error = Some(error);
+                        continue;
+                    }
                     self.connecting = false;
                     self.starting_host = false;
                     self.hosting_locally = false;
@@ -845,6 +1234,12 @@ impl ClientUi {
                     disconnect = true;
                 }
                 SignalingEvent::Disconnected => {
+                    if self.control_mesh.is_some() && self.room_code.is_some() {
+                        self.connecting = false;
+                        self.signaling = None;
+                        self.connection_status = Some("Servidor de sinalização desconectado; aguardando a eleição pela malha direta.".to_owned());
+                        continue;
+                    }
                     self.connecting = false;
                     self.starting_host = false;
                     self.hosting_locally = false;
@@ -876,8 +1271,21 @@ impl ClientUi {
     }
 
     fn request_leave(&mut self, context: &egui::Context) {
-        if self.hosting_locally && self.peer_connected {
-            self.request_host_transfer();
+        if self.hosting_locally && self.participants.len() > 1 {
+            if let Some(mesh) = self
+                .control_mesh
+                .as_ref()
+                .filter(|_| !self.control_mesh_failed)
+            {
+                self.leave_after_handoff = true;
+                mesh.leave_normally();
+                self.connection_status = Some(
+                    "Elegendo automaticamente o próximo anfitrião; esta sala continuará ativa…"
+                        .to_owned(),
+                );
+            } else {
+                self.control_status = Some("A malha de controle não está ativa; encerre a sala explicitamente ou aguarde a conexão.".to_owned());
+            }
         } else if self.incoming_transfer.is_some() {
             self.reject_incoming_transfer();
             self.leave_room();
@@ -942,15 +1350,18 @@ impl ClientUi {
             return;
         }
 
-        if (self.hosting_locally && self.peer_connected)
+        if (self.hosting_locally && self.participants.len() > 1)
             || self.outgoing_transfer.is_some()
             || self.incoming_transfer.is_some()
             || self.pending_signaling.is_some()
         {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_after_transfer = true;
-            if self.hosting_locally && self.peer_connected && self.outgoing_transfer.is_none() {
-                self.request_host_transfer();
+            if self.hosting_locally
+                && self.participants.len() > 1
+                && self.outgoing_transfer.is_none()
+            {
+                self.request_leave(context);
             }
         } else {
             self.allow_window_close = true;
@@ -1071,6 +1482,13 @@ impl ClientUi {
         }
         self.screen_texture = None;
         self.room_code = None;
+        self.participants.clear();
+        self.current_leader_id.clear();
+        self.control_queue.clear();
+        self.control_mesh = None;
+        self.pending_election_epoch = None;
+        self.pending_election_reconnect = false;
+        self.leave_after_handoff = false;
         self.join_code.clear();
         self.code_copied = false;
         self.microphone_error = None;
@@ -1128,6 +1546,13 @@ fn enumerate_host_addresses() -> Result<Vec<HostAddress>, String> {
     {
         Ok(Vec::new())
     }
+}
+
+fn signaling_address_for_control(control_address: &str) -> String {
+    control_address
+        .strip_suffix(":9001")
+        .map(|ip| format!("ws://{ip}:9000"))
+        .unwrap_or_default()
 }
 
 impl Drop for ClientUi {
