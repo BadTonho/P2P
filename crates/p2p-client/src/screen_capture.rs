@@ -32,7 +32,7 @@ pub type LatestFrame = Arc<Mutex<Option<Arc<PreviewFrame>>>>;
 
 type HandlerError = Box<dyn Error + Send + Sync>;
 type Control = CaptureControl<ScreenFrameHandler, HandlerError>;
-type PickResult = Result<Option<windows_capture::GraphicsCaptureItem>, String>;
+type PickResult = Result<Option<(windows_capture::GraphicsCaptureItem, (i32, i32))>, String>;
 
 pub struct ScreenCapture {
     control: Option<Control>,
@@ -53,16 +53,8 @@ struct PickerThreadOwner {
 
 struct PickerSelection {
     item: windows_capture::GraphicsCaptureItem,
+    size: (i32, i32),
     owner: PickerThreadOwner,
-}
-
-impl PickerSelection {
-    fn size(&self) -> Result<(i32, i32), String> {
-        self.item
-            .Size()
-            .map(|size| (size.Width, size.Height))
-            .map_err(|error| error.to_string())
-    }
 }
 
 impl PendingScreenCapture {
@@ -74,9 +66,23 @@ impl PendingScreenCapture {
             .name("windows-screen-picker".to_owned())
             .spawn(move || match GraphicsCapturePicker::pick_item() {
                 Ok(Some(selected)) => {
-                    if result_tx.send(Ok(Some(selected.item.clone()))).is_ok() {
-                        // Keep the picker owner window and WinRT apartment on their creating thread.
-                        let _ = release_rx.recv();
+                    // GraphicsCaptureItem.Size is apartment-bound. Read it on the picker thread,
+                    // where the WinRT item was created, before handing the item to capture setup.
+                    match selected.item.Size().map(|size| (size.Width, size.Height)) {
+                        Ok(size) => {
+                            if result_tx
+                                .send(Ok(Some((selected.item.clone(), size))))
+                                .is_ok()
+                            {
+                                // Keep the picker owner window and WinRT apartment on their creating thread.
+                                let _ = release_rx.recv();
+                            }
+                        }
+                        Err(error) => {
+                            let _ = result_tx.send(Err(format!(
+                                "Não foi possível consultar o tamanho da tela ou janela: {error}"
+                            )));
+                        }
                     }
                     drop(selected);
                 }
@@ -112,12 +118,12 @@ impl PendingScreenCapture {
         let picker_owner = self.picker_owner.take();
 
         match result {
-            Ok(Some(item)) => {
+            Ok(Some((item, size))) => {
                 let Some(owner) = picker_owner else {
                     return Some(Err("Os recursos do seletor já foram liberados.".to_owned()));
                 };
                 Some(
-                    ScreenCapture::start_selected(PickerSelection { item, owner }, context)
+                    ScreenCapture::start_selected(PickerSelection { item, size, owner }, context)
                         .map(Some),
                 )
             }
@@ -160,9 +166,7 @@ impl PickerThreadOwner {
 
 impl ScreenCapture {
     fn start_selected(selected: PickerSelection, context: egui::Context) -> Result<Self, String> {
-        let size = selected.size().map_err(|error| {
-            format!("Não foi possível consultar o tamanho da tela ou janela: {error}")
-        })?;
+        let size = selected.size;
         if size.0 <= 0 || size.1 <= 0 {
             return Err("A tela ou janela selecionada tem tamanho inválido.".to_owned());
         }
