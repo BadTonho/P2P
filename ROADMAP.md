@@ -9,6 +9,7 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 - Rust como linguagem principal.
 - egui/eframe para a interface gráfica.
 - Chamada de voz e compartilhamento de tela.
+- Prioridade de mídia: implementar a transmissão de tela antes da chamada de voz.
 - Salas de sinalização e fila de sucessão para até oito participantes. Voz e tela em grupo serão implementadas nas etapas WebRTC posteriores.
 - Sem câmera e sem chat de texto.
 - Conexão P2P: áudio e tela devem ir diretamente entre os computadores quando a rede permitir.
@@ -64,17 +65,17 @@ Ao criar uma sala, iniciar o servidor de sinalização no PC do anfitrião, na p
 
 **Falta validar manualmente:** fila e eleição em dois ou mais computadores físicos usando LAN e Radmin VPN, incluindo falha abrupta, bloqueio da porta 9000 e reconciliação após partição.
 
-### Etapa 5 — Fazer a chamada P2P de voz na rede local
+### Etapa 5 — Compartilhar a tela por P2P na rede local
+
+Enviar a captura da tela diretamente aos participantes usando WebRTC e permitir iniciar e parar o compartilhamento; o grupo planejado comporta até oito pessoas. A primeira validação será entre duas pessoas na mesma rede local.
+
+**Concluída quando:** o outro participante receber a tela e ela parar quando o usuário encerrar o compartilhamento ou sair da sala, sem o servidor de sinalização encaminhar imagens.
+
+### Etapa 6 — Fazer a chamada P2P de voz na rede local
 
 Transmitir voz diretamente entre participantes na mesma rede local usando WebRTC, com suporte de grupo planejado para até oito participantes.
 
 **Concluída quando:** os participantes da sala conseguirem falar e ouvir, e o servidor de sinalização não estiver encaminhando o áudio.
-
-### Etapa 6 — Compartilhar a tela por P2P na rede local
-
-Enviar a captura da tela diretamente aos participantes e permitir parar o compartilhamento; o grupo planejado comporta até oito pessoas.
-
-**Concluída quando:** os outros participantes receberem a tela e ela parar quando o usuário encerrar o compartilhamento ou a chamada.
 
 ### Etapa 7 — Conectar participantes em casas diferentes
 
