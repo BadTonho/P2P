@@ -54,6 +54,8 @@ type RemoteFrameStore = Arc<Mutex<Option<Arc<PreviewFrame>>>>;
 #[derive(Clone, Debug, Default)]
 pub struct ScreenShareMetrics {
     pub p2p_connected: bool,
+    pub local_ice_candidates: u64,
+    pub remote_ice_candidates: u64,
     pub encoded_frames: u64,
     pub sent_frames: u64,
     pub received_packets: u64,
@@ -65,6 +67,8 @@ pub struct ScreenShareMetrics {
 #[derive(Default)]
 struct SharedMetrics {
     p2p_connected: AtomicBool,
+    local_ice_candidates: AtomicU64,
+    remote_ice_candidates: AtomicU64,
     encoded_frames: AtomicU64,
     sent_frames: AtomicU64,
     received_packets: AtomicU64,
@@ -78,6 +82,8 @@ impl SharedMetrics {
     fn snapshot(&self) -> ScreenShareMetrics {
         ScreenShareMetrics {
             p2p_connected: self.p2p_connected.load(Ordering::Relaxed),
+            local_ice_candidates: self.local_ice_candidates.load(Ordering::Relaxed),
+            remote_ice_candidates: self.remote_ice_candidates.load(Ordering::Relaxed),
             encoded_frames: self.encoded_frames.load(Ordering::Relaxed),
             sent_frames: self.sent_frames.load(Ordering::Relaxed),
             received_packets: self.received_packets.load(Ordering::Relaxed),
@@ -236,6 +242,9 @@ impl PeerConnectionEventHandler for PeerEvents {
         if event.candidate.address.is_empty() {
             return;
         }
+        self.metrics
+            .local_ice_candidates
+            .fetch_add(1, Ordering::Relaxed);
         match event.candidate.to_json() {
             Ok(candidate) => match serde_json::to_string(&candidate) {
                 Ok(payload) => {
@@ -566,6 +575,9 @@ async fn run_session(
                 SignalKind::IceCandidate => {
                     match serde_json::from_str::<RTCIceCandidateInit>(&payload) {
                         Ok(candidate) => {
+                            metrics
+                                .remote_ice_candidates
+                                .fetch_add(1, Ordering::Relaxed);
                             if let Some(peer) = active_peer.as_mut() {
                                 if peer.remote_description_set {
                                     if let Err(error) =

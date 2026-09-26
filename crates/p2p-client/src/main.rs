@@ -60,6 +60,7 @@ struct ClientUi {
     pending_election_epoch: Option<u64>,
     pending_election_reconnect: bool,
     leave_after_handoff: bool,
+    ending_room_explicitly: bool,
     peer_connected: bool,
     diagnostic_status: Option<String>,
     microphone: Option<MicrophoneTest>,
@@ -185,7 +186,8 @@ impl ClientUi {
             ui.small("Permita a porta 9001 no firewall do Windows e escolha um IPv4 que seus amigos consigam alcançar (LAN ou Radmin).");
             self.show_control_address_picker(ui);
             ui.checkbox(&mut self.may_host, "Permitir que este computador seja escolhido para hospedar futuramente");
-            ui.small("Para a sala continuar se o anfitrião sair, um dos outros participantes precisa marcar esta opção e conectar a malha TCP 9001.");
+            ui.small("Opcional: isso não impede entrar na sala nem compartilhar a tela. Só permite que este PC assuma a hospedagem se o anfitrião sair.");
+            ui.small("Para a sucessão funcionar, a malha TCP 9001 também precisa conectar entre os participantes.");
         });
         ui.add_space(12.0);
 
@@ -284,7 +286,7 @@ impl ClientUi {
                     ));
                 }
                 if participants.iter().all(|participant| !participant.may_host) {
-                    ui.small("Nenhum participante autorizou a hospedagem automática; sem sucessor elegível, a sala termina.");
+                    ui.small("Ninguém autorizou a hospedagem automática. Isso não bloqueia a entrada; só significa que a sala termina se o anfitrião sair.");
                 } else {
                     ui.small("A fila será ordenada pela estabilidade dos canais diretos.");
                 }
@@ -345,6 +347,7 @@ impl ClientUi {
             ui.heading("Prévia local da tela");
             ui.label("A prévia fica na memória. A tela só é enviada diretamente ao amigo depois que você iniciar o compartilhamento.");
             ui.small("O vídeo P2P usa UDP 9002. Os dois PCs precisam permitir o aplicativo ou essa porta no firewall do Windows, na rede privada.");
+            ui.small("Nesta etapa, os PCs precisam estar na mesma rede local ou na mesma Radmin VPN. Conexões entre redes diferentes pela internet ainda não estão disponíveis.");
 
             if self.screen_capture.is_some() {
                 ui.label("Captura de tela ativa.");
@@ -436,13 +439,24 @@ impl ClientUi {
             if let Some(status) = &self.screen_share_status {
                 ui.small(status);
             }
+            if !matches!(&self.screen_share_role, ScreenShareRole::Idle)
+                || self.screen_share_metrics.local_ice_candidates > 0
+                || self.screen_share_metrics.remote_ice_candidates > 0
+                || self.screen_share_status.is_some()
+            {
+                ui.small(format!(
+                    "Última tentativa ICE: {} candidatos locais enviados, {} recebidos do amigo.",
+                    self.screen_share_metrics.local_ice_candidates,
+                    self.screen_share_metrics.remote_ice_candidates
+                ));
+            }
         });
 
         ui.add_space(12.0);
         if ui
             .add_enabled(
                 self.screen_picker.is_none() && self.outgoing_transfer.is_none(),
-                egui::Button::new(if self.hosting_locally && self.participants.len() > 1 {
+                egui::Button::new(if self.hosting_locally && self.peer_connected {
                     "Sair e transferir automaticamente"
                 } else {
                     "Sair da sala"
@@ -453,16 +467,19 @@ impl ClientUi {
             self.request_leave(ui.ctx());
         }
 
-        if self.hosting_locally && ui.button("Encerrar sala sem sucessor").clicked() {
-            if let Some(mesh) = self
-                .control_mesh
-                .as_ref()
-                .filter(|_| !self.control_mesh_failed)
-            {
-                mesh.end_room();
-            } else {
-                self.leave_room();
-            }
+        if self.hosting_locally
+            && ui
+                .add_enabled(
+                    !self.ending_room_explicitly,
+                    egui::Button::new(if self.ending_room_explicitly {
+                        "Encerrando sala…"
+                    } else {
+                        "Encerrar sala sem sucessor"
+                    }),
+                )
+                .clicked()
+        {
+            self.end_room_explicitly(ui.ctx());
         }
     }
 
@@ -1050,6 +1067,7 @@ impl ClientUi {
     fn enter_room(&mut self, code: String) {
         self.room_code = Some(code);
         self.code_copied = false;
+        self.handoff_error = None;
         self.microphone_error = None;
         self.connection_error = None;
         self.screen_status = None;
@@ -1138,7 +1156,6 @@ impl ClientUi {
     }
 
     fn update_room_roster(&mut self, participants: Vec<ParticipantInfo>, leader_id: String) {
-        self.peer_connected = participants.len() > 1;
         self.participants = participants;
         self.current_leader_id = leader_id.clone();
         if self.participants.len() != 2 && !matches!(&self.screen_share_role, ScreenShareRole::Idle)
@@ -1245,6 +1262,7 @@ impl ClientUi {
                     self.current_leader_id = participant_id.clone();
                     if participant_id == self.participant_id {
                         self.hosting_locally = true;
+                        self.peer_connected = false;
                         self.control_status =
                             Some("Este computador está hospedando a sala.".to_owned());
                         continue;
@@ -1281,11 +1299,14 @@ impl ClientUi {
                 }
                 ControlEvent::RoomEnded => {
                     let should_close = self.close_after_transfer;
+                    let ended_explicitly = self.ending_room_explicitly;
                     let has_authorized_successor = self.participants.iter().any(|participant| {
                         participant.id != self.current_leader_id && participant.may_host
                     });
                     self.leave_room();
-                    self.connection_status = Some(if has_authorized_successor {
+                    self.connection_status = Some(if ended_explicitly {
+                        "Sala encerrada por você.".to_owned()
+                    } else if has_authorized_successor {
                         "A sala foi encerrada porque o participante autorizado não conseguiu assumir a hospedagem. Confira a conexão direta pela porta TCP 9001 e se a porta TCP 9000 está livre no computador escolhido.".to_owned()
                     } else {
                         "A sala foi encerrada porque nenhum participante restante autorizou a hospedagem. Para manter a sala ativa, marque essa opção antes de entrar na próxima vez.".to_owned()
@@ -1404,7 +1425,7 @@ impl ClientUi {
                         self.signaling = self.pending_signaling.take();
                         self.pending_election_reconnect = false;
                         self.hosting_locally = true;
-                        self.peer_connected = self.participants.len() > 1;
+                        self.peer_connected = false;
                         self.enter_room(code);
                         if let Some(address) = self.selected_signaling_address() {
                             if let Some(mesh) = &self.control_mesh {
@@ -1445,6 +1466,7 @@ impl ClientUi {
                     self.pending_election_epoch = None;
                     self.pending_room_adopted = false;
                     self.hosting_locally = false;
+                    self.peer_connected = true;
                     self.enter_room(code);
                     self.connection_status = Some(
                         "Reconectado ao novo anfitrião; a identidade e a ordem foram mantidas."
@@ -1609,7 +1631,7 @@ impl ClientUi {
                         self.pending_room_adopted = false;
                         self.incoming_transfer = None;
                         self.handoff_error = Some(error);
-                    } else {
+                    } else if self.outgoing_transfer.is_some() || self.incoming_transfer.is_some() {
                         if self
                             .outgoing_transfer
                             .as_ref()
@@ -1618,6 +1640,17 @@ impl ClientUi {
                             self.outgoing_transfer = None;
                         }
                         self.handoff_error = Some(error);
+                    } else if !matches!(&self.screen_share_role, ScreenShareRole::Idle) {
+                        self.stop_screen_share(false);
+                        self.screen_share_status = Some(error);
+                    } else if self
+                        .diagnostic_status
+                        .as_deref()
+                        .is_some_and(|status| status.starts_with("Enviando sinal"))
+                    {
+                        self.diagnostic_status = Some(error);
+                    } else {
+                        self.connection_error = Some(error);
                     }
                 }
                 SignalingEvent::Signal {
@@ -1710,26 +1743,60 @@ impl ClientUi {
 
     fn request_leave(&mut self, context: &egui::Context) {
         self.stop_screen_share(true);
-        if self.hosting_locally && self.participants.len() > 1 {
+        if self.hosting_locally && self.peer_connected {
             if let Some(mesh) = self
                 .control_mesh
                 .as_ref()
                 .filter(|_| !self.control_mesh_failed)
             {
+                if !mesh.leave_normally() {
+                    self.leave_room();
+                    self.connection_status = Some(
+                        "Voce saiu; nao foi possivel iniciar a eleicao automatica.".to_owned(),
+                    );
+                    if self.close_after_transfer {
+                        self.allow_window_close = true;
+                        context.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    return;
+                }
                 self.leave_after_handoff = true;
-                mesh.leave_normally();
                 self.connection_status = Some(
                     "Elegendo automaticamente o próximo anfitrião; esta sala continuará ativa…"
                         .to_owned(),
                 );
             } else {
-                self.control_status = Some("A malha de controle não está ativa; encerre a sala explicitamente ou aguarde a conexão.".to_owned());
+                self.leave_room();
+                self.connection_status = Some(
+                    "Você saiu. A malha de controle estava indisponível, então não foi possível transferir a hospedagem.".to_owned(),
+                );
             }
         } else if self.incoming_transfer.is_some() {
             self.reject_incoming_transfer();
             self.leave_room();
         } else {
             self.leave_room();
+        }
+        if self.close_after_transfer && self.room_code.is_none() {
+            self.allow_window_close = true;
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn end_room_explicitly(&mut self, context: &egui::Context) {
+        self.stop_screen_share(true);
+        self.ending_room_explicitly = true;
+        let end_requested = self
+            .control_mesh
+            .as_ref()
+            .filter(|_| !self.control_mesh_failed)
+            .is_some_and(ControlMesh::end_room);
+        if end_requested {
+            self.connection_status =
+                Some("Encerrando a sala para todos os participantes…".to_owned());
+        } else {
+            self.leave_room();
+            self.connection_status = Some("Sala encerrada por você.".to_owned());
         }
         if self.close_after_transfer && self.room_code.is_none() {
             self.allow_window_close = true;
@@ -1789,17 +1856,14 @@ impl ClientUi {
             return;
         }
 
-        if (self.hosting_locally && self.participants.len() > 1)
+        if (self.hosting_locally && self.peer_connected)
             || self.outgoing_transfer.is_some()
             || self.incoming_transfer.is_some()
             || self.pending_signaling.is_some()
         {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_after_transfer = true;
-            if self.hosting_locally
-                && self.participants.len() > 1
-                && self.outgoing_transfer.is_none()
-            {
+            if self.hosting_locally && self.peer_connected && self.outgoing_transfer.is_none() {
                 self.request_leave(context);
             }
         } else {
@@ -1852,11 +1916,7 @@ impl ClientUi {
                         }
                     }
                     if ui.button("Encerrar sala").clicked() {
-                        self.leave_room();
-                        if self.close_after_transfer {
-                            self.allow_window_close = true;
-                            context.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
+                        self.end_room_explicitly(context);
                     }
                 });
             });
@@ -1902,11 +1962,7 @@ impl ClientUi {
                             })
                             .clicked()
                     {
-                        self.leave_room();
-                        if self.close_after_transfer {
-                            self.allow_window_close = true;
-                            context.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
+                        self.end_room_explicitly(context);
                     }
                 });
             });
@@ -1929,6 +1985,7 @@ impl ClientUi {
         self.pending_election_epoch = None;
         self.pending_election_reconnect = false;
         self.leave_after_handoff = false;
+        self.ending_room_explicitly = false;
         self.join_code.clear();
         self.code_copied = false;
         self.microphone_error = None;

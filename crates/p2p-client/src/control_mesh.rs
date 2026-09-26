@@ -152,8 +152,8 @@ impl ControlMesh {
         });
     }
 
-    pub fn leave_normally(&self) {
-        let _ = self.commands.send(Command::LeaveNormally);
+    pub fn leave_normally(&self) -> bool {
+        self.commands.send(Command::LeaveNormally).is_ok()
     }
 
     pub fn publish_leader(&self, address: String, epoch: u64) {
@@ -166,8 +166,8 @@ impl ControlMesh {
         let _ = self.commands.send(Command::CandidateFailed { epoch });
     }
 
-    pub fn end_room(&self) {
-        let _ = self.commands.send(Command::EndRoom);
+    pub fn end_room(&self) -> bool {
+        self.commands.send(Command::EndRoom).is_ok()
     }
 
     pub fn try_recv(&self) -> Option<ControlEvent> {
@@ -1574,7 +1574,7 @@ mod tests {
             "host did not receive the guest's host eligibility status"
         );
 
-        host_mesh.leave_normally();
+        let _ = host_mesh.leave_normally();
         let elected = receive_until(&guest_mesh.events, Duration::from_secs(4), |event| {
             matches!(event, ControlEvent::BecomeHost { .. })
         })
