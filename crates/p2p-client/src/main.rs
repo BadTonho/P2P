@@ -2,19 +2,21 @@
 
 mod audio_capture;
 mod screen_capture;
+mod signaling_client;
 
 use std::time::Duration;
 
 use audio_capture::MicrophoneTest;
 use eframe::egui;
 use screen_capture::{PendingScreenCapture, ScreenCapture};
-
-const DEMO_ROOM_CODE: &str = "DEMO-0001";
+use signaling_client::{RoomAction, SignalingClient, SignalingEvent};
+use signaling_protocol::SignalKind;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsCategory {
     #[default]
     Audio,
+    Connection,
 }
 
 #[derive(Default)]
@@ -24,6 +26,13 @@ struct ClientUi {
     code_copied: bool,
     settings_open: bool,
     settings_category: SettingsCategory,
+    server_url: String,
+    connecting: bool,
+    connection_status: Option<String>,
+    connection_error: Option<String>,
+    signaling: Option<SignalingClient>,
+    peer_connected: bool,
+    diagnostic_status: Option<String>,
     microphone: Option<MicrophoneTest>,
     microphone_level: f32,
     microphone_level_dbfs: f32,
@@ -43,11 +52,14 @@ impl ClientUi {
         if self.microphone.is_some()
             || self.screen_capture.is_some()
             || self.screen_picker.is_some()
+            || self.connecting
+            || self.signaling.is_some()
         {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         self.refresh_microphone();
         self.refresh_screen(ui.ctx());
+        self.refresh_signaling();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut open_settings = false;
@@ -58,7 +70,7 @@ impl ClientUi {
                 ui.vertical(|ui| {
                     ui.add_space(16.0);
                     ui.heading("P2P - Voz e tela");
-                    ui.label("Demonstração local — sem conexão ou transmissão");
+                    ui.label("Sinalização na rede local — sem áudio ou tela transmitidos");
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -96,10 +108,13 @@ impl ClientUi {
     fn show_home(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.heading("Criar uma sala");
-            ui.label("Crie uma sala de demonstração e compartilhe o código com seu amigo.");
+            ui.label("Crie uma sala no servidor e compartilhe o código com seu amigo.");
 
-            if ui.button("Criar sala").clicked() {
-                self.enter_room(DEMO_ROOM_CODE.to_owned());
+            if ui
+                .add_enabled(!self.connecting, egui::Button::new("Criar sala"))
+                .clicked()
+            {
+                self.start_signaling(RoomAction::Create);
             }
         });
 
@@ -112,27 +127,38 @@ impl ClientUi {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.join_code)
-                        .hint_text("Ex.: DEMO-0001")
+                        .hint_text("Código da sala")
                         .desired_width(220.0),
                 );
 
-                let has_code = !self.join_code.trim().is_empty();
+                let has_code = !self.join_code.trim().is_empty() && !self.connecting;
                 if ui
                     .add_enabled(has_code, egui::Button::new("Entrar"))
                     .clicked()
                 {
-                    let code = self.join_code.trim().to_owned();
-                    self.enter_room(code);
+                    let code = self.join_code.trim().to_ascii_uppercase();
+                    self.start_signaling(RoomAction::Join(code));
                 }
             });
         });
+
+        if self.connecting {
+            ui.label("Conectando ao servidor de sinalizacao...");
+        }
+        if let Some(status) = &self.connection_status {
+            ui.label(status);
+        }
+        if let Some(error) = &self.connection_error {
+            ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+        }
+        ui.small("Configure o endereço do servidor em Configurações > Conexão antes de criar ou entrar numa sala.");
     }
 
     fn show_room(&mut self, ui: &mut egui::Ui) {
         let code = self.room_code.clone().unwrap_or_default();
 
         ui.group(|ui| {
-            ui.heading("Sala de demonstração");
+            ui.heading("Sala");
             ui.horizontal(|ui| {
                 ui.label(format!("Código: {code}"));
                 if ui.button("Copiar código").clicked() {
@@ -143,6 +169,31 @@ impl ClientUi {
 
             if self.code_copied {
                 ui.label("Código copiado para a área de transferência.");
+            }
+
+            ui.label(
+                self.connection_status
+                    .as_deref()
+                    .unwrap_or("Conectado ao servidor."),
+            );
+            if let Some(error) = &self.connection_error {
+                ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+            }
+            if self.peer_connected {
+                ui.label("Seu amigo está conectado.");
+                if ui.button("Testar sinalização").clicked() {
+                    self.diagnostic_status = Some("Enviando sinal de diagnóstico…".to_owned());
+                    if let Some(signaling) = &self.signaling {
+                        if let Err(error) = signaling.send_diagnostic() {
+                            self.diagnostic_status = Some(error);
+                        }
+                    }
+                }
+            } else {
+                ui.label("Aguardando seu amigo entrar na sala…");
+            }
+            if let Some(status) = &self.diagnostic_status {
+                ui.small(status);
             }
         });
 
@@ -197,14 +248,33 @@ impl ClientUi {
                 if ui.selectable_label(selected, "Áudio").clicked() {
                     self.select_settings_category(SettingsCategory::Audio);
                 }
+                let selected = self.settings_category == SettingsCategory::Connection;
+                if ui.selectable_label(selected, "Conexão").clicked() {
+                    self.select_settings_category(SettingsCategory::Connection);
+                }
             });
 
             ui.separator();
 
             ui.vertical(|ui| match self.settings_category {
                 SettingsCategory::Audio => self.show_audio_settings(ui),
+                SettingsCategory::Connection => self.show_connection_settings(ui),
             });
         });
+    }
+
+    fn show_connection_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Conexão");
+        ui.label("Endereço WebSocket do notebook que está executando o servidor de sinalização.");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.server_url)
+                .hint_text("ws://192.168.1.10:9000")
+                .desired_width(300.0),
+        );
+        ui.small("O endereço fica somente na memória enquanto este aplicativo estiver aberto.");
+        ui.small(
+            "Na mesma rede Wi-Fi, use o IP local do notebook e libere a porta 9000 no firewall.",
+        );
     }
 
     fn show_audio_settings(&mut self, ui: &mut egui::Ui) {
@@ -446,7 +516,117 @@ impl ClientUi {
         self.room_code = Some(code);
         self.code_copied = false;
         self.microphone_error = None;
+        self.connection_error = None;
         self.screen_status = None;
+    }
+
+    fn start_signaling(&mut self, action: RoomAction) {
+        if self.signaling.is_some() || self.connecting {
+            return;
+        }
+        self.connection_error = None;
+        self.connection_status = Some("Conectando ao servidor de sinalização…".to_owned());
+        self.connecting = true;
+        self.peer_connected = false;
+        self.diagnostic_status = None;
+        self.room_code = None;
+
+        match SignalingClient::start(self.server_url.trim().to_owned(), action) {
+            Ok(client) => self.signaling = Some(client),
+            Err(error) => {
+                self.connecting = false;
+                self.connection_status = Some("Desconectado.".to_owned());
+                self.connection_error = Some(error);
+            }
+        }
+    }
+
+    fn refresh_signaling(&mut self) {
+        let events = self
+            .signaling
+            .as_ref()
+            .map(|client| std::iter::from_fn(|| client.try_recv()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut disconnect = false;
+        let mut acknowledge_diagnostic = false;
+
+        for event in events {
+            match event {
+                SignalingEvent::RoomCreated(code) => {
+                    self.connecting = false;
+                    self.connection_status = Some("Sala criada; aguardando seu amigo.".to_owned());
+                    self.enter_room(code);
+                }
+                SignalingEvent::RoomJoined(code) => {
+                    self.connecting = false;
+                    self.peer_connected = true;
+                    self.connection_status = Some("Seu amigo já está na sala.".to_owned());
+                    self.enter_room(code);
+                }
+                SignalingEvent::PeerJoined => {
+                    self.connecting = false;
+                    self.peer_connected = true;
+                    self.connection_status = Some("Seu amigo entrou na sala.".to_owned());
+                }
+                SignalingEvent::PeerLeft => {
+                    self.peer_connected = false;
+                    self.connection_status =
+                        Some("Seu amigo desconectou; aguardando outra conexão.".to_owned());
+                    self.diagnostic_status = None;
+                }
+                SignalingEvent::Signal {
+                    kind: SignalKind::Diagnostic,
+                    payload,
+                } => match payload.as_str() {
+                    "diagnostic-ping-v1" => {
+                        self.diagnostic_status =
+                            Some("Sinal recebido; enviando confirmação ao seu amigo.".to_owned());
+                        acknowledge_diagnostic = true;
+                    }
+                    "diagnostic-pong-v1" => {
+                        self.diagnostic_status = Some(
+                            "Seu amigo confirmou o recebimento do sinal de diagnóstico.".to_owned(),
+                        );
+                    }
+                    _ => {}
+                },
+                SignalingEvent::Signal { .. } => {
+                    self.connection_status = Some("Sinal de conexão recebido.".to_owned());
+                }
+                SignalingEvent::Error(error) => {
+                    self.connecting = false;
+                    self.peer_connected = false;
+                    self.room_code = None;
+                    self.connection_status = Some("Desconectado.".to_owned());
+                    self.connection_error = Some(error);
+                    disconnect = true;
+                }
+                SignalingEvent::Disconnected => {
+                    self.connecting = false;
+                    self.peer_connected = false;
+                    self.room_code = None;
+                    self.connection_status = Some("Conexão com o servidor encerrada.".to_owned());
+                    disconnect = true;
+                }
+            }
+        }
+
+        if acknowledge_diagnostic {
+            if let Some(signaling) = &self.signaling {
+                if let Err(error) = signaling.acknowledge_diagnostic() {
+                    self.diagnostic_status = Some(error);
+                }
+            }
+        }
+
+        if disconnect {
+            self.signaling = None;
+            self.screen_picker = None;
+            if let Some(mut capture) = self.screen_capture.take() {
+                let _ = capture.stop();
+            }
+            self.screen_texture = None;
+        }
     }
 
     fn leave_room(&mut self) {
@@ -461,6 +641,12 @@ impl ClientUi {
         self.code_copied = false;
         self.microphone_error = None;
         self.screen_status = None;
+        self.signaling = None;
+        self.connecting = false;
+        self.peer_connected = false;
+        self.connection_status = Some("Desconectado.".to_owned());
+        self.connection_error = None;
+        self.diagnostic_status = None;
     }
 }
 
@@ -471,6 +657,7 @@ impl Drop for ClientUi {
         if let Some(mut capture) = self.screen_capture.take() {
             let _ = capture.stop();
         }
+        self.signaling = None;
     }
 }
 

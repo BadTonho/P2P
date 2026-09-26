@@ -2,10 +2,12 @@
 members = [
     "crates/p2p-client",
     "crates/signaling-server",
+    "crates/signaling-protocol",
 ]
 default-members = [
     "crates/p2p-client",
     "crates/signaling-server",
+    "crates/signaling-protocol",
 ]
 resolver = "2"
 
