@@ -26,9 +26,12 @@ struct ClientUi {
     settings_category: SettingsCategory,
     microphone: Option<MicrophoneTest>,
     microphone_level: f32,
+    microphone_level_dbfs: f32,
+    monitor_gain_db: f32,
     microphone_error: Option<String>,
     microphone_monitor_error: Option<String>,
     microphone_audio_warning: bool,
+    microphone_clipping_warning: bool,
     screen_capture: Option<ScreenCapture>,
     screen_texture: Option<egui::TextureHandle>,
     screen_status: Option<String>,
@@ -196,6 +199,22 @@ impl ClientUi {
             ui.heading("Teste do microfone");
             ui.label("Durante o teste, sua voz é reproduzida ao vivo na saída padrão do Windows. O áudio não é gravado nem transmitido.");
             ui.small("Use fones de ouvido para evitar que o som dos alto-falantes volte ao microfone.");
+            ui.small("O medidor mostra o nível em dBFS, sem aplicar o ganho do retorno.");
+
+            let gain_changed = ui
+                .add(
+                    egui::Slider::new(&mut self.monitor_gain_db, 0.0..=18.0)
+                        .text("Ganho do retorno")
+                        .suffix(" dB")
+                        .step_by(1.0),
+                )
+                .changed();
+            if gain_changed {
+                if let Some(microphone) = &self.microphone {
+                    microphone.set_monitor_gain_db(self.monitor_gain_db);
+                }
+            }
+            ui.small("O ganho altera apenas o som ouvido. Valores altos podem distorcer.");
 
             if let Some(error) = &self.microphone_error {
                 ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
@@ -209,6 +228,12 @@ impl ClientUi {
                     "O retorno teve cortes por falta ou excesso de amostras. Pare e inicie o teste novamente.",
                 );
             }
+            if self.microphone_clipping_warning {
+                ui.colored_label(
+                    egui::Color32::from_rgb(190, 95, 35),
+                    "O retorno está distorcendo; reduza o ganho.",
+                );
+            }
 
             if self.microphone.is_some() {
                 if self.microphone_monitor_error.is_none() {
@@ -218,7 +243,7 @@ impl ClientUi {
                 }
                 ui.add(
                     egui::ProgressBar::new(self.microphone_level)
-                        .text(format!("Nível: {:.0}%", self.microphone_level * 100.0)),
+                        .text(format!("Nível: {:.1} dBFS", self.microphone_level_dbfs)),
                 );
                 if ui.button("Parar teste do microfone").clicked() {
                     self.stop_microphone();
@@ -258,8 +283,10 @@ impl ClientUi {
         self.microphone_error = None;
         self.microphone_monitor_error = None;
         self.microphone_audio_warning = false;
+        self.microphone_clipping_warning = false;
         self.microphone_level = 0.0;
-        match MicrophoneTest::start() {
+        self.microphone_level_dbfs = -60.0;
+        match MicrophoneTest::start(self.monitor_gain_db) {
             Ok(test) => self.microphone = Some(test),
             Err(error) => self.microphone_error = Some(error),
         }
@@ -268,6 +295,8 @@ impl ClientUi {
     fn stop_microphone(&mut self) {
         self.microphone = None;
         self.microphone_level = 0.0;
+        self.microphone_level_dbfs = -60.0;
+        self.microphone_clipping_warning = false;
     }
 
     fn refresh_microphone(&mut self) {
@@ -275,15 +304,21 @@ impl ClientUi {
             return;
         };
 
-        let level = microphone.level();
+        let rms = microphone.level();
+        let level_dbfs = if rms > 0.0 { 20.0 * rms.log10() } else { -60.0 };
+        let level_dbfs = level_dbfs.clamp(-60.0, 0.0);
+        let level = (level_dbfs + 60.0) / 60.0;
         let microphone_error = microphone.take_microphone_error();
         let monitor_error = microphone.take_monitor_error();
         let audio_warning = microphone.take_audio_warning();
+        let clipping_warning = microphone.take_clipping_warning();
         if monitor_error.is_some() {
             microphone.stop_monitoring();
         }
 
         self.microphone_level = level;
+        self.microphone_level_dbfs = level_dbfs;
+        self.microphone_clipping_warning = clipping_warning;
         if audio_warning {
             self.microphone_audio_warning = true;
         }
@@ -399,6 +434,8 @@ impl Drop for ClientUi {
 
 fn main() -> eframe::Result {
     let mut app = ClientUi::default();
+    app.monitor_gain_db = 6.0;
+    app.microphone_level_dbfs = -60.0;
 
     eframe::run_ui_native(
         "P2P - Voz e tela",

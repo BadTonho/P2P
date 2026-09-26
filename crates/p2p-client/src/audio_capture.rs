@@ -16,10 +16,12 @@ pub struct MicrophoneTest {
     monitor_error: Arc<Mutex<Option<String>>>,
     audio_warning: Arc<AtomicBool>,
     monitor_queue_enabled: Arc<AtomicBool>,
+    monitor_gain: Arc<AtomicU32>,
+    clipping_warning: Arc<AtomicBool>,
 }
 
 impl MicrophoneTest {
-    pub fn start() -> Result<Self, String> {
+    pub fn start(monitor_gain_db: f32) -> Result<Self, String> {
         let host = cpal::default_host();
         let input_device = host.default_input_device().ok_or_else(|| {
             "Nenhum microfone padrão foi encontrado. Conecte um microfone ou escolha um como padrão nas configurações de Som do Windows.".to_owned()
@@ -41,6 +43,10 @@ impl MicrophoneTest {
         let overflow_pending = Arc::new(AtomicBool::new(false));
         let audio_warning = Arc::new(AtomicBool::new(false));
         let monitor_queue_enabled = Arc::new(AtomicBool::new(true));
+        let monitor_gain = Arc::new(AtomicU32::new(
+            gain_db_to_amplitude(monitor_gain_db).to_bits(),
+        ));
+        let clipping_warning = Arc::new(AtomicBool::new(false));
 
         let input_stream = match input_sample_format {
             cpal::SampleFormat::I8 => build_input_stream::<i8>(
@@ -206,6 +212,8 @@ impl MicrophoneTest {
                             &overflow_pending,
                             &audio_warning,
                             &monitor_queue_enabled,
+                            &monitor_gain,
+                            &clipping_warning,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::I16 => build_output_stream::<i16>(
@@ -217,6 +225,8 @@ impl MicrophoneTest {
                             &overflow_pending,
                             &audio_warning,
                             &monitor_queue_enabled,
+                            &monitor_gain,
+                            &clipping_warning,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::I24 => build_output_stream::<cpal::I24>(
@@ -228,6 +238,8 @@ impl MicrophoneTest {
                             &overflow_pending,
                             &audio_warning,
                             &monitor_queue_enabled,
+                            &monitor_gain,
+                            &clipping_warning,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::I32 => build_output_stream::<i32>(
@@ -239,6 +251,8 @@ impl MicrophoneTest {
                             &overflow_pending,
                             &audio_warning,
                             &monitor_queue_enabled,
+                            &monitor_gain,
+                            &clipping_warning,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::I64 => build_output_stream::<i64>(
@@ -250,6 +264,8 @@ impl MicrophoneTest {
                             &overflow_pending,
                             &audio_warning,
                             &monitor_queue_enabled,
+                            &monitor_gain,
+                            &clipping_warning,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::U8 => build_output_stream::<u8>(
@@ -261,6 +277,8 @@ impl MicrophoneTest {
                             &overflow_pending,
                             &audio_warning,
                             &monitor_queue_enabled,
+                            &monitor_gain,
+                            &clipping_warning,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::U16 => build_output_stream::<u16>(
@@ -272,6 +290,8 @@ impl MicrophoneTest {
                             &overflow_pending,
                             &audio_warning,
                             &monitor_queue_enabled,
+                            &monitor_gain,
+                            &clipping_warning,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::U24 => build_output_stream::<cpal::U24>(
@@ -283,6 +303,8 @@ impl MicrophoneTest {
                             &overflow_pending,
                             &audio_warning,
                             &monitor_queue_enabled,
+                            &monitor_gain,
+                            &clipping_warning,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::U32 => build_output_stream::<u32>(
@@ -294,6 +316,8 @@ impl MicrophoneTest {
                             &overflow_pending,
                             &audio_warning,
                             &monitor_queue_enabled,
+                            &monitor_gain,
+                            &clipping_warning,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::U64 => build_output_stream::<u64>(
@@ -305,6 +329,8 @@ impl MicrophoneTest {
                             &overflow_pending,
                             &audio_warning,
                             &monitor_queue_enabled,
+                            &monitor_gain,
+                            &clipping_warning,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::F32 => build_output_stream::<f32>(
@@ -316,6 +342,8 @@ impl MicrophoneTest {
                             &overflow_pending,
                             &audio_warning,
                             &monitor_queue_enabled,
+                            &monitor_gain,
+                            &clipping_warning,
                             &monitor_error,
                         ),
                         cpal::SampleFormat::F64 => build_output_stream::<f64>(
@@ -327,6 +355,8 @@ impl MicrophoneTest {
                             &overflow_pending,
                             &audio_warning,
                             &monitor_queue_enabled,
+                            &monitor_gain,
+                            &clipping_warning,
                             &monitor_error,
                         ),
                         _ => Err("O formato de áudio da saída padrão não é compatível com o monitoramento.".to_owned()),
@@ -382,6 +412,8 @@ impl MicrophoneTest {
             monitor_error,
             audio_warning,
             monitor_queue_enabled,
+            monitor_gain,
+            clipping_warning,
         })
     }
 
@@ -401,10 +433,23 @@ impl MicrophoneTest {
         self.audio_warning.swap(false, Ordering::AcqRel)
     }
 
+    pub fn set_monitor_gain_db(&self, gain_db: f32) {
+        self.monitor_gain
+            .store(gain_db_to_amplitude(gain_db).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn take_clipping_warning(&self) -> bool {
+        self.clipping_warning.swap(false, Ordering::AcqRel)
+    }
+
     pub fn stop_monitoring(&mut self) {
         self.monitor_queue_enabled.store(false, Ordering::Release);
         self.monitor_stream = None;
     }
+}
+
+fn gain_db_to_amplitude(gain_db: f32) -> f32 {
+    10.0_f32.powf(gain_db.clamp(0.0, 18.0) / 20.0)
 }
 
 fn build_input_stream<T>(
@@ -492,6 +537,8 @@ fn build_output_stream<T>(
     overflow_pending: &Arc<AtomicBool>,
     audio_warning: &Arc<AtomicBool>,
     monitor_queue_enabled: &Arc<AtomicBool>,
+    monitor_gain: &Arc<AtomicU32>,
+    clipping_warning: &Arc<AtomicBool>,
     monitor_error: &Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream, String>
 where
@@ -499,6 +546,8 @@ where
 {
     let overflow_pending = Arc::clone(overflow_pending);
     let audio_warning = Arc::clone(audio_warning);
+    let monitor_gain = Arc::clone(monitor_gain);
+    let clipping_warning = Arc::clone(clipping_warning);
     let callback_error = Arc::clone(monitor_error);
     let callback_queue_enabled = Arc::clone(monitor_queue_enabled);
     let channels = channels.max(1);
@@ -530,13 +579,18 @@ where
                     .ceil() as usize
                     + 4;
                 resampler.refill(&mut consumer, required_source_samples);
+                let gain = f32::from_bits(monitor_gain.load(Ordering::Relaxed));
 
                 for frame in output.chunks_mut(channels) {
                     let next_sample = resampler.next_sample();
                     if next_sample.is_none() && resampler.has_produced {
                         audio_warning.store(true, Ordering::Release);
                     }
-                    let sample = next_sample.unwrap_or(0.0).clamp(-1.0, 1.0);
+                    let amplified_sample = next_sample.unwrap_or(0.0) * gain;
+                    if amplified_sample.abs() > 1.0 {
+                        clipping_warning.store(true, Ordering::Release);
+                    }
+                    let sample = amplified_sample.clamp(-1.0, 1.0);
                     frame.fill(<T as cpal::Sample>::from_sample(sample));
                 }
             },
