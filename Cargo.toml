@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "crates/p2p-client",
+    "crates/signaling-server",
+]
+default-members = [
+    "crates/p2p-client",
+    "crates/signaling-server",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+rust-version = "1.95"
