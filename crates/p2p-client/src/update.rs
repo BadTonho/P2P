@@ -15,7 +15,11 @@ use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const MANIFEST_URL: &str = env!("P2P_UPDATE_MANIFEST_URL");
+const DRIVE_FOLDER_ID: &str = env!("P2P_UPDATE_DRIVE_FOLDER_ID");
+const DRIVE_API_KEY: &str = env!("P2P_UPDATE_DRIVE_API_KEY");
+const DRIVE_FILES_API_URL: &str = "https://www.googleapis.com/drive/v3/files";
+const DRIVE_FILE_DOWNLOAD_URL: &str = "https://drive.google.com/uc";
+const MANIFEST_NAME: &str = "update-manifest.json";
 const MANIFEST_MAX_BYTES: u64 = 64 * 1024;
 const UPDATE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const UPDATE_DIRECTORY: &str = "P2P-Voz-e-tela\\updates";
@@ -68,14 +72,26 @@ impl UpdateManager {
     }
 
     pub fn is_configured() -> bool {
-        !MANIFEST_URL.trim().is_empty()
+        !DRIVE_FOLDER_ID.trim().is_empty() && !DRIVE_API_KEY.trim().is_empty()
+    }
+
+    pub fn configuration_message() -> &'static str {
+        if DRIVE_FOLDER_ID.trim().is_empty() {
+            "A pasta de atualizações do Google Drive não está configurada nesta compilação."
+        } else {
+            "A pasta do Google Drive já está configurada, mas falta compilar com P2P_UPDATE_DRIVE_API_KEY. Os amigos não precisam fazer login no Google."
+        }
+    }
+
+    pub fn drive_folder_url() -> String {
+        format!("https://drive.google.com/drive/folders/{DRIVE_FOLDER_ID}")
     }
 
     pub fn check(&mut self) {
         let sender = self.channel();
         if !Self::is_configured() {
             let _ = sender.send(UpdateEvent::CheckFinished(Err(
-                "Esta compilação não tem um link de atualizações configurado.".to_owned(),
+                Self::configuration_message().to_owned(),
             )));
             return;
         }
@@ -85,7 +101,7 @@ impl UpdateManager {
             "Verificando atualizações"
         );
         thread::spawn(move || {
-            let result = check_for_update(MANIFEST_URL);
+            let result = check_for_update(DRIVE_FOLDER_ID, DRIVE_API_KEY);
             match &result {
                 Ok(Some(manifest)) => tracing::info!(
                     version = %manifest.version,
@@ -154,9 +170,14 @@ fn validate_https_url(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn check_for_update(manifest_url: &str) -> Result<Option<UpdateManifest>, String> {
-    validate_https_url(manifest_url)?;
+fn check_for_update(folder_id: &str, api_key: &str) -> Result<Option<UpdateManifest>, String> {
+    validate_drive_folder_id(folder_id)?;
+    if api_key.trim().is_empty() {
+        return Err(UpdateManager::configuration_message().to_owned());
+    }
     let client = new_http_client()?;
+    let manifest_file = find_manifest_file(&client, folder_id, api_key)?;
+    let manifest_url = drive_file_download_url(&manifest_file)?;
     let response = client
         .get(manifest_url)
         .send()
@@ -179,6 +200,118 @@ fn check_for_update(manifest_url: &str) -> Result<Option<UpdateManifest>, String
         std::cmp::Ordering::Greater => Ok(Some(manifest)),
         std::cmp::Ordering::Equal | std::cmp::Ordering::Less => Ok(None),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct DriveFileList {
+    #[serde(default)]
+    files: Vec<DriveFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DriveFile {
+    id: String,
+    name: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    #[serde(rename = "resourceKey")]
+    resource_key: Option<String>,
+}
+
+fn validate_drive_folder_id(folder_id: &str) -> Result<(), String> {
+    if folder_id.is_empty()
+        || !folder_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err("O ID da pasta pública do Google Drive está inválido.".to_owned());
+    }
+    Ok(())
+}
+
+fn find_manifest_file(
+    client: &Client,
+    folder_id: &str,
+    api_key: &str,
+) -> Result<DriveFile, String> {
+    let query = format!(
+        "'{}' in parents and name = '{}' and trashed = false",
+        folder_id, MANIFEST_NAME
+    );
+    let response = client
+        .get(DRIVE_FILES_API_URL)
+        .header("x-goog-api-key", api_key)
+        .query(&[
+            ("q", query.as_str()),
+            ("fields", "files(id,name,mimeType,resourceKey)"),
+            ("pageSize", "10"),
+            ("supportsAllDrives", "true"),
+            ("includeItemsFromAllDrives", "true"),
+        ])
+        .send()
+        .map_err(|error| sanitized_request_error(&error))?;
+    if response.status().as_u16() == 401 || response.status().as_u16() == 403 {
+        return Err("O Google Drive recusou a listagem da pasta. Confira se a Drive API está habilitada, se a chave é válida e se ela está restrita à Drive API.".to_owned());
+    }
+    if response.status().as_u16() == 404 {
+        return Err(
+            "A pasta configurada não foi encontrada ou não permite acesso público.".to_owned(),
+        );
+    }
+    let response = validate_response(
+        response,
+        MANIFEST_MAX_BYTES,
+        "resultado da pasta de atualizações",
+    )?;
+    if is_html(&response) {
+        return Err(
+            "O Google Drive respondeu com HTML ao listar a pasta de atualizações.".to_owned(),
+        );
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MANIFEST_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            "Não foi possível ler a lista de arquivos da pasta de atualizações.".to_owned()
+        })?;
+    if bytes.len() as u64 > MANIFEST_MAX_BYTES {
+        return Err("A resposta da pasta de atualizações excede o limite de tamanho.".to_owned());
+    }
+    let file_list: DriveFileList = serde_json::from_slice(&bytes).map_err(|_| {
+        "Não foi possível listar a pasta. Confira se a Drive API está habilitada, se a chave está correta e se a pasta permite acesso a qualquer pessoa com o link.".to_owned()
+    })?;
+    let mut matching = file_list.files.into_iter().filter(|file| {
+        file.name == MANIFEST_NAME && !file.mime_type.starts_with("application/vnd.google-apps.")
+    });
+    let Some(file) = matching.next() else {
+        return Err(format!(
+            "A pasta configurada ainda não contém o arquivo {MANIFEST_NAME}."
+        ));
+    };
+    if matching.next().is_some() {
+        return Err(format!(
+            "Há mais de um arquivo {MANIFEST_NAME} na pasta. Deixe apenas um com esse nome."
+        ));
+    }
+    if file.id.is_empty() {
+        return Err("O Google Drive encontrou o manifesto, mas não informou seu ID.".to_owned());
+    }
+    Ok(file)
+}
+
+fn drive_file_download_url(file: &DriveFile) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(DRIVE_FILE_DOWNLOAD_URL)
+        .map_err(|_| "Não foi possível preparar o link do manifesto no Google Drive.".to_owned())?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("export", "download");
+        query.append_pair("id", &file.id);
+        if let Some(resource_key) = file.resource_key.as_deref() {
+            query.append_pair("resourcekey", resource_key);
+        }
+    }
+    Ok(url)
 }
 
 fn validate_response(

@@ -770,12 +770,17 @@ impl ClientUi {
     fn show_update_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Atualizações");
         ui.label(format!("Versão instalada: {}", env!("CARGO_PKG_VERSION")));
+        ui.hyperlink_to(
+            "Abrir pasta configurada no Google Drive",
+            UpdateManager::drive_folder_url(),
+        );
+        ui.small("O app procura nessa pasta o arquivo update-manifest.json.");
         ui.add_space(8.0);
 
         if !UpdateManager::is_configured() {
             ui.colored_label(
                 egui::Color32::from_rgb(190, 95, 35),
-                "Esta versão foi compilada sem um link de manifesto. Configure P2P_UPDATE_MANIFEST_URL e compile novamente para habilitar atualizações.",
+                UpdateManager::configuration_message(),
             );
         } else {
             match self.update_status.clone() {
@@ -783,7 +788,7 @@ impl ClientUi {
                     ui.label("Verificando se há uma versão nova…");
                 }
                 UpdateStatus::Unconfigured => {
-                    ui.label("Configure o link do manifesto para habilitar atualizações.");
+                    ui.label(UpdateManager::configuration_message());
                 }
                 UpdateStatus::UpToDate => {
                     ui.label("Você está usando a versão mais recente.");

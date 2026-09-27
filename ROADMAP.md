@@ -105,7 +105,7 @@ Se a conexão direta falhar em algumas redes, decidir entre manter o requisito e
 
 Tratar encerramento do compartilhamento, desconexões, acesso às salas e estados de captura. Distribuir o aplicativo como um executável `.exe` solto, sem instalador, e documentar o compartilhamento do endereço de rede e do código da sala.
 
-**Atualizador implementado:** em Configurações > Atualizações, o app verifica versões em um manifesto do Google Drive, permite baixar sob demanda e reiniciar para aplicar. O download valida HTTPS, tamanho, SHA-256 e formato PE; a substituição usa um aplicador auxiliar com backup e rollback. Não há assinatura digital; o SHA-256 detecta corrupção, não autentica o publicador. A versão distribuída precisa embutir o link estável do manifesto via `P2P_UPDATE_MANIFEST_URL`. As instruções de publicação estão em `ATUALIZACOES.md`.
+**Atualizador implementado:** em Configurações > Atualizações, o app procura `update-manifest.json` na pasta do Google Drive configurada, permite baixar sob demanda e reiniciar para aplicar. A pasta do projeto já está definida como padrão; a compilação distribuída precisa incluir uma API key restrita à Google Drive API para localizar o arquivo público sem login dos amigos. O download valida HTTPS, tamanho, SHA-256 e formato PE; a substituição usa um aplicador auxiliar com backup e rollback. Não há assinatura digital; o SHA-256 detecta corrupção, não autentica o publicador. As instruções de publicação estão em `ATUALIZACOES.md`.
 
 **Falta validar:** publicar um manifesto e executável reais no Drive, testar o download anônimo, aplicar uma atualização entre duas versões e confirmar a recuperação após falha.
 
