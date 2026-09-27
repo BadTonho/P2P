@@ -26,6 +26,8 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
     RtpCodecKind,
 };
+use rtc::statistics::StatsSelector;
+use rtc::statistics::report::{RTCStatsReport, RTCStatsReportEntry};
 use signaling_protocol::SignalKind;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle as TokioJoinHandle;
@@ -42,6 +44,7 @@ use webrtc::runtime::TokioRuntime;
 
 use crate::logging::safe_stun_endpoint;
 use crate::screen_capture::{LatestFrame, PreviewFrame};
+use crate::turn_relay::TurnCredentials;
 
 const VIDEO_PAYLOAD_TYPE: PayloadType = 102;
 const VIDEO_CLOCK_RATE: u32 = 90_000;
@@ -86,10 +89,13 @@ pub fn validate_stun_uri(input: &str) -> Result<String, String> {
 #[derive(Clone, Debug, Default)]
 pub struct ScreenShareMetrics {
     pub p2p_connected: bool,
+    pub route: Option<MediaRoute>,
     pub local_ice_candidates: u64,
     pub remote_ice_candidates: u64,
     pub local_srflx_candidates: u64,
     pub remote_srflx_candidates: u64,
+    pub local_relay_candidates: u64,
+    pub remote_relay_candidates: u64,
     pub encoded_frames: u64,
     pub sent_frames: u64,
     pub received_packets: u64,
@@ -99,13 +105,22 @@ pub struct ScreenShareMetrics {
     pub h264_diagnostics: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaRoute {
+    Direct,
+    Turn,
+}
+
 #[derive(Default)]
 struct SharedMetrics {
     p2p_connected: AtomicBool,
+    route: AtomicU64,
     local_ice_candidates: AtomicU64,
     remote_ice_candidates: AtomicU64,
     local_srflx_candidates: AtomicU64,
     remote_srflx_candidates: AtomicU64,
+    local_relay_candidates: AtomicU64,
+    remote_relay_candidates: AtomicU64,
     encoded_frames: AtomicU64,
     sent_frames: AtomicU64,
     received_packets: AtomicU64,
@@ -148,10 +163,17 @@ impl SharedMetrics {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         ScreenShareMetrics {
             p2p_connected: self.p2p_connected.load(Ordering::Relaxed),
+            route: match self.route.load(Ordering::Relaxed) {
+                1 => Some(MediaRoute::Direct),
+                2 => Some(MediaRoute::Turn),
+                _ => None,
+            },
             local_ice_candidates: self.local_ice_candidates.load(Ordering::Relaxed),
             remote_ice_candidates: self.remote_ice_candidates.load(Ordering::Relaxed),
             local_srflx_candidates: self.local_srflx_candidates.load(Ordering::Relaxed),
             remote_srflx_candidates: self.remote_srflx_candidates.load(Ordering::Relaxed),
+            local_relay_candidates: self.local_relay_candidates.load(Ordering::Relaxed),
+            remote_relay_candidates: self.remote_relay_candidates.load(Ordering::Relaxed),
             encoded_frames: self.encoded_frames.load(Ordering::Relaxed),
             sent_frames: self.sent_frames.load(Ordering::Relaxed),
             received_packets: self.received_packets.load(Ordering::Relaxed),
@@ -649,25 +671,35 @@ pub struct ScreenShareSession {
 }
 
 impl ScreenShareSession {
-    pub fn new(context: egui::Context, stun_server: Option<String>) -> Result<Self, String> {
+    pub fn new(
+        context: egui::Context,
+        stun_server: Option<String>,
+        turn_credentials: Option<TurnCredentials>,
+    ) -> Result<Self, String> {
         if let Some(server) = stun_server.as_deref() {
             if let Err(error) = validate_stun_uri(server) {
                 tracing::error!(reason = %error, "URI STUN recusada antes de iniciar WebRTC");
                 return Err(error);
             }
         }
-        Self::with_udp_address(context, format!("0.0.0.0:{MEDIA_UDP_PORT}"), stun_server)
+        Self::with_udp_address(
+            context,
+            format!("0.0.0.0:{MEDIA_UDP_PORT}"),
+            stun_server,
+            turn_credentials,
+        )
     }
 
     #[cfg(test)]
     fn new_loopback(context: egui::Context) -> Result<Self, String> {
-        Self::with_udp_address(context, "127.0.0.1:0".to_owned(), None)
+        Self::with_udp_address(context, "127.0.0.1:0".to_owned(), None, None)
     }
 
     fn with_udp_address(
         context: egui::Context,
         udp_address: String,
         stun_server: Option<String>,
+        turn_credentials: Option<TurnCredentials>,
     ) -> Result<Self, String> {
         tracing::info!(
             udp_address = %udp_address,
@@ -703,6 +735,7 @@ impl ScreenShareSession {
                     worker_remote_frame,
                     udp_address,
                     stun_server,
+                    turn_credentials,
                     worker_metrics,
                 ));
             })
@@ -779,6 +812,7 @@ struct PeerEvents {
     remote_frame_sequence: Arc<AtomicU64>,
     metrics: Arc<SharedMetrics>,
     stun_server: Option<String>,
+    turn_enabled: bool,
 }
 
 #[async_trait::async_trait]
@@ -799,6 +833,11 @@ impl PeerConnectionEventHandler for PeerEvents {
         if event.candidate.typ == rtc::peer_connection::transport::RTCIceCandidateType::Srflx {
             self.metrics
                 .local_srflx_candidates
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if event.candidate.typ == rtc::peer_connection::transport::RTCIceCandidateType::Relay {
+            self.metrics
+                .local_relay_candidates
                 .fetch_add(1, Ordering::Relaxed);
         }
         match event.candidate.to_json() {
@@ -824,6 +863,40 @@ impl PeerConnectionEventHandler for PeerEvents {
         self.context.request_repaint();
     }
 
+    async fn on_ice_candidate_error(
+        &self,
+        event: rtc::peer_connection::event::RTCPeerConnectionIceErrorEvent,
+    ) {
+        let is_turn = event.url.starts_with("turn:");
+        let is_auth_error = matches!(event.error_code, 401 | 438 | 702);
+        tracing::warn!(
+            ice_error_code = event.error_code,
+            turn_server = is_turn,
+            turn_enabled = self.turn_enabled,
+            "Falha ao reunir candidato ICE; URL e credenciais omitidas"
+        );
+        let message = if is_turn && is_auth_error {
+            "O servidor TURN recusou as credenciais temporárias (erro de autenticação ICE). A sala pode ter expirado; crie outra sala e tente novamente.".to_owned()
+        } else if is_turn {
+            format!(
+                "Não foi possível obter um endereço de retransmissão TURN (erro ICE {}). Confira UDP 3478 e UDP 50000–50100 no roteador e no firewall do anfitrião.",
+                event.error_code
+            )
+        } else if self.turn_enabled {
+            format!(
+                "Falha ao reunir candidato ICE via STUN (erro {}). O app ainda tentará TURN se o anfitrião o habilitou.",
+                event.error_code
+            )
+        } else {
+            format!(
+                "Falha ao reunir candidato ICE via STUN (erro {}).",
+                event.error_code
+            )
+        };
+        let _ = self.events.send(ScreenShareEvent::State(message));
+        self.context.request_repaint();
+    }
+
     async fn on_ice_connection_state_change(
         &self,
         state: webrtc::peer_connection::RTCIceConnectionState,
@@ -842,6 +915,7 @@ impl PeerConnectionEventHandler for PeerEvents {
             }
             webrtc::peer_connection::RTCIceConnectionState::Disconnected => {
                 self.metrics.p2p_connected.store(false, Ordering::Relaxed);
+                self.metrics.route.store(0, Ordering::Relaxed);
                 *self
                     .metrics
                     .connected_at
@@ -851,6 +925,7 @@ impl PeerConnectionEventHandler for PeerEvents {
             }
             webrtc::peer_connection::RTCIceConnectionState::Failed => {
                 self.metrics.p2p_connected.store(false, Ordering::Relaxed);
+                self.metrics.route.store(0, Ordering::Relaxed);
                 *self
                     .metrics
                     .connected_at
@@ -860,9 +935,19 @@ impl PeerConnectionEventHandler for PeerEvents {
                     let safe_stun_server = safe_stun_endpoint(stun_server);
                     let local = self.metrics.local_srflx_candidates.load(Ordering::Relaxed);
                     let remote = self.metrics.remote_srflx_candidates.load(Ordering::Relaxed);
-                    format!(
-                        "O ICE não encontrou um caminho direto pela internet. Candidatos públicos via STUN: {local} locais e {remote} recebidos do amigo. Confira a URI {safe_stun_server}, o firewall e UDP {MEDIA_UDP_PORT}; esta etapa não usa TURN."
-                    )
+                    if self.turn_enabled {
+                        let local_relay =
+                            self.metrics.local_relay_candidates.load(Ordering::Relaxed);
+                        let remote_relay =
+                            self.metrics.remote_relay_candidates.load(Ordering::Relaxed);
+                        format!(
+                            "O ICE não conectou. Candidatos STUN: {local} locais e {remote} remotos; candidatos TURN: {local_relay} locais e {remote_relay} remotos. Confira {safe_stun_server}, UDP 3478 e UDP 50000–50100 no anfitrião; se não houve candidato TURN, recrie a sala para renovar as credenciais."
+                        )
+                    } else {
+                        format!(
+                            "O ICE não encontrou um caminho direto pela internet. Candidatos públicos via STUN: {local} locais e {remote} recebidos do amigo. Confira a URI {safe_stun_server}, o firewall e UDP {MEDIA_UDP_PORT}; TURN está desativado nesta sala."
+                        )
+                    }
                 } else {
                     format!(
                         "O ICE não encontrou um caminho UDP. Confira se o firewall dos dois PCs permite o aplicativo ou UDP {MEDIA_UDP_PORT} na rede privada."
@@ -873,8 +958,13 @@ impl PeerConnectionEventHandler for PeerEvents {
                         self.metrics.local_srflx_candidates.load(Ordering::Relaxed),
                     remote_srflx_candidates =
                         self.metrics.remote_srflx_candidates.load(Ordering::Relaxed),
+                    local_relay_candidates =
+                        self.metrics.local_relay_candidates.load(Ordering::Relaxed),
+                    remote_relay_candidates =
+                        self.metrics.remote_relay_candidates.load(Ordering::Relaxed),
                     stun_configured = self.stun_server.is_some(),
-                    "ICE falhou em encontrar caminho UDP direto"
+                    turn_enabled = self.turn_enabled,
+                    "ICE falhou em estabelecer caminho UDP"
                 );
                 let _ = self.events.send(ScreenShareEvent::Error(message));
                 self.context.request_repaint();
@@ -882,6 +972,7 @@ impl PeerConnectionEventHandler for PeerEvents {
             }
             webrtc::peer_connection::RTCIceConnectionState::Closed => {
                 self.metrics.p2p_connected.store(false, Ordering::Relaxed);
+                self.metrics.route.store(0, Ordering::Relaxed);
                 *self
                     .metrics
                     .connected_at
@@ -913,6 +1004,7 @@ impl PeerConnectionEventHandler for PeerEvents {
             RTCPeerConnectionState::Failed => {}
             RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Closed => {
                 self.metrics.p2p_connected.store(false, Ordering::Relaxed);
+                self.metrics.route.store(0, Ordering::Relaxed);
                 *self
                     .metrics
                     .connected_at
@@ -1000,6 +1092,7 @@ async fn run_session(
     remote_frame: RemoteFrameStore,
     udp_address: String,
     stun_server: Option<String>,
+    turn_credentials: Option<TurnCredentials>,
     metrics: Arc<SharedMetrics>,
 ) {
     let mut active_peer: Option<PeerSession> = None;
@@ -1007,6 +1100,7 @@ async fn run_session(
     let remote_frame_sequence = Arc::new(AtomicU64::new(0));
     let mut connection_check = tokio::time::interval(CONNECTION_CHECK_INTERVAL);
     connection_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_route_check = Instant::now();
 
     loop {
         tokio::select! {
@@ -1014,7 +1108,33 @@ async fn run_session(
                 let Some(peer) = active_peer.as_mut() else {
                     continue;
                 };
-                let connection_timeout = if stun_server.is_some() {
+                if peer.metrics.p2p_connected.load(Ordering::Relaxed)
+                    && last_route_check.elapsed() >= Duration::from_secs(1)
+                {
+                    last_route_check = Instant::now();
+                    let report = peer
+                        .connection
+                        .get_stats(Instant::now(), StatsSelector::None)
+                        .await;
+                    if let Some(route) = selected_media_route(&report) {
+                        let route_code = match route {
+                            MediaRoute::Direct => 1,
+                            MediaRoute::Turn => 2,
+                        };
+                        let previous = peer.metrics.route.swap(route_code, Ordering::Relaxed);
+                        if previous != route_code {
+                            tracing::info!(?route, "Rota ICE de mídia selecionada");
+                            let label = match route {
+                                MediaRoute::Direct => "Conexão direta P2P selecionada.",
+                                MediaRoute::Turn => "Conexão retransmitida pelo servidor TURN do anfitrião.",
+                            };
+                            let _ = events.send(ScreenShareEvent::State(label.to_owned()));
+                        }
+                        context.request_repaint();
+                    }
+                }
+
+                let connection_timeout = if stun_server.is_some() || turn_credentials.is_some() {
                     INTERNET_PEER_CONNECTION_TIMEOUT
                 } else {
                     PEER_CONNECTION_TIMEOUT
@@ -1022,11 +1142,19 @@ async fn run_session(
                 if !peer.metrics.p2p_connected.load(Ordering::Relaxed)
                     && peer.started_at.elapsed() >= connection_timeout
                 {
-                    let message = if let Some(stun_server) = &stun_server {
+                    let message = if turn_credentials.is_some() {
+                        let local_relay = peer.metrics.local_relay_candidates.load(Ordering::Relaxed);
+                        let remote_relay = peer.metrics.remote_relay_candidates.load(Ordering::Relaxed);
+                        let local_srflx = peer.metrics.local_srflx_candidates.load(Ordering::Relaxed);
+                        let remote_srflx = peer.metrics.remote_srflx_candidates.load(Ordering::Relaxed);
+                        format!(
+                            "A conexão WebRTC não foi estabelecida em {connection_timeout:?}. O ICE reuniu {local_relay} candidatos TURN locais e {remote_relay} remotos; STUN: {local_srflx} locais e {remote_srflx} remotos. Confira o endereço público, UDP 3478, UDP 50000–50100 e as regras do firewall/roteador do anfitrião."
+                        )
+                    } else if let Some(stun_server) = &stun_server {
                         let local = peer.metrics.local_srflx_candidates.load(Ordering::Relaxed);
                         let remote = peer.metrics.remote_srflx_candidates.load(Ordering::Relaxed);
                         format!(
-                            "A conexão P2P não foi estabelecida em {connection_timeout:?}. Candidatos públicos via STUN: {local} locais e {remote} recebidos do amigo. Confira a URI {stun_server}, as regras de NAT e o firewall/UDP {MEDIA_UDP_PORT} dos dois PCs. Não há TURN nem retransmissão nesta etapa."
+                            "A conexão WebRTC não foi estabelecida em {connection_timeout:?}. Candidatos públicos via STUN: {local} locais e {remote} recebidos do amigo. Confira a URI {stun_server}, as regras de NAT e o firewall/UDP {MEDIA_UDP_PORT} dos dois PCs. TURN está desativado nesta sala."
                         )
                     } else {
                         format!(
@@ -1092,6 +1220,7 @@ async fn run_session(
                     Arc::clone(&metrics),
                     &udp_address,
                     stun_server.as_deref(),
+                    turn_credentials.as_ref(),
                 )
                 .await
                 {
@@ -1118,6 +1247,7 @@ async fn run_session(
                         Arc::clone(&metrics),
                         &udp_address,
                         stun_server.as_deref(),
+                        turn_credentials.as_ref(),
                     )
                     .await
                     {
@@ -1170,6 +1300,11 @@ async fn run_session(
                                     .remote_srflx_candidates
                                     .fetch_add(1, Ordering::Relaxed);
                             }
+                            if candidate.candidate.contains(" typ relay ") {
+                                metrics
+                                    .remote_relay_candidates
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             if let Some(peer) = active_peer.as_mut() {
                                 if peer.remote_description_set {
                                     if let Err(error) =
@@ -1206,6 +1341,37 @@ async fn run_session(
     }
 }
 
+fn selected_media_route(report: &RTCStatsReport) -> Option<MediaRoute> {
+    let selected_pair_id = report.iter().find_map(|entry| match entry {
+        RTCStatsReportEntry::Transport(transport)
+            if !transport.selected_candidate_pair_id.is_empty() =>
+        {
+            Some(transport.selected_candidate_pair_id.as_str())
+        }
+        _ => None,
+    })?;
+    let pair = match report.get(selected_pair_id)? {
+        RTCStatsReportEntry::IceCandidatePair(pair) => pair,
+        _ => return None,
+    };
+    let relay_candidate_type = rtc::peer_connection::transport::RTCIceCandidateType::Relay;
+    let local_is_relay = matches!(
+        report.get(&pair.local_candidate_id),
+        Some(RTCStatsReportEntry::LocalCandidate(candidate))
+            if candidate.candidate_type == relay_candidate_type
+    );
+    let remote_is_relay = matches!(
+        report.get(&pair.remote_candidate_id),
+        Some(RTCStatsReportEntry::RemoteCandidate(candidate))
+            if candidate.candidate_type == relay_candidate_type
+    );
+    Some(if local_is_relay || remote_is_relay {
+        MediaRoute::Turn
+    } else {
+        MediaRoute::Direct
+    })
+}
+
 async fn create_peer(
     events: &std_mpsc::Sender<ScreenShareEvent>,
     context: egui::Context,
@@ -1214,6 +1380,7 @@ async fn create_peer(
     metrics: Arc<SharedMetrics>,
     udp_address: &str,
     stun_server: Option<&str>,
+    turn_credentials: Option<&TurnCredentials>,
 ) -> Result<Arc<dyn PeerConnection>, String> {
     let video_codec = RTCRtpCodecParameters {
         rtp_codec: RTCRtpCodec {
@@ -1240,14 +1407,40 @@ async fn create_peer(
         remote_frame_sequence,
         metrics,
         stun_server: stun_server.map(str::to_owned),
+        turn_enabled: turn_credentials.is_some(),
     });
     let mut configuration = RTCConfigurationBuilder::new();
+    let mut ice_servers = Vec::new();
     if let Some(stun_server) = stun_server {
         let validated_stun = validate_stun_uri(stun_server)?;
-        configuration = configuration.with_ice_servers(vec![RTCIceServer {
+        ice_servers.push(RTCIceServer {
             urls: vec![validated_stun],
             ..Default::default()
-        }]);
+        });
+    }
+    if let Some(credentials) = turn_credentials {
+        if !credentials.url.starts_with("turn:")
+            || !credentials.url.contains("?transport=udp")
+            || credentials.url.chars().any(char::is_whitespace)
+            || credentials.url.contains('@')
+            || credentials.username.is_empty()
+            || credentials.credential.is_empty()
+        {
+            return Err("A configuração TURN recebida do anfitrião é inválida.".to_owned());
+        }
+        let turn_server = RTCIceServer {
+            urls: vec![credentials.url.clone()],
+            username: credentials.username.clone(),
+            credential: credentials.credential.clone(),
+            ..Default::default()
+        };
+        turn_server
+            .urls()
+            .map_err(|error| format!("A URL do servidor TURN é inválida: {error}"))?;
+        ice_servers.push(turn_server);
+    }
+    if !ice_servers.is_empty() {
+        configuration = configuration.with_ice_servers(ice_servers);
     }
     let connection = PeerConnectionBuilder::new()
         .with_configuration(configuration.build())
@@ -1279,6 +1472,7 @@ async fn create_sender(
     metrics: Arc<SharedMetrics>,
     udp_address: &str,
     stun_server: Option<&str>,
+    turn_credentials: Option<&TurnCredentials>,
 ) -> Result<PeerSession, String> {
     let connection = create_peer(
         events,
@@ -1288,6 +1482,7 @@ async fn create_sender(
         Arc::clone(&metrics),
         udp_address,
         stun_server,
+        turn_credentials,
     )
     .await?;
     let codec = RTCRtpCodec {
@@ -1420,6 +1615,7 @@ async fn create_receiver(
     metrics: Arc<SharedMetrics>,
     udp_address: &str,
     stun_server: Option<&str>,
+    turn_credentials: Option<&TurnCredentials>,
 ) -> Result<PeerSession, String> {
     let connection = create_peer(
         events,
@@ -1429,6 +1625,7 @@ async fn create_receiver(
         Arc::clone(&metrics),
         udp_address,
         stun_server,
+        turn_credentials,
     )
     .await?;
     let offer =

@@ -12,6 +12,7 @@ bytes = "1"
 eframe = "0.36.2"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rand = "0.9"
 sha2 = "0.10"
 openh264 = { version = "0.9.8", features = ["source"] }
 rtrb = "0.4"
@@ -24,7 +25,9 @@ signaling-server = { path = "../signaling-server" }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "sync", "time"] }
 tokio-tungstenite = "0.30"
 time = { version = "0.3.55", features = ["formatting"] }
+turn-server = { version = "=4.1.5", default-features = false, features = ["udp"] }
 tracing = "0.1"
+tracing-log = "0.2"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "time"] }
 webrtc = "0.21"
 windows-capture = "2.0.1"

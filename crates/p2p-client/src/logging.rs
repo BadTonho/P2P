@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use time::{Date, Duration, OffsetDateTime};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::time::UtcTime;
-use tracing_subscriber::prelude::*;
 
 const LOG_FOLDER_NAME: &str = "P2P-Voz-e-tela";
 const LOG_FILE_PREFIX: &str = "p2p-";
@@ -66,6 +65,18 @@ struct RollingSink {
     file: Option<File>,
 }
 
+fn install_subscriber<S>(subscriber: S) -> Result<(), String>
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|error| format!("não foi possível ativar o subscriber: {error}"))?;
+    tracing_log::LogTracer::builder()
+        .ignore_crate("turn_server")
+        .init()
+        .map_err(|error| format!("não foi possível ativar o adaptador de logs: {error}"))
+}
+
 struct LogLine {
     writer: SharedLogWriter,
     bytes: Vec<u8>,
@@ -96,7 +107,7 @@ impl LoggingState {
                 .with_timer(UtcTime::rfc_3339())
                 .with_max_level(tracing::Level::DEBUG)
                 .finish();
-            if let Err(error) = subscriber.try_init() {
+            if let Err(error) = install_subscriber(subscriber) {
                 state.startup_message = Some(format!(
                     "{} Logger indisponível: {error}",
                     state.startup_message.unwrap_or_default()
@@ -129,7 +140,7 @@ impl LoggingState {
             startup_message,
             export_message: None,
         };
-        if let Err(error) = subscriber.try_init() {
+        if let Err(error) = install_subscriber(subscriber) {
             state.startup_message = Some(format!("Não foi possível ativar o logger: {error}"));
         }
 

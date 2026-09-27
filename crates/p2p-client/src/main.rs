@@ -6,9 +6,10 @@ mod logging;
 mod screen_capture;
 mod screen_sharing;
 mod signaling_client;
+mod turn_relay;
 mod update;
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use audio_capture::MicrophoneTest;
@@ -19,7 +20,10 @@ use screen_capture::{PendingScreenCapture, ScreenCapture};
 use screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
 use signaling_client::{SignalingClient, SignalingEvent};
 use signaling_protocol::{ParticipantInfo, RoomMode, SignalKind};
+use turn_relay::{TurnCredentials, TurnRelayServer, TurnRoomConfig};
 use update::{UpdateEvent, UpdateManager, UpdateManifest};
+
+const TURN_CONFIG_SIGNAL_PREFIX: &str = "p2p-turn-room-config-v1:";
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsCategory {
@@ -60,11 +64,16 @@ struct ClientUi {
     server_url: String,
     stun_server_url: String,
     create_room_mode: RoomMode,
+    use_turn_on_create: bool,
     room_mode: RoomMode,
     connecting: bool,
     connection_status: Option<String>,
     connection_error: Option<String>,
     signaling: Option<SignalingClient>,
+    turn_server: Option<TurnRelayServer>,
+    turn_room_config: Option<TurnRoomConfig>,
+    turn_config_received: bool,
+    turn_config_wait_started_at: Option<Instant>,
     pending_signaling: Option<SignalingClient>,
     pending_room_adopted: bool,
     hosting_locally: bool,
@@ -252,6 +261,7 @@ impl ClientUi {
         self.refresh_microphone();
         self.refresh_screen(ui.ctx());
         self.refresh_signaling(ui.ctx());
+        self.refresh_turn_state();
         self.refresh_screen_share(ui.ctx());
         self.refresh_control_mesh(ui.ctx());
         self.refresh_updates(ui.ctx());
@@ -378,12 +388,21 @@ impl ClientUi {
                 ui.heading("Teste controlado pela internet");
                 ui.label("A sala aceitará somente você e mais uma pessoa. O anfitrião precisa permanecer online; não há sucessão pela internet.");
                 ui.small("O anfitrião encaminha TCP 9000 no roteador para este PC e permite a porta no firewall do Windows. CGNAT pode impedir conexões de entrada.");
-                ui.small("A mídia tenta uma conexão UDP P2P na porta 9002 com STUN. Não há TURN nem retransmissão de vídeo.");
+                ui.checkbox(
+                    &mut self.use_turn_on_create,
+                    "Usar TURN como alternativa se a conexão direta falhar",
+                );
+                if self.use_turn_on_create {
+                    ui.small("O TURN usa UDP 3478 e UDP 50000–50100. Encaminhe essa porta e essa faixa no roteador para este PC e permita-as no firewall.");
+                    ui.small("A tela continuará P2P quando possível; se o caminho direto falhar, o PC anfitrião retransmitirá a mídia e usará mais banda.");
+                } else {
+                    ui.small("Sem TURN, a tela só conecta quando o ICE encontra um caminho direto UDP usando STUN.");
+                }
                 ui.colored_label(
                     egui::Color32::from_rgb(190, 95, 35),
-                    "A sinalização usa ws:// sem criptografia ou autenticação. Use apenas testes controlados com pessoas conhecidas; não use para distribuição regular.",
+                    "A sinalização usa ws:// sem criptografia ou autenticação. Credenciais temporárias do TURN também passam por esse canal. Use apenas testes controlados com pessoas conhecidas; não use para distribuição regular.",
                 );
-                ui.small("Configure o IPv4 público ou nome DDNS e a URI STUN em Configurações > Conexão antes de criar a sala.");
+                ui.small("Configure o IPv4 público ou nome DDNS e a URI STUN em Configurações > Conexão antes de criar a sala. O endereço público também será usado pelo TURN.");
             });
         }
         ui.add_space(12.0);
@@ -560,6 +579,11 @@ impl ClientUi {
                     }
                 }
                 ui.small("O roteador precisa encaminhar TCP 9000 para este PC; libere também o aplicativo no firewall.");
+                if self.turn_server.is_some() {
+                    ui.small("TURN ativo neste PC: encaminhe UDP 3478 e UDP 50000–50100 para este PC e permita essas portas no firewall.");
+                } else {
+                    ui.small("Nesta sala, o TURN está desativado; a tela depende de uma conexão direta.");
+                }
             } else if self.hosting_locally {
                 ui.separator();
                 ui.heading("Endereço para seu amigo");
@@ -575,12 +599,26 @@ impl ClientUi {
 
         ui.group(|ui| {
             ui.heading("Prévia local da tela");
-            ui.label("A prévia fica na memória. A tela só é enviada diretamente ao amigo depois que você iniciar o compartilhamento.");
+            ui.label("A prévia fica na memória. Ao iniciar o compartilhamento, a tela tenta P2P direto; se o anfitrião habilitou TURN e o caminho direto falhar, poderá ser retransmitida pelo PC anfitrião.");
             if self.room_mode == RoomMode::InternetTest {
-                ui.small("O vídeo P2P usa UDP 9002. Os dois PCs precisam permitir o aplicativo ou essa porta no firewall do perfil de rede em uso.");
-                ui.small("Teste controlado: a sinalização usa ws:// sem criptografia nem autenticação. Somente duas pessoas; sem TURN ou retransmissão. O anfitrião precisa permanecer online.");
+                ui.small("O vídeo direto usa UDP 9002. TURN usa UDP 3478 e UDP 50000–50100 no PC anfitrião; o roteador e o firewall precisam permitir essas portas.");
+                ui.small("Teste controlado: a sinalização usa ws:// sem criptografia nem autenticação. Credenciais TURN temporárias passam por esse canal. Somente duas pessoas; o anfitrião precisa permanecer online.");
                 ui.small(format!("STUN configurado: {}", self.stun_server_url));
-                ui.small("O operador do STUN pode ver o IP público de quem consulta; ele não recebe os quadros da tela.");
+                if self.hosting_locally {
+                    ui.small(if self.turn_server.is_some() {
+                        "Este PC está hospedando o TURN desta sala; ele só retransmite a mídia se ICE não conseguir uma rota direta."
+                    } else {
+                        "O anfitrião desativou TURN para esta sala; a conexão depende de P2P direto."
+                    });
+                } else if self.turn_config_received {
+                    ui.small(if self.turn_room_config.as_ref().is_some_and(|config| config.turn.is_some()) {
+                        "O anfitrião habilitou TURN como alternativa; a rota escolhida será indicada quando a conexão WebRTC iniciar."
+                    } else {
+                        "O anfitrião desativou TURN; esta sala depende de P2P direto."
+                    });
+                } else {
+                    ui.small("Aguardando a configuração de rede enviada pelo anfitrião…");
+                }
             } else {
                 ui.small("O vídeo P2P usa UDP 9002. Os dois PCs precisam permitir o aplicativo ou essa porta no firewall do Windows, na rede privada.");
                 ui.small("Nesta etapa, os PCs precisam estar na mesma rede local ou na mesma Radmin VPN. Conexões entre redes diferentes pela internet ainda não estão disponíveis.");
@@ -610,6 +648,7 @@ impl ClientUi {
                 ScreenShareRole::Idle => {
                     let allowed = self.participants.len() == 2
                         && self.peer_connected
+                        && self.turn_configuration_ready()
                         && self.screen_capture.is_some()
                         && self.screen_share_session.is_none();
                     if ui
@@ -624,6 +663,8 @@ impl ClientUi {
                         ui.small("Selecione uma tela ou janela para habilitar o compartilhamento.");
                     } else if !self.peer_connected {
                         ui.small("Aguardando o outro participante entrar na sala.");
+                    } else if !self.turn_configuration_ready() {
+                        ui.small("Aguardando a configuração de mídia do anfitrião.");
                     }
                 }
                 ScreenShareRole::Requesting { .. } => {
@@ -634,11 +675,10 @@ impl ClientUi {
                     }
                 }
                 ScreenShareRole::Sending { .. } => {
-                    ui.label(if self.screen_share_metrics.p2p_connected {
-                        "Conexão P2P estabelecida; transmitindo a tela."
-                    } else {
-                        "Pedido aceito; negociando a conexão P2P da tela."
-                    });
+                    ui.label(self.screen_route_status(
+                        "transmitindo a tela.",
+                        "Pedido aceito; negociando a conexão WebRTC da tela.",
+                    ));
                     ui.small(format!(
                         "H.264: {} quadros codificados, {} quadros enviados.",
                         self.screen_share_metrics.encoded_frames,
@@ -650,11 +690,10 @@ impl ClientUi {
                     }
                 }
                 ScreenShareRole::Receiving { .. } => {
-                    ui.label(if self.screen_share_metrics.p2p_connected {
-                        "Conexão P2P estabelecida; aguardando ou recebendo vídeo."
-                    } else {
-                        "Pedido aceito; negociando a conexão P2P da tela."
-                    });
+                    ui.label(self.screen_route_status(
+                        "aguardando ou recebendo vídeo.",
+                        "Pedido aceito; negociando a conexão WebRTC da tela.",
+                    ));
                     ui.small(format!(
                         "Vídeo: {} pacotes recebidos, {} quadros decodificados, {} erros H.264.",
                         self.screen_share_metrics.received_packets,
@@ -684,11 +723,13 @@ impl ClientUi {
                 || self.screen_share_status.is_some()
             {
                 ui.small(format!(
-                    "Última tentativa ICE: {} candidatos locais ({} públicos via STUN), {} recebidos do amigo ({} públicos via STUN).",
+                    "Última tentativa ICE: {} candidatos locais ({} STUN, {} TURN), {} do amigo ({} STUN, {} TURN).",
                     self.screen_share_metrics.local_ice_candidates,
                     self.screen_share_metrics.local_srflx_candidates,
+                    self.screen_share_metrics.local_relay_candidates,
                     self.screen_share_metrics.remote_ice_candidates,
-                    self.screen_share_metrics.remote_srflx_candidates
+                    self.screen_share_metrics.remote_srflx_candidates,
+                    self.screen_share_metrics.remote_relay_candidates
                 ));
             }
         });
@@ -930,7 +971,7 @@ impl ClientUi {
         );
         ui.separator();
         ui.heading("STUN para conexão direta de mídia");
-        ui.label("Uma única URI stun:; não use endereço turn: nesta etapa.");
+        ui.label("Uma única URI stun: para tentar conexão direta. O TURN é configurado automaticamente pelo anfitrião ao criar uma sala Internet.");
         ui.add(
             egui::TextEdit::singleline(&mut self.stun_server_url)
                 .hint_text("stun:stun.l.google.com:19302")
@@ -939,8 +980,9 @@ impl ClientUi {
         if let Err(error) = screen_sharing::validate_stun_uri(&self.stun_server_url) {
             ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
         }
-        ui.small("STUN ajuda os PCs a tentar encontrar um caminho UDP direto; não retransmite vídeo e não funciona em todas as redes.");
+        ui.small("STUN ajuda os PCs a tentar encontrar um caminho UDP direto; não retransmite vídeo. TURN pode ser habilitado pelo anfitrião como alternativa.");
         ui.small("O servidor integrado continua apenas na sinalização TCP 9000. Para receber pela internet, encaminhe essa porta no roteador e permita o app no firewall.");
+        ui.small("Quando TURN estiver habilitado, o anfitrião também encaminha UDP 3478 e UDP 50000–50100. CGNAT impede conexões de entrada também para o TURN.");
         ui.small("Não é necessário manter um notebook separado ligado.");
     }
 
@@ -1299,6 +1341,14 @@ impl ClientUi {
                         Some("O compartilhamento ainda está limitado a duas pessoas.".to_owned());
                     return;
                 }
+                if self.room_mode == RoomMode::InternetTest && !self.turn_config_received {
+                    let _ = self
+                        .send_screen_share_signal(SignalKind::ScreenShareBusy, request.request_id);
+                    self.screen_share_status = Some(
+                        "Aguardando a configuração de mídia enviada pelo anfitrião.".to_owned(),
+                    );
+                    return;
+                }
 
                 let local_order = self
                     .participants
@@ -1329,7 +1379,11 @@ impl ClientUi {
                     }
                 }
 
-                match ScreenShareSession::new(context.clone(), self.stun_server_for_room()) {
+                match ScreenShareSession::new(
+                    context.clone(),
+                    self.stun_server_for_room(),
+                    self.turn_credentials_for_room(),
+                ) {
                     Ok(session) => {
                         self.screen_share_session = Some(session);
                         self.screen_share_metrics = ScreenShareMetrics::default();
@@ -1375,7 +1429,11 @@ impl ClientUi {
                     );
                     return;
                 };
-                match ScreenShareSession::new(context.clone(), self.stun_server_for_room()) {
+                match ScreenShareSession::new(
+                    context.clone(),
+                    self.stun_server_for_room(),
+                    self.turn_credentials_for_room(),
+                ) {
                     Ok(session) => {
                         if let Err(error) = session.start_sending(source) {
                             session.stop();
@@ -1444,6 +1502,66 @@ impl ClientUi {
             .send_signal(kind, payload)
     }
 
+    fn send_turn_room_config(&self) {
+        let Some(config) = &self.turn_room_config else {
+            return;
+        };
+        let payload = match serde_json::to_string(config) {
+            Ok(payload) => format!("{TURN_CONFIG_SIGNAL_PREFIX}{payload}"),
+            Err(error) => {
+                tracing::error!(error = %error, "Não foi possível serializar a configuração de mídia da sala");
+                return;
+            }
+        };
+        let result = self
+            .signaling
+            .as_ref()
+            .ok_or_else(|| "A conexão de sinalização não está disponível.".to_owned())
+            .and_then(|signaling| signaling.send_signal(SignalKind::Diagnostic, payload));
+        match result {
+            Ok(()) => tracing::info!(
+                turn_enabled = config.turn.is_some(),
+                "Configuração ICE da sala enviada ao outro participante; credenciais omitidas"
+            ),
+            Err(error) => tracing::error!(
+                error = %error,
+                "Não foi possível enviar a configuração ICE da sala"
+            ),
+        }
+    }
+
+    fn turn_credentials_for_room(&self) -> Option<TurnCredentials> {
+        if self.room_mode != RoomMode::InternetTest {
+            return None;
+        }
+        let mut credentials = self.turn_room_config.as_ref()?.turn.clone()?;
+        if self.hosting_locally {
+            // The host must not depend on router NAT loopback to reach its own TURN service.
+            // The TURN server still advertises the configured public relay address.
+            credentials.url = "turn:127.0.0.1:3478?transport=udp".to_owned();
+        }
+        Some(credentials)
+    }
+
+    fn turn_configuration_ready(&self) -> bool {
+        self.room_mode != RoomMode::InternetTest || self.turn_config_received
+    }
+
+    fn screen_route_status(&self, connected: &str, negotiating: &str) -> String {
+        if !self.screen_share_metrics.p2p_connected {
+            return negotiating.to_owned();
+        }
+        match self.screen_share_metrics.route {
+            Some(screen_sharing::MediaRoute::Turn) => {
+                format!("Conexão retransmitida via TURN; {connected}")
+            }
+            Some(screen_sharing::MediaRoute::Direct) => {
+                format!("Conexão direta P2P estabelecida; {connected}")
+            }
+            None => format!("Conexão WebRTC estabelecida; {connected}"),
+        }
+    }
+
     fn refresh_screen_share(&mut self, context: &egui::Context) {
         if let Some(session) = self.screen_share_session.as_ref() {
             self.screen_share_metrics = session.metrics();
@@ -1456,6 +1574,9 @@ impl ClientUi {
                     p2p_connected = metrics.p2p_connected,
                     local_ice = metrics.local_ice_candidates,
                     remote_ice = metrics.remote_ice_candidates,
+                    local_relay = metrics.local_relay_candidates,
+                    remote_relay = metrics.remote_relay_candidates,
+                    route = ?metrics.route,
                     encoded = metrics.encoded_frames,
                     sent = metrics.sent_frames,
                     received_packets = metrics.received_packets,
@@ -1586,6 +1707,10 @@ impl ClientUi {
             return;
         }
         tracing::info!(room_mode = ?self.create_room_mode, "Iniciando criação de sala");
+        self.turn_server = None;
+        self.turn_room_config = None;
+        self.turn_config_received = false;
+        self.turn_config_wait_started_at = None;
         if self.create_room_mode == RoomMode::InternetTest {
             if let Err(error) = signaling_ws_url(&self.server_url) {
                 tracing::error!(reason = %error, "Configuração do endereço Internet inválida para criar sala");
@@ -1604,6 +1729,37 @@ impl ClientUi {
                 stun_endpoint = %safe_stun_endpoint(&self.stun_server_url),
                 "Configuração de rede do teste Internet validada"
             );
+            if self.use_turn_on_create {
+                let external_ipv4 = match resolve_public_ipv4(&self.server_url) {
+                    Ok(address) => address,
+                    Err(error) => {
+                        self.connection_error = Some(format!(
+                            "Não foi possível configurar o TURN. Confira o IPv4 público ou DDNS em Configurações > Conexão: {error}"
+                        ));
+                        return;
+                    }
+                };
+                match TurnRelayServer::start(external_ipv4) {
+                    Ok((server, credentials)) => {
+                        tracing::info!(
+                            "TURN local pronto em UDP 3478; credenciais temporárias omitidas"
+                        );
+                        self.turn_server = Some(server);
+                        self.turn_room_config = Some(TurnRoomConfig {
+                            turn: Some(credentials),
+                        });
+                        self.turn_config_received = true;
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "Não foi possível iniciar o TURN local");
+                        self.connection_error = Some(error);
+                        return;
+                    }
+                }
+            } else {
+                self.turn_room_config = Some(TurnRoomConfig { turn: None });
+                self.turn_config_received = true;
+            }
         }
         if self.create_room_mode == RoomMode::Local {
             tracing::info!(
@@ -1631,6 +1787,9 @@ impl ClientUi {
                 self.starting_host = false;
                 self.connection_status = Some("Desconectado.".to_owned());
                 self.connection_error = Some(error);
+                self.turn_server = None;
+                self.turn_room_config = None;
+                self.turn_config_received = false;
             }
         }
     }
@@ -1650,6 +1809,10 @@ impl ClientUi {
             }
         };
         tracing::info!(endpoint = %server_url, "Conectando para entrar em sala; código omitido");
+        self.turn_server = None;
+        self.turn_room_config = None;
+        self.turn_config_received = false;
+        self.turn_config_wait_started_at = Some(Instant::now());
         self.room_mode = RoomMode::Local;
         self.connection_error = None;
         self.connection_status = Some("Conectando ao anfitrião…".to_owned());
@@ -2188,6 +2351,9 @@ impl ClientUi {
                     self.connecting = false;
                     self.peer_connected = true;
                     self.connection_status = Some("Seu amigo entrou na sala.".to_owned());
+                    if self.hosting_locally && self.room_mode == RoomMode::InternetTest {
+                        self.send_turn_room_config();
+                    }
                 }
                 SignalingEvent::PeerLeft => {
                     tracing::warn!("Outro participante saiu ou desconectou da sala");
@@ -2307,21 +2473,50 @@ impl ClientUi {
                     kind: SignalKind::Diagnostic,
                     payload,
                 } => {
-                    tracing::debug!("Sinal de diagnóstico recebido; payload omitido");
-                    match payload.as_str() {
-                        "diagnostic-ping-v1" => {
-                            self.diagnostic_status = Some(
-                                "Sinal recebido; enviando confirmação ao seu amigo.".to_owned(),
-                            );
-                            acknowledge_diagnostic = true;
+                    if let Some(serialized) = payload.strip_prefix(TURN_CONFIG_SIGNAL_PREFIX) {
+                        match serde_json::from_str::<TurnRoomConfig>(serialized) {
+                            Ok(config) => {
+                                let turn_enabled = config.turn.is_some();
+                                self.turn_room_config = Some(config);
+                                self.turn_config_received = true;
+                                self.turn_config_wait_started_at = None;
+                                tracing::info!(
+                                    turn_enabled,
+                                    "Configuração ICE recebida do anfitrião; credenciais omitidas"
+                                );
+                                self.connection_status = Some(if turn_enabled {
+                                    "Configuração recebida; TURN está disponível como alternativa."
+                                        .to_owned()
+                                } else {
+                                    "Configuração recebida; esta sala usa somente conexão direta."
+                                        .to_owned()
+                                });
+                            }
+                            Err(error) => {
+                                tracing::error!(error = %error, "Configuração ICE da sala inválida");
+                                self.connection_error = Some(
+                                    "O anfitrião enviou uma configuração de mídia inválida."
+                                        .to_owned(),
+                                );
+                            }
                         }
-                        "diagnostic-pong-v1" => {
-                            self.diagnostic_status = Some(
-                                "Seu amigo confirmou o recebimento do sinal de diagnóstico."
-                                    .to_owned(),
-                            );
+                    } else {
+                        tracing::debug!("Sinal de diagnóstico recebido; payload omitido");
+                        match payload.as_str() {
+                            "diagnostic-ping-v1" => {
+                                self.diagnostic_status = Some(
+                                    "Sinal recebido; enviando confirmação ao seu amigo.".to_owned(),
+                                );
+                                acknowledge_diagnostic = true;
+                            }
+                            "diagnostic-pong-v1" => {
+                                self.diagnostic_status = Some(
+                                    "Seu amigo confirmou o recebimento do sinal de diagnóstico."
+                                        .to_owned(),
+                                );
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 SignalingEvent::Signal { kind, payload } => {
@@ -2390,12 +2585,59 @@ impl ClientUi {
         if disconnect {
             self.stop_screen_share(false);
             self.signaling = None;
+            self.turn_server = None;
+            self.turn_room_config = None;
+            self.turn_config_received = false;
+            self.turn_config_wait_started_at = None;
             self.pending_signaling = None;
             self.screen_picker = None;
             if let Some(mut capture) = self.screen_capture.take() {
                 let _ = capture.stop();
             }
             self.screen_texture = None;
+        }
+    }
+
+    fn refresh_turn_state(&mut self) {
+        let failure = self
+            .turn_server
+            .as_mut()
+            .and_then(TurnRelayServer::try_failure);
+        if let Some(error) = failure {
+            tracing::error!(error = %error, "Servidor TURN integrado encerrou com erro");
+            self.turn_server = None;
+            self.turn_room_config = Some(TurnRoomConfig { turn: None });
+            self.turn_config_received = true;
+            self.send_turn_room_config();
+            self.connection_error = Some(format!(
+                "O servidor TURN parou: {error}. O compartilhamento poderá usar somente conexão direta."
+            ));
+            if self.screen_share_session.is_some() {
+                self.stop_screen_share(false);
+                self.screen_share_status = Some(
+                    "O servidor TURN parou. Inicie novamente para tentar uma conexão direta."
+                        .to_owned(),
+                );
+            }
+        }
+
+        if self.room_mode == RoomMode::InternetTest
+            && !self.hosting_locally
+            && !self.turn_config_received
+            && self
+                .turn_config_wait_started_at
+                .is_some_and(|started| started.elapsed() >= Duration::from_secs(5))
+        {
+            tracing::warn!(
+                "O anfitrião não enviou configuração TURN em 5 segundos; mantendo tentativa direta"
+            );
+            self.turn_room_config = Some(TurnRoomConfig { turn: None });
+            self.turn_config_received = true;
+            self.turn_config_wait_started_at = None;
+            self.connection_status = Some(
+                "O anfitrião não enviou configuração TURN; a tela tentará somente conexão direta."
+                    .to_owned(),
+            );
         }
     }
 
@@ -2636,6 +2878,10 @@ impl ClientUi {
         tracing::info!("Saindo da sala e liberando recursos locais");
         self.stop_microphone();
         self.stop_screen_share(true);
+        self.turn_server = None;
+        self.turn_room_config = None;
+        self.turn_config_received = false;
+        self.turn_config_wait_started_at = None;
         self.screen_picker = None;
         if let Some(mut capture) = self.screen_capture.take() {
             let _ = capture.stop();
@@ -2752,12 +2998,15 @@ impl ClientUi {
                 .collect(),
             screen_share_state: share_state.to_owned(),
             screen_metrics: format!(
-                "P2P={}, ICE local/remoto={}/{}, ICE srflx local/remoto={}/{}, quadros codificados/enviados/decodificados={}/{}/{}, pacotes recebidos={}, erros de decodificação={}, diagnóstico H.264={} ",
+                "P2P={}, rota={:?}, ICE local/remoto={}/{}, srflx local/remoto={}/{}, relay local/remoto={}/{}, quadros codificados/enviados/decodificados={}/{}/{}, pacotes recebidos={}, erros de decodificação={}, diagnóstico H.264={} ",
                 metrics.p2p_connected,
+                metrics.route,
                 metrics.local_ice_candidates,
                 metrics.remote_ice_candidates,
                 metrics.local_srflx_candidates,
                 metrics.remote_srflx_candidates,
+                metrics.local_relay_candidates,
+                metrics.remote_relay_candidates,
                 metrics.encoded_frames,
                 metrics.sent_frames,
                 metrics.decoded_frames,
@@ -2862,6 +3111,47 @@ fn signaling_ws_url(input: &str) -> Result<String, String> {
     Ok(format!("ws://{host}:9000"))
 }
 
+fn resolve_public_ipv4(input: &str) -> Result<Ipv4Addr, String> {
+    let endpoint = signaling_ws_url(input)?;
+    let authority = endpoint
+        .strip_prefix("ws://")
+        .and_then(|value| value.strip_suffix(":9000"))
+        .ok_or_else(|| {
+            "Informe o IPv4 público ou nome DDNS usado para acessar o anfitrião.".to_owned()
+        })?;
+
+    let addresses = (authority, 3478)
+        .to_socket_addrs()
+        .map_err(|error| format!("Não foi possível resolver o endereço do anfitrião: {error}"))?;
+    let address = addresses
+        .filter_map(|address| match address.ip() {
+            IpAddr::V4(ipv4) if is_public_ipv4_candidate(ipv4) => Some(ipv4),
+            _ => None,
+        })
+        .next()
+        .ok_or_else(|| {
+            "O endereço não resolveu para um IPv4 público. TURN precisa de um endereço público alcançável; CGNAT não permite essa conexão de entrada.".to_owned()
+        })?;
+    Ok(address)
+}
+
+fn is_public_ipv4_candidate(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    let is_shared_address_space = octets[0] == 100 && (64..=127).contains(&octets[1]);
+    let is_documentation_range = matches!(
+        octets,
+        [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
+    );
+    !address.is_private()
+        && !address.is_loopback()
+        && !address.is_link_local()
+        && !address.is_unspecified()
+        && !address.is_multicast()
+        && !address.is_broadcast()
+        && !is_shared_address_space
+        && !is_documentation_range
+}
+
 fn signaling_address_for_control(control_address: &str) -> String {
     control_address
         .strip_suffix(":9001")
@@ -2895,6 +3185,7 @@ fn main() -> eframe::Result {
     app.monitor_gain_db = 6.0;
     app.microphone_level_dbfs = -60.0;
     app.stun_server_url = "stun:stun.l.google.com:19302".to_owned();
+    app.use_turn_on_create = true;
 
     tracing::info!("Interface gráfica sendo inicializada");
 
@@ -2921,7 +3212,8 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::signaling_ws_url;
+    use super::{is_public_ipv4_candidate, signaling_ws_url};
+    use std::net::Ipv4Addr;
 
     #[test]
     fn signaling_address_accepts_ipv4_or_ddns_with_fixed_port() {
@@ -2941,5 +3233,13 @@ mod tests {
         assert!(signaling_ws_url("2001:db8::1").is_err());
         assert!(signaling_ws_url("192.0.2.10:9001").is_err());
         assert!(signaling_ws_url("192.0.2.10/room").is_err());
+    }
+
+    #[test]
+    fn turn_host_address_requires_a_public_ipv4_candidate() {
+        assert!(is_public_ipv4_candidate(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_public_ipv4_candidate(Ipv4Addr::new(192, 168, 1, 5)));
+        assert!(!is_public_ipv4_candidate(Ipv4Addr::new(100, 80, 2, 3)));
+        assert!(!is_public_ipv4_candidate(Ipv4Addr::new(203, 0, 113, 5)));
     }
 }

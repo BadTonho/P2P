@@ -95,11 +95,19 @@ Configurar uma única URI stun: (inicialmente stun:stun.l.google.com:19302) para
 
 **Concluída quando:** dois PCs em redes residenciais diferentes entrarem pelo endereço público e código, e compartilharem a tela diretamente. Ainda falta validar encaminhamento TCP 9000, CGNAT, firewall UDP 9002 e estabelecimento ICE entre duas casas. Também falta confirmar manualmente que a tela não passa pelo servidor.
 
-### Etapa 7 — Decidir o tratamento de redes que bloqueiam P2P
+### Etapa 7 — TURN opcional no PC anfitrião
 
-Se a conexão direta falhar em algumas redes, decidir entre manter o requisito estrito de P2P — e informar que o compartilhamento não pode ser estabelecido — ou adicionar TURN como alternativa. TURN retransmite a tela e exige mais banda no servidor.
+Ao criar uma sala Internet, o anfitrião pode deixar **Usar TURN como alternativa** ativado (padrão) ou desativá-lo. O aplicativo inicia o TURN integrado no próprio processo e o encerra ao sair da sala ou fechar o app; a distribuição continua em um único `.exe`, sem processo auxiliar separado.
 
-**Concluída quando:** a decisão sobre TURN estiver tomada e o aplicativo informar claramente quando a conexão é direta ou retransmitida.
+O anfitrião precisa encaminhar UDP 3478 e UDP 50000–50100 no roteador ao próprio PC e liberar as portas no firewall. O modo exige IPv4 público alcançável ou DDNS que resolva para ele; CGNAT não é contornado. STUN e candidatos diretos continuam habilitados, e ICE seleciona TURN apenas se o caminho direto não funcionar. O servidor de sinalização não recebe nem retransmite quadros.
+
+O aplicativo gera credenciais temporárias para cada sala e as envia ao outro participante pela sinalização existente. Como a sinalização ainda usa `ws://` sem criptografia, as credenciais podem ser interceptadas; usar somente em testes controlados com pessoas conhecidas. `wss://` e autenticação continuam necessários antes da distribuição regular.
+
+**Implementado:** opção TURN ativada por padrão no modo Internet; TURN/UDP integrado em UDP 3478 com faixa 50000–50100; credenciais temporárias por sala; configuração ICE com STUN e TURN; diagnóstico de falha de inicialização, erros ICE/autenticação e contagens de candidatos; identificação da rota WebRTC selecionada como direta ou retransmitida. A mídia continua fora do servidor de sinalização.
+
+**Falta validar manualmente:** em duas casas, conferir a conexão direta quando disponível e a retransmissão TURN quando o caminho direto estiver bloqueado; testar porta ocupada, autenticação inválida, portas sem encaminhamento e encerramento do serviço ao fechar a sala. A compilação e os testes locais não substituem essa validação de roteador/firewall.
+
+**Concluída quando:** esses cenários forem exercitados entre duas redes residenciais e a rota escolhida e a chegada dos quadros decodificados forem confirmadas.
 
 ### Etapa 8 — Preparar o uso e distribuir o executável
 
