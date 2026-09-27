@@ -7,11 +7,25 @@ use tokio::sync::oneshot;
 const LISTEN_ADDRESS: &str = "0.0.0.0:9000";
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind(LISTEN_ADDRESS).await?;
-    println!("Servidor de sinalização escutando em {LISTEN_ADDRESS}.");
-    println!("No Windows, use ipconfig para encontrar o IPv4 deste computador.");
-    println!("Configure os clientes com ws://<IP-IPv4-DO-COMPUTADOR>:9000.");
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init()?;
+    let listener = match TcpListener::bind(LISTEN_ADDRESS).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(listen_address = LISTEN_ADDRESS, error = %error, "Falha ao abrir porta do servidor de sinalização");
+            return Err(Box::new(error) as Box<dyn Error + Send + Sync>);
+        }
+    };
+    tracing::info!(
+        listen_address = LISTEN_ADDRESS,
+        "Servidor de sinalização escutando"
+    );
+    tracing::info!("No Windows, use ipconfig para encontrar o IPv4 deste computador");
+    tracing::info!("Configure os clientes com ws://<IP-IPv4-DO-COMPUTADOR>:9000");
     let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
     serve(listener, shutdown_receiver, None).await?;
     Ok(())

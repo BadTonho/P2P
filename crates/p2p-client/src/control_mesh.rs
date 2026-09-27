@@ -331,9 +331,11 @@ async fn run_mesh(
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: std_mpsc::Sender<ControlEvent>,
 ) {
+    tracing::info!(listen_address = %listen_address, "Iniciando malha direta de controle");
     let listener = match TcpListener::bind(listen_address).await {
         Ok(listener) => listener,
         Err(error) => {
+            tracing::error!(error = %error, "Falha ao abrir o listener TCP da malha de controle");
             let _ = events.send(ControlEvent::Error(format!(
                 "Não foi possível abrir a porta de controle 9001. Libere-a no firewall e feche outro aplicativo que a esteja usando: {error}"
             )));
@@ -359,19 +361,24 @@ async fn run_mesh(
         last_unstable_notice: None,
     }));
     let _ = events.send(ControlEvent::Ready);
+    tracing::info!("Listener da malha de controle pronto");
     let mut ticker = interval(PROBE_PERIOD);
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                if let Ok((stream, _)) = accepted {
-                    let task_state = state.clone();
-                    let task_events = events.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = accept_peer(stream, task_state.clone(), task_events).await {
-                            eprintln!("Falha no canal de controle recebido: {error}");
-                        }
-                    });
+                match accepted {
+                    Ok((stream, address)) => {
+                        tracing::debug!(peer = %address, "Conexão TCP recebida para malha de controle");
+                        let task_state = state.clone();
+                        let task_events = events.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = accept_peer(stream, task_state.clone(), task_events).await {
+                                tracing::warn!(error = %error, "Falha no canal de controle recebido");
+                            }
+                        });
+                    }
+                    Err(error) => tracing::error!(error = %error, "Falha ao aceitar conexão da malha de controle"),
                 }
             }
             command = commands.recv() => {
@@ -388,6 +395,7 @@ async fn run_mesh(
                         state.known_since.retain(|id, _| known_ids.contains(id.as_str()));
                         state.links.retain(|id, _| known_ids.contains(id.as_str()));
                         state.remote_status.retain(|id, _| known_ids.contains(id.as_str()));
+                        tracing::info!(participants = participants.len(), leader_address = %leader_address, "Lista da sala sincronizada na malha de controle");
                         state.roster = participants;
                         if !leader_id.is_empty()
                             && (state.epoch == 0 || state.leader_id == leader_id)
@@ -400,13 +408,16 @@ async fn run_mesh(
                         }
                     }
                     Some(Command::LeaveNormally) => {
+                        tracing::info!("Iniciando sucessão por saída normal do anfitrião");
                         let local_id = state.lock().await.local.id.clone();
                         initiate_election(&state, &events, true, true, Some(local_id)).await;
                     }
                     Some(Command::PublishLeader { address, epoch }) => {
+                        tracing::info!(epoch, address = %address, "Publicando endereço do novo anfitrião");
                         publish_leader(&state, &events, address, epoch).await;
                     }
                     Some(Command::CandidateFailed { epoch }) => {
+                        tracing::warn!(epoch, "Candidato da sucessão não ficou pronto; avançando fila");
                         let failed = state.lock().await.election.as_ref()
                             .filter(|election| election.epoch == epoch)
                             .and_then(|election| election.candidates.get(election.index).cloned());
@@ -416,6 +427,7 @@ async fn run_mesh(
                         fail_current_candidate(&state, &events, epoch).await;
                     }
                     Some(Command::EndRoom) => {
+                        tracing::warn!("Anfitrião encerrou explicitamente a sala");
                         let epoch = {
                             let mut state = state.lock().await;
                             state.epoch = state.epoch.saturating_add(1);
@@ -455,14 +467,38 @@ async fn connect_peer(
     let url = format!("ws://{address}");
     match timeout(Duration::from_secs(3), connect_async(url)).await {
         Ok(Ok((websocket, _))) => {
+            tracing::info!(peer_address = %address, "Conexão direta de controle estabelecida");
             if let Err(error) = attach_socket(websocket, state.clone(), events).await {
-                eprintln!("Falha ao conectar ao participante: {error}");
+                tracing::warn!(peer_address = %address, error = %error, "Falha ao completar handshake de controle");
             }
         }
-        _ => {}
+        Ok(Err(error)) => log_control_connect_failure(&address, error.to_string()),
+        Err(_) => log_control_connect_failure(&address, "timeout de 3 segundos".to_owned()),
     }
     // Se a tentativa falhou, libera o endereço para que o próximo pulso tente novamente.
     state.lock().await.connecting.remove(&id);
+}
+
+fn log_control_connect_failure(address: &str, error: String) {
+    static LAST_FAILURES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    let failures = LAST_FAILURES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let should_log = {
+        let mut failures = failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        let should_log = failures
+            .get(address)
+            .is_none_or(|last| now.duration_since(*last) >= Duration::from_secs(10));
+        if should_log {
+            failures.insert(address.to_owned(), now);
+        }
+        should_log
+    };
+    if should_log {
+        tracing::warn!(peer_address = %address, error = %error, "Falha ao conectar ao participante pela malha de controle; repetição limitada a uma linha por 10 segundos");
+    }
 }
 
 async fn attach_socket<S>(
@@ -505,6 +541,11 @@ where
         },
         _ => return Err("mensagem Hello ausente no canal de controle".to_owned()),
     };
+    tracing::info!(
+        participant_order = claimed_remote.order,
+        may_host = claimed_remote.may_host,
+        "Participante identificado na malha de controle"
+    );
     let remote = {
         let state = state.lock().await;
         state
@@ -885,8 +926,15 @@ async fn tick_mesh(state: &SharedState, events: &std_mpsc::Sender<ControlEvent>)
         }
     } else if !leader_id.is_empty() {
         if links_missing {
+            tracing::warn!(epoch, "Anfitrião sem pulsos; timeout de liveness iniciado");
             initiate_election(state, events, false, true, None).await;
         } else if remote_host_unstable || local_host_unstable {
+            tracing::warn!(
+                epoch,
+                remote_host_unstable,
+                local_host_unstable,
+                "Enlace do anfitrião excedeu limite de estabilidade"
+            );
             initiate_election(state, events, false, false, None).await;
         }
     }
@@ -1040,9 +1088,19 @@ async fn initiate_election(
         )
         .await;
     }
+    tracing::warn!(
+        epoch,
+        orderly,
+        candidate_count = candidates.len(),
+        "Eleição de anfitrião iniciada"
+    );
     if candidates.is_empty() {
         state.lock().await.election = None;
         if end_if_no_candidate {
+            tracing::error!(
+                epoch,
+                "Sala encerrada porque não há candidato elegível para hospedagem"
+            );
             broadcast(state, ControlMessage::EndRoom { epoch }).await;
             let _ = events.send(ControlEvent::RoomEnded);
         }
@@ -1098,6 +1156,11 @@ async fn apply_election(
         }
     };
     if should_apply {
+        tracing::warn!(
+            epoch,
+            candidate_count = candidates.len(),
+            "Eleição recebida e aplicada"
+        );
         broadcast(
             state,
             ControlMessage::ElectionStart {
@@ -1108,6 +1171,7 @@ async fn apply_election(
         )
         .await;
         if candidates.is_empty() {
+            tracing::error!(epoch, "Eleição recebida sem candidatos disponíveis");
             let _ = events.send(ControlEvent::RoomEnded);
         } else if candidates.first() == Some(&state.lock().await.local.id) {
             let state = state.lock().await;
@@ -1158,6 +1222,11 @@ async fn fail_current_candidate(
         }
     };
     if let Some(candidate) = next {
+        tracing::warn!(
+            epoch,
+            remaining_candidates = candidates.len(),
+            "Tentativa de hospedagem passou ao próximo candidato"
+        );
         broadcast(
             state,
             ControlMessage::ElectionStart {
@@ -1182,6 +1251,7 @@ async fn fail_current_candidate(
             });
         }
     } else {
+        tracing::error!(epoch, "Todos os candidatos falharam; encerrando sala");
         broadcast(state, ControlMessage::EndRoom { epoch }).await;
         let _ = events.send(ControlEvent::RoomEnded);
     }
@@ -1193,6 +1263,7 @@ async fn publish_leader(
     address: String,
     epoch: u64,
 ) {
+    tracing::info!(epoch, address = %address, "Novo anfitrião publicou endereço de sinalização");
     let (local_id, order) = {
         let mut state = state.lock().await;
         if epoch < state.epoch {

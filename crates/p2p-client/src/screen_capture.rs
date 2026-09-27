@@ -70,6 +70,7 @@ impl PendingScreenCapture {
                     // where the WinRT item was created, before handing the item to capture setup.
                     match selected.item.Size().map(|size| (size.Width, size.Height)) {
                         Ok(size) => {
+                            tracing::info!(width = size.0, height = size.1, "Seletor do Windows escolheu uma tela ou janela");
                             if result_tx
                                 .send(Ok(Some((selected.item.clone(), size))))
                                 .is_ok()
@@ -79,6 +80,7 @@ impl PendingScreenCapture {
                             }
                         }
                         Err(error) => {
+                            tracing::error!(error = %error, "Não foi possível consultar dimensão do item de captura");
                             let _ = result_tx.send(Err(format!(
                                 "Não foi possível consultar o tamanho da tela ou janela: {error}"
                             )));
@@ -87,9 +89,11 @@ impl PendingScreenCapture {
                     drop(selected);
                 }
                 Ok(None) | Err(PickerError::Canceled) => {
+                    tracing::info!("Seletor de tela cancelado; captura não iniciada");
                     let _ = result_tx.send(Ok(None));
                 }
                 Err(error) => {
+                    tracing::error!(error = %error, "Seletor do Windows falhou");
                     let _ = result_tx.send(Err(format!("O seletor do Windows falhou: {error}")));
                 }
             })
@@ -168,6 +172,11 @@ impl ScreenCapture {
     fn start_selected(selected: PickerSelection, context: egui::Context) -> Result<Self, String> {
         let size = selected.size;
         if size.0 <= 0 || size.1 <= 0 {
+            tracing::error!(
+                width = size.0,
+                height = size.1,
+                "Item selecionado tem tamanho inválido"
+            );
             return Err("A tela ou janela selecionada tem tamanho inválido.".to_owned());
         }
         let latest_frame = Arc::new(Mutex::new(None));
@@ -187,8 +196,15 @@ impl ScreenCapture {
                 source_closed: Arc::clone(&source_closed),
             },
         );
-        let control = ScreenFrameHandler::start_free_threaded(settings)
-            .map_err(|error| format!("O Windows não iniciou a captura da tela: {error}"))?;
+        let control = ScreenFrameHandler::start_free_threaded(settings).map_err(|error| {
+            tracing::error!(error = %error, "Windows Graphics Capture não iniciou");
+            format!("O Windows não iniciou a captura da tela: {error}")
+        })?;
+        tracing::info!(
+            width = size.0,
+            height = size.1,
+            "Captura local da tela iniciada"
+        );
 
         Ok(Self {
             control: Some(control),

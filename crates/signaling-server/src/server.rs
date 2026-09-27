@@ -623,20 +623,27 @@ pub async fn serve(
     registry.transfer_reservation = transfer_reservation;
     let rooms = Arc::new(Mutex::new(registry));
     let next_connection_id = Arc::new(AtomicU64::new(1));
+    tracing::info!(local_address = ?listener.local_addr().ok(), "Servidor de sinalização pronto para aceitar conexões");
 
     loop {
         let accepted = tokio::select! {
             _ = &mut shutdown => break,
             accepted = listener.accept() => accepted,
         };
-        let (stream, address) = accepted?;
+        let (stream, address) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                tracing::error!(error = %error, "Listener de sinalização falhou ao aceitar conexão");
+                return Err(error);
+            }
+        };
         let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(connection_id, peer_address = %address, "Cliente conectado ao servidor de sinalização");
         let rooms = Arc::clone(&rooms);
         tokio::spawn(async move {
             handle_connection(stream, connection_id, rooms).await;
-            println!("Cliente desconectado: {address}");
+            tracing::info!(connection_id, peer_address = %address, "Cliente desconectado do servidor de sinalização");
         });
-        println!("Cliente conectado: {address}");
     }
     Ok(())
 }
@@ -645,7 +652,7 @@ async fn handle_connection(stream: TcpStream, connection_id: ConnectionId, rooms
     let websocket = match accept_async(stream).await {
         Ok(websocket) => websocket,
         Err(error) => {
-            eprintln!("Falha ao abrir WebSocket: {error}");
+            tracing::warn!(connection_id, error = %error, "Falha no handshake WebSocket recebido");
             return;
         }
     };
@@ -666,13 +673,14 @@ async fn serve_websocket(
                 OutboundMessage::Protocol(message) => match serde_json::to_string(&message) {
                     Ok(json) => WebSocketMessage::Text(json.into()),
                     Err(error) => {
-                        eprintln!("Falha ao serializar resposta de sinalizacao: {error}");
+                        tracing::error!(connection_id, error = %error, "Falha ao serializar resposta do servidor");
                         continue;
                     }
                 },
                 OutboundMessage::Control(message) => message,
             };
-            if websocket_sender.send(message).await.is_err() {
+            if let Err(error) = websocket_sender.send(message).await {
+                tracing::warn!(connection_id, error = %error, "Falha ao enviar resposta pelo WebSocket");
                 break;
             }
         }
@@ -680,13 +688,22 @@ async fn serve_websocket(
     });
 
     while let Some(frame) = websocket_receiver.next().await {
-        let Ok(frame) = frame else {
-            break;
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::warn!(connection_id, error = %error, "Falha ao receber mensagem WebSocket");
+                break;
+            }
         };
 
         match frame {
             WebSocketMessage::Text(text) => {
                 if text.len() > MAX_MESSAGE_BYTES {
+                    tracing::warn!(
+                        connection_id,
+                        payload_bytes = text.len(),
+                        "Mensagem recebida excedeu o limite; conteúdo omitido"
+                    );
                     send_error(&outgoing, "A mensagem excede o limite permitido.");
                     break;
                 }
@@ -695,6 +712,7 @@ async fn serve_websocket(
                         handle_client_message(connection_id, message, &outgoing, &rooms).await;
                     }
                     Err(error) => {
+                        tracing::warn!(connection_id, error = %error, "Mensagem JSON inválida recebida; conteúdo omitido");
                         send_error(
                             &outgoing,
                             &format!("Mensagem de sinalizacao invalida: {error}"),
@@ -716,7 +734,10 @@ async fn serve_websocket(
         }
     }
 
-    rooms.lock().await.leave_room(connection_id);
+    let left_room = rooms.lock().await.leave_room(connection_id);
+    if left_room {
+        tracing::info!(connection_id, "Cliente removido da sala ao fechar conexão");
+    }
     drop(outgoing);
     let _ = writer.await;
 }
@@ -727,6 +748,23 @@ async fn handle_client_message(
     outgoing: &Outgoing,
     rooms: &SharedRooms,
 ) {
+    let operation = match &message {
+        ClientMessage::CreateRoom => "create_room",
+        ClientMessage::CreateRoomIdentified { .. } => "create_room_identified",
+        ClientMessage::JoinRoom { .. } => "join_room",
+        ClientMessage::JoinRoomIdentified { .. } => "join_room_identified",
+        ClientMessage::Signal { .. } => "signal",
+        ClientMessage::IdentifyParticipant { .. } => "identify_participant",
+        ClientMessage::LeaveRoom => "leave_room",
+        ClientMessage::RequestHostTransfer => "request_host_transfer",
+        ClientMessage::AdoptTransferredRoom { .. } => "adopt_transferred_room",
+        ClientMessage::ConfirmHostTransfer { .. } => "confirm_host_transfer",
+        ClientMessage::RejectHostTransfer { .. } => "reject_host_transfer",
+        ClientMessage::CancelHostTransfer { .. } => "cancel_host_transfer",
+    };
+    if let ClientMessage::Signal { kind, payload } = &message {
+        tracing::debug!(connection_id, signal_kind = ?kind, payload_bytes = payload.len(), "Encaminhando sinal sem registrar conteúdo");
+    }
     let result = match message {
         ClientMessage::CreateRoom => rooms
             .lock()
@@ -814,7 +852,10 @@ async fn handle_client_message(
     };
 
     if let Err(message) = result {
+        tracing::warn!(connection_id, operation, reason = %message, "Operação do protocolo recusada");
         send_error(outgoing, &message);
+    } else if operation != "signal" {
+        tracing::debug!(connection_id, operation, "Operação do protocolo concluída");
     }
 }
 

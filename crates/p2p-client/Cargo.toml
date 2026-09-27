@@ -13,6 +13,7 @@ eframe = "0.36.2"
 futures-util = "0.3"
 openh264 = { version = "0.9.8", features = ["source"] }
 rtrb = "0.4"
+rfd = { version = "0.16", default-features = false }
 rtc = "0.21"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,6 +21,9 @@ signaling-protocol = { path = "../signaling-protocol" }
 signaling-server = { path = "../signaling-server" }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "sync", "time"] }
 tokio-tungstenite = "0.30"
+time = { version = "0.3.55", features = ["formatting"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "time"] }
 webrtc = "0.21"
 windows-capture = "2.0.1"
 

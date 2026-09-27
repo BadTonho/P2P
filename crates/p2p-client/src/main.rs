@@ -2,16 +2,18 @@
 
 mod audio_capture;
 mod control_mesh;
+mod logging;
 mod screen_capture;
 mod screen_sharing;
 mod signaling_client;
 
 use std::net::Ipv4Addr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use audio_capture::MicrophoneTest;
 use control_mesh::{ControlEvent, ControlMesh, QueueEntry};
 use eframe::egui;
+use logging::{DiagnosticSnapshot, LoggingState, safe_signaling_endpoint, safe_stun_endpoint};
 use screen_capture::{PendingScreenCapture, ScreenCapture};
 use screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
 use signaling_client::{SignalingClient, SignalingEvent};
@@ -84,6 +86,11 @@ struct ClientUi {
     remote_screen_texture: Option<egui::TextureHandle>,
     remote_screen_sequence: u64,
     screen_share_metrics: ScreenShareMetrics,
+    logging: LoggingState,
+    last_screen_metrics_log_at: Option<Instant>,
+    last_control_link_state: Option<(usize, usize)>,
+    last_control_metrics_log_at: Option<Instant>,
+    last_audio_metrics_log_at: Option<Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -136,6 +143,7 @@ impl ClientUi {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut open_settings = false;
             let mut close_settings = false;
+            let mut export_logs = false;
             let settings_open = self.settings_open;
 
             ui.horizontal(|ui| {
@@ -146,6 +154,7 @@ impl ClientUi {
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    export_logs = ui.button("Exportar logs").clicked();
                     if settings_open {
                         close_settings = ui.button("Voltar").clicked();
                     } else {
@@ -158,6 +167,22 @@ impl ClientUi {
                     }
                 });
             });
+
+            if export_logs {
+                self.export_logs();
+            }
+
+            if let Some(error) = self.logging.take_write_error() {
+                self.logging.export_message = Some(format!(
+                    "Falha ao gravar logs: {error}. Confira a pasta de logs abaixo."
+                ));
+            }
+            if let Some(message) = &self.logging.startup_message {
+                ui.colored_label(egui::Color32::from_rgb(190, 95, 35), message);
+            }
+            if let Some(message) = &self.logging.export_message {
+                ui.small(message);
+            }
 
             ui.add_space(20.0);
 
@@ -726,6 +751,8 @@ impl ClientUi {
     }
 
     fn start_microphone(&mut self) {
+        tracing::info!("Iniciando teste local de microfone e retorno de áudio");
+        self.last_audio_metrics_log_at = None;
         self.microphone_error = None;
         self.microphone_monitor_error = None;
         self.microphone_audio_warning = false;
@@ -733,13 +760,26 @@ impl ClientUi {
         self.microphone_level = 0.0;
         self.microphone_level_dbfs = -60.0;
         match MicrophoneTest::start(self.monitor_gain_db) {
-            Ok(test) => self.microphone = Some(test),
-            Err(error) => self.microphone_error = Some(error),
+            Ok(test) => {
+                self.microphone = Some(test);
+                tracing::info!(
+                    gain_db = self.monitor_gain_db,
+                    "Teste do microfone iniciado"
+                );
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "Falha ao iniciar teste do microfone");
+                self.microphone_error = Some(error);
+            }
         }
     }
 
     fn stop_microphone(&mut self) {
+        let was_active = self.microphone.is_some();
         self.microphone = None;
+        if was_active {
+            tracing::info!("Teste local do microfone encerrado");
+        }
         self.microphone_level = 0.0;
         self.microphone_level_dbfs = -60.0;
         self.microphone_clipping_warning = false;
@@ -753,6 +793,17 @@ impl ClientUi {
         let rms = microphone.level();
         let level_dbfs = if rms > 0.0 { 20.0 * rms.log10() } else { -60.0 };
         let level_dbfs = level_dbfs.clamp(-60.0, 0.0);
+        if self
+            .last_audio_metrics_log_at
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+        {
+            tracing::info!(
+                level_dbfs,
+                gain_db = self.monitor_gain_db,
+                "Resumo periódico do teste de microfone"
+            );
+            self.last_audio_metrics_log_at = Some(Instant::now());
+        }
         let level = (level_dbfs + 60.0) / 60.0;
         let microphone_error = microphone.take_microphone_error();
         let monitor_error = microphone.take_monitor_error();
@@ -764,14 +815,25 @@ impl ClientUi {
 
         self.microphone_level = level;
         self.microphone_level_dbfs = level_dbfs;
+        if clipping_warning && !self.microphone_clipping_warning {
+            tracing::warn!(
+                gain_db = self.monitor_gain_db,
+                "Retorno local de microfone atingiu limitação digital"
+            );
+        }
         self.microphone_clipping_warning = clipping_warning;
         if audio_warning {
+            if !self.microphone_audio_warning {
+                tracing::warn!("Fila de áudio local reportou excesso ou falta de amostras");
+            }
             self.microphone_audio_warning = true;
         }
         if let Some(error) = monitor_error {
+            tracing::error!(error = %error, "Falha no retorno local de áudio; medidor continua ativo");
             self.microphone_monitor_error = Some(error);
         }
         if let Some(error) = microphone_error {
+            tracing::error!(error = %error, "Falha na captura do microfone; teste encerrado");
             self.microphone = None;
             self.microphone_level = 0.0;
             self.microphone_error = Some(error);
@@ -779,6 +841,7 @@ impl ClientUi {
     }
 
     fn select_screen(&mut self, _context: &egui::Context) {
+        tracing::info!("Usuário abriu o seletor de tela ou janela do Windows");
         self.screen_status = None;
         match PendingScreenCapture::begin() {
             Ok(picker) => {
@@ -813,6 +876,7 @@ impl ClientUi {
                         Some("Seleção cancelada; a captura permaneceu desligada.".to_owned());
                 }
                 Err(error) => {
+                    tracing::error!(error = %error, "Falha ao iniciar captura de tela após seleção");
                     self.screen_status = Some(format!(
                         "Não foi possível iniciar a captura da tela: {error}"
                     ));
@@ -1086,6 +1150,11 @@ impl ClientUi {
     }
 
     fn send_screen_share_signal(&self, kind: SignalKind, payload: String) -> Result<(), String> {
+        tracing::debug!(
+            signal_kind = ?kind,
+            payload_bytes = payload.len(),
+            "Enviando sinal de compartilhamento; conteúdo omitido"
+        );
         self.signaling
             .as_ref()
             .ok_or_else(|| "A conexão de sinalização não está disponível.".to_owned())?
@@ -1095,6 +1164,26 @@ impl ClientUi {
     fn refresh_screen_share(&mut self, context: &egui::Context) {
         if let Some(session) = self.screen_share_session.as_ref() {
             self.screen_share_metrics = session.metrics();
+            let should_log_metrics = self
+                .last_screen_metrics_log_at
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(5));
+            if should_log_metrics {
+                let metrics = &self.screen_share_metrics;
+                tracing::info!(
+                    p2p_connected = metrics.p2p_connected,
+                    local_ice = metrics.local_ice_candidates,
+                    remote_ice = metrics.remote_ice_candidates,
+                    encoded = metrics.encoded_frames,
+                    sent = metrics.sent_frames,
+                    received_packets = metrics.received_packets,
+                    decoded = metrics.decoded_frames,
+                    decode_errors = metrics.decode_errors,
+                    h264 = %metrics.h264_diagnostics,
+                    last_decode_error = metrics.last_decode_error.as_deref().unwrap_or(""),
+                    "Resumo periódico da mídia de compartilhamento"
+                );
+                self.last_screen_metrics_log_at = Some(Instant::now());
+            }
         }
         let events = self
             .screen_share_session
@@ -1105,18 +1194,25 @@ impl ClientUi {
         for event in events {
             match event {
                 ScreenShareEvent::Signal { kind, payload } => {
+                    tracing::debug!(signal_kind = ?kind, "Sinal de negociação de tela gerado; conteúdo omitido");
                     let result = self.send_screen_share_signal(kind, payload);
                     if let Err(error) = result {
+                        tracing::error!(error = %error, "Falha ao encaminhar sinal de tela pela sinalização");
                         self.screen_share_status = Some(error);
                         stop_session = true;
                     }
                 }
-                ScreenShareEvent::State(status) => self.screen_share_status = Some(status),
+                ScreenShareEvent::State(status) => {
+                    tracing::info!(state = %status, "Estado WebRTC de compartilhamento alterado");
+                    self.screen_share_status = Some(status)
+                }
                 ScreenShareEvent::Error(error) => {
+                    tracing::error!(error = %error, "Erro na sessão WebRTC de compartilhamento");
                     self.screen_share_status = Some(error);
                     stop_session = true;
                 }
                 ScreenShareEvent::ConnectionClosed => {
+                    tracing::warn!("Conexão P2P de compartilhamento encerrada");
                     self.screen_share_status =
                         Some("A conexão P2P de tela foi encerrada ou perdida.".to_owned());
                     stop_session = true;
@@ -1166,6 +1262,12 @@ impl ClientUi {
             ScreenShareRole::Idle => None,
         };
         let was_active = request_id.is_some();
+        if was_active {
+            tracing::info!(
+                announce,
+                "Encerrando sessão de compartilhamento de tela; identificador omitido"
+            );
+        }
         if announce {
             if let Some(request_id) = request_id {
                 let _ = self.send_screen_share_signal(SignalKind::ScreenShareStopped, request_id);
@@ -1200,17 +1302,31 @@ impl ClientUi {
         if self.signaling.is_some() || self.connecting {
             return;
         }
+        tracing::info!(room_mode = ?self.create_room_mode, "Iniciando criação de sala");
         if self.create_room_mode == RoomMode::InternetTest {
             if let Err(error) = signaling_ws_url(&self.server_url) {
+                tracing::error!(reason = %error, "Configuração do endereço Internet inválida para criar sala");
                 self.connection_error = Some(format!(
                     "Configure um IPv4 público ou nome DDNS válido em Configurações > Conexão: {error}"
                 ));
                 return;
             }
             if let Err(error) = screen_sharing::validate_stun_uri(&self.stun_server_url) {
+                tracing::error!(reason = %error, "Configuração STUN inválida para criar sala");
                 self.connection_error = Some(error);
                 return;
             }
+            tracing::info!(
+                signaling_endpoint = %safe_signaling_endpoint(&self.server_url),
+                stun_endpoint = %safe_stun_endpoint(&self.stun_server_url),
+                "Configuração de rede do teste Internet validada"
+            );
+        }
+        if self.create_room_mode == RoomMode::Local {
+            tracing::info!(
+                signaling_endpoint = ?self.selected_signaling_address(),
+                "Endereço local escolhido para anunciar a sala"
+            );
         }
         self.refresh_host_addresses();
         self.room_mode = self.create_room_mode;
@@ -1227,6 +1343,7 @@ impl ClientUi {
         match SignalingClient::start_host_with_participant(participant, self.room_mode) {
             Ok(client) => self.signaling = Some(client),
             Err(error) => {
+                tracing::error!(error = %error, "Falha ao iniciar sala hospedada localmente");
                 self.connecting = false;
                 self.starting_host = false;
                 self.connection_status = Some("Desconectado.".to_owned());
@@ -1242,12 +1359,14 @@ impl ClientUi {
         let server_url = match signaling_ws_url(&self.server_url) {
             Ok(url) => url,
             Err(error) => {
+                tracing::error!(reason = %error, "Endereço do anfitrião inválido ao entrar em sala");
                 self.connection_error = Some(format!(
                     "Informe o IPv4 ou nome DDNS do anfitrião em Configurações > Conexão: {error}"
                 ));
                 return;
             }
         };
+        tracing::info!(endpoint = %server_url, "Conectando para entrar em sala; código omitido");
         self.room_mode = RoomMode::Local;
         self.connection_error = None;
         self.connection_status = Some("Conectando ao anfitrião…".to_owned());
@@ -1262,6 +1381,7 @@ impl ClientUi {
         match SignalingClient::join_with_participant(server_url, code, participant) {
             Ok(client) => self.signaling = Some(client),
             Err(error) => {
+                tracing::error!(error = %error, "Falha ao iniciar a conexão de entrada na sala");
                 self.connecting = false;
                 self.connection_status = Some("Desconectado.".to_owned());
                 self.connection_error = Some(error);
@@ -1365,15 +1485,49 @@ impl ClientUi {
         for event in pending {
             match event {
                 ControlEvent::Ready => {
+                    tracing::info!("Malha de controle TCP pronta");
                     self.control_mesh_failed = false;
                     self.control_status = Some("Canal de controle ativo na porta 9001.".to_owned());
                 }
                 ControlEvent::Error(error) => {
+                    tracing::error!(error = %error, "Erro na malha de controle");
                     self.control_mesh_failed = true;
                     self.control_status = Some(error);
                 }
-                ControlEvent::QueueUpdated(queue) => self.control_queue = queue,
+                ControlEvent::QueueUpdated(queue) => {
+                    self.control_queue = queue;
+                    if self
+                        .last_control_metrics_log_at
+                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(10))
+                    {
+                        let summary = self
+                            .control_queue
+                            .iter()
+                            .map(|entry| {
+                                format!(
+                                    "ordem {}: perda {:.1}%, jitter {:.1} ms, latência {:.1} ms, elegível {}",
+                                    entry.participant.order,
+                                    entry.loss_percent,
+                                    entry.jitter_ms,
+                                    entry.latency_ms,
+                                    entry.eligible
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        tracing::debug!(candidates = %summary, "Resumo periódico de estabilidade da fila");
+                        self.last_control_metrics_log_at = Some(Instant::now());
+                    }
+                }
                 ControlEvent::LinksUpdated { connected, total } => {
+                    if self.last_control_link_state != Some((connected, total)) {
+                        tracing::info!(
+                            connected,
+                            total,
+                            "Quantidade de enlaces de controle conectados mudou"
+                        );
+                        self.last_control_link_state = Some((connected, total));
+                    }
                     self.control_status = Some(if total == 0 {
                         "Canal de controle ativo; aguardando outros participantes.".to_owned()
                     } else if connected < total {
@@ -1387,6 +1541,10 @@ impl ClientUi {
                     });
                 }
                 ControlEvent::HostUnstable { loss_percent } => {
+                    tracing::warn!(
+                        loss_percent,
+                        "Anfitrião marcado instável; iniciando sucessão"
+                    );
                     self.control_status = Some(format!(
                         "Anfitrião instável ({loss_percent:.1}% de perda). Elegendo o próximo participante elegível…"
                     ));
@@ -1396,6 +1554,7 @@ impl ClientUi {
                     epoch,
                     participants,
                 } => {
+                    tracing::warn!(epoch, "Participante local eleito para hospedar a sala");
                     let participant = self.local_participant_info();
                     match SignalingClient::start_elected_host(code, participant, participants) {
                         Ok(client) => {
@@ -1405,6 +1564,7 @@ impl ClientUi {
                             self.control_status = Some("Você foi escolhido para assumir; iniciando o servidor na porta 9000…".to_owned());
                         }
                         Err(error) => {
+                            tracing::error!(error = %error, epoch, "Candidato eleito não conseguiu iniciar servidor");
                             self.control_status =
                                 Some(format!("Não foi possível iniciar o servidor: {error}"));
                             if let Some(mesh) = &self.control_mesh {
@@ -1418,6 +1578,11 @@ impl ClientUi {
                     address,
                     epoch,
                 } => {
+                    tracing::warn!(
+                        epoch,
+                        is_local_leader = participant_id == self.participant_id,
+                        "Liderança da sala mudou"
+                    );
                     self.current_leader_id = participant_id.clone();
                     if participant_id == self.participant_id {
                         self.hosting_locally = true;
@@ -1457,6 +1622,7 @@ impl ClientUi {
                     }
                 }
                 ControlEvent::RoomEnded => {
+                    tracing::warn!("Malha de controle informou que a sala terminou");
                     let should_close = self.close_after_transfer;
                     let ended_explicitly = self.ending_room_explicitly;
                     let has_authorized_successor = self.participants.iter().any(|participant| {
@@ -1483,6 +1649,13 @@ impl ClientUi {
         self.addresses_loaded = true;
         match enumerate_host_addresses() {
             Ok(addresses) => {
+                tracing::info!(
+                    adapter_count = addresses.len(),
+                    "Lista de adaptadores IPv4 atualizada"
+                );
+                for address in &addresses {
+                    tracing::info!(adapter = %address.adapter, ipv4 = %address.ipv4, "Adaptador IPv4 disponível");
+                }
                 self.host_addresses = addresses;
                 self.host_addresses_error = None;
                 if self.selected_host_address >= self.host_addresses.len() {
@@ -1490,6 +1663,7 @@ impl ClientUi {
                 }
             }
             Err(error) => {
+                tracing::error!(error = %error, "Falha ao enumerar adaptadores IPv4");
                 self.host_addresses.clear();
                 self.host_addresses_error = Some(error);
             }
@@ -1498,6 +1672,7 @@ impl ClientUi {
 
     fn show_control_address_picker(&mut self, ui: &mut egui::Ui) {
         if !self.host_addresses.is_empty() {
+            let previous_selection = self.selected_host_address;
             self.selected_host_address = self
                 .selected_host_address
                 .min(self.host_addresses.len().saturating_sub(1));
@@ -1513,6 +1688,10 @@ impl ClientUi {
                         );
                     }
                 });
+            if previous_selection != self.selected_host_address {
+                let selected = &self.host_addresses[self.selected_host_address];
+                tracing::info!(adapter = %selected.adapter, ipv4 = %selected.ipv4, "Adaptador escolhido para a malha de controle");
+            }
             ui.monospace(format!(
                 "ws://{}:9001",
                 self.host_addresses[self.selected_host_address].ipv4
@@ -1529,6 +1708,7 @@ impl ClientUi {
 
     fn show_host_address_picker(&mut self, ui: &mut egui::Ui) {
         if !self.host_addresses.is_empty() {
+            let previous_selection = self.selected_host_address;
             self.selected_host_address = self
                 .selected_host_address
                 .min(self.host_addresses.len().saturating_sub(1));
@@ -1544,6 +1724,10 @@ impl ClientUi {
                         );
                     }
                 });
+            if previous_selection != self.selected_host_address {
+                let selected = &self.host_addresses[self.selected_host_address];
+                tracing::info!(adapter = %selected.adapter, ipv4 = %selected.ipv4, "Adaptador escolhido para anunciar a sala");
+            }
             let url = format!(
                 "ws://{}:9000",
                 self.host_addresses[self.selected_host_address].ipv4
@@ -1579,6 +1763,9 @@ impl ClientUi {
         for event in pending_events {
             match event {
                 SignalingEvent::RoomAdopted(code) => {
+                    tracing::info!(
+                        "Servidor informou que a sala transferida foi adotada; código omitido"
+                    );
                     if let Some(epoch) = self.pending_election_epoch.take() {
                         self.pending_room_adopted = true;
                         self.signaling = self.pending_signaling.take();
@@ -1620,6 +1807,9 @@ impl ClientUi {
                     }
                 }
                 SignalingEvent::RoomJoined(code) if self.pending_election_reconnect => {
+                    tracing::info!(
+                        "Reconexão à sala concluída após eleição de anfitrião; código omitido"
+                    );
                     self.signaling = self.pending_signaling.take();
                     self.pending_election_reconnect = false;
                     self.pending_election_epoch = None;
@@ -1633,6 +1823,7 @@ impl ClientUi {
                     );
                 }
                 SignalingEvent::Error(error) | SignalingEvent::ServerError(error) => {
+                    tracing::error!(error = %error, "Erro recebido durante conexão ou transferência de sala");
                     if let Some(epoch) = self.pending_election_epoch.take() {
                         if !self.pending_election_reconnect {
                             if let Some(mesh) = &self.control_mesh {
@@ -1657,6 +1848,7 @@ impl ClientUi {
                         Some(format!("Não foi possível assumir a hospedagem: {error}"));
                 }
                 SignalingEvent::Disconnected => {
+                    tracing::warn!("Conexão pendente de sala foi desconectada");
                     if let Some(epoch) = self.pending_election_epoch.take() {
                         if !self.pending_election_reconnect {
                             if let Some(mesh) = &self.control_mesh {
@@ -1689,6 +1881,7 @@ impl ClientUi {
         for event in events {
             match event {
                 SignalingEvent::RoomCreated(code) => {
+                    tracing::info!(room_mode = ?self.room_mode, "Sala criada no servidor integrado; código omitido");
                     self.connecting = false;
                     self.starting_host = false;
                     self.hosting_locally = true;
@@ -1697,20 +1890,24 @@ impl ClientUi {
                     self.enter_room(code);
                 }
                 SignalingEvent::RoomJoined(code) => {
+                    tracing::info!("Entrada na sala concluída; código omitido");
                     self.connecting = false;
                     self.peer_connected = true;
                     self.connection_status = Some("Você entrou na sala do anfitrião.".to_owned());
                     self.enter_room(code);
                 }
                 SignalingEvent::RoomAdopted(_) => {
+                    tracing::info!("Sala adotada pelo participante local após transferência");
                     self.room_mode = RoomMode::Local;
                 }
                 SignalingEvent::PeerJoined => {
+                    tracing::info!("Outro participante entrou na sala");
                     self.connecting = false;
                     self.peer_connected = true;
                     self.connection_status = Some("Seu amigo entrou na sala.".to_owned());
                 }
                 SignalingEvent::PeerLeft => {
+                    tracing::warn!("Outro participante saiu ou desconectou da sala");
                     self.stop_screen_share(false);
                     self.peer_connected = false;
                     self.connection_status =
@@ -1728,17 +1925,23 @@ impl ClientUi {
                     leader_id,
                     room_mode,
                 } => {
+                    tracing::info!(participants = participants.len(), room_mode = ?room_mode, "Lista de participantes atualizada");
                     self.update_room_roster(participants, leader_id, room_mode);
                 }
                 SignalingEvent::HostTransferPending { code, token } => {
+                    tracing::info!(
+                        "Transferência de hospedagem solicitada; códigos e tokens omitidos"
+                    );
                     self.outgoing_transfer = Some((code, token));
                     self.handoff_error = None;
                 }
                 SignalingEvent::HostTransferRequested { code, token } => {
+                    tracing::info!("Pedido de transferência recebido; códigos e tokens omitidos");
                     self.incoming_transfer = Some((code, token));
                     self.handoff_error = None;
                 }
                 SignalingEvent::HostTransferComplete(code) => {
+                    tracing::info!("Transferência de hospedagem concluída; código omitido");
                     if self.hosting_locally {
                         let should_close = self.close_after_transfer;
                         self.leave_room();
@@ -1762,6 +1965,7 @@ impl ClientUi {
                     }
                 }
                 SignalingEvent::HostTransferCanceled(message) => {
+                    tracing::warn!(reason = %message, "Transferência de hospedagem cancelada");
                     if self.outgoing_transfer.is_some()
                         || self.incoming_transfer.is_some()
                         || self.pending_signaling.is_some()
@@ -1774,6 +1978,7 @@ impl ClientUi {
                     }
                 }
                 SignalingEvent::ServerError(error) => {
+                    tracing::error!(error = %error, "Servidor recusou a operação solicitada");
                     if self.connecting {
                         self.connecting = false;
                         self.starting_host = false;
@@ -1818,20 +2023,26 @@ impl ClientUi {
                 SignalingEvent::Signal {
                     kind: SignalKind::Diagnostic,
                     payload,
-                } => match payload.as_str() {
-                    "diagnostic-ping-v1" => {
-                        self.diagnostic_status =
-                            Some("Sinal recebido; enviando confirmação ao seu amigo.".to_owned());
-                        acknowledge_diagnostic = true;
+                } => {
+                    tracing::debug!("Sinal de diagnóstico recebido; payload omitido");
+                    match payload.as_str() {
+                        "diagnostic-ping-v1" => {
+                            self.diagnostic_status = Some(
+                                "Sinal recebido; enviando confirmação ao seu amigo.".to_owned(),
+                            );
+                            acknowledge_diagnostic = true;
+                        }
+                        "diagnostic-pong-v1" => {
+                            self.diagnostic_status = Some(
+                                "Seu amigo confirmou o recebimento do sinal de diagnóstico."
+                                    .to_owned(),
+                            );
+                        }
+                        _ => {}
                     }
-                    "diagnostic-pong-v1" => {
-                        self.diagnostic_status = Some(
-                            "Seu amigo confirmou o recebimento do sinal de diagnóstico.".to_owned(),
-                        );
-                    }
-                    _ => {}
-                },
+                }
                 SignalingEvent::Signal { kind, payload } => {
+                    tracing::debug!(signal_kind = ?kind, payload_bytes = payload.len(), "Sinal de negociação recebido; payload omitido");
                     if matches!(
                         kind,
                         SignalKind::Offer
@@ -1848,6 +2059,7 @@ impl ClientUi {
                     }
                 }
                 SignalingEvent::Error(error) => {
+                    tracing::error!(error = %error, "Conexão de sinalização falhou durante a sala");
                     if self.control_mesh.is_some() && self.room_code.is_some() {
                         self.connecting = false;
                         self.starting_host = false;
@@ -1866,6 +2078,7 @@ impl ClientUi {
                     disconnect = true;
                 }
                 SignalingEvent::Disconnected => {
+                    tracing::warn!("Conexão de sinalização encerrada durante a sala");
                     if self.control_mesh.is_some() && self.room_code.is_some() {
                         self.connecting = false;
                         self.signaling = None;
@@ -2137,6 +2350,7 @@ impl ClientUi {
     }
 
     fn leave_room(&mut self) {
+        tracing::info!("Saindo da sala e liberando recursos locais");
         self.stop_microphone();
         self.stop_screen_share(true);
         self.screen_picker = None;
@@ -2172,6 +2386,103 @@ impl ClientUi {
         self.connection_error = None;
         self.diagnostic_status = None;
         self.handoff_error = None;
+    }
+
+    fn export_logs(&mut self) {
+        tracing::info!("Usuário solicitou exportação dos logs");
+        let now = time::OffsetDateTime::now_utc();
+        let timestamp = format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+            now.year(),
+            u8::from(now.month()),
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        );
+        let selected = rfd::FileDialog::new()
+            .set_file_name(format!("p2p-diagnostico-{timestamp}.log"))
+            .add_filter("Arquivo de log", &["log"])
+            .save_file();
+        let Some(selected) = selected else {
+            self.logging.export_message = None;
+            tracing::debug!("Exportação de logs cancelada pelo usuário");
+            return;
+        };
+
+        let mut destination = selected;
+        if !destination
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("log"))
+        {
+            destination.set_extension("log");
+        }
+        if self.host_addresses.is_empty() {
+            self.refresh_host_addresses();
+        }
+        let snapshot = self.diagnostic_snapshot();
+        match self.logging.export_to(&destination, &snapshot) {
+            Ok(()) => {
+                self.logging.export_message =
+                    Some(format!("Logs exportados em {}", destination.display()));
+                tracing::info!("Exportação de logs concluída; caminho não registrado");
+            }
+            Err(error) => {
+                self.logging.export_message =
+                    Some(format!("Não foi possível exportar os logs: {error}"));
+                tracing::error!(error = %error, "Falha ao exportar logs");
+            }
+        }
+    }
+
+    fn diagnostic_snapshot(&self) -> DiagnosticSnapshot {
+        let share_state = match &self.screen_share_role {
+            ScreenShareRole::Idle => "inativo",
+            ScreenShareRole::Requesting { .. } => "solicitando",
+            ScreenShareRole::Sending { .. } => "enviando",
+            ScreenShareRole::Receiving { .. } => "recebendo",
+        };
+        let metrics = &self.screen_share_metrics;
+        DiagnosticSnapshot {
+            log_directory: self.logging.log_directory_label().to_owned(),
+            logging_status: self
+                .logging
+                .startup_message
+                .clone()
+                .unwrap_or_else(|| "ativo".to_owned()),
+            room_mode: match self.room_mode {
+                RoomMode::Local => "local/Radmin",
+                RoomMode::InternetTest => "internet (teste)",
+            }
+            .to_owned(),
+            connected_to_signaling: self.signaling.is_some() && !self.connecting,
+            participant_count: self.participants.len(),
+            signaling_address: safe_signaling_endpoint(&self.server_url),
+            stun_server: safe_stun_endpoint(&self.stun_server_url),
+            microphone_active: self.microphone.is_some(),
+            microphone_level_dbfs: self.microphone_level_dbfs,
+            microphone_gain_db: self.monitor_gain_db,
+            adapters: self
+                .host_addresses
+                .iter()
+                .map(|address| (address.adapter.clone(), address.ipv4.to_string()))
+                .collect(),
+            screen_share_state: share_state.to_owned(),
+            screen_metrics: format!(
+                "P2P={}, ICE local/remoto={}/{}, ICE srflx local/remoto={}/{}, quadros codificados/enviados/decodificados={}/{}/{}, pacotes recebidos={}, erros de decodificação={}, diagnóstico H.264={} ",
+                metrics.p2p_connected,
+                metrics.local_ice_candidates,
+                metrics.remote_ice_candidates,
+                metrics.local_srflx_candidates,
+                metrics.remote_srflx_candidates,
+                metrics.encoded_frames,
+                metrics.sent_frames,
+                metrics.decoded_frames,
+                metrics.received_packets,
+                metrics.decode_errors,
+                metrics.h264_diagnostics
+            ),
+        }
     }
 }
 
@@ -2277,6 +2588,7 @@ fn signaling_address_for_control(control_address: &str) -> String {
 
 impl Drop for ClientUi {
     fn drop(&mut self) {
+        tracing::info!("Encerrando aplicativo e liberando capturas e conexões");
         self.stop_microphone();
         self.stop_screen_share(true);
         self.screen_picker = None;
@@ -2289,9 +2601,13 @@ impl Drop for ClientUi {
 
 fn main() -> eframe::Result {
     let mut app = ClientUi::default();
+    app.logging = LoggingState::initialize();
+    logging::install_panic_hook();
     app.monitor_gain_db = 6.0;
     app.microphone_level_dbfs = -60.0;
     app.stun_server_url = "stun:stun.l.google.com:19302".to_owned();
+
+    tracing::info!("Interface gráfica sendo inicializada");
 
     eframe::run_ui_native(
         "P2P - Voz e tela",

@@ -40,6 +40,7 @@ use webrtc::peer_connection::{
 };
 use webrtc::runtime::TokioRuntime;
 
+use crate::logging::safe_stun_endpoint;
 use crate::screen_capture::{LatestFrame, PreviewFrame};
 
 const VIDEO_PAYLOAD_TYPE: PayloadType = 102;
@@ -55,6 +56,10 @@ const FIRST_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 
 type RemoteFrameStore = Arc<Mutex<Option<Arc<PreviewFrame>>>>;
+
+fn should_log_aggregate_error(count: u64) -> bool {
+    count.is_power_of_two()
+}
 
 pub fn validate_stun_uri(input: &str) -> Result<String, String> {
     let uri = input.trim();
@@ -282,7 +287,14 @@ impl SharedMetrics {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         flow.assembly_errors += 1;
+        let count = flow.assembly_errors;
         flow.last_assembly_error = Some(error);
+        if should_log_aggregate_error(count) {
+            tracing::warn!(
+                assembly_errors = count,
+                "Erro de montagem H.264; resumos repetidos registrados em contagens dobradas"
+            );
+        }
     }
 }
 
@@ -502,7 +514,7 @@ fn decode_h264_access_unit(
         }
         Ok(None) => {}
         Err(error) => {
-            metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+            let count = metrics.decode_errors.fetch_add(1, Ordering::Relaxed) + 1;
             let detail = if error.native_code() & 0x10 != 0 {
                 format!(
                     "{error} (dsNoParamSets: SPS/PPS ausentes ou incompatíveis; quadro: {sample_diagnostics})"
@@ -514,6 +526,15 @@ fn decode_h264_access_unit(
                 .last_decode_error
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail);
+            if should_log_aggregate_error(count) {
+                tracing::warn!(
+                    decode_errors = count,
+                    native_code = error.native_code(),
+                    frame = %sample_diagnostics,
+                    error = %error,
+                    "Decodificador H.264 rejeitou quadro; resumos repetidos registrados em contagens dobradas"
+                );
+            }
             context.request_repaint();
         }
     }
@@ -630,7 +651,10 @@ pub struct ScreenShareSession {
 impl ScreenShareSession {
     pub fn new(context: egui::Context, stun_server: Option<String>) -> Result<Self, String> {
         if let Some(server) = stun_server.as_deref() {
-            validate_stun_uri(server)?;
+            if let Err(error) = validate_stun_uri(server) {
+                tracing::error!(reason = %error, "URI STUN recusada antes de iniciar WebRTC");
+                return Err(error);
+            }
         }
         Self::with_udp_address(context, format!("0.0.0.0:{MEDIA_UDP_PORT}"), stun_server)
     }
@@ -645,6 +669,11 @@ impl ScreenShareSession {
         udp_address: String,
         stun_server: Option<String>,
     ) -> Result<Self, String> {
+        tracing::info!(
+            udp_address = %udp_address,
+            stun_endpoint = %stun_server.as_deref().map(safe_stun_endpoint).unwrap_or_else(|| "(não configurado)".to_owned()),
+            "Criando sessão WebRTC para compartilhamento de tela"
+        );
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = std_mpsc::channel();
         let remote_frame = Arc::new(Mutex::new(None));
@@ -761,6 +790,12 @@ impl PeerConnectionEventHandler for PeerEvents {
         self.metrics
             .local_ice_candidates
             .fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            candidate_type = ?event.candidate.typ,
+            address = %event.candidate.address,
+            port = event.candidate.port,
+            "Candidato ICE local descoberto; SDP/candidato completo omitido"
+        );
         if event.candidate.typ == rtc::peer_connection::transport::RTCIceCandidateType::Srflx {
             self.metrics
                 .local_srflx_candidates
@@ -793,6 +828,7 @@ impl PeerConnectionEventHandler for PeerEvents {
         &self,
         state: webrtc::peer_connection::RTCIceConnectionState,
     ) {
+        tracing::info!(state = ?state, "Estado ICE mudou");
         let status = match state {
             webrtc::peer_connection::RTCIceConnectionState::New => {
                 "ICE aguardando candidatos do outro computador.".to_owned()
@@ -821,16 +857,25 @@ impl PeerConnectionEventHandler for PeerEvents {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 let message = if let Some(stun_server) = &self.stun_server {
+                    let safe_stun_server = safe_stun_endpoint(stun_server);
                     let local = self.metrics.local_srflx_candidates.load(Ordering::Relaxed);
                     let remote = self.metrics.remote_srflx_candidates.load(Ordering::Relaxed);
                     format!(
-                        "O ICE não encontrou um caminho direto pela internet. Candidatos públicos via STUN: {local} locais e {remote} recebidos do amigo. Confira a URI {stun_server}, o firewall e UDP {MEDIA_UDP_PORT}; esta etapa não usa TURN."
+                        "O ICE não encontrou um caminho direto pela internet. Candidatos públicos via STUN: {local} locais e {remote} recebidos do amigo. Confira a URI {safe_stun_server}, o firewall e UDP {MEDIA_UDP_PORT}; esta etapa não usa TURN."
                     )
                 } else {
                     format!(
                         "O ICE não encontrou um caminho UDP. Confira se o firewall dos dois PCs permite o aplicativo ou UDP {MEDIA_UDP_PORT} na rede privada."
                     )
                 };
+                tracing::error!(
+                    local_srflx_candidates =
+                        self.metrics.local_srflx_candidates.load(Ordering::Relaxed),
+                    remote_srflx_candidates =
+                        self.metrics.remote_srflx_candidates.load(Ordering::Relaxed),
+                    stun_configured = self.stun_server.is_some(),
+                    "ICE falhou em encontrar caminho UDP direto"
+                );
                 let _ = self.events.send(ScreenShareEvent::Error(message));
                 self.context.request_repaint();
                 return;
@@ -851,6 +896,7 @@ impl PeerConnectionEventHandler for PeerEvents {
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        tracing::info!(state = ?state, "Estado da conexão WebRTC mudou");
         match state {
             RTCPeerConnectionState::Connected => {
                 self.metrics.p2p_connected.store(true, Ordering::Relaxed);
@@ -884,6 +930,7 @@ impl PeerConnectionEventHandler for PeerEvents {
     }
 
     async fn on_track(&self, track: Arc<dyn TrackRemote>) {
+        tracing::info!("Faixa de vídeo remota recebida; iniciando depacketizador/decodificador");
         let events = self.events.clone();
         let context = self.context.clone();
         let remote_frame = Arc::clone(&self.remote_frame);
@@ -893,6 +940,7 @@ impl PeerConnectionEventHandler for PeerEvents {
             let mut decoder = match Decoder::new() {
                 Ok(decoder) => decoder,
                 Err(error) => {
+                    tracing::error!(error = %error, "Falha ao iniciar decodificador OpenH264");
                     let _ = events.send(ScreenShareEvent::Error(format!(
                         "Nao foi possivel iniciar o decodificador H.264: {error}"
                     )));
@@ -1557,8 +1605,18 @@ mod tests {
 
     use super::{
         Encoder, FRAME_DURATION, LatestFrame, PreviewFrame, ScreenShareEvent, ScreenShareSession,
-        encode_frame, validate_stun_uri,
+        encode_frame, should_log_aggregate_error, validate_stun_uri,
     };
+
+    #[test]
+    fn repeated_media_errors_are_logged_at_doubling_counts() {
+        assert!([1, 2, 4, 8, 16].into_iter().all(should_log_aggregate_error));
+        assert!(
+            [0, 3, 5, 25, 100]
+                .into_iter()
+                .all(|count| !should_log_aggregate_error(count))
+        );
+    }
 
     #[test]
     fn stun_uri_accepts_one_stun_server_and_rejects_turn_or_invalid_values() {

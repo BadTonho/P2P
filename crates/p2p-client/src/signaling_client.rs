@@ -277,9 +277,11 @@ async fn run_client(
     let mut server_shutdown = None;
     let mut server_task = None;
     if let Some(reservation) = local_server {
+        tracing::info!(listen_address = %local_server_address, "Iniciando servidor de sinalização integrado");
         let listener = match TcpListener::bind(local_server_address).await {
             Ok(listener) => listener,
             Err(error) => {
+                tracing::error!(error = %error, "Falha ao abrir a porta TCP do servidor de sinalização");
                 let _ = events.send(SignalingEvent::Error(format!(
                     "Nao foi possivel hospedar a sala na porta 9000: {error}. Feche outro servidor ou aplicativo que esteja usando essa porta."
                 )));
@@ -296,6 +298,7 @@ async fn run_client(
     }
 
     if !server_url.starts_with("ws://") {
+        tracing::error!("Endereço de sinalização rejeitado: esquema inválido");
         let _ = events.send(SignalingEvent::Error(
             "Informe o servidor no formato ws://IP-DO-ANFITRIAO:9000.".to_owned(),
         ));
@@ -303,9 +306,14 @@ async fn run_client(
         return;
     }
 
+    tracing::info!(endpoint = %server_url, "Conectando ao servidor WebSocket de sinalização");
     let connected = match timeout(CONNECT_TIMEOUT, connect_async(server_url.as_str())).await {
-        Ok(Ok((websocket, _response))) => websocket,
+        Ok(Ok((websocket, _response))) => {
+            tracing::info!(endpoint = %server_url, "Conexão WebSocket de sinalização estabelecida");
+            websocket
+        }
         Ok(Err(error)) => {
+            tracing::error!(endpoint = %server_url, error = %error, "Falha ao conectar ao servidor de sinalização");
             let _ = events.send(SignalingEvent::Error(format!(
                 "Nao foi possivel chegar ao servidor de sinalizacao TCP 9000. Confira o endereco, o encaminhamento da porta no roteador e o firewall do anfitriao: {error}"
             )));
@@ -313,6 +321,7 @@ async fn run_client(
             return;
         }
         Err(_) => {
+            tracing::error!(endpoint = %server_url, timeout_seconds = CONNECT_TIMEOUT.as_secs(), "Tempo limite ao conectar ao servidor de sinalização");
             let _ = events.send(SignalingEvent::Error(
                 "A conexao ao servidor de sinalizacao TCP 9000 expirou. Confira o endereco, o encaminhamento da porta no roteador e o firewall do anfitriao.".to_owned(),
             ));
@@ -325,6 +334,7 @@ async fn run_client(
     let request = match serde_json::to_string(&initial_message) {
         Ok(request) => request,
         Err(error) => {
+            tracing::error!(error = %error, "Falha ao serializar pedido de entrada/criação da sala");
             let _ = events.send(SignalingEvent::Error(format!(
                 "Nao foi possivel preparar o pedido da sala: {error}"
             )));
@@ -333,6 +343,7 @@ async fn run_client(
         }
     };
     if let Err(error) = writer.send(WebSocketMessage::Text(request.into())).await {
+        tracing::error!(error = %error, "Falha ao enviar pedido inicial de sinalização");
         let _ = events.send(SignalingEvent::Error(format!(
             "Falha ao enviar o pedido da sala: {error}"
         )));
@@ -349,48 +360,61 @@ async fn run_client(
                     Some(Ok(WebSocketMessage::Text(text))) => {
                         match serde_json::from_str::<ServerMessage>(text.as_str()) {
                             Ok(ServerMessage::RoomCreated { code }) => {
+                                tracing::info!("Servidor confirmou criação da sala; código omitido");
                                 let _ = send_client_message(&mut writer, ClientMessage::IdentifyParticipant { participant: participant.clone() }).await;
                                 let _ = events.send(SignalingEvent::RoomCreated(code));
                             }
                             Ok(ServerMessage::RoomJoined { code }) => {
+                                tracing::info!("Servidor confirmou entrada na sala; código omitido");
                                 let _ = send_client_message(&mut writer, ClientMessage::IdentifyParticipant { participant: participant.clone() }).await;
                                 let _ = events.send(SignalingEvent::RoomJoined(code));
                             }
                             Ok(ServerMessage::RoomAdopted { code }) => {
+                                tracing::info!("Servidor confirmou adoção de sala; código omitido");
                                 let _ = send_client_message(&mut writer, ClientMessage::IdentifyParticipant { participant: participant.clone() }).await;
                                 let _ = events.send(SignalingEvent::RoomAdopted(code));
                             }
                             Ok(ServerMessage::PeerJoined) => {
+                                tracing::info!("Servidor notificou entrada de outro participante");
                                 let _ = events.send(SignalingEvent::PeerJoined);
                             }
                             Ok(ServerMessage::PeerLeft) => {
+                                tracing::warn!("Servidor notificou saída de outro participante");
                                 let _ = events.send(SignalingEvent::PeerLeft);
                             }
                             Ok(ServerMessage::HostTransferPending { code, token }) => {
+                                tracing::info!("Servidor confirmou pedido de transferência; código e token omitidos");
                                 let _ = events.send(SignalingEvent::HostTransferPending { code, token });
                             }
                             Ok(ServerMessage::HostTransferRequested { code, token }) => {
+                                tracing::info!("Servidor enviou pedido de transferência; código e token omitidos");
                                 let _ = events.send(SignalingEvent::HostTransferRequested { code, token });
                             }
                             Ok(ServerMessage::HostTransferComplete { code }) => {
+                                tracing::info!("Servidor confirmou transferência concluída; código omitido");
                                 let _ = events.send(SignalingEvent::HostTransferComplete(code));
                                 transfer_complete = true;
                                 break;
                             }
                             Ok(ServerMessage::HostTransferCanceled { message }) => {
+                                tracing::warn!(reason = %message, "Servidor cancelou a transferência de hospedagem");
                                 let _ = events.send(SignalingEvent::HostTransferCanceled(message));
                             }
                             Ok(ServerMessage::Signal { kind, payload }) => {
+                                tracing::debug!(signal_kind = ?kind, payload_bytes = payload.len(), "Sinal recebido; payload omitido");
                                 let _ = events.send(SignalingEvent::Signal { kind, payload });
                             }
                             Ok(ServerMessage::RoomRoster { participants, leader_id, room_mode }) => {
+                                tracing::info!(participants = participants.len(), room_mode = ?room_mode, "Servidor atualizou lista de participantes");
                                 let _ = events.send(SignalingEvent::RoomRoster { participants, leader_id, room_mode });
                             }
                             Ok(ServerMessage::RoomLeft) => break,
                             Ok(ServerMessage::Error { message }) => {
+                                tracing::warn!(reason = %message, "Servidor recusou operação de sinalização");
                                 let _ = events.send(SignalingEvent::ServerError(message));
                             }
                             Err(error) => {
+                                tracing::error!(error = %error, "Resposta JSON inválida do servidor");
                                 let _ = events.send(SignalingEvent::Error(format!(
                                     "Resposta invalida do servidor: {error}"
                                 )));
@@ -404,8 +428,20 @@ async fn run_client(
                             break;
                         }
                     }
-                    Some(Ok(WebSocketMessage::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(WebSocketMessage::Close(_))) => {
+                        tracing::warn!("Servidor encerrou a conexão WebSocket");
+                        break;
+                    }
+                    None => {
+                        tracing::warn!("Fluxo WebSocket terminou sem mensagem de encerramento");
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        tracing::error!(error = %error, "Erro no fluxo WebSocket de sinalização");
+                        break;
+                    }
                     Some(Ok(WebSocketMessage::Binary(_))) => {
+                        tracing::error!("Servidor enviou formato binário inesperado");
                         let _ = events.send(SignalingEvent::Error(
                             "O servidor enviou uma mensagem em formato inesperado.".to_owned()
                         ));
@@ -418,6 +454,7 @@ async fn run_client(
             command = commands.recv() => {
                 match command {
                     Some(ClientCommand::SendDiagnostic) => {
+                        tracing::debug!("Enviando sinal de diagnóstico sem dados pessoais");
                         if let Err(error) = send_signal(&mut writer, SignalKind::Diagnostic, DIAGNOSTIC_PAYLOAD).await {
                             let _ = events.send(SignalingEvent::Error(error));
                             failed = true;
@@ -432,6 +469,7 @@ async fn run_client(
                         }
                     }
                     Some(ClientCommand::SendSignal { kind, payload }) => {
+                        tracing::debug!(signal_kind = ?kind, payload_bytes = payload.len(), "Enviando sinal; conteúdo omitido");
                         if let Err(error) = send_signal(&mut writer, kind, &payload).await {
                             let _ = events.send(SignalingEvent::Error(error));
                             failed = true;
@@ -439,6 +477,7 @@ async fn run_client(
                         }
                     }
                     Some(ClientCommand::RequestHostTransfer) => {
+                        tracing::info!("Solicitando transferência de hospedagem");
                         if let Err(error) = send_client_message(&mut writer, ClientMessage::RequestHostTransfer).await {
                             let _ = events.send(SignalingEvent::Error(error));
                             failed = true;
@@ -446,6 +485,7 @@ async fn run_client(
                         }
                     }
                     Some(ClientCommand::CancelHostTransfer { token }) => {
+                        tracing::info!("Cancelando transferência de hospedagem; token omitido");
                         if let Err(error) = send_client_message(&mut writer, ClientMessage::CancelHostTransfer { token }).await {
                             let _ = events.send(SignalingEvent::Error(error));
                             failed = true;
@@ -453,6 +493,7 @@ async fn run_client(
                         }
                     }
                     Some(ClientCommand::ConfirmHostTransfer { code, token }) => {
+                        tracing::info!("Confirmando transferência de hospedagem; código e token omitidos");
                         let message = ClientMessage::ConfirmHostTransfer { code, token };
                         if let Err(error) = send_client_message(&mut writer, message).await {
                             let _ = events.send(SignalingEvent::Error(error));
@@ -461,6 +502,7 @@ async fn run_client(
                         }
                     }
                     Some(ClientCommand::RejectHostTransfer { token }) => {
+                        tracing::warn!("Recusando transferência de hospedagem; token omitido");
                         let message = ClientMessage::RejectHostTransfer { token };
                         if let Err(error) = send_client_message(&mut writer, message).await {
                             let _ = events.send(SignalingEvent::Error(error));
@@ -469,6 +511,7 @@ async fn run_client(
                         }
                     }
                     Some(ClientCommand::Leave) | None => {
+                        tracing::info!("Enviando saída da sala e fechando conexão WebSocket");
                         let _ = send_client_message(&mut writer, ClientMessage::LeaveRoom).await;
                         let _ = writer.close().await;
                         break;
@@ -479,8 +522,14 @@ async fn run_client(
     }
 
     if !failed && !transfer_complete {
+        tracing::warn!("Cliente de sinalização desconectado sem transferência concluída");
         let _ = events.send(SignalingEvent::Disconnected);
     }
+    tracing::debug!(
+        failed,
+        transfer_complete,
+        "Encerrando tarefas do servidor integrado"
+    );
     stop_local_server(server_shutdown, server_task).await;
 }
 
