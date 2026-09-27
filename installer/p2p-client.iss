@@ -14,6 +14,8 @@ AppName=P2P - Voz e tela
 AppVersion={#AppVersion}
 AppPublisher=BadTonho
 DefaultDirName={localappdata}\Programs\P2P-Voz-e-tela
+; Always show the destination page, including when upgrading an existing install.
+DisableDirPage=no
 DefaultGroupName=P2P - Voz e tela
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
