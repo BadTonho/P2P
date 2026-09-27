@@ -317,6 +317,7 @@ struct MeshState {
     displaced_at: Option<Instant>,
     recovery_since: Option<Instant>,
     leader_last_seen: Instant,
+    leader_control_seen: bool,
     last_unstable_notice: Option<Instant>,
 }
 
@@ -342,6 +343,7 @@ async fn run_mesh(
             return;
         }
     };
+    let leader_is_local = leader_id == local.id;
     let state = std::sync::Arc::new(Mutex::new(MeshState {
         local,
         room_code,
@@ -358,6 +360,7 @@ async fn run_mesh(
         displaced_at: None,
         recovery_since: None,
         leader_last_seen: Instant::now(),
+        leader_control_seen: leader_is_local,
         last_unstable_notice: None,
     }));
     let _ = events.send(ControlEvent::Ready);
@@ -402,6 +405,7 @@ async fn run_mesh(
                         {
                             if state.leader_id != leader_id {
                                 state.leader_last_seen = Instant::now();
+                                state.leader_control_seen = leader_id == state.local.id;
                             }
                             state.leader_id = leader_id;
                             state.leader_address = leader_address;
@@ -600,11 +604,16 @@ where
                         if participant_id == remote.id {
                             let metrics = Metrics { loss_percent, jitter_ms, latency_ms, samples: probe_count as usize, consecutive_losses };
                             let mut state = state.lock().await;
-                            state.remote_status.insert(participant_id, (metrics, eligible, now));
-                            if leader_id == state.leader_id {
+                            if participant_id == state.leader_id {
                                 state.leader_last_seen = now;
+                                state.leader_control_seen = true;
                             }
+                            state.remote_status.insert(participant_id, (metrics, eligible, now));
                             if epoch > state.epoch || (epoch == state.epoch && canonical_precedes(&state, &leader_id)) {
+                                if state.leader_id != leader_id {
+                                    state.leader_control_seen = leader_id == state.local.id;
+                                    state.leader_last_seen = now;
+                                }
                                 state.epoch = epoch;
                                 state.leader_id = leader_id.clone();
                                 state.leader_address = leader_address.clone();
@@ -650,6 +659,7 @@ where
                                 state.leader_id = participant_id.clone();
                                 state.leader_address = address.clone();
                                 state.leader_last_seen = now;
+                                state.leader_control_seen = participant_id == state.local.id;
                                 state.election = None;
                                 if participant_id != state.local.id {
                                     if was_local_leader {
@@ -699,6 +709,7 @@ where
                 }
                 if remote.id == state.leader_id {
                     state.leader_last_seen = now;
+                    state.leader_control_seen = true;
                 }
             }
             outgoing_message = outgoing.recv() => {
@@ -791,6 +802,7 @@ async fn tick_mesh(state: &SharedState, events: &std_mpsc::Sender<ControlEvent>)
             && own_metrics.loss_percent >= UNSTABLE_LOSS_PERCENT)
             || own_metrics.consecutive_losses >= 5;
         let links_missing = state.leader_id != state.local.id
+            && state.leader_control_seen
             && now.duration_since(state.leader_last_seen) >= HOST_TIMEOUT;
         let remote_host_unstable =
             state
@@ -944,6 +956,7 @@ fn own_worst_metrics(state: &mut MeshState, now: Instant) -> Metrics {
     // O enlace com o anfitrião que já expirou não deve tornar inelegível o
     // sucessor: ele está medindo a conexão que será substituída pela eleição.
     let ignore_timed_out_leader = state.leader_id != state.local.id
+        && state.leader_control_seen
         && now.duration_since(state.leader_last_seen) >= HOST_TIMEOUT;
     let mut metrics = state
         .links
@@ -1273,6 +1286,7 @@ async fn publish_leader(
         state.leader_id = state.local.id.clone();
         state.leader_address = address.clone();
         state.leader_last_seen = Instant::now();
+        state.leader_control_seen = true;
         state.election = None;
         (state.local.id.clone(), state.local.order)
     };
@@ -1433,6 +1447,7 @@ mod tests {
             displaced_at: None,
             recovery_since: None,
             leader_last_seen: now,
+            leader_control_seen: true,
             last_unstable_notice: None,
         }
     }

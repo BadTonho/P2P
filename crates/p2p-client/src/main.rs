@@ -372,7 +372,7 @@ impl ClientUi {
             ui.group(|ui| {
                 ui.heading("Rede de controle da sala");
                 ui.label("Todos os participantes mantêm uma conexão direta de controle pela porta TCP 9001.");
-                ui.small("Permita a porta 9001 no firewall do Windows e escolha um IPv4 que seus amigos consigam alcançar (LAN ou Radmin).");
+                ui.small("Permita TCP 9001 no firewall e escolha o adaptador pelo qual os outros participantes alcançam este PC. Esta escolha vale para criar e entrar: use Radmin VPN se entrar pelo endereço Radmin; use Ethernet/Wi-Fi se entrar pela rede local.");
                 self.show_control_address_picker(ui);
                 ui.checkbox(&mut self.may_host, "Permitir que este computador seja escolhido para hospedar futuramente");
                 ui.small("Opcional: isso não impede entrar na sala nem compartilhar a tela. Só permite que este PC assuma a hospedagem se o anfitrião sair.");
