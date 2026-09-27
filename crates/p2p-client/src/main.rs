@@ -775,9 +775,13 @@ impl ClientUi {
                         "Pedido aceito; negociando a conexão WebRTC da tela.",
                     ));
                     ui.small(format!(
-                        "H.264: {} quadros codificados, {} quadros enviados.",
+                        "H.264: {} entradas no encoder, {} quadros produzidos; enviados {} (IDR {}, P {}), descartados antes do IDR {}.",
+                        self.screen_share_metrics.encoder_input_frames,
                         self.screen_share_metrics.encoded_frames,
-                        self.screen_share_metrics.sent_frames
+                        self.screen_share_metrics.sent_frames,
+                        self.screen_share_metrics.sent_idr_frames,
+                        self.screen_share_metrics.sent_delta_frames,
+                        self.screen_share_metrics.dropped_before_initial_idr
                     ));
                     ui.small(&self.screen_share_metrics.h264_diagnostics);
                     if ui.button("Parar compartilhamento").clicked() {
@@ -790,9 +794,11 @@ impl ClientUi {
                         "Pedido aceito; negociando a conexão WebRTC da tela.",
                     ));
                     ui.small(format!(
-                        "Vídeo: {} pacotes recebidos, {} quadros decodificados, {} erros H.264.",
+                        "Vídeo: {} pacotes recebidos, {} quadros decodificados ({} P montados, {} P decodificados), {} erros H.264.",
                         self.screen_share_metrics.received_packets,
                         self.screen_share_metrics.decoded_frames,
+                        self.screen_share_metrics.received_delta_frames,
+                        self.screen_share_metrics.decoded_delta_frames,
                         self.screen_share_metrics.decode_errors
                     ));
                     if let Some(error) = &self.screen_share_metrics.last_decode_error {
@@ -1694,6 +1700,8 @@ impl ClientUi {
                     decoder_fallback = metrics.decoder_fallback_reason.as_deref().unwrap_or(""),
                     encoded = metrics.encoded_frames,
                     sent = metrics.sent_frames,
+                    received_delta_frames = metrics.received_delta_frames,
+                    decoded_delta_frames = metrics.decoded_delta_frames,
                     received_packets = metrics.received_packets,
                     decoded = metrics.decoded_frames,
                     decode_errors = metrics.decode_errors,
@@ -1705,11 +1713,15 @@ impl ClientUi {
                     capture_skipped = capture_performance.skipped_frames,
                     capture_readback_avg_ms = average_ms(capture_performance.readback_nanos, capture_performance.processed_frames),
                     capture_resize_avg_ms = average_ms(capture_performance.resize_nanos, capture_performance.processed_frames),
+                    encoder_input_frames = performance.encoder_input_frames,
                     encode_fps = performance.encoded_frames as f64 / interval_seconds,
-                    encode_frames = performance.encoded_frames,
+                    encoded_frames = performance.encoded_frames,
                     encode_avg_ms = average_ms(performance.encode_nanos, performance.encode_samples),
                     send_fps = performance.sent_frames as f64 / interval_seconds,
                     send_frames = performance.sent_frames,
+                    dropped_before_initial_idr = performance.dropped_before_initial_idr,
+                    sent_idr_frames = performance.sent_idr_frames,
+                    sent_delta_frames = performance.sent_delta_frames,
                     send_queue_wait_avg_ms = average_ms(performance.queue_wait_nanos, performance.queue_wait_samples),
                     write_sample_avg_ms = average_ms(performance.write_sample_nanos, performance.write_sample_samples),
                     "Resumo periódico da mídia de compartilhamento"
@@ -3158,7 +3170,7 @@ impl ClientUi {
                 .collect(),
             screen_share_state: share_state.to_owned(),
             screen_metrics: format!(
-                "P2P={}, rota={:?}, codec local/remoto={}/{}, fallback local/remoto={}/{}, ICE local/remoto={}/{}, srflx local/remoto={}/{}, relay local/remoto={}/{}, quadros codificados/enviados/decodificados={}/{}/{}, pacotes recebidos={}, erros de decodificação={}, diagnóstico H.264={} ",
+                "P2P={}, rota={:?}, codec local/remoto={}/{}, fallback local/remoto={}/{}, ICE local/remoto={}/{}, srflx local/remoto={}/{}, relay local/remoto={}/{}, entradas/quadros H.264/enviados/decodificados={}/{}/{}/{}, IDR/P enviados={}/{}, descartados antes do IDR={}, quadros P montados/decodificados={}/{}, pacotes recebidos={}, erros de decodificação={}, diagnóstico H.264={} ",
                 metrics.p2p_connected,
                 metrics.route,
                 metrics.encoder_backend,
@@ -3171,9 +3183,15 @@ impl ClientUi {
                 metrics.remote_srflx_candidates,
                 metrics.local_relay_candidates,
                 metrics.remote_relay_candidates,
+                metrics.encoder_input_frames,
                 metrics.encoded_frames,
                 metrics.sent_frames,
                 metrics.decoded_frames,
+                metrics.sent_idr_frames,
+                metrics.sent_delta_frames,
+                metrics.dropped_before_initial_idr,
+                metrics.received_delta_frames,
+                metrics.decoded_delta_frames,
                 metrics.received_packets,
                 metrics.decode_errors,
                 metrics.h264_diagnostics

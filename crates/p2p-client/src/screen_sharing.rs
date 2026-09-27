@@ -61,6 +61,22 @@ const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 
 type RemoteFrameStore = Arc<Mutex<Option<Arc<PreviewFrame>>>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum H264FrameKind {
+    Idr,
+    Delta,
+}
+
+fn classify_h264_access_unit(nals: &[u8]) -> Option<H264FrameKind> {
+    if nals.contains(&5) {
+        Some(H264FrameKind::Idr)
+    } else if nals.iter().any(|nal_type| (1..=4).contains(nal_type)) {
+        Some(H264FrameKind::Delta)
+    } else {
+        None
+    }
+}
+
 fn should_log_aggregate_error(count: u64) -> bool {
     count.is_power_of_two()
 }
@@ -97,10 +113,16 @@ pub struct ScreenShareMetrics {
     pub remote_srflx_candidates: u64,
     pub local_relay_candidates: u64,
     pub remote_relay_candidates: u64,
+    pub encoder_input_frames: u64,
     pub encoded_frames: u64,
     pub sent_frames: u64,
+    pub dropped_before_initial_idr: u64,
+    pub sent_idr_frames: u64,
+    pub sent_delta_frames: u64,
     pub received_packets: u64,
+    pub received_delta_frames: u64,
     pub decoded_frames: u64,
+    pub decoded_delta_frames: u64,
     pub decode_errors: u64,
     pub last_decode_error: Option<String>,
     pub h264_diagnostics: String,
@@ -112,8 +134,12 @@ pub struct ScreenShareMetrics {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScreenSharePerformanceSnapshot {
+    pub encoder_input_frames: u64,
     pub encoded_frames: u64,
     pub sent_frames: u64,
+    pub dropped_before_initial_idr: u64,
+    pub sent_idr_frames: u64,
+    pub sent_delta_frames: u64,
     pub encode_nanos: u64,
     pub encode_samples: u64,
     pub queue_wait_nanos: u64,
@@ -138,13 +164,22 @@ struct SharedMetrics {
     remote_srflx_candidates: AtomicU64,
     local_relay_candidates: AtomicU64,
     remote_relay_candidates: AtomicU64,
+    encoder_input_frames: AtomicU64,
     encoded_frames: AtomicU64,
     sent_frames: AtomicU64,
+    dropped_before_initial_idr: AtomicU64,
+    sent_idr_frames: AtomicU64,
+    sent_delta_frames: AtomicU64,
     received_packets: AtomicU64,
     decoded_frames: AtomicU64,
+    decoded_delta_frames: AtomicU64,
     decode_errors: AtomicU64,
+    interval_encoder_input_frames: AtomicU64,
     interval_encoded_frames: AtomicU64,
     interval_sent_frames: AtomicU64,
+    interval_dropped_before_initial_idr: AtomicU64,
+    interval_sent_idr_frames: AtomicU64,
+    interval_sent_delta_frames: AtomicU64,
     interval_encode_nanos: AtomicU64,
     interval_encode_samples: AtomicU64,
     interval_queue_wait_nanos: AtomicU64,
@@ -165,9 +200,11 @@ struct H264FlowDiagnostics {
     encoded_sps: u64,
     encoded_pps: u64,
     encoded_idr: u64,
+    encoded_delta_frames: u64,
     received_sps: u64,
     received_pps: u64,
     received_idr: u64,
+    received_delta_nals: u64,
     received_single_nals: u64,
     received_stap_a: u64,
     received_fu_a_start: u64,
@@ -178,6 +215,7 @@ struct H264FlowDiagnostics {
     assembled_with_sps: u64,
     assembled_with_pps: u64,
     assembled_with_idr: u64,
+    assembled_delta_frames: u64,
     assembly_errors: u64,
     last_encoded_nals: String,
     last_access_unit: String,
@@ -203,10 +241,16 @@ impl SharedMetrics {
             remote_srflx_candidates: self.remote_srflx_candidates.load(Ordering::Relaxed),
             local_relay_candidates: self.local_relay_candidates.load(Ordering::Relaxed),
             remote_relay_candidates: self.remote_relay_candidates.load(Ordering::Relaxed),
+            encoder_input_frames: self.encoder_input_frames.load(Ordering::Relaxed),
             encoded_frames: self.encoded_frames.load(Ordering::Relaxed),
             sent_frames: self.sent_frames.load(Ordering::Relaxed),
+            dropped_before_initial_idr: self.dropped_before_initial_idr.load(Ordering::Relaxed),
+            sent_idr_frames: self.sent_idr_frames.load(Ordering::Relaxed),
+            sent_delta_frames: self.sent_delta_frames.load(Ordering::Relaxed),
             received_packets: self.received_packets.load(Ordering::Relaxed),
+            received_delta_frames: h264_flow.assembled_delta_frames,
             decoded_frames: self.decoded_frames.load(Ordering::Relaxed),
+            decoded_delta_frames: self.decoded_delta_frames.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
             last_decode_error: self
                 .last_decode_error
@@ -234,14 +278,16 @@ impl SharedMetrics {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
             h264_diagnostics: format!(
-                "Codificado: SPS/PPS/IDR {}/{}/{} ({}); RTP: SPS/PPS/IDR {}/{}/{}, single/STAP-A/FU-A início/fim {}/{}/{}/{}, lacunas/reordenação {}/{}; quadros montados: {} (com SPS/PPS/IDR {}/{}/{}), erros de montagem {}; último quadro: {}{}.",
+                "Codificado SPS/PPS/IDR/P {}/{}/{}/{}, última saída {}; RTP SPS/PPS/IDR/P {}/{}/{}/{}, single/STAP-A/FU-A início/fim {}/{}/{}/{}, lacunas/reordenação {}/{}; quadros montados: {} (IDR {}, P {}), com SPS/PPS {}/{}, erros de montagem {}; último quadro: {}{}.",
                 h264_flow.encoded_sps,
                 h264_flow.encoded_pps,
                 h264_flow.encoded_idr,
+                h264_flow.encoded_delta_frames,
                 h264_flow.last_encoded_nals,
                 h264_flow.received_sps,
                 h264_flow.received_pps,
                 h264_flow.received_idr,
+                h264_flow.received_delta_nals,
                 h264_flow.received_single_nals,
                 h264_flow.received_stap_a,
                 h264_flow.received_fu_a_start,
@@ -249,9 +295,10 @@ impl SharedMetrics {
                 h264_flow.sequence_gaps,
                 h264_flow.out_of_order_packets,
                 h264_flow.assembled_access_units,
+                h264_flow.assembled_with_idr,
+                h264_flow.assembled_delta_frames,
                 h264_flow.assembled_with_sps,
                 h264_flow.assembled_with_pps,
-                h264_flow.assembled_with_idr,
                 h264_flow.assembly_errors,
                 h264_flow.last_access_unit,
                 h264_flow
@@ -287,6 +334,10 @@ impl SharedMetrics {
 
     fn record_encoded_access_unit(&self, data: &[u8]) {
         let nals = annex_b_nal_types(data);
+        if classify_h264_access_unit(&nals).is_some() {
+            self.encoded_frames.fetch_add(1, Ordering::Relaxed);
+            self.interval_encoded_frames.fetch_add(1, Ordering::Relaxed);
+        }
         let mut flow = self
             .h264_flow
             .lock()
@@ -299,7 +350,40 @@ impl SharedMetrics {
                 _ => {}
             }
         }
+        if classify_h264_access_unit(&nals) == Some(H264FrameKind::Delta) {
+            flow.encoded_delta_frames += 1;
+        }
         flow.last_encoded_nals = describe_nal_types(&nals, data.len());
+    }
+
+    fn record_encoder_input_frame(&self) {
+        self.encoder_input_frames.fetch_add(1, Ordering::Relaxed);
+        self.interval_encoder_input_frames
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_drop_before_initial_idr(&self) {
+        self.dropped_before_initial_idr
+            .fetch_add(1, Ordering::Relaxed);
+        self.interval_dropped_before_initial_idr
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_sent_frame(&self, kind: H264FrameKind) {
+        self.sent_frames.fetch_add(1, Ordering::Relaxed);
+        self.interval_sent_frames.fetch_add(1, Ordering::Relaxed);
+        match kind {
+            H264FrameKind::Idr => {
+                self.sent_idr_frames.fetch_add(1, Ordering::Relaxed);
+                self.interval_sent_idr_frames
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            H264FrameKind::Delta => {
+                self.sent_delta_frames.fetch_add(1, Ordering::Relaxed);
+                self.interval_sent_delta_frames
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     fn record_received_packet(
@@ -345,6 +429,7 @@ impl SharedMetrics {
                 7 => flow.received_sps += 1,
                 8 => flow.received_pps += 1,
                 5 => flow.received_idr += 1,
+                1..=4 => flow.received_delta_nals += 1,
                 _ => {}
             }
         }
@@ -370,6 +455,9 @@ impl SharedMetrics {
         if contains_idr {
             flow.assembled_with_idr += 1;
         }
+        if !contains_idr && nals.iter().any(|nal_type| (1..=4).contains(nal_type)) {
+            flow.assembled_delta_frames += 1;
+        }
         flow.last_access_unit = description.clone();
         description
     }
@@ -392,8 +480,16 @@ impl SharedMetrics {
 
     fn take_performance_snapshot(&self) -> ScreenSharePerformanceSnapshot {
         ScreenSharePerformanceSnapshot {
+            encoder_input_frames: self
+                .interval_encoder_input_frames
+                .swap(0, Ordering::Relaxed),
             encoded_frames: self.interval_encoded_frames.swap(0, Ordering::Relaxed),
             sent_frames: self.interval_sent_frames.swap(0, Ordering::Relaxed),
+            dropped_before_initial_idr: self
+                .interval_dropped_before_initial_idr
+                .swap(0, Ordering::Relaxed),
+            sent_idr_frames: self.interval_sent_idr_frames.swap(0, Ordering::Relaxed),
+            sent_delta_frames: self.interval_sent_delta_frames.swap(0, Ordering::Relaxed),
             encode_nanos: self.interval_encode_nanos.swap(0, Ordering::Relaxed),
             encode_samples: self.interval_encode_samples.swap(0, Ordering::Relaxed),
             queue_wait_nanos: self.interval_queue_wait_nanos.swap(0, Ordering::Relaxed),
@@ -645,6 +741,11 @@ fn decode_h264_access_unit(
                 return None;
             }
             metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
+            if classify_h264_access_unit(&annex_b_nal_types(access_unit))
+                == Some(H264FrameKind::Delta)
+            {
+                metrics.decoded_delta_frames.fetch_add(1, Ordering::Relaxed);
+            }
             let next_sequence = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             *remote_frame
                 .lock()
@@ -699,7 +800,7 @@ fn is_hardware_device_failure(error: &str) -> bool {
     .any(|needle| error.contains(needle))
 }
 
-fn annex_b_nal_types(data: &[u8]) -> Vec<u8> {
+fn annex_b_nals(data: &[u8]) -> Vec<&[u8]> {
     fn next_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
         let mut index = from;
         while index + 3 <= data.len() {
@@ -718,20 +819,140 @@ fn annex_b_nal_types(data: &[u8]) -> Vec<u8> {
         return Vec::new();
     };
     let mut nal_start = start + start_code_len;
-    let mut nal_types = Vec::new();
+    let mut nals = Vec::new();
 
     while nal_start < data.len() {
         if let Some((next_start, next_start_code_len)) = next_start_code(data, nal_start) {
             if next_start > nal_start {
-                nal_types.push(data[nal_start] & 0x1f);
+                nals.push(&data[nal_start..next_start]);
             }
             nal_start = next_start + next_start_code_len;
         } else {
-            nal_types.push(data[nal_start] & 0x1f);
+            nals.push(&data[nal_start..]);
             break;
         }
     }
-    nal_types
+    nals
+}
+
+fn annex_b_nal_types(data: &[u8]) -> Vec<u8> {
+    annex_b_nals(data)
+        .into_iter()
+        .filter_map(|nal| nal.first().map(|header| header & 0x1f))
+        .collect()
+}
+
+#[derive(Default)]
+struct H264ForwardingGate {
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+    initial_idr_forwarded: bool,
+}
+
+enum H264ForwardDecision {
+    Forward {
+        access_unit: Vec<u8>,
+        kind: H264FrameKind,
+    },
+    DropBeforeInitialIdr,
+    DropInitialIdrWithoutParameterSets,
+    DropWithoutPicture,
+}
+
+impl H264ForwardingGate {
+    fn reset(&mut self) {
+        self.sps = None;
+        self.pps = None;
+        self.initial_idr_forwarded = false;
+    }
+
+    fn waiting_for_initial_idr(&self) -> bool {
+        !self.initial_idr_forwarded
+    }
+
+    fn prepare(&mut self, access_unit: &[u8]) -> H264ForwardDecision {
+        let nals = annex_b_nals(access_unit);
+        if nals.is_empty() {
+            return H264ForwardDecision::DropWithoutPicture;
+        }
+
+        for nal in &nals {
+            match nal.first().map(|header| header & 0x1f) {
+                Some(7) => self.sps = Some(nal.to_vec()),
+                Some(8) => self.pps = Some(nal.to_vec()),
+                _ => {}
+            }
+        }
+
+        let nal_types = nals
+            .iter()
+            .filter_map(|nal| nal.first().map(|header| header & 0x1f))
+            .collect::<Vec<_>>();
+        let Some(kind) = classify_h264_access_unit(&nal_types) else {
+            return H264ForwardDecision::DropWithoutPicture;
+        };
+
+        if self.waiting_for_initial_idr() && kind != H264FrameKind::Idr {
+            return H264ForwardDecision::DropBeforeInitialIdr;
+        }
+
+        let Some(sps) = self.sps.as_deref() else {
+            return if kind == H264FrameKind::Idr {
+                H264ForwardDecision::DropInitialIdrWithoutParameterSets
+            } else {
+                H264ForwardDecision::DropBeforeInitialIdr
+            };
+        };
+        let Some(pps) = self.pps.as_deref() else {
+            return if kind == H264FrameKind::Idr {
+                H264ForwardDecision::DropInitialIdrWithoutParameterSets
+            } else {
+                H264ForwardDecision::DropBeforeInitialIdr
+            };
+        };
+
+        let includes_sps = nal_types.contains(&7);
+        let includes_pps = nal_types.contains(&8);
+        let output = if kind == H264FrameKind::Idr && (!includes_sps || !includes_pps) {
+            access_unit_with_parameter_sets(&nals, sps, pps)
+        } else {
+            access_unit.to_vec()
+        };
+
+        if kind == H264FrameKind::Idr {
+            self.initial_idr_forwarded = true;
+        }
+        H264ForwardDecision::Forward {
+            access_unit: output,
+            kind,
+        }
+    }
+}
+
+fn access_unit_with_parameter_sets(nals: &[&[u8]], sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    fn append_nal(output: &mut Vec<u8>, nal: &[u8]) {
+        output.extend_from_slice(&[0, 0, 0, 1]);
+        output.extend_from_slice(nal);
+    }
+
+    let mut output = Vec::new();
+    let mut insertion_complete = false;
+    for nal in nals {
+        let nal_type = nal.first().map(|header| header & 0x1f);
+        if !insertion_complete && nal_type != Some(9) {
+            append_nal(&mut output, sps);
+            append_nal(&mut output, pps);
+            insertion_complete = true;
+        }
+        if nal_type != Some(7) && nal_type != Some(8) {
+            append_nal(&mut output, nal);
+        }
+    }
+    if !insertion_complete {
+        append_nal(&mut output, sps);
+        append_nal(&mut output, pps);
+    }
+    output
 }
 
 fn rtp_payload_nal_types(payload: &[u8]) -> Vec<u8> {
@@ -1183,6 +1404,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                 .spawn(move || {
                     let mut decoder: Option<ActiveH264Decoder> = None;
                     let mut using_cpu_pending_sps = false;
+                    let mut cpu_waiting_for_idr = false;
                     let mut hardware_frames_without_output = 0u32;
                     while let Ok(access_unit) = decoder_rx.recv() {
                         let has_sps_and_idr = {
@@ -1227,6 +1449,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                                     );
                                                     decoder = Some(ActiveH264Decoder::OpenH264(cpu));
                                                     using_cpu_pending_sps = false;
+                                                    cpu_waiting_for_idr = false;
                                                 }
                                                 Err(cpu_error) => {
                                                     tracing::error!(error = %cpu_error, "Falha ao iniciar decodificador H.264 de CPU");
@@ -1248,6 +1471,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                             );
                                             decoder = Some(ActiveH264Decoder::OpenH264(cpu));
                                             using_cpu_pending_sps = true;
+                                            cpu_waiting_for_idr = true;
                                         }
                                         Err(error) => {
                                             let _ = worker_events.send(ScreenShareEvent::Error(format!(
@@ -1269,6 +1493,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                         Some("Aceleração Media Foundation está disponível apenas no Windows.".to_owned()),
                                     );
                                     decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                    cpu_waiting_for_idr = !has_sps_and_idr;
                                 }
                                 Err(error) => {
                                     let _ = worker_events.send(ScreenShareEvent::Error(format!(
@@ -1276,6 +1501,15 @@ impl PeerConnectionEventHandler for PeerEvents {
                                     )));
                                     return;
                                 }
+                            }
+                        }
+
+                        if cpu_waiting_for_idr {
+                            if has_sps_and_idr {
+                                cpu_waiting_for_idr = false;
+                            } else {
+                                worker_metrics.record_assembled_access_unit(&access_unit);
+                                continue;
                             }
                         }
 
@@ -1305,16 +1539,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                         );
                                         decoder = Some(ActiveH264Decoder::OpenH264(cpu));
                                         using_cpu_pending_sps = false;
-                                        if let Some(decoder) = decoder.as_mut() {
-                                            decode_h264_access_unit(
-                                                &access_unit,
-                                                decoder,
-                                                &worker_context,
-                                                &worker_remote_frame,
-                                                &worker_sequence,
-                                                &worker_metrics,
-                                            );
-                                        }
+                                        cpu_waiting_for_idr = true;
                                     }
                                     Err(error) => {
                                         let _ = worker_events.send(ScreenShareEvent::Error(format!(
@@ -1341,16 +1566,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                             decoder = Some(ActiveH264Decoder::OpenH264(cpu));
                                             using_cpu_pending_sps = false;
                                             hardware_frames_without_output = 0;
-                                            if let Some(decoder) = decoder.as_mut() {
-                                                decode_h264_access_unit(
-                                                    &access_unit,
-                                                    decoder,
-                                                    &worker_context,
-                                                    &worker_remote_frame,
-                                                    &worker_sequence,
-                                                    &worker_metrics,
-                                                );
-                                            }
+                                            cpu_waiting_for_idr = true;
                                         }
                                         Err(error) => {
                                             let _ = worker_events.send(ScreenShareEvent::Error(format!(
@@ -1885,7 +2101,7 @@ async fn create_sender(
     // Preserve the order of encoded H.264 frames: P-frames depend on earlier frames.
     // The source capture already keeps only its newest raw frame, so a tiny bounded queue
     // limits latency without replacing encoded reference frames.
-    let (sample_tx, sample_rx) = mpsc::channel::<Vec<u8>>(1);
+    let (sample_tx, sample_rx) = mpsc::channel::<EncodedFrame>(1);
     let encoder_stop = Arc::new(AtomicBool::new(false));
     let encoder_stop_worker = Arc::clone(&encoder_stop);
     let encoder_events = events.clone();
@@ -1910,9 +2126,9 @@ async fn create_sender(
             return;
         };
         let mut sample_rx = sample_rx;
-        while let Some(data) = sample_rx.recv().await {
+        while let Some(encoded_frame) = sample_rx.recv().await {
             let sample = Sample {
-                data: Bytes::from(data),
+                data: Bytes::from(encoded_frame.bytes),
                 duration: FRAME_DURATION,
                 ..Sample::new(Instant::now())
             };
@@ -1934,10 +2150,7 @@ async fn create_sender(
                 )));
                 break;
             } else {
-                writer_metrics.sent_frames.fetch_add(1, Ordering::Relaxed);
-                writer_metrics
-                    .interval_sent_frames
-                    .fetch_add(1, Ordering::Relaxed);
+                writer_metrics.record_sent_frame(encoded_frame.kind);
             }
         }
     });
@@ -2050,12 +2263,13 @@ async fn close_peer(mut peer: PeerSession) {
 
 fn encode_latest_frames(
     source: LatestFrame,
-    samples: mpsc::Sender<Vec<u8>>,
+    samples: mpsc::Sender<EncodedFrame>,
     stop: Arc<AtomicBool>,
     metrics: Arc<SharedMetrics>,
 ) -> Result<(), String> {
     let mut encoder: Option<ActiveH264Encoder> = None;
     let mut hardware_warmup_frames = 0u32;
+    let mut forwarding_gate = H264ForwardingGate::default();
     let mut last_sequence = None;
     let mut next_frame = Instant::now();
 
@@ -2086,6 +2300,7 @@ fn encode_latest_frames(
         }
         last_sequence = Some(frame.sequence);
         validate_encoder_frame(&frame)?;
+        metrics.record_encoder_input_frame();
         if encoder.is_none() {
             #[cfg(windows)]
             {
@@ -2123,37 +2338,34 @@ fn encode_latest_frames(
                 let encoded_result = encode_frame(cpu, &frame);
                 metrics.record_encode_duration(encode_started_at.elapsed());
                 let encoded = encoded_result?;
-                send_encoded_frame(&encoded, &samples, &metrics)?;
+                forward_encoded_access_unit(&encoded, &samples, &metrics, &mut forwarding_gate)?;
                 None
             }
             #[cfg(windows)]
             ActiveH264Encoder::MediaFoundation(hardware) => {
+                if forwarding_gate.waiting_for_initial_idr() {
+                    hardware_warmup_frames = hardware_warmup_frames.saturating_add(1);
+                }
                 let encode_started_at = Instant::now();
                 let encode_result = hardware.encode_rgba(&frame.rgba);
                 metrics.record_encode_duration(encode_started_at.elapsed());
                 match encode_result {
                     Ok(encoded) => {
-                        if encoded.is_empty() {
-                            hardware_warmup_frames = hardware_warmup_frames.saturating_add(1);
-                            if hardware_warmup_frames > 90 {
-                                Some("O codificador de hardware não produziu H.264 após 3 segundos de aquecimento.".to_owned())
-                            } else {
-                                None
-                            }
+                        let was_waiting_for_idr = forwarding_gate.waiting_for_initial_idr();
+                        forward_encoded_access_unit(
+                            &encoded,
+                            &samples,
+                            &metrics,
+                            &mut forwarding_gate,
+                        )?;
+                        if was_waiting_for_idr && !forwarding_gate.waiting_for_initial_idr() {
+                            hardware_warmup_frames = 0;
+                        }
+                        if forwarding_gate.waiting_for_initial_idr() && hardware_warmup_frames > 90
+                        {
+                            Some("O codificador de hardware não enviou um IDR inicial com SPS/PPS após 90 quadros de entrada; usando OpenH264.".to_owned())
                         } else {
-                            let nals = annex_b_nal_types(&encoded);
-                            if !nals.contains(&7) || !nals.contains(&8) || !nals.contains(&5) {
-                                hardware_warmup_frames = hardware_warmup_frames.saturating_add(1);
-                                if hardware_warmup_frames > 90 {
-                                    Some("O codificador de hardware não enviou SPS/PPS/IDR após 3 segundos; usando OpenH264.".to_owned())
-                                } else {
-                                    None
-                                }
-                            } else {
-                                send_encoded_frame(&encoded, &samples, &metrics)?;
-                                hardware_warmup_frames = 0;
-                                None
-                            }
+                            None
                         }
                     }
                     Err(error) => Some(error),
@@ -2164,12 +2376,15 @@ fn encode_latest_frames(
         if let Some(reason) = hardware_failure {
             tracing::warn!(fallback_reason = %reason, "Falha no codificador H.264 de hardware; mudando para OpenH264 na CPU");
             metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
+            forwarding_gate.reset();
+            hardware_warmup_frames = 0;
             let mut cpu = openh264_encoder()?;
+            metrics.record_encoder_input_frame();
             let encode_started_at = Instant::now();
             let encoded_result = encode_frame(&mut cpu, &frame);
             metrics.record_encode_duration(encode_started_at.elapsed());
             let encoded = encoded_result?;
-            send_encoded_frame(&encoded, &samples, &metrics)?;
+            forward_encoded_access_unit(&encoded, &samples, &metrics, &mut forwarding_gate)?;
             encoder = Some(ActiveH264Encoder::OpenH264(cpu));
         }
         if next_frame < Instant::now() {
@@ -2197,20 +2412,48 @@ fn openh264_encoder() -> Result<Encoder, String> {
         .map_err(|error| format!("Não foi possível iniciar o codificador H.264 OpenH264: {error}"))
 }
 
+struct EncodedFrame {
+    bytes: Vec<u8>,
+    kind: H264FrameKind,
+}
+
+fn forward_encoded_access_unit(
+    encoded: &[u8],
+    samples: &mpsc::Sender<EncodedFrame>,
+    metrics: &SharedMetrics,
+    forwarding_gate: &mut H264ForwardingGate,
+) -> Result<(), String> {
+    if encoded.is_empty() {
+        return Ok(());
+    }
+
+    metrics.record_encoded_access_unit(encoded);
+    match forwarding_gate.prepare(encoded) {
+        H264ForwardDecision::Forward { access_unit, kind } => {
+            send_encoded_frame(&access_unit, kind, samples, metrics)
+        }
+        H264ForwardDecision::DropBeforeInitialIdr => {
+            metrics.record_drop_before_initial_idr();
+            Ok(())
+        }
+        H264ForwardDecision::DropInitialIdrWithoutParameterSets
+        | H264ForwardDecision::DropWithoutPicture => Ok(()),
+    }
+}
+
 fn send_encoded_frame(
     encoded: &[u8],
-    samples: &mpsc::Sender<Vec<u8>>,
+    kind: H264FrameKind,
+    samples: &mpsc::Sender<EncodedFrame>,
     metrics: &SharedMetrics,
 ) -> Result<(), String> {
     if encoded.is_empty() {
         return Ok(());
     }
-    metrics.record_encoded_access_unit(encoded);
-    metrics.encoded_frames.fetch_add(1, Ordering::Relaxed);
-    metrics
-        .interval_encoded_frames
-        .fetch_add(1, Ordering::Relaxed);
-    let sample = encoded.to_vec();
+    let sample = EncodedFrame {
+        bytes: encoded.to_vec(),
+        kind,
+    };
     let queue_wait_started_at = Instant::now();
     let send_result = samples.blocking_send(sample);
     metrics.interval_queue_wait_nanos.fetch_add(
@@ -2277,9 +2520,19 @@ mod tests {
     use openh264::formats::YUVSource;
 
     use super::{
-        Encoder, FRAME_DURATION, LatestFrame, PreviewFrame, ScreenShareEvent, ScreenShareSession,
-        annex_b_nal_types, encode_frame, should_log_aggregate_error, validate_stun_uri,
+        Encoder, FRAME_DURATION, H264ForwardDecision, H264ForwardingGate, H264FrameKind,
+        LatestFrame, PreviewFrame, ScreenShareEvent, ScreenShareSession, annex_b_nal_types,
+        classify_h264_access_unit, encode_frame, should_log_aggregate_error, validate_stun_uri,
     };
+
+    fn annex_b_access_unit(nals: &[&[u8]]) -> Vec<u8> {
+        let mut access_unit = Vec::new();
+        for nal in nals {
+            access_unit.extend_from_slice(&[0, 0, 0, 1]);
+            access_unit.extend_from_slice(nal);
+        }
+        access_unit
+    }
 
     #[test]
     fn repeated_media_errors_are_logged_at_doubling_counts() {
@@ -2300,6 +2553,66 @@ mod tests {
         assert!(validate_stun_uri("turn:relay.example:3478").is_err());
         assert!(validate_stun_uri("stun:one.example:3478,stun:two.example:3478").is_err());
         assert!(validate_stun_uri("not-a-stun-uri").is_err());
+    }
+
+    #[test]
+    fn h264_forwarding_gate_waits_for_idr_then_forwards_delta_frames() {
+        let sps = [0x67, 0x64, 0x00, 0x1f];
+        let pps = [0x68, 0x00];
+        let idr = [0x65, 0x88];
+        let delta = [0x41, 0x9a];
+        let mut gate = H264ForwardingGate::default();
+
+        assert_eq!(classify_h264_access_unit(&[7, 8]), None);
+        assert_eq!(
+            classify_h264_access_unit(&[7, 8, 5]),
+            Some(H264FrameKind::Idr)
+        );
+        assert_eq!(classify_h264_access_unit(&[1]), Some(H264FrameKind::Delta));
+
+        assert!(matches!(
+            gate.prepare(&annex_b_access_unit(&[&idr])),
+            H264ForwardDecision::DropInitialIdrWithoutParameterSets
+        ));
+        assert!(matches!(
+            gate.prepare(&annex_b_access_unit(&[&delta])),
+            H264ForwardDecision::DropBeforeInitialIdr
+        ));
+        assert!(matches!(
+            gate.prepare(&annex_b_access_unit(&[&sps, &pps])),
+            H264ForwardDecision::DropWithoutPicture
+        ));
+
+        let first_idr = gate.prepare(&annex_b_access_unit(&[&idr]));
+        match first_idr {
+            H264ForwardDecision::Forward { access_unit, kind } => {
+                assert_eq!(kind, H264FrameKind::Idr);
+                assert_eq!(annex_b_nal_types(&access_unit), vec![7, 8, 5]);
+            }
+            _ => panic!("o IDR inicial deve ser encaminhado com SPS e PPS"),
+        }
+
+        assert!(matches!(
+            gate.prepare(&annex_b_access_unit(&[&delta])),
+            H264ForwardDecision::Forward {
+                kind: H264FrameKind::Delta,
+                ..
+            }
+        ));
+
+        let next_idr = gate.prepare(&annex_b_access_unit(&[&idr]));
+        match next_idr {
+            H264ForwardDecision::Forward { access_unit, kind } => {
+                assert_eq!(kind, H264FrameKind::Idr);
+                assert_eq!(annex_b_nal_types(&access_unit), vec![7, 8, 5]);
+            }
+            _ => panic!("IDR posterior deve reenviar os parâmetros guardados"),
+        }
+
+        assert!(matches!(
+            gate.prepare(&annex_b_access_unit(&[&sps, &pps])),
+            H264ForwardDecision::DropWithoutPicture
+        ));
     }
 
     #[test]
@@ -2344,7 +2657,9 @@ mod tests {
             }
         };
         eprintln!("Codificador de teste: {}", encoder.name());
-        let mut access_unit = None;
+        let mut forwarding_gate = H264ForwardingGate::default();
+        let mut initial_idr = None;
+        let mut forwarded_delta = false;
         for sequence in 0..90u8 {
             let mut rgba = vec![0u8; 320 * 240 * 4];
             for (index, pixel) in rgba.chunks_exact_mut(4).enumerate() {
@@ -2354,15 +2669,22 @@ mod tests {
                 pixel[3] = 255;
             }
             let encoded = encoder.encode_rgba(&rgba).unwrap();
-            if annex_b_nal_types(&encoded).contains(&7)
-                && annex_b_nal_types(&encoded).contains(&8)
-                && annex_b_nal_types(&encoded).contains(&5)
+            if let H264ForwardDecision::Forward { access_unit, kind } =
+                forwarding_gate.prepare(&encoded)
             {
-                access_unit = Some(encoded);
-                break;
+                match kind {
+                    H264FrameKind::Idr => {
+                        initial_idr.get_or_insert(access_unit);
+                    }
+                    H264FrameKind::Delta => forwarded_delta = true,
+                };
             }
         }
-        let access_unit = access_unit.expect("codificador de hardware precisa emitir SPS/PPS/IDR");
+        assert!(
+            forwarded_delta,
+            "codificador de hardware precisa emitir quadros P depois do IDR inicial"
+        );
+        let access_unit = initial_idr.expect("codificador de hardware precisa emitir SPS/PPS/IDR");
         assert_eq!(
             mf_video::sps_dimensions(&access_unit),
             Some((320, 240)),
@@ -2447,7 +2769,7 @@ mod tests {
     }
 
     #[test]
-    fn loopback_webrtc_negotiates_transfers_a_frame_and_closes() {
+    fn loopback_webrtc_negotiates_transfers_idr_and_delta_frames_and_closes() {
         let context = egui::Context::default();
         let sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
         let receiver = ScreenShareSession::new_loopback(context).unwrap();
@@ -2491,6 +2813,9 @@ mod tests {
 
             if let Some(frame) = receiver.latest_remote_frame() {
                 received_frame = Some((frame.width, frame.height));
+            }
+            let receiver_metrics = receiver.metrics();
+            if receiver_metrics.decoded_frames >= 2 && receiver_metrics.decoded_delta_frames >= 1 {
                 break;
             }
             if Instant::now() >= next_frame {
@@ -2518,6 +2843,31 @@ mod tests {
             Some((320, 240)),
             "sender metrics: {:?}; receiver metrics: {:?}",
             sender_metrics,
+            receiver_metrics
+        );
+        assert!(
+            sender_metrics.sent_idr_frames >= 1,
+            "loopback deve enviar o IDR inicial; sender metrics: {:?}",
+            sender_metrics
+        );
+        assert!(
+            sender_metrics.sent_delta_frames >= 1,
+            "loopback deve enviar quadros P; sender metrics: {:?}",
+            sender_metrics
+        );
+        assert!(
+            receiver_metrics.decoded_delta_frames >= 1,
+            "loopback deve decodificar pelo menos um quadro P; receiver metrics: {:?}",
+            receiver_metrics
+        );
+        assert!(
+            receiver_metrics.decoded_frames >= 2,
+            "loopback deve decodificar o IDR e pelo menos um quadro P; receiver metrics: {:?}",
+            receiver_metrics
+        );
+        assert_eq!(
+            receiver_metrics.decode_errors, 0,
+            "loopback não deve produzir erros H.264; receiver metrics: {:?}",
             receiver_metrics
         );
     }
