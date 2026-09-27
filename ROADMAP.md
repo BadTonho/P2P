@@ -101,11 +101,15 @@ Se a conexão direta falhar em algumas redes, decidir entre manter o requisito e
 
 **Concluída quando:** a decisão sobre TURN estiver tomada e o aplicativo informar claramente quando a conexão é direta ou retransmitida.
 
-### Etapa 8 — Preparar o uso e o instalador
+### Etapa 8 — Preparar o uso e distribuir o executável
 
-Tratar encerramento do compartilhamento, desconexões, acesso às salas e estados de captura. Gerar o instalador do aplicativo cliente e documentar o compartilhamento do endereço de rede e do código da sala.
+Tratar encerramento do compartilhamento, desconexões, acesso às salas e estados de captura. Distribuir o aplicativo como um executável `.exe` solto, sem instalador, e documentar o compartilhamento do endereço de rede e do código da sala.
 
-**Concluída quando:** for possível instalar o cliente em outro computador e seguir os passos para conectar-se ao PC anfitrião e compartilhar a tela.
+**Atualizador implementado:** em Configurações > Atualizações, o app verifica versões em um manifesto do Google Drive, permite baixar sob demanda e reiniciar para aplicar. O download valida HTTPS, tamanho, SHA-256 e formato PE; a substituição usa um aplicador auxiliar com backup e rollback. Não há assinatura digital; o SHA-256 detecta corrupção, não autentica o publicador. A versão distribuída precisa embutir o link estável do manifesto via `P2P_UPDATE_MANIFEST_URL`. As instruções de publicação estão em `ATUALIZACOES.md`.
+
+**Falta validar:** publicar um manifesto e executável reais no Drive, testar o download anônimo, aplicar uma atualização entre duas versões e confirmar a recuperação após falha.
+
+**Concluída quando:** amigos conseguirem baixar o `.exe`, seguir os passos para conectar-se ao PC anfitrião e compartilhar a tela, e receber versões novas pelo atualizador opcional.
 
 ### Etapa 9 (opcional) — Fazer chamadas P2P de voz
 

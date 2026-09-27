@@ -6,6 +6,7 @@ mod logging;
 mod screen_capture;
 mod screen_sharing;
 mod signaling_client;
+mod update;
 
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,12 +19,35 @@ use screen_capture::{PendingScreenCapture, ScreenCapture};
 use screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
 use signaling_client::{SignalingClient, SignalingEvent};
 use signaling_protocol::{ParticipantInfo, RoomMode, SignalKind};
+use update::{UpdateEvent, UpdateManager, UpdateManifest};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsCategory {
     #[default]
     Audio,
     Connection,
+    Updates,
+}
+
+#[derive(Clone, Default)]
+enum UpdateStatus {
+    #[default]
+    Checking,
+    Unconfigured,
+    UpToDate,
+    Available(UpdateManifest),
+    Downloading {
+        manifest: UpdateManifest,
+        received: u64,
+    },
+    CancellingDownload(UpdateManifest),
+    Downloaded {
+        manifest: UpdateManifest,
+        path: std::path::PathBuf,
+    },
+    PreparingToApply,
+    Applying,
+    Failed(String),
 }
 
 #[derive(Default)]
@@ -91,6 +115,8 @@ struct ClientUi {
     last_control_link_state: Option<(usize, usize)>,
     last_control_metrics_log_at: Option<Instant>,
     last_audio_metrics_log_at: Option<Instant>,
+    updates: UpdateManager,
+    update_status: UpdateStatus,
 }
 
 #[derive(Clone, Default)]
@@ -121,6 +147,88 @@ struct HostAddress {
 }
 
 impl ClientUi {
+    fn refresh_updates(&mut self, context: &egui::Context) {
+        if self.room_code.is_some() {
+            if let UpdateStatus::Downloading { manifest, .. } = &self.update_status {
+                let manifest = manifest.clone();
+                self.updates.cancel_download();
+                self.update_status = UpdateStatus::CancellingDownload(manifest);
+            }
+        }
+
+        while let Some(event) = self.updates.try_recv() {
+            match event {
+                UpdateEvent::CheckFinished(Ok(Some(manifest))) => {
+                    self.update_status = UpdateStatus::Available(manifest);
+                }
+                UpdateEvent::CheckFinished(Ok(None)) => {
+                    self.update_status = UpdateStatus::UpToDate;
+                }
+                UpdateEvent::CheckFinished(Err(error)) => {
+                    self.update_status = if UpdateManager::is_configured() {
+                        UpdateStatus::Failed(error)
+                    } else {
+                        UpdateStatus::Unconfigured
+                    };
+                }
+                UpdateEvent::DownloadProgress {
+                    version, received, ..
+                } => {
+                    if let UpdateStatus::Downloading {
+                        manifest,
+                        received: current,
+                    } = &mut self.update_status
+                    {
+                        if manifest.version == version {
+                            *current = received;
+                        }
+                    }
+                }
+                UpdateEvent::DownloadFinished { manifest, path } => {
+                    self.update_status = UpdateStatus::Downloaded { manifest, path };
+                }
+                UpdateEvent::DownloadCancelled { version } => {
+                    let manifest = match &self.update_status {
+                        UpdateStatus::Downloading { manifest, .. }
+                        | UpdateStatus::CancellingDownload(manifest)
+                            if manifest.version == version =>
+                        {
+                            Some(manifest.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(manifest) = manifest {
+                        self.update_status = UpdateStatus::Available(manifest);
+                    }
+                }
+                UpdateEvent::DownloadFailed { version, error } => {
+                    self.update_status = UpdateStatus::Failed(format!(
+                        "Falha ao baixar a versão {version}: {error}"
+                    ));
+                }
+                UpdateEvent::ApplyStarted => {
+                    self.update_status = UpdateStatus::Applying;
+                    tracing::info!("Fechando o aplicativo para instalar a atualização");
+                    context.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                UpdateEvent::ApplyFailed(error) => {
+                    tracing::error!(error = %error, "Não foi possível preparar a atualização");
+                    self.update_status = UpdateStatus::Failed(error);
+                }
+            }
+        }
+    }
+
+    fn update_blocks_room_actions(&self) -> bool {
+        matches!(
+            &self.update_status,
+            UpdateStatus::Downloading { .. }
+                | UpdateStatus::CancellingDownload(_)
+                | UpdateStatus::PreparingToApply
+                | UpdateStatus::Applying
+        )
+    }
+
     fn show(&mut self, ui: &mut egui::Ui) {
         let context = ui.ctx().clone();
         if self.microphone.is_some()
@@ -130,6 +238,14 @@ impl ClientUi {
             || self.connecting
             || self.signaling.is_some()
             || self.control_mesh.is_some()
+            || matches!(
+                &self.update_status,
+                UpdateStatus::Checking
+                    | UpdateStatus::Downloading { .. }
+                    | UpdateStatus::CancellingDownload(_)
+                    | UpdateStatus::PreparingToApply
+                    | UpdateStatus::Applying
+            )
         {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
@@ -138,10 +254,12 @@ impl ClientUi {
         self.refresh_signaling(ui.ctx());
         self.refresh_screen_share(ui.ctx());
         self.refresh_control_mesh(ui.ctx());
+        self.refresh_updates(ui.ctx());
         self.handle_window_close(ui.ctx());
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut open_settings = false;
+            let mut open_update_settings = false;
             let mut close_settings = false;
             let mut export_logs = false;
             let settings_open = self.settings_open;
@@ -184,9 +302,32 @@ impl ClientUi {
                 ui.small(message);
             }
 
+            let update_notice = match &self.update_status {
+                UpdateStatus::Available(manifest) => Some(format!(
+                    "A versão {} está disponível.",
+                    manifest.version
+                )),
+                UpdateStatus::Downloaded { manifest, .. } => Some(format!(
+                    "A versão {} foi baixada; reinicie para aplicar.",
+                    manifest.version
+                )),
+                _ => None,
+            };
+            if let Some(notice) = update_notice {
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(85, 170, 110), notice);
+                    if ui.button("Ver atualização").clicked() {
+                        open_update_settings = true;
+                    }
+                });
+            }
+
             ui.add_space(20.0);
 
-            if open_settings {
+            if open_update_settings {
+                self.open_settings();
+                self.settings_category = SettingsCategory::Updates;
+            } else if open_settings {
                 self.open_settings();
             } else if close_settings {
                 self.close_settings();
@@ -254,7 +395,10 @@ impl ClientUi {
             );
 
             if ui
-                .add_enabled(!self.connecting, egui::Button::new("Criar sala"))
+                .add_enabled(
+                    !self.connecting && !self.update_blocks_room_actions(),
+                    egui::Button::new("Criar sala"),
+                )
                 .clicked()
             {
                 self.start_hosting();
@@ -274,7 +418,9 @@ impl ClientUi {
                         .desired_width(220.0),
                 );
 
-                let has_code = !self.join_code.trim().is_empty() && !self.connecting;
+                let has_code = !self.join_code.trim().is_empty()
+                    && !self.connecting
+                    && !self.update_blocks_room_actions();
                 if ui
                     .add_enabled(has_code, egui::Button::new("Entrar"))
                     .clicked()
@@ -605,6 +751,10 @@ impl ClientUi {
                 if ui.selectable_label(selected, "Conexão").clicked() {
                     self.select_settings_category(SettingsCategory::Connection);
                 }
+                let selected = self.settings_category == SettingsCategory::Updates;
+                if ui.selectable_label(selected, "Atualizações").clicked() {
+                    self.select_settings_category(SettingsCategory::Updates);
+                }
             });
 
             ui.separator();
@@ -612,8 +762,136 @@ impl ClientUi {
             ui.vertical(|ui| match self.settings_category {
                 SettingsCategory::Audio => self.show_audio_settings(ui),
                 SettingsCategory::Connection => self.show_connection_settings(ui),
+                SettingsCategory::Updates => self.show_update_settings(ui),
             });
         });
+    }
+
+    fn show_update_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Atualizações");
+        ui.label(format!("Versão instalada: {}", env!("CARGO_PKG_VERSION")));
+        ui.add_space(8.0);
+
+        if !UpdateManager::is_configured() {
+            ui.colored_label(
+                egui::Color32::from_rgb(190, 95, 35),
+                "Esta versão foi compilada sem um link de manifesto. Configure P2P_UPDATE_MANIFEST_URL e compile novamente para habilitar atualizações.",
+            );
+        } else {
+            match self.update_status.clone() {
+                UpdateStatus::Checking => {
+                    ui.label("Verificando se há uma versão nova…");
+                }
+                UpdateStatus::Unconfigured => {
+                    ui.label("Configure o link do manifesto para habilitar atualizações.");
+                }
+                UpdateStatus::UpToDate => {
+                    ui.label("Você está usando a versão mais recente.");
+                }
+                UpdateStatus::Available(manifest) => {
+                    ui.label(format!("A versão {} está disponível.", manifest.version));
+                    if self.room_code.is_some() {
+                        ui.small("Saia da sala para baixar a atualização.");
+                    }
+                    if ui
+                        .add_enabled(
+                            self.room_code.is_none(),
+                            egui::Button::new("Baixar atualização"),
+                        )
+                        .clicked()
+                    {
+                        tracing::info!(version = %manifest.version, "Usuário iniciou download de atualização");
+                        self.updates.download(manifest.clone());
+                        self.update_status = UpdateStatus::Downloading {
+                            manifest,
+                            received: 0,
+                        };
+                    }
+                }
+                UpdateStatus::Downloading { manifest, received } => {
+                    let progress = if manifest.size_bytes == 0 {
+                        0.0
+                    } else {
+                        received as f32 / manifest.size_bytes as f32
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(progress.clamp(0.0, 1.0)).text(format!(
+                            "Baixando {}: {} de {}",
+                            manifest.version,
+                            format_bytes(received),
+                            format_bytes(manifest.size_bytes)
+                        )),
+                    );
+                    if ui.button("Cancelar download").clicked() {
+                        self.updates.cancel_download();
+                        self.update_status = UpdateStatus::CancellingDownload(manifest);
+                    }
+                    if self.room_code.is_some() {
+                        ui.small("O download será cancelado porque há uma sala ativa.");
+                    }
+                }
+                UpdateStatus::CancellingDownload(_) => {
+                    ui.label("Cancelando o download…");
+                }
+                UpdateStatus::Downloaded { manifest, path } => {
+                    ui.label(format!(
+                        "A versão {} foi baixada e validada.",
+                        manifest.version
+                    ));
+                    if self.room_code.is_some() {
+                        ui.small("Saia da sala antes de reiniciar para aplicar a atualização.");
+                    }
+                    if ui
+                        .add_enabled(
+                            self.room_code.is_none(),
+                            egui::Button::new("Reiniciar para atualizar"),
+                        )
+                        .clicked()
+                    {
+                        tracing::info!(version = %manifest.version, "Usuário solicitou aplicação da atualização");
+                        self.update_status = UpdateStatus::PreparingToApply;
+                        self.updates.apply(path);
+                    }
+                }
+                UpdateStatus::PreparingToApply => {
+                    ui.label("Preparando a atualização ao lado do aplicativo…");
+                }
+                UpdateStatus::Applying => {
+                    ui.label("O aplicativo será fechado e reaberto com a nova versão.");
+                }
+                UpdateStatus::Failed(error) => {
+                    ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+                }
+            }
+        }
+
+        if self.room_code.is_some() {
+            ui.small(
+                "Downloads e reinicializações ficam bloqueados enquanto você está em uma sala.",
+            );
+        }
+        let operation_running = matches!(
+            &self.update_status,
+            UpdateStatus::Checking
+                | UpdateStatus::Downloading { .. }
+                | UpdateStatus::CancellingDownload(_)
+                | UpdateStatus::PreparingToApply
+                | UpdateStatus::Applying
+        );
+        if ui
+            .add_enabled(
+                UpdateManager::is_configured() && !operation_running,
+                egui::Button::new("Verificar atualizações"),
+            )
+            .clicked()
+        {
+            tracing::info!("Usuário solicitou nova verificação de atualização");
+            self.update_status = UpdateStatus::Checking;
+            self.updates.check();
+        }
+        ui.separator();
+        ui.small("O download usa HTTPS e valida tamanho e SHA-256. Não há assinatura digital: essas verificações detectam corrupção, mas não confirmam quem publicou os arquivos.");
+        ui.small("As atualizações só são baixadas e aplicadas por sua escolha; o app não faz isso enquanto você está em uma sala.");
     }
 
     fn show_connection_settings(&mut self, ui: &mut egui::Ui) {
@@ -1299,7 +1577,7 @@ impl ClientUi {
     }
 
     fn start_hosting(&mut self) {
-        if self.signaling.is_some() || self.connecting {
+        if self.signaling.is_some() || self.connecting || self.update_blocks_room_actions() {
             return;
         }
         tracing::info!(room_mode = ?self.create_room_mode, "Iniciando criação de sala");
@@ -1353,7 +1631,7 @@ impl ClientUi {
     }
 
     fn start_join(&mut self, code: String) {
-        if self.signaling.is_some() || self.connecting {
+        if self.signaling.is_some() || self.connecting || self.update_blocks_room_actions() {
             return;
         }
         let server_url = match signaling_ws_url(&self.server_url) {
@@ -2589,6 +2867,7 @@ fn signaling_address_for_control(control_address: &str) -> String {
 impl Drop for ClientUi {
     fn drop(&mut self) {
         tracing::info!("Encerrando aplicativo e liberando capturas e conexões");
+        self.updates.cancel_download();
         self.stop_microphone();
         self.stop_screen_share(true);
         self.screen_picker = None;
@@ -2600,9 +2879,14 @@ impl Drop for ClientUi {
 }
 
 fn main() -> eframe::Result {
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(exit_code) = update::helper_arguments(&arguments) {
+        std::process::exit(exit_code);
+    }
     let mut app = ClientUi::default();
     app.logging = LoggingState::initialize();
     logging::install_panic_hook();
+    app.updates.check();
     app.monitor_gain_db = 6.0;
     app.microphone_level_dbfs = -60.0;
     app.stun_server_url = "stun:stun.l.google.com:19302".to_owned();
@@ -2616,6 +2900,18 @@ fn main() -> eframe::Result {
             egui::CentralPanel::default().show(ui, |ui| app.show(ui));
         },
     )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    if bytes >= MIB as u64 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else if bytes >= KIB as u64 {
+        format!("{:.1} KiB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 #[cfg(test)]

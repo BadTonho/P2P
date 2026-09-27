@@ -11,6 +11,8 @@ cpal = "0.18.2"
 bytes = "1"
 eframe = "0.36.2"
 futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+sha2 = "0.10"
 openh264 = { version = "0.9.8", features = ["source"] }
 rtrb = "0.4"
 rfd = { version = "0.16", default-features = false }
