@@ -3403,6 +3403,7 @@ dependencies = [
  "tracing-subscriber",
  "turn-server",
  "webrtc",
+ "windows",
  "windows-capture",
 ]
 

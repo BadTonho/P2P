@@ -77,6 +77,12 @@ Usar o servidor da sala apenas para trocar pedido, oferta, resposta, candidatos 
 
 **Implementado:** captura de até 1280×720, codificação H.264 com OpenH264 incluído, envio WebRTC de até 30 fps, decodificação da tela remota, negociação por oferta/resposta e ICE, controle para pedir/aceitar/recusar/encerrar compartilhamento, desempate pela ordem de entrada quando há pedidos simultâneos, parada ao encerrar a captura ou perder a conexão. Salas com mais de duas pessoas não podem iniciar o compartilhamento.
 
+**Aceleração de vídeo:** no Windows, o aplicativo tenta usar codificadores H.264 de hardware enumerados pelo Media Foundation e decodificadores DXVA/Direct3D 11. A entrada continua sendo convertida para NV12 na CPU e o quadro decodificado é copiado de volta para a memória do aplicativo; captura, prévia e interface não foram migradas para a GPU. Se o codec ou a inicialização do dispositivo não estiver disponível, o app usa OpenH264 na CPU. A interface e os logs exibem o codec ativo e a razão do fallback. O formato solicitado continua H.264 Baseline, até 1280×720 e 30 fps.
+
+**Validação automatizada local:** o NVIDIA H.264 Encoder MFT deste PC gerou SPS/PPS/IDR Baseline e o quadro foi decodificado pelo OpenH264, cobrindo a compatibilidade com receptores antigos. O Microsoft H264 Video Decoder MFT inicializou DXVA, mas não produziu quadros neste PC; o teste de loopback confirmou a troca para OpenH264 e a chegada da imagem.
+
+**Ainda falta validar manualmente:** conferir no Gerenciador de Tarefas o uso dos mecanismos de vídeo, testar com outros drivers/GPU que o DXVA entregue quadros, e transmitir entre dois computadores físicos. A aceleração do decoder pode ficar em CPU neste PC; o motivo aparece na interface e nos logs.
+
 **Validação manual:** transmissão do PC principal para o notebook confirmada, com 104 quadros decodificados e zero erros H.264; cancelamento do seletor confirmado. A transmissão inversa não foi validada porque o notebook tem hardware limitado.
 
 **Ainda falta validar:** fechar a janela capturada, testar o encerramento da sessão e confirmar que o servidor nunca recebe quadros de vídeo. Também falta validar com firewall e adaptadores que as pessoas realmente usarão. O teste inverso pode ser feito depois com outro computador mais potente.

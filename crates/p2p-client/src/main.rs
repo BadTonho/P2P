@@ -3,6 +3,7 @@
 mod audio_capture;
 mod control_mesh;
 mod logging;
+mod mf_video;
 mod screen_capture;
 mod screen_sharing;
 mod settings;
@@ -684,6 +685,21 @@ impl ClientUi {
             } else {
                 ui.small("O vídeo P2P usa UDP 9002. Os dois PCs precisam permitir o aplicativo ou essa porta no firewall do Windows, na rede privada.");
                 ui.small("Nesta etapa, os PCs precisam estar na mesma rede local ou na mesma Radmin VPN. Conexões entre redes diferentes pela internet ainda não estão disponíveis.");
+            }
+            if !self.screen_share_metrics.encoder_backend.is_empty()
+                || !self.screen_share_metrics.decoder_backend.is_empty()
+            {
+                ui.small(format!(
+                    "Codec local: {}. Codec remoto: {}.",
+                    self.screen_share_metrics.encoder_backend,
+                    self.screen_share_metrics.decoder_backend
+                ));
+                if let Some(reason) = &self.screen_share_metrics.encoder_fallback_reason {
+                    ui.small(format!("Fallback do codificador: {reason}"));
+                }
+                if let Some(reason) = &self.screen_share_metrics.decoder_fallback_reason {
+                    ui.small(format!("Fallback do decodificador: {reason}"));
+                }
             }
 
             if self.screen_capture.is_some() {
@@ -1626,6 +1642,10 @@ impl ClientUi {
                     local_relay = metrics.local_relay_candidates,
                     remote_relay = metrics.remote_relay_candidates,
                     route = ?metrics.route,
+                    encoder_backend = %metrics.encoder_backend,
+                    encoder_fallback = metrics.encoder_fallback_reason.as_deref().unwrap_or(""),
+                    decoder_backend = %metrics.decoder_backend,
+                    decoder_fallback = metrics.decoder_fallback_reason.as_deref().unwrap_or(""),
                     encoded = metrics.encoded_frames,
                     sent = metrics.sent_frames,
                     received_packets = metrics.received_packets,
@@ -3061,9 +3081,13 @@ impl ClientUi {
                 .collect(),
             screen_share_state: share_state.to_owned(),
             screen_metrics: format!(
-                "P2P={}, rota={:?}, ICE local/remoto={}/{}, srflx local/remoto={}/{}, relay local/remoto={}/{}, quadros codificados/enviados/decodificados={}/{}/{}, pacotes recebidos={}, erros de decodificação={}, diagnóstico H.264={} ",
+                "P2P={}, rota={:?}, codec local/remoto={}/{}, fallback local/remoto={}/{}, ICE local/remoto={}/{}, srflx local/remoto={}/{}, relay local/remoto={}/{}, quadros codificados/enviados/decodificados={}/{}/{}, pacotes recebidos={}, erros de decodificação={}, diagnóstico H.264={} ",
                 metrics.p2p_connected,
                 metrics.route,
+                metrics.encoder_backend,
+                metrics.decoder_backend,
+                metrics.encoder_fallback_reason.as_deref().unwrap_or(""),
+                metrics.decoder_fallback_reason.as_deref().unwrap_or(""),
                 metrics.local_ice_candidates,
                 metrics.remote_ice_candidates,
                 metrics.local_srflx_candidates,

@@ -43,6 +43,7 @@ use webrtc::peer_connection::{
 use webrtc::runtime::TokioRuntime;
 
 use crate::logging::safe_stun_endpoint;
+use crate::mf_video;
 use crate::screen_capture::{LatestFrame, PreviewFrame};
 use crate::turn_relay::TurnCredentials;
 
@@ -103,6 +104,10 @@ pub struct ScreenShareMetrics {
     pub decode_errors: u64,
     pub last_decode_error: Option<String>,
     pub h264_diagnostics: String,
+    pub encoder_backend: String,
+    pub encoder_fallback_reason: Option<String>,
+    pub decoder_backend: String,
+    pub decoder_fallback_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +132,10 @@ struct SharedMetrics {
     decoded_frames: AtomicU64,
     decode_errors: AtomicU64,
     last_decode_error: Mutex<Option<String>>,
+    encoder_backend: Mutex<String>,
+    encoder_fallback_reason: Mutex<Option<String>>,
+    decoder_backend: Mutex<String>,
+    decoder_fallback_reason: Mutex<Option<String>>,
     connected_at: Mutex<Option<Instant>>,
     h264_flow: Mutex<H264FlowDiagnostics>,
 }
@@ -184,6 +193,26 @@ impl SharedMetrics {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
+            encoder_backend: self
+                .encoder_backend
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            encoder_fallback_reason: self
+                .encoder_fallback_reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            decoder_backend: self
+                .decoder_backend
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            decoder_fallback_reason: self
+                .decoder_fallback_reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             h264_diagnostics: format!(
                 "Codificado: SPS/PPS/IDR {}/{}/{} ({}); RTP: SPS/PPS/IDR {}/{}/{}, single/STAP-A/FU-A início/fim {}/{}/{}/{}, lacunas/reordenação {}/{}; quadros montados: {} (com SPS/PPS/IDR {}/{}/{}), erros de montagem {}; último quadro: {}{}.",
                 h264_flow.encoded_sps,
@@ -212,6 +241,28 @@ impl SharedMetrics {
                     .unwrap_or_default(),
             ),
         }
+    }
+
+    fn set_encoder_backend(&self, backend: String, fallback: Option<String>) {
+        *self
+            .encoder_backend
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = backend;
+        *self
+            .encoder_fallback_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = fallback;
+    }
+
+    fn set_decoder_backend(&self, backend: String, fallback: Option<String>) {
+        *self
+            .decoder_backend
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = backend;
+        *self
+            .decoder_fallback_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = fallback;
     }
 
     fn record_encoded_access_unit(&self, data: &[u8]) {
@@ -504,23 +555,54 @@ fn validate_stap_a(payload: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+enum ActiveH264Decoder {
+    OpenH264(Decoder),
+    #[cfg(windows)]
+    MediaFoundation(mf_video::HardwareDecoder),
+}
+
 fn decode_h264_access_unit(
     access_unit: &[u8],
-    decoder: &mut Decoder,
+    decoder: &mut ActiveH264Decoder,
     context: &egui::Context,
     remote_frame: &RemoteFrameStore,
     sequence: &AtomicU64,
     metrics: &SharedMetrics,
-) {
+) -> Option<String> {
     let sample_diagnostics = metrics.record_assembled_access_unit(access_unit);
-    match decoder.decode(access_unit) {
-        Ok(Some(yuv)) => {
-            let (width, height) = yuv.dimensions();
+    let decoded = match decoder {
+        ActiveH264Decoder::OpenH264(decoder) => decoder
+            .decode(access_unit)
+            .map(|frame| {
+                frame.map(|yuv| {
+                    let (width, height) = yuv.dimensions();
+                    let mut rgba = vec![0; yuv.rgba8_len()];
+                    yuv.write_rgba8(&mut rgba);
+                    (width as u32, height as u32, rgba)
+                })
+            })
+            .map_err(|error| {
+                let detail = if error.native_code() & 0x10 != 0 {
+                    format!(
+                        "{error} (dsNoParamSets: SPS/PPS ausentes ou incompatíveis; quadro: {sample_diagnostics})"
+                    )
+                } else {
+                    format!("{error}; quadro: {sample_diagnostics}")
+                };
+                (detail, Some(error.native_code()))
+            }),
+        #[cfg(windows)]
+        ActiveH264Decoder::MediaFoundation(decoder) => decoder
+            .decode(access_unit)
+            .map(|frame| frame.map(|frame| (frame.width, frame.height, frame.rgba)))
+            .map_err(|error| (format!("{error}; quadro: {sample_diagnostics}"), None)),
+    };
+
+    match decoded {
+        Ok(Some((width, height, rgba))) => {
             if width == 0 || height == 0 {
-                return;
+                return None;
             }
-            let mut rgba = vec![0; yuv.rgba8_len()];
-            yuv.write_rgba8(&mut rgba);
             metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
             let next_sequence = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             *remote_frame
@@ -528,38 +610,52 @@ fn decode_h264_access_unit(
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(Arc::new(PreviewFrame {
                     sequence: next_sequence,
-                    width: width as u32,
-                    height: height as u32,
+                    width,
+                    height,
                     rgba,
                 }));
             context.request_repaint();
+            None
         }
-        Ok(None) => {}
-        Err(error) => {
+        Ok(None) => None,
+        Err((detail, native_code)) => {
+            #[cfg(windows)]
+            let hardware_decoder = matches!(&*decoder, ActiveH264Decoder::MediaFoundation(_));
+            #[cfg(not(windows))]
+            let hardware_decoder = false;
             let count = metrics.decode_errors.fetch_add(1, Ordering::Relaxed) + 1;
-            let detail = if error.native_code() & 0x10 != 0 {
-                format!(
-                    "{error} (dsNoParamSets: SPS/PPS ausentes ou incompatíveis; quadro: {sample_diagnostics})"
-                )
-            } else {
-                format!("{error}; quadro: {sample_diagnostics}")
-            };
             *metrics
                 .last_decode_error
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail);
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail.clone());
             if should_log_aggregate_error(count) {
                 tracing::warn!(
                     decode_errors = count,
-                    native_code = error.native_code(),
+                    native_code = native_code.unwrap_or_default(),
                     frame = %sample_diagnostics,
-                    error = %error,
-                    "Decodificador H.264 rejeitou quadro; resumos repetidos registrados em contagens dobradas"
+                    error = %detail,
+                    backend = %metrics.decoder_backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                    "Decodificador de vídeo rejeitou quadro; resumos repetidos registrados em contagens dobradas"
                 );
             }
             context.request_repaint();
+            hardware_decoder.then_some(detail)
         }
     }
+}
+
+fn is_hardware_device_failure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "dxva",
+        "d3d11",
+        "dispositivo de vídeo",
+        "superfície d3d",
+        "0x887a",
+        "0xc00d36b5",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
 }
 
 fn annex_b_nal_types(data: &[u8]) -> Vec<u8> {
@@ -1022,23 +1118,216 @@ impl PeerConnectionEventHandler for PeerEvents {
     }
 
     async fn on_track(&self, track: Arc<dyn TrackRemote>) {
-        tracing::info!("Faixa de vídeo remota recebida; iniciando depacketizador/decodificador");
+        tracing::info!(
+            "Faixa de vídeo remota recebida; iniciando depacketizador e worker de codec"
+        );
         let events = self.events.clone();
         let context = self.context.clone();
         let remote_frame = Arc::clone(&self.remote_frame);
         let sequence = Arc::clone(&self.remote_frame_sequence);
         let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
-            let mut decoder = match Decoder::new() {
-                Ok(decoder) => decoder,
-                Err(error) => {
-                    tracing::error!(error = %error, "Falha ao iniciar decodificador OpenH264");
-                    let _ = events.send(ScreenShareEvent::Error(format!(
-                        "Nao foi possivel iniciar o decodificador H.264: {error}"
-                    )));
-                    return;
-                }
-            };
+            let (decoder_tx, decoder_rx) = std_mpsc::sync_channel::<Vec<u8>>(8);
+            let worker_events = events.clone();
+            let worker_context = context.clone();
+            let worker_remote_frame = Arc::clone(&remote_frame);
+            let worker_sequence = Arc::clone(&sequence);
+            let worker_metrics = Arc::clone(&metrics);
+            let worker = thread::Builder::new()
+                .name("p2p-h264-decoder".to_owned())
+                .spawn(move || {
+                    let mut decoder: Option<ActiveH264Decoder> = None;
+                    let mut using_cpu_pending_sps = false;
+                    let mut hardware_frames_without_output = 0u32;
+                    while let Ok(access_unit) = decoder_rx.recv() {
+                        let has_sps_and_idr = {
+                            let nals = annex_b_nal_types(&access_unit);
+                            nals.contains(&7) && nals.contains(&8) && nals.contains(&5)
+                        };
+
+                        #[cfg(windows)]
+                        let should_try_hardware = decoder.is_none()
+                            || (using_cpu_pending_sps && has_sps_and_idr);
+                        #[cfg(not(windows))]
+                        let should_try_hardware = false;
+
+                        if should_try_hardware {
+                            #[cfg(windows)]
+                            {
+                                if let Some((width, height)) = mf_video::sps_dimensions(&access_unit) {
+                                    match mf_video::HardwareDecoder::new(width, height) {
+                                        Ok(hardware) => {
+                                            let name = hardware.name().to_owned();
+                                            worker_metrics.set_decoder_backend(
+                                                format!("GPU — DXVA / {name}"),
+                                                None,
+                                            );
+                                            tracing::info!(
+                                                codec = %name,
+                                                width,
+                                                height,
+                                                "Decodificador H.264 DXVA ativado"
+                                            );
+                                            decoder = Some(ActiveH264Decoder::MediaFoundation(hardware));
+                                            using_cpu_pending_sps = false;
+                                        }
+                                        Err(error) => {
+                                            let reason = format!("DXVA indisponível: {error}");
+                                            tracing::warn!(fallback_reason = %reason, "Usando decodificador H.264 OpenH264 na CPU");
+                                            match Decoder::new() {
+                                                Ok(cpu) => {
+                                                    worker_metrics.set_decoder_backend(
+                                                        "CPU — OpenH264".to_owned(),
+                                                        Some(reason),
+                                                    );
+                                                    decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                                    using_cpu_pending_sps = false;
+                                                }
+                                                Err(cpu_error) => {
+                                                    tracing::error!(error = %cpu_error, "Falha ao iniciar decodificador H.264 de CPU");
+                                                    let _ = worker_events.send(ScreenShareEvent::Error(format!(
+                                                        "Não foi possível iniciar decodificador H.264 de hardware nem OpenH264: {error}; {cpu_error}"
+                                                    )));
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if decoder.is_none() {
+                                    let reason = "Aguardando SPS/PPS para iniciar DXVA; usando CPU neste quadro".to_owned();
+                                    match Decoder::new() {
+                                        Ok(cpu) => {
+                                            worker_metrics.set_decoder_backend(
+                                                "CPU — OpenH264 (aguardando SPS/PPS)".to_owned(),
+                                                Some(reason),
+                                            );
+                                            decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                            using_cpu_pending_sps = true;
+                                        }
+                                        Err(error) => {
+                                            let _ = worker_events.send(ScreenShareEvent::Error(format!(
+                                                "Não foi possível iniciar o decodificador H.264: {error}"
+                                            )));
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        #[cfg(not(windows))]
+                        if decoder.is_none() {
+                            match Decoder::new() {
+                                Ok(cpu) => {
+                                    worker_metrics.set_decoder_backend(
+                                        "CPU — OpenH264".to_owned(),
+                                        Some("Aceleração Media Foundation está disponível apenas no Windows.".to_owned()),
+                                    );
+                                    decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                }
+                                Err(error) => {
+                                    let _ = worker_events.send(ScreenShareEvent::Error(format!(
+                                        "Não foi possível iniciar o decodificador H.264: {error}"
+                                    )));
+                                    return;
+                                }
+                            }
+                        }
+
+                        if let Some(active_decoder) = decoder.as_mut() {
+                            let decoded_before =
+                                worker_metrics.decoded_frames.load(Ordering::Relaxed);
+                            let hardware_error = decode_h264_access_unit(
+                                &access_unit,
+                                active_decoder,
+                                &worker_context,
+                                &worker_remote_frame,
+                                &worker_sequence,
+                                &worker_metrics,
+                            );
+                            #[cfg(windows)]
+                            if hardware_error
+                                .as_deref()
+                                .is_some_and(is_hardware_device_failure)
+                            {
+                                let reason = hardware_error.unwrap_or_default();
+                                tracing::warn!(fallback_reason = %reason, "Falha do dispositivo DXVA; mudando para OpenH264 na CPU");
+                                match Decoder::new() {
+                                    Ok(cpu) => {
+                                        worker_metrics.set_decoder_backend(
+                                            "CPU — OpenH264".to_owned(),
+                                            Some(reason),
+                                        );
+                                        decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                        using_cpu_pending_sps = false;
+                                        if let Some(decoder) = decoder.as_mut() {
+                                            decode_h264_access_unit(
+                                                &access_unit,
+                                                decoder,
+                                                &worker_context,
+                                                &worker_remote_frame,
+                                                &worker_sequence,
+                                                &worker_metrics,
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let _ = worker_events.send(ScreenShareEvent::Error(format!(
+                                            "DXVA falhou e OpenH264 não pôde iniciar: {error}"
+                                        )));
+                                        return;
+                                    }
+                                }
+                            }
+
+                            if matches!(decoder.as_ref(), Some(ActiveH264Decoder::MediaFoundation(_)))
+                                && worker_metrics.decoded_frames.load(Ordering::Relaxed) == decoded_before
+                            {
+                                hardware_frames_without_output = hardware_frames_without_output.saturating_add(1);
+                                if hardware_frames_without_output >= 5 {
+                                    let reason = "DXVA recebeu 5 quadros H.264 sem produzir imagem; usando OpenH264 na CPU.".to_owned();
+                                    tracing::warn!(fallback_reason = %reason, "Decodificador DXVA sem saída; mudando para OpenH264 na CPU");
+                                    match Decoder::new() {
+                                        Ok(cpu) => {
+                                            worker_metrics.set_decoder_backend(
+                                                "CPU — OpenH264".to_owned(),
+                                                Some(reason),
+                                            );
+                                            decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                            using_cpu_pending_sps = false;
+                                            hardware_frames_without_output = 0;
+                                            if let Some(decoder) = decoder.as_mut() {
+                                                decode_h264_access_unit(
+                                                    &access_unit,
+                                                    decoder,
+                                                    &worker_context,
+                                                    &worker_remote_frame,
+                                                    &worker_sequence,
+                                                    &worker_metrics,
+                                                );
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let _ = worker_events.send(ScreenShareEvent::Error(format!(
+                                                "DXVA não produziu imagem e OpenH264 não pôde iniciar: {error}"
+                                            )));
+                                            return;
+                                        }
+                                    }
+                                }
+                            } else {
+                                hardware_frames_without_output = 0;
+                            }
+                        }
+                    }
+                });
+            if let Err(error) = worker {
+                tracing::error!(error = %error, "Falha ao iniciar worker do decodificador H.264");
+                let _ = events.send(ScreenShareEvent::Error(format!(
+                    "Não foi possível iniciar o worker do decodificador H.264: {error}"
+                )));
+                return;
+            }
             let mut assembler = H264AccessUnitAssembler::default();
             let mut previous_sequence = None;
             let mut flush_pending = tokio::time::interval(Duration::from_millis(10));
@@ -1066,14 +1355,22 @@ impl PeerConnectionEventHandler for PeerEvents {
 
                 for result in assembler.take_ready(Instant::now()) {
                     match result {
-                        Ok(access_unit) => decode_h264_access_unit(
-                            &access_unit,
-                            &mut decoder,
-                            &context,
-                            &remote_frame,
-                            &sequence,
-                            &metrics,
-                        ),
+                        Ok(access_unit) => match decoder_tx.try_send(access_unit) {
+                            Ok(()) => {}
+                            Err(std_mpsc::TrySendError::Full(_)) => {
+                                metrics.record_assembly_error(
+                                    "worker de decodificação atrasado; quadro H.264 descartado"
+                                        .to_owned(),
+                                );
+                                context.request_repaint();
+                            }
+                            Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                                let _ = events.send(ScreenShareEvent::Error(
+                                    "O worker do decodificador H.264 foi encerrado.".to_owned(),
+                                ));
+                                return;
+                            }
+                        },
                         Err(error) => {
                             metrics.record_assembly_error(error);
                             context.request_repaint();
@@ -1701,15 +1998,8 @@ fn encode_latest_frames(
     stop: Arc<AtomicBool>,
     metrics: Arc<SharedMetrics>,
 ) -> Result<(), String> {
-    let encoder_config = EncoderConfig::new()
-        .bitrate(BitRate::from_bps(4_000_000))
-        .max_frame_rate(FrameRate::from_hz(30.0))
-        .usage_type(UsageType::ScreenContentRealTime)
-        .adaptive_quantization(false)
-        .background_detection(false)
-        .intra_frame_period(IntraFramePeriod::from_num_frames(30));
-    let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), encoder_config)
-        .map_err(|error| format!("Não foi possível iniciar o codificador H.264: {error}"))?;
+    let mut encoder: Option<ActiveH264Encoder> = None;
+    let mut hardware_warmup_frames = 0u32;
     let mut last_sequence = None;
     let mut next_frame = Instant::now();
 
@@ -1739,13 +2029,83 @@ fn encode_latest_frames(
             continue;
         }
         last_sequence = Some(frame.sequence);
-        let encoded = encode_frame(&mut encoder, &frame)?;
-        if !encoded.is_empty() {
-            metrics.record_encoded_access_unit(&encoded);
-            metrics.encoded_frames.fetch_add(1, Ordering::Relaxed);
-            samples
-                .blocking_send(encoded)
-                .map_err(|_| "O envio de vídeo foi encerrado.".to_owned())?;
+        validate_encoder_frame(&frame)?;
+        if encoder.is_none() {
+            #[cfg(windows)]
+            {
+                match mf_video::HardwareEncoder::new(frame.width, frame.height) {
+                    Ok(hardware) => {
+                        let name = hardware.name().to_owned();
+                        tracing::info!(codec = %name, width = frame.width, height = frame.height, "Codificador H.264 de hardware ativado");
+                        metrics
+                            .set_encoder_backend(format!("GPU — Media Foundation / {name}"), None);
+                        encoder = Some(ActiveH264Encoder::MediaFoundation(hardware));
+                    }
+                    Err(error) => {
+                        let reason =
+                            format!("Media Foundation H.264 de hardware indisponível: {error}");
+                        tracing::warn!(fallback_reason = %reason, "Usando codificador H.264 OpenH264 na CPU");
+                        metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
+                        encoder = Some(ActiveH264Encoder::OpenH264(openh264_encoder()?));
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let reason = "Media Foundation está disponível apenas no Windows.".to_owned();
+                metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
+                encoder = Some(ActiveH264Encoder::OpenH264(openh264_encoder()?));
+            }
+        }
+
+        let active = encoder
+            .as_mut()
+            .expect("codificador inicializado antes de codificar");
+        let hardware_failure = match active {
+            ActiveH264Encoder::OpenH264(cpu) => {
+                let encoded = encode_frame(cpu, &frame)?;
+                send_encoded_frame(&encoded, &samples, &metrics)?;
+                None
+            }
+            #[cfg(windows)]
+            ActiveH264Encoder::MediaFoundation(hardware) => {
+                match hardware.encode_rgba(&frame.rgba) {
+                    Ok(encoded) => {
+                        if encoded.is_empty() {
+                            hardware_warmup_frames = hardware_warmup_frames.saturating_add(1);
+                            if hardware_warmup_frames > 90 {
+                                Some("O codificador de hardware não produziu H.264 após 3 segundos de aquecimento.".to_owned())
+                            } else {
+                                None
+                            }
+                        } else {
+                            let nals = annex_b_nal_types(&encoded);
+                            if !nals.contains(&7) || !nals.contains(&8) || !nals.contains(&5) {
+                                hardware_warmup_frames = hardware_warmup_frames.saturating_add(1);
+                                if hardware_warmup_frames > 90 {
+                                    Some("O codificador de hardware não enviou SPS/PPS/IDR após 3 segundos; usando OpenH264.".to_owned())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                send_encoded_frame(&encoded, &samples, &metrics)?;
+                                hardware_warmup_frames = 0;
+                                None
+                            }
+                        }
+                    }
+                    Err(error) => Some(error),
+                }
+            }
+        };
+
+        if let Some(reason) = hardware_failure {
+            tracing::warn!(fallback_reason = %reason, "Falha no codificador H.264 de hardware; mudando para OpenH264 na CPU");
+            metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
+            let mut cpu = openh264_encoder()?;
+            let encoded = encode_frame(&mut cpu, &frame)?;
+            send_encoded_frame(&encoded, &samples, &metrics)?;
+            encoder = Some(ActiveH264Encoder::OpenH264(cpu));
         }
         if next_frame < Instant::now() {
             next_frame = Instant::now() + FRAME_DURATION;
@@ -1754,7 +2114,40 @@ fn encode_latest_frames(
     Ok(())
 }
 
-fn encode_frame(encoder: &mut Encoder, frame: &PreviewFrame) -> Result<Vec<u8>, String> {
+enum ActiveH264Encoder {
+    OpenH264(Encoder),
+    #[cfg(windows)]
+    MediaFoundation(mf_video::HardwareEncoder),
+}
+
+fn openh264_encoder() -> Result<Encoder, String> {
+    let encoder_config = EncoderConfig::new()
+        .bitrate(BitRate::from_bps(4_000_000))
+        .max_frame_rate(FrameRate::from_hz(30.0))
+        .usage_type(UsageType::ScreenContentRealTime)
+        .adaptive_quantization(false)
+        .background_detection(false)
+        .intra_frame_period(IntraFramePeriod::from_num_frames(30));
+    Encoder::with_api_config(OpenH264API::from_source(), encoder_config)
+        .map_err(|error| format!("Não foi possível iniciar o codificador H.264 OpenH264: {error}"))
+}
+
+fn send_encoded_frame(
+    encoded: &[u8],
+    samples: &mpsc::Sender<Vec<u8>>,
+    metrics: &SharedMetrics,
+) -> Result<(), String> {
+    if encoded.is_empty() {
+        return Ok(());
+    }
+    metrics.record_encoded_access_unit(encoded);
+    metrics.encoded_frames.fetch_add(1, Ordering::Relaxed);
+    samples
+        .blocking_send(encoded.to_vec())
+        .map_err(|_| "O envio de vídeo foi encerrado.".to_owned())
+}
+
+fn validate_encoder_frame(frame: &PreviewFrame) -> Result<(), String> {
     if frame.width < 2
         || frame.height < 2
         || frame.width > 1280
@@ -1773,6 +2166,11 @@ fn encode_frame(encoder: &mut Encoder, frame: &PreviewFrame) -> Result<Vec<u8>, 
     if frame.rgba.len() != expected_len {
         return Err("O quadro da tela tem um tamanho de imagem inválido.".to_owned());
     }
+    Ok(())
+}
+
+fn encode_frame(encoder: &mut Encoder, frame: &PreviewFrame) -> Result<Vec<u8>, String> {
+    validate_encoder_frame(frame)?;
 
     let rgba = RgbaSliceU8::new(&frame.rgba, (frame.width as usize, frame.height as usize));
     let yuv = YUVBuffer::from_rgba8_source(rgba);
@@ -1797,12 +2195,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::egui;
+    #[cfg(windows)]
+    use crate::mf_video;
     use openh264::decoder::Decoder;
     use openh264::formats::YUVSource;
 
     use super::{
         Encoder, FRAME_DURATION, LatestFrame, PreviewFrame, ScreenShareEvent, ScreenShareSession,
-        encode_frame, should_log_aggregate_error, validate_stun_uri,
+        annex_b_nal_types, encode_frame, should_log_aggregate_error, validate_stun_uri,
     };
 
     #[test]
@@ -1855,6 +2255,119 @@ mod tests {
             rgba: Vec::new(),
         };
         assert!(encode_frame(&mut encoder, &frame).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn available_media_foundation_h264_hardware_emits_baseline_parameter_sets() {
+        let mut encoder = match mf_video::HardwareEncoder::new(320, 240) {
+            Ok(encoder) => encoder,
+            Err(reason) => {
+                eprintln!("Sem codificador H.264 de hardware compatível neste PC: {reason}");
+                return;
+            }
+        };
+        eprintln!("Codificador de teste: {}", encoder.name());
+        let mut access_unit = None;
+        for sequence in 0..90u8 {
+            let mut rgba = vec![0u8; 320 * 240 * 4];
+            for (index, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+                pixel[0] = (index as u8).wrapping_add(sequence.wrapping_mul(11));
+                pixel[1] = (index / 320) as u8;
+                pixel[2] = (index % 320) as u8;
+                pixel[3] = 255;
+            }
+            let encoded = encoder.encode_rgba(&rgba).unwrap();
+            if annex_b_nal_types(&encoded).contains(&7)
+                && annex_b_nal_types(&encoded).contains(&8)
+                && annex_b_nal_types(&encoded).contains(&5)
+            {
+                access_unit = Some(encoded);
+                break;
+            }
+        }
+        let access_unit = access_unit.expect("codificador de hardware precisa emitir SPS/PPS/IDR");
+        assert_eq!(
+            mf_video::sps_dimensions(&access_unit),
+            Some((320, 240)),
+            "SPS H.264 de hardware precisa anunciar o tamanho do quadro"
+        );
+        let nals = annex_b_nal_types(&access_unit);
+        assert!(nals.contains(&7));
+        let mut cursor = 0;
+        let mut sps_profile = None;
+        while cursor + 3 < access_unit.len() {
+            let mut prefix = None;
+            for start in cursor..access_unit.len().saturating_sub(2) {
+                if access_unit[start..].starts_with(&[0, 0, 0, 1]) {
+                    prefix = Some((start, 4));
+                    break;
+                }
+                if access_unit[start..].starts_with(&[0, 0, 1]) {
+                    prefix = Some((start, 3));
+                    break;
+                }
+            }
+            let Some((_, prefix_len)) = prefix else { break };
+            let nal_start = prefix.unwrap().0 + prefix_len;
+            let mut next = None;
+            for start in nal_start..access_unit.len().saturating_sub(2) {
+                if access_unit[start..].starts_with(&[0, 0, 0, 1]) {
+                    next = Some(start);
+                    break;
+                }
+                if access_unit[start..].starts_with(&[0, 0, 1]) {
+                    next = Some(start);
+                    break;
+                }
+            }
+            let end = next.unwrap_or(access_unit.len());
+            if nal_start + 1 < end && access_unit[nal_start] & 0x1f == 7 {
+                sps_profile = Some(access_unit[nal_start + 1]);
+                break;
+            }
+            cursor = end;
+        }
+        assert_eq!(sps_profile, Some(66), "SPS deve usar perfil Baseline");
+
+        let mut decoder = match mf_video::HardwareDecoder::new(320, 240) {
+            Ok(decoder) => decoder,
+            Err(reason) => {
+                eprintln!("Sem decodificador DXVA compatível neste PC: {reason}");
+                return;
+            }
+        };
+        eprintln!("Decodificador de teste: {}", decoder.name());
+        let mut decoded = None;
+        let mut hardware_error = None;
+        for _ in 0..8 {
+            match decoder.decode(&access_unit) {
+                Ok(Some(frame)) => {
+                    decoded = Some(frame);
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    hardware_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let Some(decoded) = decoded else {
+            let reason = hardware_error.unwrap_or_else(|| {
+                "o decodificador DXVA não produziu quadro no teste controlado".to_owned()
+            });
+            eprintln!("DXVA sem saída; conferindo fallback OpenH264: {reason}");
+            let mut cpu = Decoder::new().unwrap();
+            let decoded = cpu
+                .decode(&access_unit)
+                .unwrap()
+                .expect("OpenH264 deve decodificar o mesmo quadro H.264");
+            assert_eq!(decoded.dimensions(), (320, 240));
+            return;
+        };
+        assert_eq!((decoded.width, decoded.height), (320, 240));
+        assert_eq!(decoded.rgba.len(), 320 * 240 * 4);
     }
 
     #[test]
@@ -1920,8 +2433,16 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
 
+        let sender_metrics = sender.metrics();
+        let receiver_metrics = receiver.metrics();
         receiver.stop();
         sender.stop();
-        assert_eq!(received_frame, Some((320, 240)));
+        assert_eq!(
+            received_frame,
+            Some((320, 240)),
+            "sender metrics: {:?}; receiver metrics: {:?}",
+            sender_metrics,
+            receiver_metrics
+        );
     }
 }
