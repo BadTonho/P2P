@@ -5,6 +5,7 @@ mod control_mesh;
 mod logging;
 mod screen_capture;
 mod screen_sharing;
+mod settings;
 mod signaling_client;
 mod turn_relay;
 mod update;
@@ -18,6 +19,7 @@ use eframe::egui;
 use logging::{DiagnosticSnapshot, LoggingState, safe_signaling_endpoint, safe_stun_endpoint};
 use screen_capture::{PendingScreenCapture, ScreenCapture};
 use screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
+use settings::AppSettings;
 use signaling_client::{SignalingClient, SignalingEvent};
 use signaling_protocol::{ParticipantInfo, RoomMode, SignalKind};
 use turn_relay::{TurnCredentials, TurnRelayServer, TurnRoomConfig};
@@ -85,6 +87,7 @@ struct ClientUi {
     host_addresses: Vec<HostAddress>,
     host_addresses_error: Option<String>,
     selected_host_address: usize,
+    preferred_control_ipv4: Option<Ipv4Addr>,
     addresses_loaded: bool,
     participant_id: String,
     may_host: bool,
@@ -125,6 +128,9 @@ struct ClientUi {
     last_audio_metrics_log_at: Option<Instant>,
     updates: UpdateManager,
     update_status: UpdateStatus,
+    settings_error: Option<String>,
+    settings_dirty: bool,
+    settings_save_at: Option<Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -233,8 +239,47 @@ impl ClientUi {
         )
     }
 
+    fn preferences_snapshot(&self) -> AppSettings {
+        let mut settings = AppSettings::default();
+        settings.server_url = self.server_url.clone();
+        settings.stun_server_url = self.stun_server_url.clone();
+        settings.monitor_gain_db = self.monitor_gain_db;
+        settings.create_room_mode = self.create_room_mode;
+        settings.use_turn_on_create = self.use_turn_on_create;
+        settings.may_host = self.may_host;
+        settings.control_ipv4 = self.preferred_control_ipv4;
+        settings
+    }
+
+    fn apply_preferences(&mut self, preferences: AppSettings) {
+        self.server_url = preferences.server_url;
+        self.stun_server_url = preferences.stun_server_url;
+        self.monitor_gain_db = preferences.monitor_gain_db;
+        self.create_room_mode = preferences.create_room_mode;
+        self.use_turn_on_create = preferences.use_turn_on_create;
+        self.may_host = preferences.may_host;
+        self.preferred_control_ipv4 = preferences.control_ipv4;
+    }
+
+    fn save_preferences(&mut self) {
+        self.settings_dirty = true;
+        self.settings_save_at = None;
+        match settings::save(&self.preferences_snapshot()) {
+            Ok(()) => {
+                self.settings_dirty = false;
+                self.settings_error = None;
+                tracing::info!("Preferências do aplicativo salvas");
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "Não foi possível salvar as preferências do aplicativo");
+                self.settings_error = Some(error);
+            }
+        }
+    }
+
     fn show(&mut self, ui: &mut egui::Ui) {
         let context = ui.ctx().clone();
+        let preferences_before_frame = self.preferences_snapshot();
         if self.microphone.is_some()
             || self.screen_capture.is_some()
             || self.screen_picker.is_some()
@@ -306,6 +351,12 @@ impl ClientUi {
             if let Some(message) = &self.logging.export_message {
                 ui.small(message);
             }
+            if let Some(message) = self.settings_error.clone() {
+                ui.colored_label(egui::Color32::from_rgb(190, 95, 35), message);
+                if ui.button("Tentar salvar preferências").clicked() {
+                    self.save_preferences();
+                }
+            }
 
             let update_notice = match &self.update_status {
                 UpdateStatus::Available(manifest) => Some(format!(
@@ -347,6 +398,22 @@ impl ClientUi {
             }
             self.show_handoff_panel(ui, &context);
         });
+
+        if self.preferences_snapshot() != preferences_before_frame {
+            self.settings_dirty = true;
+            self.settings_save_at = Some(Instant::now() + Duration::from_millis(400));
+        }
+        if self.settings_dirty {
+            if let Some(save_at) = self.settings_save_at {
+                let now = Instant::now();
+                if now >= save_at {
+                    self.save_preferences();
+                    context.request_repaint();
+                } else {
+                    context.request_repaint_after(save_at - now);
+                }
+            }
+        }
     }
 
     fn show_home(&mut self, ui: &mut egui::Ui) {
@@ -2086,8 +2153,20 @@ impl ClientUi {
                 }
                 self.host_addresses = addresses;
                 self.host_addresses_error = None;
-                if self.selected_host_address >= self.host_addresses.len() {
-                    self.selected_host_address = 0;
+                if !self.host_addresses.is_empty() {
+                    self.selected_host_address = self
+                        .preferred_control_ipv4
+                        .and_then(|preferred| {
+                            self.host_addresses
+                                .iter()
+                                .position(|address| address.ipv4 == preferred)
+                        })
+                        .unwrap_or(0);
+                    let selected_ipv4 = self.host_addresses[self.selected_host_address].ipv4;
+                    if self.preferred_control_ipv4 != Some(selected_ipv4) {
+                        self.preferred_control_ipv4 = Some(selected_ipv4);
+                        tracing::info!(ipv4 = %selected_ipv4, "Adaptador de controle padrão selecionado porque o IPv4 salvo não está ativo");
+                    }
                 }
             }
             Err(error) => {
@@ -2118,6 +2197,7 @@ impl ClientUi {
                 });
             if previous_selection != self.selected_host_address {
                 let selected = &self.host_addresses[self.selected_host_address];
+                self.preferred_control_ipv4 = Some(selected.ipv4);
                 tracing::info!(adapter = %selected.adapter, ipv4 = %selected.ipv4, "Adaptador escolhido para a malha de controle");
             }
             ui.monospace(format!(
@@ -2154,6 +2234,7 @@ impl ClientUi {
                 });
             if previous_selection != self.selected_host_address {
                 let selected = &self.host_addresses[self.selected_host_address];
+                self.preferred_control_ipv4 = Some(selected.ipv4);
                 tracing::info!(adapter = %selected.adapter, ipv4 = %selected.ipv4, "Adaptador escolhido para anunciar a sala");
             }
             let url = format!(
@@ -3143,6 +3224,9 @@ fn signaling_address_for_control(control_address: &str) -> String {
 
 impl Drop for ClientUi {
     fn drop(&mut self) {
+        if let Err(error) = settings::save(&self.preferences_snapshot()) {
+            tracing::error!(error = %error, "Não foi possível salvar as preferências ao encerrar");
+        }
         tracing::info!("Encerrando aplicativo e liberando capturas e conexões");
         self.updates.cancel_download();
         self.stop_microphone();
@@ -3164,10 +3248,13 @@ fn main() -> eframe::Result {
     app.logging = LoggingState::initialize();
     logging::install_panic_hook();
     app.updates.check();
-    app.monitor_gain_db = 6.0;
     app.microphone_level_dbfs = -60.0;
-    app.stun_server_url = "stun:stun.l.google.com:19302".to_owned();
-    app.use_turn_on_create = true;
+    let (preferences, settings_warning) = settings::load();
+    app.apply_preferences(preferences);
+    app.settings_error = settings_warning;
+    if let Some(error) = &app.settings_error {
+        tracing::warn!(error = %error, "Preferências não puderam ser carregadas; usando valores padrão");
+    }
 
     tracing::info!("Interface gráfica sendo inicializada");
 

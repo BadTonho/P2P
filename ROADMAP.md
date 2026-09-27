@@ -109,17 +109,19 @@ O aplicativo gera credenciais temporárias para cada sala e as envia ao outro pa
 
 **Concluída quando:** esses cenários forem exercitados entre duas redes residenciais e a rota escolhida e a chegada dos quadros decodificados forem confirmadas.
 
-### Etapa 8 — Preparar o uso e distribuir o executável
+### Etapa 8 — Preparar o uso e distribuir o aplicativo
 
-Tratar encerramento do compartilhamento, desconexões, acesso às salas e estados de captura. Distribuir o aplicativo como um executável `.exe` solto, sem instalador, e documentar o compartilhamento do endereço de rede e do código da sala.
+Tratar encerramento do compartilhamento, desconexões, acesso às salas e estados de captura. Distribuir o aplicativo com um instalador Windows por usuário e também manter o `.exe` solto para o atualizador do GitHub. Documentar a instalação, o compartilhamento do endereço de rede e o código da sala.
 
 **Atualizador migrado para GitHub Releases:** em Configurações > Atualizações, o app consulta a API pública do repositório, permite baixar sob demanda e reiniciar para aplicar. O release estável precisa ter uma tag `vMAJOR.MINOR.PATCH` e o asset `p2p-client.exe`; não é necessário incluir chave de API ou manifesto. O download valida HTTPS, tamanho, SHA-256 informado pelo GitHub e formato PE; a substituição usa um aplicador auxiliar com backup e rollback. Não há assinatura digital. As instruções de publicação estão em `ATUALIZACOES.md`.
 
+**Instalador e preferências:** o setup por usuário instala em `%LOCALAPPDATA%\Programs\P2P-Voz-e-tela`, sem exigir administrador. O aplicativo salva preferências em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json`; atualizações preservam o arquivo e a desinstalação o remove. Códigos de sala e credenciais temporárias não são persistidos. O script `scripts/build-installer.ps1` compila o `.exe` e o instalador Inno Setup localmente.
+
 **Primeira publicação:** a versão do workspace permanece 1.0.0 e será a primeira versão pública com o atualizador GitHub.
 
-**Falta publicar e validar:** compilar o release 1.0.0, publicá-lo no GitHub com o asset de nome exato `p2p-client.exe` e validar uma atualização futura e a recuperação após falha. Também falta validar manualmente os cenários de rede da Etapa 7 entre duas casas, incluindo a rota TURN.
+**Falta validar:** instalar o setup, conferir a persistência das preferências e a remoção na desinstalação. Publicar os dois assets (`p2p-client.exe` e `P2P-Voz-e-tela-Setup.exe`) em um GitHub Release e validar uma atualização futura e a recuperação após falha. Também falta validar manualmente os cenários de rede da Etapa 7 entre duas casas, incluindo a rota TURN.
 
-**Concluída quando:** amigos conseguirem baixar o `.exe`, seguir os passos para conectar-se ao PC anfitrião e compartilhar a tela, e receber versões novas pelo atualizador opcional.
+**Concluída quando:** amigos conseguirem instalar pelo setup, seguir os passos para conectar-se ao PC anfitrião e compartilhar a tela, manter suas preferências ao atualizar e receber versões novas pelo atualizador opcional.
 
 ### Etapa 9 (opcional) — Fazer chamadas P2P de voz
 

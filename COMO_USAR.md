@@ -2,6 +2,15 @@
 
 Este guia cobre a versão Windows 1.0.0. O aplicativo compartilha tela; chamada de voz, câmera e chat de texto ainda não estão disponíveis. A captura local fica na memória. Nenhum vídeo é gravado.
 
+## Instalar o aplicativo
+
+1. Baixe `P2P-Voz-e-tela-Setup.exe` no GitHub Release mais recente e execute-o. A instalação é feita no seu usuário e não exige administrador.
+2. Abra **P2P - Voz e tela** pelo menu Iniciar.
+3. O app lembra endereço do anfitrião, STUN, ganho de áudio, modo de criação, opção TURN, autorização para hospedagem e adaptador de controle. As preferências ficam neste computador e sobrevivem às atualizações. O código da sala e credenciais temporárias não são salvos.
+4. Se preferir, o release também oferece `p2p-client.exe` para executar sem o instalador.
+
+Ao desinstalar pelo Windows, as preferências são removidas. Os logs de diagnóstico permanecem em `%LOCALAPPDATA%\P2P-Voz-e-tela\logs`.
+
 ## Antes de começar
 
 - Cada pessoa precisa executar o `p2p-client.exe` no Windows 10 versão 1803 ou posterior, ou Windows 11.
