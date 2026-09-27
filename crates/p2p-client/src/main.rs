@@ -313,6 +313,7 @@ impl ClientUi {
             let mut open_update_settings = false;
             let mut close_settings = false;
             let mut export_logs = false;
+            let mut open_logs_directory = false;
             let settings_open = self.settings_open;
 
             ui.horizontal(|ui| {
@@ -339,6 +340,22 @@ impl ClientUi {
 
             if export_logs {
                 self.export_logs();
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                ui.small(format!(
+                    "Log desta execução: {}",
+                    self.logging.current_log_file_label()
+                ));
+                if let Some(path) = self.logging.current_log_file() {
+                    if ui.small_button("Copiar caminho").clicked() {
+                        ui.ctx().copy_text(path.display().to_string());
+                    }
+                }
+                open_logs_directory = ui.small_button("Abrir pasta de logs").clicked();
+            });
+            if open_logs_directory {
+                self.open_logs_directory();
             }
 
             if let Some(error) = self.logging.take_write_error() {
@@ -3090,6 +3107,22 @@ impl ClientUi {
         }
     }
 
+    fn open_logs_directory(&mut self) {
+        match self.logging.open_log_directory() {
+            Ok(()) => {
+                self.logging.export_message = Some(format!(
+                    "Pasta de logs: {}",
+                    self.logging.actual_log_directory_label()
+                ));
+            }
+            Err(error) => {
+                self.logging.export_message =
+                    Some(format!("Não foi possível abrir a pasta de logs: {error}"));
+                tracing::error!(error = %error, "Falha ao abrir a pasta de logs");
+            }
+        }
+    }
+
     fn diagnostic_snapshot(&self) -> DiagnosticSnapshot {
         let share_state = match &self.screen_share_role {
             ScreenShareRole::Idle => "inativo",
@@ -3099,7 +3132,8 @@ impl ClientUi {
         };
         let metrics = &self.screen_share_metrics;
         DiagnosticSnapshot {
-            log_directory: self.logging.log_directory_label().to_owned(),
+            log_directory: self.logging.actual_log_directory_label(),
+            current_log_file: self.logging.current_log_file_label(),
             logging_status: self
                 .logging
                 .startup_message

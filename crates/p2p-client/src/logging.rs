@@ -14,6 +14,7 @@ const RETENTION_DAYS: i64 = 14;
 #[derive(Default)]
 pub struct LoggingState {
     log_directory: Option<PathBuf>,
+    current_log_file: Option<PathBuf>,
     last_write_error: Option<Arc<Mutex<Option<String>>>>,
     pub startup_message: Option<String>,
     pub export_message: Option<String>,
@@ -39,6 +40,7 @@ pub fn install_panic_hook() {
 #[derive(Default)]
 pub struct DiagnosticSnapshot {
     pub log_directory: String,
+    pub current_log_file: String,
     pub logging_status: String,
     pub room_mode: String,
     pub connected_to_signaling: bool,
@@ -60,8 +62,7 @@ struct SharedLogWriter {
 }
 
 struct RollingSink {
-    directory: PathBuf,
-    current_date: Option<String>,
+    path: PathBuf,
     file: Option<File>,
 }
 
@@ -116,9 +117,9 @@ impl LoggingState {
             return state;
         };
 
-        let sink = Arc::new(Mutex::new(
-            rolling_sink.expect("directory implies an opened sink"),
-        ));
+        let rolling_sink = rolling_sink.expect("directory implies an opened sink");
+        let current_log_file = Some(rolling_sink.path.clone());
+        let sink = Arc::new(Mutex::new(rolling_sink));
         let last_error = Arc::new(Mutex::new(None));
         let writer = SharedLogWriter {
             sink,
@@ -136,6 +137,7 @@ impl LoggingState {
 
         let mut state = Self {
             log_directory: Some(directory),
+            current_log_file,
             last_write_error: Some(last_error),
             startup_message,
             export_message: None,
@@ -149,6 +151,7 @@ impl LoggingState {
             os = std::env::consts::OS,
             architecture = std::env::consts::ARCH,
             log_directory = state.log_directory_label(),
+            log_file = state.current_log_file_label(),
             "Aplicativo iniciado; logger persistente pronto"
         );
         state
@@ -179,6 +182,10 @@ impl LoggingState {
             std::env::consts::ARCH
         ));
         output.push_str(&format!("Pasta de logs: {}\n", snapshot.log_directory));
+        output.push_str(&format!(
+            "Arquivo desta execução: {}\n",
+            snapshot.current_log_file
+        ));
         output.push_str(&format!("Estado do logger: {}\n", snapshot.logging_status));
         output.push_str(&format!("Modo da sala: {}\n", snapshot.room_mode));
         output.push_str(&format!(
@@ -213,20 +220,12 @@ impl LoggingState {
             }
         }
         output.push_str("\nDados excluídos: código da sala, tokens, payloads de sinalização e conteúdo de áudio/vídeo/tela.\n");
-        output.push_str("\n========== LOGS RETIDOS ==========\n");
+        output.push_str("\n========== LOG DESTA EXECUÇÃO ==========\n");
 
-        if let Some(directory) = &self.log_directory {
-            let mut files = log_files(directory)?;
-            files.sort();
-            for file in files {
-                output.push_str(&format!(
-                    "\n========== {} ==========\n",
-                    file.file_name().unwrap_or_default().to_string_lossy()
-                ));
-                output.push_str(&fs::read_to_string(file)?);
-                if !output.ends_with('\n') {
-                    output.push('\n');
-                }
+        if let Some(current_log_file) = &self.current_log_file {
+            output.push_str(&fs::read_to_string(current_log_file)?);
+            if !output.ends_with('\n') {
+                output.push('\n');
             }
         } else {
             output.push_str("Logger persistente indisponível nesta execução.\n");
@@ -251,6 +250,49 @@ impl LoggingState {
 
     pub fn log_directory(&self) -> Option<&Path> {
         self.log_directory.as_deref()
+    }
+
+    pub fn actual_log_directory_label(&self) -> String {
+        self.log_directory
+            .as_ref()
+            .map(|directory| directory.display().to_string())
+            .unwrap_or_else(|| "(indisponível)".to_owned())
+    }
+
+    pub fn current_log_file(&self) -> Option<&Path> {
+        self.current_log_file.as_deref()
+    }
+
+    pub fn current_log_file_label(&self) -> String {
+        self.current_log_file
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(indisponível)".to_owned())
+    }
+
+    pub fn open_log_directory(&self) -> io::Result<()> {
+        let Some(directory) = &self.log_directory else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "A pasta de logs não está disponível.",
+            ));
+        };
+
+        #[cfg(windows)]
+        {
+            std::process::Command::new("explorer.exe")
+                .arg(directory)
+                .spawn()
+                .map(|_| ())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = directory;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Abrir a pasta de logs está disponível apenas no Windows.",
+            ))
+        }
     }
 
     pub fn log_directory_label(&self) -> &'static str {
@@ -340,17 +382,21 @@ impl RollingSink {
     fn open(directory: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&directory)?;
         prune_logs(&directory);
-        let mut sink = Self {
-            directory,
-            current_date: None,
-            file: None,
-        };
-        sink.rotate_if_needed()?;
-        Ok(sink)
+        let path = directory.join(session_log_filename(
+            OffsetDateTime::now_utc(),
+            std::process::id(),
+        ));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Self {
+            path,
+            file: Some(file),
+        })
     }
 
     fn write_line(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.rotate_if_needed()?;
         if let Some(file) = &mut self.file {
             file.write_all(bytes)?;
             if !bytes.ends_with(b"\n") {
@@ -358,19 +404,6 @@ impl RollingSink {
             }
             file.flush()?;
         }
-        Ok(())
-    }
-
-    fn rotate_if_needed(&mut self) -> io::Result<()> {
-        let date = date_key(OffsetDateTime::now_utc().date());
-        if self.current_date.as_deref() == Some(&date) {
-            return Ok(());
-        }
-        let path = self.directory.join(format!("{LOG_FILE_PREFIX}{date}.log"));
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        self.current_date = Some(date);
-        self.file = Some(file);
-        prune_logs(&self.directory);
         Ok(())
     }
 }
@@ -418,6 +451,18 @@ fn date_key(date: Date) -> String {
     )
 }
 
+fn session_log_filename(now: OffsetDateTime, process_id: u32) -> String {
+    let subsecond_nanos = now.unix_timestamp_nanos().rem_euclid(1_000_000_000);
+    format!(
+        "{LOG_FILE_PREFIX}{}-{:02}{:02}{:02}-{:09}-{process_id}.log",
+        date_key(now.date()),
+        now.hour(),
+        now.minute(),
+        now.second(),
+        subsecond_nanos
+    )
+}
+
 fn log_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(directory)? {
@@ -442,8 +487,8 @@ fn prune_logs(directory: &Path) {
         if let Some(name) = file.file_name().and_then(|name| name.to_str()) {
             let date = name
                 .strip_prefix(LOG_FILE_PREFIX)
-                .and_then(|name| name.strip_suffix(".log"));
-            if date.is_some_and(|date| date.len() == 10 && date < cutoff.as_str()) {
+                .and_then(|name| name.get(..10));
+            if date.is_some_and(|date| date < cutoff.as_str()) {
                 let _ = fs::remove_file(file);
             }
         }
@@ -475,16 +520,13 @@ mod tests {
             OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         let mut sink = RollingSink::open(directory.clone()).unwrap();
+        let current_log = sink.path.clone();
         sink.write_line("evento de teste: captura iniciada".as_bytes())
             .unwrap();
         drop(sink);
 
-        let current = directory.join(format!(
-            "{LOG_FILE_PREFIX}{}.log",
-            date_key(OffsetDateTime::now_utc().date())
-        ));
         assert_eq!(
-            fs::read_to_string(current).unwrap(),
+            fs::read_to_string(current_log).unwrap(),
             "evento de teste: captura iniciada\n"
         );
         let _ = fs::remove_dir_all(directory);
@@ -505,8 +547,10 @@ mod tests {
         let today = OffsetDateTime::now_utc().date();
         let old = date_key(today - Duration::days(15));
         let retained = date_key(today - Duration::days(13));
-        let old_path = directory.join(format!("{LOG_FILE_PREFIX}{old}.log"));
-        let retained_path = directory.join(format!("{LOG_FILE_PREFIX}{retained}.log"));
+        let old_path = directory.join(format!("{LOG_FILE_PREFIX}{old}-120000-123456789-1.log"));
+        let retained_path = directory.join(format!(
+            "{LOG_FILE_PREFIX}{retained}-120000-123456789-1.log"
+        ));
         let unrelated_path = directory.join("notes.log");
         fs::write(&old_path, "old").unwrap();
         fs::write(&retained_path, "recent").unwrap();
@@ -521,15 +565,21 @@ mod tests {
     }
 
     #[test]
-    fn export_contains_network_diagnostics_and_retained_logs() {
+    fn export_contains_network_diagnostics_and_only_the_current_session_log() {
         let directory = std::env::temp_dir().join(format!(
             "p2p-log-export-{}-{}",
             std::process::id(),
             OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(&directory).unwrap();
-        let daily_log = directory.join(format!("{LOG_FILE_PREFIX}2026-09-26.log"));
-        fs::write(&daily_log, "room_transition=joined\n").unwrap();
+        let previous_log = directory.join(format!(
+            "{LOG_FILE_PREFIX}2026-09-26-210000-123456789-41.log"
+        ));
+        let current_log = directory.join(format!(
+            "{LOG_FILE_PREFIX}2026-09-27-210000-123456789-42.log"
+        ));
+        fs::write(&previous_log, "previous_session_event=true\n").unwrap();
+        fs::write(&current_log, "current_session_event=true\n").unwrap();
         let export = std::env::temp_dir().join(format!(
             "p2p-diagnostic-{}-{}.log",
             std::process::id(),
@@ -537,9 +587,11 @@ mod tests {
         ));
         let state = LoggingState {
             log_directory: Some(directory.clone()),
+            current_log_file: Some(current_log.clone()),
             ..LoggingState::default()
         };
         let snapshot = DiagnosticSnapshot {
+            current_log_file: current_log.display().to_string(),
             room_mode: "local/Radmin".to_owned(),
             signaling_address: "ws://user:secret@192.168.1.25:9000/ROOM-CODE-SECRET?token=secret"
                 .to_owned(),
@@ -552,7 +604,8 @@ mod tests {
 
         let contents = fs::read_to_string(&export).unwrap();
         assert!(contents.contains("Radmin VPN: 26.1.2.3"));
-        assert!(contents.contains("room_transition=joined"));
+        assert!(contents.contains("current_session_event=true"));
+        assert!(!contents.contains("previous_session_event=true"));
         assert!(contents.contains("ws://192.168.1.25:9000"));
         assert!(contents.contains("stun:stun.example:3478"));
         assert!(!contents.contains("secret"));
