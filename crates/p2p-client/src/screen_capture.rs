@@ -1,10 +1,11 @@
 use std::error::Error;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, Receiver, SyncSender, TryRecvError},
 };
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
@@ -19,6 +20,7 @@ use windows_capture::settings::{
 
 const MAX_FRAME_WIDTH: u32 = 1280;
 const MAX_FRAME_HEIGHT: u32 = 720;
+const MIN_CAPTURE_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
 #[derive(Clone)]
 pub struct PreviewFrame {
@@ -30,6 +32,33 @@ pub struct PreviewFrame {
 
 pub type LatestFrame = Arc<Mutex<Option<Arc<PreviewFrame>>>>;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CapturePerformanceSnapshot {
+    pub processed_frames: u64,
+    pub skipped_frames: u64,
+    pub readback_nanos: u64,
+    pub resize_nanos: u64,
+}
+
+#[derive(Default)]
+struct CapturePerformanceCounters {
+    processed_frames: AtomicU64,
+    skipped_frames: AtomicU64,
+    readback_nanos: AtomicU64,
+    resize_nanos: AtomicU64,
+}
+
+impl CapturePerformanceCounters {
+    fn take_snapshot(&self) -> CapturePerformanceSnapshot {
+        CapturePerformanceSnapshot {
+            processed_frames: self.processed_frames.swap(0, Ordering::Relaxed),
+            skipped_frames: self.skipped_frames.swap(0, Ordering::Relaxed),
+            readback_nanos: self.readback_nanos.swap(0, Ordering::Relaxed),
+            resize_nanos: self.resize_nanos.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
 type HandlerError = Box<dyn Error + Send + Sync>;
 type Control = CaptureControl<ScreenFrameHandler, HandlerError>;
 type PickResult = Result<Option<(windows_capture::GraphicsCaptureItem, (i32, i32))>, String>;
@@ -37,6 +66,7 @@ type PickResult = Result<Option<(windows_capture::GraphicsCaptureItem, (i32, i32
 pub struct ScreenCapture {
     control: Option<Control>,
     latest_frame: LatestFrame,
+    performance: Arc<CapturePerformanceCounters>,
     source_closed: Arc<AtomicBool>,
     picker_owner: Option<PickerThreadOwner>,
 }
@@ -180,6 +210,7 @@ impl ScreenCapture {
             return Err("A tela ou janela selecionada tem tamanho inválido.".to_owned());
         }
         let latest_frame = Arc::new(Mutex::new(None));
+        let performance = Arc::new(CapturePerformanceCounters::default());
         let source_closed = Arc::new(AtomicBool::new(false));
         let settings = Settings::new(
             PickerItemForThread(selected.item.clone()),
@@ -193,6 +224,7 @@ impl ScreenCapture {
                 _size: size,
                 context,
                 latest_frame: Arc::clone(&latest_frame),
+                performance: Arc::clone(&performance),
                 source_closed: Arc::clone(&source_closed),
             },
         );
@@ -209,6 +241,7 @@ impl ScreenCapture {
         Ok(Self {
             control: Some(control),
             latest_frame,
+            performance,
             source_closed,
             picker_owner: Some(selected.owner),
         })
@@ -223,6 +256,10 @@ impl ScreenCapture {
 
     pub fn frame_source(&self) -> LatestFrame {
         Arc::clone(&self.latest_frame)
+    }
+
+    pub(crate) fn take_performance_snapshot(&self) -> CapturePerformanceSnapshot {
+        self.performance.take_snapshot()
     }
 
     pub fn source_closed(&self) -> bool {
@@ -270,6 +307,7 @@ struct HandlerFlags {
     _size: (i32, i32),
     context: egui::Context,
     latest_frame: LatestFrame,
+    performance: Arc<CapturePerformanceCounters>,
     source_closed: Arc<AtomicBool>,
 }
 
@@ -293,9 +331,29 @@ impl TryInto<GraphicsCaptureItemType> for PickerItemForThread {
 struct ScreenFrameHandler {
     context: egui::Context,
     latest_frame: LatestFrame,
+    performance: Arc<CapturePerformanceCounters>,
     source_closed: Arc<AtomicBool>,
     scratch: Vec<u8>,
     sequence: u64,
+    frame_rate_limiter: FrameRateLimiter,
+}
+
+#[derive(Default)]
+struct FrameRateLimiter {
+    last_processed_at: Option<Instant>,
+}
+
+impl FrameRateLimiter {
+    fn should_process(&mut self, now: Instant) -> bool {
+        if self
+            .last_processed_at
+            .is_some_and(|last| now.saturating_duration_since(last) < MIN_CAPTURE_FRAME_INTERVAL)
+        {
+            return false;
+        }
+        self.last_processed_at = Some(now);
+        true
+    }
 }
 
 impl GraphicsCaptureApiHandler for ScreenFrameHandler {
@@ -306,9 +364,11 @@ impl GraphicsCaptureApiHandler for ScreenFrameHandler {
         Ok(Self {
             context: context.flags.context,
             latest_frame: context.flags.latest_frame,
+            performance: context.flags.performance,
             source_closed: context.flags.source_closed,
             scratch: Vec::new(),
             sequence: 0,
+            frame_rate_limiter: FrameRateLimiter::default(),
         })
     }
 
@@ -317,20 +377,40 @@ impl GraphicsCaptureApiHandler for ScreenFrameHandler {
         frame: &mut Frame,
         _capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        if !self.frame_rate_limiter.should_process(Instant::now()) {
+            self.performance
+                .skipped_frames
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+
         let width = frame.width();
         let height = frame.height();
         if width == 0 || height == 0 {
             return Ok(());
         }
 
+        let readback_started_at = Instant::now();
         let frame_buffer = frame.buffer()?;
         let rgba = frame_buffer.as_nopadding_buffer(&mut self.scratch);
+        self.performance.readback_nanos.fetch_add(
+            readback_started_at.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
         self.sequence = self.sequence.wrapping_add(1);
+        let resize_started_at = Instant::now();
         let preview = downsample_rgba(rgba, width, height, self.sequence);
+        self.performance.resize_nanos.fetch_add(
+            resize_started_at.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
         *self
             .latest_frame
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(preview));
+        self.performance
+            .processed_frames
+            .fetch_add(1, Ordering::Relaxed);
         self.context.request_repaint();
         Ok(())
     }
@@ -383,7 +463,19 @@ fn even_dimension(value: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::scaled_dimensions;
+    use std::time::{Duration, Instant};
+
+    use super::{FrameRateLimiter, MIN_CAPTURE_FRAME_INTERVAL, scaled_dimensions};
+
+    #[test]
+    fn capture_limiter_accepts_first_frame_and_caps_at_30_fps() {
+        let start = Instant::now();
+        let mut limiter = FrameRateLimiter::default();
+
+        assert!(limiter.should_process(start));
+        assert!(!limiter.should_process(start + Duration::from_millis(16)));
+        assert!(limiter.should_process(start + MIN_CAPTURE_FRAME_INTERVAL));
+    }
 
     #[test]
     fn capture_frames_fit_the_720p_h264_limit() {

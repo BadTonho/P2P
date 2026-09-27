@@ -1452,6 +1452,7 @@ impl ClientUi {
                     Ok(session) => {
                         self.screen_share_session = Some(session);
                         self.screen_share_metrics = ScreenShareMetrics::default();
+                        self.last_screen_metrics_log_at = Some(Instant::now());
                         self.screen_share_role = ScreenShareRole::Receiving {
                             request_id: request.request_id.clone(),
                         };
@@ -1500,6 +1501,9 @@ impl ClientUi {
                     self.turn_credentials_for_room(),
                 ) {
                     Ok(session) => {
+                        if let Some(capture) = self.screen_capture.as_ref() {
+                            let _ = capture.take_performance_snapshot();
+                        }
                         if let Err(error) = session.start_sending(source) {
                             session.stop();
                             self.screen_share_role = ScreenShareRole::Idle;
@@ -1507,6 +1511,7 @@ impl ClientUi {
                             return;
                         }
                         self.screen_share_session = Some(session);
+                        self.last_screen_metrics_log_at = Some(Instant::now());
                         self.screen_share_role = ScreenShareRole::Sending { request_id };
                         self.screen_share_status =
                             Some("Iniciando a codificação e a conexão direta…".to_owned());
@@ -1635,6 +1640,30 @@ impl ClientUi {
                 .is_none_or(|last| last.elapsed() >= Duration::from_secs(5));
             if should_log_metrics {
                 let metrics = &self.screen_share_metrics;
+                let logged_at = Instant::now();
+                let interval = self
+                    .last_screen_metrics_log_at
+                    .map_or(Duration::from_secs(5), |last| {
+                        logged_at.saturating_duration_since(last)
+                    });
+                let interval_seconds = interval.as_secs_f64().max(0.001);
+                let performance = session.take_performance_snapshot();
+                let capture_performance =
+                    if matches!(&self.screen_share_role, ScreenShareRole::Sending { .. }) {
+                        self.screen_capture
+                            .as_ref()
+                            .map(ScreenCapture::take_performance_snapshot)
+                            .unwrap_or_default()
+                    } else {
+                        Default::default()
+                    };
+                let average_ms = |nanos: u64, samples: u64| {
+                    if samples == 0 {
+                        0.0
+                    } else {
+                        nanos as f64 / samples as f64 / 1_000_000.0
+                    }
+                };
                 tracing::info!(
                     p2p_connected = metrics.p2p_connected,
                     local_ice = metrics.local_ice_candidates,
@@ -1653,9 +1682,22 @@ impl ClientUi {
                     decode_errors = metrics.decode_errors,
                     h264 = %metrics.h264_diagnostics,
                     last_decode_error = metrics.last_decode_error.as_deref().unwrap_or(""),
+                    interval_seconds,
+                    capture_fps = capture_performance.processed_frames as f64 / interval_seconds,
+                    capture_processed = capture_performance.processed_frames,
+                    capture_skipped = capture_performance.skipped_frames,
+                    capture_readback_avg_ms = average_ms(capture_performance.readback_nanos, capture_performance.processed_frames),
+                    capture_resize_avg_ms = average_ms(capture_performance.resize_nanos, capture_performance.processed_frames),
+                    encode_fps = performance.encoded_frames as f64 / interval_seconds,
+                    encode_frames = performance.encoded_frames,
+                    encode_avg_ms = average_ms(performance.encode_nanos, performance.encode_samples),
+                    send_fps = performance.sent_frames as f64 / interval_seconds,
+                    send_frames = performance.sent_frames,
+                    send_queue_wait_avg_ms = average_ms(performance.queue_wait_nanos, performance.queue_wait_samples),
+                    write_sample_avg_ms = average_ms(performance.write_sample_nanos, performance.write_sample_samples),
                     "Resumo periódico da mídia de compartilhamento"
                 );
-                self.last_screen_metrics_log_at = Some(Instant::now());
+                self.last_screen_metrics_log_at = Some(logged_at);
             }
         }
         let events = self
@@ -1749,6 +1791,7 @@ impl ClientUi {
         if let Some(session) = self.screen_share_session.take() {
             session.stop();
         }
+        self.last_screen_metrics_log_at = None;
         self.screen_share_role = ScreenShareRole::Idle;
         self.remote_screen_texture = None;
         self.remote_screen_sequence = 0;

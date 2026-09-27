@@ -110,6 +110,18 @@ pub struct ScreenShareMetrics {
     pub decoder_fallback_reason: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScreenSharePerformanceSnapshot {
+    pub encoded_frames: u64,
+    pub sent_frames: u64,
+    pub encode_nanos: u64,
+    pub encode_samples: u64,
+    pub queue_wait_nanos: u64,
+    pub queue_wait_samples: u64,
+    pub write_sample_nanos: u64,
+    pub write_sample_samples: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaRoute {
     Direct,
@@ -131,6 +143,14 @@ struct SharedMetrics {
     received_packets: AtomicU64,
     decoded_frames: AtomicU64,
     decode_errors: AtomicU64,
+    interval_encoded_frames: AtomicU64,
+    interval_sent_frames: AtomicU64,
+    interval_encode_nanos: AtomicU64,
+    interval_encode_samples: AtomicU64,
+    interval_queue_wait_nanos: AtomicU64,
+    interval_queue_wait_samples: AtomicU64,
+    interval_write_sample_nanos: AtomicU64,
+    interval_write_sample_samples: AtomicU64,
     last_decode_error: Mutex<Option<String>>,
     encoder_backend: Mutex<String>,
     encoder_fallback_reason: Mutex<Option<String>>,
@@ -368,6 +388,27 @@ impl SharedMetrics {
                 "Erro de montagem H.264; resumos repetidos registrados em contagens dobradas"
             );
         }
+    }
+
+    fn take_performance_snapshot(&self) -> ScreenSharePerformanceSnapshot {
+        ScreenSharePerformanceSnapshot {
+            encoded_frames: self.interval_encoded_frames.swap(0, Ordering::Relaxed),
+            sent_frames: self.interval_sent_frames.swap(0, Ordering::Relaxed),
+            encode_nanos: self.interval_encode_nanos.swap(0, Ordering::Relaxed),
+            encode_samples: self.interval_encode_samples.swap(0, Ordering::Relaxed),
+            queue_wait_nanos: self.interval_queue_wait_nanos.swap(0, Ordering::Relaxed),
+            queue_wait_samples: self.interval_queue_wait_samples.swap(0, Ordering::Relaxed),
+            write_sample_nanos: self.interval_write_sample_nanos.swap(0, Ordering::Relaxed),
+            write_sample_samples: self
+                .interval_write_sample_samples
+                .swap(0, Ordering::Relaxed),
+        }
+    }
+
+    fn record_encode_duration(&self, elapsed: Duration) {
+        self.interval_encode_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        self.interval_encode_samples.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -871,6 +912,10 @@ impl ScreenShareSession {
 
     pub fn metrics(&self) -> ScreenShareMetrics {
         self.metrics.snapshot()
+    }
+
+    pub fn take_performance_snapshot(&self) -> ScreenSharePerformanceSnapshot {
+        self.metrics.take_performance_snapshot()
     }
 
     pub fn stop(mut self) {
@@ -1871,17 +1916,28 @@ async fn create_sender(
                 duration: FRAME_DURATION,
                 ..Sample::new(Instant::now())
             };
-            if let Err(error) = writer_track
+            let write_started_at = Instant::now();
+            let write_result = writer_track
                 .sample_writer(ssrc, VIDEO_PAYLOAD_TYPE)
                 .write_sample(&sample)
-                .await
-            {
+                .await;
+            writer_metrics.interval_write_sample_nanos.fetch_add(
+                write_started_at.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            writer_metrics
+                .interval_write_sample_samples
+                .fetch_add(1, Ordering::Relaxed);
+            if let Err(error) = write_result {
                 let _ = writer_events.send(ScreenShareEvent::Error(format!(
                     "Falha ao enviar um quadro H.264 pela conexão P2P: {error}"
                 )));
                 break;
             } else {
                 writer_metrics.sent_frames.fetch_add(1, Ordering::Relaxed);
+                writer_metrics
+                    .interval_sent_frames
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     });
@@ -2063,13 +2119,19 @@ fn encode_latest_frames(
             .expect("codificador inicializado antes de codificar");
         let hardware_failure = match active {
             ActiveH264Encoder::OpenH264(cpu) => {
-                let encoded = encode_frame(cpu, &frame)?;
+                let encode_started_at = Instant::now();
+                let encoded_result = encode_frame(cpu, &frame);
+                metrics.record_encode_duration(encode_started_at.elapsed());
+                let encoded = encoded_result?;
                 send_encoded_frame(&encoded, &samples, &metrics)?;
                 None
             }
             #[cfg(windows)]
             ActiveH264Encoder::MediaFoundation(hardware) => {
-                match hardware.encode_rgba(&frame.rgba) {
+                let encode_started_at = Instant::now();
+                let encode_result = hardware.encode_rgba(&frame.rgba);
+                metrics.record_encode_duration(encode_started_at.elapsed());
+                match encode_result {
                     Ok(encoded) => {
                         if encoded.is_empty() {
                             hardware_warmup_frames = hardware_warmup_frames.saturating_add(1);
@@ -2103,7 +2165,10 @@ fn encode_latest_frames(
             tracing::warn!(fallback_reason = %reason, "Falha no codificador H.264 de hardware; mudando para OpenH264 na CPU");
             metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
             let mut cpu = openh264_encoder()?;
-            let encoded = encode_frame(&mut cpu, &frame)?;
+            let encode_started_at = Instant::now();
+            let encoded_result = encode_frame(&mut cpu, &frame);
+            metrics.record_encode_duration(encode_started_at.elapsed());
+            let encoded = encoded_result?;
             send_encoded_frame(&encoded, &samples, &metrics)?;
             encoder = Some(ActiveH264Encoder::OpenH264(cpu));
         }
@@ -2142,9 +2207,20 @@ fn send_encoded_frame(
     }
     metrics.record_encoded_access_unit(encoded);
     metrics.encoded_frames.fetch_add(1, Ordering::Relaxed);
-    samples
-        .blocking_send(encoded.to_vec())
-        .map_err(|_| "O envio de vídeo foi encerrado.".to_owned())
+    metrics
+        .interval_encoded_frames
+        .fetch_add(1, Ordering::Relaxed);
+    let sample = encoded.to_vec();
+    let queue_wait_started_at = Instant::now();
+    let send_result = samples.blocking_send(sample);
+    metrics.interval_queue_wait_nanos.fetch_add(
+        queue_wait_started_at.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
+    metrics
+        .interval_queue_wait_samples
+        .fetch_add(1, Ordering::Relaxed);
+    send_result.map_err(|_| "O envio de vídeo foi encerrado.".to_owned())
 }
 
 fn validate_encoder_frame(frame: &PreviewFrame) -> Result<(), String> {
