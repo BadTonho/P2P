@@ -13,4 +13,4 @@ signaling-protocol = { path = "../signaling-protocol" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
 tokio-tungstenite = "0.30"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3.23", features = ["fmt", "time"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "time"] }

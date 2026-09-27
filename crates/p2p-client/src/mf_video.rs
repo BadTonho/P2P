@@ -26,6 +26,7 @@ mod windows_backend {
     use windows::Win32::System::Com::{
         COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
     };
+    use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4};
     use windows::core::{IUnknown, Interface};
 
     const FRAME_RATE: u32 = 30;
@@ -334,6 +335,7 @@ mod windows_backend {
         height: u32,
         next_time_hns: i64,
         name: String,
+        force_keyframe_available: Option<bool>,
     }
 
     impl HardwareEncoder {
@@ -355,11 +357,53 @@ mod windows_backend {
                 height,
                 next_time_hns: 0,
                 name,
+                force_keyframe_available: None,
             })
         }
 
         pub fn name(&self) -> &str {
             &self.name
+        }
+
+        pub fn force_keyframe(&mut self) -> Result<bool, String> {
+            if self.force_keyframe_available == Some(false) {
+                return Ok(false);
+            }
+            let codec_api = match self.transform.transform.cast::<ICodecAPI>() {
+                Ok(codec_api) => codec_api,
+                Err(_) => {
+                    self.force_keyframe_available = Some(false);
+                    return Ok(false);
+                }
+            };
+            if unsafe { codec_api.IsSupported(&CODECAPI_AVEncVideoForceKeyFrame) }.is_err() {
+                self.force_keyframe_available = Some(false);
+                return Ok(false);
+            }
+
+            let value = VARIANT {
+                Anonymous: VARIANT_0 {
+                    Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                        vt: VT_UI4,
+                        wReserved1: 0,
+                        wReserved2: 0,
+                        wReserved3: 0,
+                        Anonymous: VARIANT_0_0_0 { ulVal: 1 },
+                    }),
+                },
+            };
+            match unsafe { codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value) } {
+                Ok(()) => {
+                    self.force_keyframe_available = Some(true);
+                    Ok(true)
+                }
+                Err(error) => {
+                    self.force_keyframe_available = Some(false);
+                    Err(format!(
+                        "Media Foundation recusou o controle de quadro-chave: {error}"
+                    ))
+                }
+            }
         }
 
         pub fn encode_rgba(&mut self, rgba: &[u8]) -> Result<Vec<u8>, String> {

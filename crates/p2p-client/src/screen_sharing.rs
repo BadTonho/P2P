@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
@@ -11,21 +11,26 @@ use openh264::OpenH264API;
 use openh264::decoder::Decoder;
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType};
 use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
-use rtc::interceptor::Registry;
+use rtc::interceptor::{
+    Attribute, Interceptor, Packet as InterceptorPacket, Registry, Slot, StreamInfo, TaggedPacket,
+};
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
 use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MediaEngine};
 use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceServer};
 use rtc::peer_connection::transport::RTCIceCandidateInit;
+use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp::codec::h264::H264Packet;
 use rtc::rtp::packet::Packet as RtpPacket;
 use rtc::rtp::packetizer::Depacketizer;
 use rtc::rtp_transceiver::PayloadType;
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
-    RtpCodecKind,
+    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
+    RTCRtpEncodingParameters, RtpCodecKind,
 };
+use rtc::sansio;
+use rtc::shared::error::Error as InterceptorError;
 use rtc::statistics::StatsSelector;
 use rtc::statistics::report::{RTCStatsReport, RTCStatsReportEntry};
 use signaling_protocol::SignalKind;
@@ -33,8 +38,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio::time::timeout;
 use webrtc::media_stream::Track;
-use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
+use webrtc::media_stream::track_local::{TrackLocal, TrackLocalEvent};
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCPeerConnectionIceEvent,
@@ -58,8 +63,61 @@ const PEER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const INTERNET_PEER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const FIRST_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_millis(200);
+const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(750);
+
+#[derive(Default)]
+struct PliForwarder {
+    read_queue: VecDeque<TaggedPacket>,
+    write_queue: VecDeque<TaggedPacket>,
+}
+
+impl sansio::Protocol<TaggedPacket, TaggedPacket, ()> for PliForwarder {
+    type Rout = TaggedPacket;
+    type Wout = TaggedPacket;
+    type Eout = ();
+    type Error = InterceptorError;
+    type Time = Instant;
+
+    fn handle_read(&mut self, mut message: TaggedPacket) -> Result<(), Self::Error> {
+        if let InterceptorPacket::Rtcp(packets) = &message.message.packet {
+            let pli_packets = packets
+                .iter()
+                .filter(|packet| packet.as_any().is::<PictureLossIndication>())
+                .cloned()
+                .collect::<Vec<_>>();
+            if pli_packets.is_empty() {
+                return Ok(());
+            }
+            message.message.packet = InterceptorPacket::Rtcp(pli_packets);
+            message.message.add(Attribute::DeliverToApplication);
+        }
+        self.read_queue.push_back(message);
+        Ok(())
+    }
+
+    fn poll_read(&mut self) -> Option<Self::Rout> {
+        self.read_queue.pop_front()
+    }
+
+    fn handle_write(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
+        self.write_queue.push_back(message);
+        Ok(())
+    }
+
+    fn poll_write(&mut self) -> Option<Self::Wout> {
+        self.write_queue.pop_front()
+    }
+}
+
+impl Interceptor for PliForwarder {
+    fn bind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn bind_remote_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
+}
 
 type RemoteFrameStore = Arc<Mutex<Option<Arc<PreviewFrame>>>>;
+type RemoteTrackStore = Arc<Mutex<Option<Arc<dyn TrackRemote>>>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum H264FrameKind {
@@ -123,7 +181,12 @@ pub struct ScreenShareMetrics {
     pub received_delta_frames: u64,
     pub decoded_frames: u64,
     pub decoded_delta_frames: u64,
+    pub decoded_idr_frames: u64,
     pub decode_errors: u64,
+    pub pli_requests_sent: u64,
+    pub pli_requests_received: u64,
+    pub keyframe_resyncs: u64,
+    pub last_recovery_time_millis: Option<u64>,
     pub last_decode_error: Option<String>,
     pub h264_diagnostics: String,
     pub encoder_backend: String,
@@ -173,6 +236,7 @@ struct SharedMetrics {
     received_packets: AtomicU64,
     decoded_frames: AtomicU64,
     decoded_delta_frames: AtomicU64,
+    decoded_idr_frames: AtomicU64,
     decode_errors: AtomicU64,
     interval_encoder_input_frames: AtomicU64,
     interval_encoded_frames: AtomicU64,
@@ -217,6 +281,14 @@ struct H264FlowDiagnostics {
     assembled_with_idr: u64,
     assembled_delta_frames: u64,
     assembly_errors: u64,
+    pli_requests_sent: u64,
+    pli_requests_received: u64,
+    keyframe_resyncs: u64,
+    dropped_while_waiting_for_idr: u64,
+    resync_started_at: Option<Instant>,
+    recovery_count: u64,
+    recovery_time_millis_total: u128,
+    last_recovery_time_millis: Option<u64>,
     last_encoded_nals: String,
     last_access_unit: String,
     last_assembly_error: Option<String>,
@@ -251,7 +323,12 @@ impl SharedMetrics {
             received_delta_frames: h264_flow.assembled_delta_frames,
             decoded_frames: self.decoded_frames.load(Ordering::Relaxed),
             decoded_delta_frames: self.decoded_delta_frames.load(Ordering::Relaxed),
+            decoded_idr_frames: self.decoded_idr_frames.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
+            pli_requests_sent: h264_flow.pli_requests_sent,
+            pli_requests_received: h264_flow.pli_requests_received,
+            keyframe_resyncs: h264_flow.keyframe_resyncs,
+            last_recovery_time_millis: h264_flow.last_recovery_time_millis,
             last_decode_error: self
                 .last_decode_error
                 .lock()
@@ -306,6 +383,20 @@ impl SharedMetrics {
                     .as_ref()
                     .map(|error| format!("; último erro de montagem: {error}"))
                     .unwrap_or_default(),
+            ) + &format!(
+                " PLI sent/received {}/{}, keyframe resyncs {}, frames dropped until IDR {}, IDR recovery {} ms last / {} ms avg ({} recoveries).",
+                h264_flow.pli_requests_sent,
+                h264_flow.pli_requests_received,
+                h264_flow.keyframe_resyncs,
+                h264_flow.dropped_while_waiting_for_idr,
+                h264_flow.last_recovery_time_millis.unwrap_or_default(),
+                if h264_flow.recovery_count == 0 {
+                    0
+                } else {
+                    (h264_flow.recovery_time_millis_total / u128::from(h264_flow.recovery_count))
+                        as u64
+                },
+                h264_flow.recovery_count,
             ),
         }
     }
@@ -390,7 +481,7 @@ impl SharedMetrics {
         &self,
         packet: &rtc::rtp::packet::Packet,
         previous_sequence: &mut Option<u16>,
-    ) {
+    ) -> bool {
         let payload = &packet.payload;
         let packet_type = payload.first().map(|byte| byte & 0x1f);
         let nals = rtp_payload_nal_types(payload);
@@ -399,10 +490,12 @@ impl SharedMetrics {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+        let mut sequence_gap_detected = false;
         if let Some(previous) = *previous_sequence {
             let distance = packet.header.sequence_number.wrapping_sub(previous);
             if (2..0x8000).contains(&distance) {
                 flow.sequence_gaps += u64::from(distance - 1);
+                sequence_gap_detected = true;
                 *previous_sequence = Some(packet.header.sequence_number);
             } else if distance == 0 || distance >= 0x8000 {
                 flow.out_of_order_packets += 1;
@@ -433,6 +526,7 @@ impl SharedMetrics {
                 _ => {}
             }
         }
+        sequence_gap_detected
     }
 
     fn record_assembled_access_unit(&self, data: &[u8]) -> String {
@@ -455,6 +549,14 @@ impl SharedMetrics {
         if contains_idr {
             flow.assembled_with_idr += 1;
         }
+        if contains_idr && contains_sps && contains_pps {
+            if let Some(started_at) = flow.resync_started_at.take() {
+                let elapsed = started_at.elapsed().as_millis();
+                flow.recovery_count += 1;
+                flow.recovery_time_millis_total += elapsed;
+                flow.last_recovery_time_millis = Some(elapsed.min(u128::from(u64::MAX)) as u64);
+            }
+        }
         if !contains_idr && nals.iter().any(|nal_type| (1..=4).contains(nal_type)) {
             flow.assembled_delta_frames += 1;
         }
@@ -476,6 +578,38 @@ impl SharedMetrics {
                 "Erro de montagem H.264; resumos repetidos registrados em contagens dobradas"
             );
         }
+    }
+
+    fn record_pli_sent(&self) {
+        self.h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pli_requests_sent += 1;
+    }
+
+    fn record_pli_received(&self) {
+        self.h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pli_requests_received += 1;
+    }
+
+    fn record_keyframe_resync(&self) {
+        let mut flow = self
+            .h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        flow.keyframe_resyncs += 1;
+        if flow.resync_started_at.is_none() {
+            flow.resync_started_at = Some(Instant::now());
+        }
+    }
+
+    fn record_drop_waiting_for_idr(&self) {
+        self.h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dropped_while_waiting_for_idr += 1;
     }
 
     fn take_performance_snapshot(&self) -> ScreenSharePerformanceSnapshot {
@@ -517,6 +651,65 @@ struct PendingRtpFrame {
     packets: Vec<RtpPacket>,
     first_received: Instant,
     marker_seen: bool,
+}
+
+struct QueuedAccessUnit {
+    generation: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct KeyframeRequestLimiter {
+    last_request: Option<Instant>,
+}
+
+impl KeyframeRequestLimiter {
+    fn allow(&mut self, now: Instant) -> bool {
+        if self
+            .last_request
+            .is_some_and(|last| now.saturating_duration_since(last) < KEYFRAME_REQUEST_MIN_INTERVAL)
+        {
+            return false;
+        }
+        self.last_request = Some(now);
+        true
+    }
+}
+
+async fn send_picture_loss_indication(
+    track: &dyn TrackRemote,
+    metrics: &SharedMetrics,
+    limiter: &mut KeyframeRequestLimiter,
+) {
+    if !limiter.allow(Instant::now()) {
+        return;
+    }
+    let Some(media_ssrc) = track.ssrcs().await.first().copied() else {
+        tracing::warn!("Nao foi possivel enviar PLI: a faixa remota nao tem SSRC");
+        return;
+    };
+    let pli = PictureLossIndication {
+        sender_ssrc: 0,
+        media_ssrc,
+    };
+    match track.write_rtcp(vec![Box::new(pli)]).await {
+        Ok(()) => {
+            metrics.record_pli_sent();
+            tracing::debug!("Pedido RTCP PLI enviado para solicitar um quadro-chave");
+        }
+        Err(error) => tracing::warn!(error = %error, "Falha ao enviar pedido RTCP PLI"),
+    }
+}
+
+fn begin_stream_resync(
+    generation: &AtomicU64,
+    metrics: &SharedMetrics,
+    keyframe_request_tx: &mpsc::Sender<()>,
+) -> u64 {
+    let generation = generation.fetch_add(1, Ordering::Relaxed) + 1;
+    metrics.record_keyframe_resync();
+    let _ = keyframe_request_tx.try_send(());
+    generation
 }
 
 impl H264AccessUnitAssembler {
@@ -698,6 +891,11 @@ enum ActiveH264Decoder {
     MediaFoundation(mf_video::HardwareDecoder),
 }
 
+struct DecodeFailure {
+    detail: String,
+    hardware_decoder: bool,
+}
+
 fn decode_h264_access_unit(
     access_unit: &[u8],
     decoder: &mut ActiveH264Decoder,
@@ -705,7 +903,7 @@ fn decode_h264_access_unit(
     remote_frame: &RemoteFrameStore,
     sequence: &AtomicU64,
     metrics: &SharedMetrics,
-) -> Option<String> {
+) -> Option<DecodeFailure> {
     let sample_diagnostics = metrics.record_assembled_access_unit(access_unit);
     let decoded = match decoder {
         ActiveH264Decoder::OpenH264(decoder) => decoder
@@ -741,10 +939,14 @@ fn decode_h264_access_unit(
                 return None;
             }
             metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
-            if classify_h264_access_unit(&annex_b_nal_types(access_unit))
-                == Some(H264FrameKind::Delta)
-            {
-                metrics.decoded_delta_frames.fetch_add(1, Ordering::Relaxed);
+            match classify_h264_access_unit(&annex_b_nal_types(access_unit)) {
+                Some(H264FrameKind::Delta) => {
+                    metrics.decoded_delta_frames.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(H264FrameKind::Idr) => {
+                    metrics.decoded_idr_frames.fetch_add(1, Ordering::Relaxed);
+                }
+                None => {}
             }
             let next_sequence = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             *remote_frame
@@ -781,7 +983,10 @@ fn decode_h264_access_unit(
                 );
             }
             context.request_repaint();
-            hardware_decoder.then_some(detail)
+            Some(DecodeFailure {
+                detail,
+                hardware_decoder,
+            })
         }
     }
 }
@@ -1006,6 +1211,19 @@ fn describe_nal_types(nal_types: &[u8], byte_len: usize) -> String {
     format!("{byte_len} bytes, NAL [{names}]")
 }
 
+fn should_decode_access_unit(waiting_for_idr: &mut bool, access_unit: &[u8]) -> bool {
+    if !*waiting_for_idr {
+        return true;
+    }
+    let nals = annex_b_nal_types(access_unit);
+    if nals.contains(&7) && nals.contains(&8) && nals.contains(&5) {
+        *waiting_for_idr = false;
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug)]
 pub enum ScreenShareEvent {
     Signal { kind: SignalKind, payload: String },
@@ -1016,7 +1234,12 @@ pub enum ScreenShareEvent {
 
 enum Command {
     StartSending(LatestFrame),
-    Signal { kind: SignalKind, payload: String },
+    Signal {
+        kind: SignalKind,
+        payload: String,
+    },
+    #[cfg(test)]
+    RequestKeyFrameForTest,
     Stop,
 }
 
@@ -1024,6 +1247,8 @@ pub struct ScreenShareSession {
     commands: mpsc::UnboundedSender<Command>,
     events: std_mpsc::Receiver<ScreenShareEvent>,
     remote_frame: RemoteFrameStore,
+    #[allow(dead_code)] // Usado pelo teste loopback para provocar um PLI explícito.
+    remote_track: RemoteTrackStore,
     metrics: Arc<SharedMetrics>,
     worker: Option<JoinHandle<()>>,
 }
@@ -1067,8 +1292,10 @@ impl ScreenShareSession {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = std_mpsc::channel();
         let remote_frame = Arc::new(Mutex::new(None));
+        let remote_track = Arc::new(Mutex::new(None));
         let metrics = Arc::new(SharedMetrics::default());
         let worker_remote_frame = Arc::clone(&remote_frame);
+        let worker_remote_track = Arc::clone(&remote_track);
         let worker_metrics = Arc::clone(&metrics);
         let worker = thread::Builder::new()
             .name("p2p-screen-share".to_owned())
@@ -1091,6 +1318,7 @@ impl ScreenShareSession {
                     events_tx,
                     context,
                     worker_remote_frame,
+                    worker_remote_track,
                     udp_address,
                     stun_server,
                     turn_credentials,
@@ -1103,6 +1331,7 @@ impl ScreenShareSession {
             commands: commands_tx,
             events: events_rx,
             remote_frame,
+            remote_track,
             metrics,
             worker: Some(worker),
         })
@@ -1112,6 +1341,21 @@ impl ScreenShareSession {
         self.commands
             .send(Command::StartSending(source))
             .map_err(|_| "A sessão WebRTC foi encerrada.".to_owned())
+    }
+
+    #[cfg(test)]
+    fn request_keyframe_for_test(&self) -> Result<(), String> {
+        if self
+            .remote_track
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        {
+            return Err("A faixa remota ainda nao esta disponivel para o teste PLI.".to_owned());
+        }
+        self.commands
+            .send(Command::RequestKeyFrameForTest)
+            .map_err(|_| "A sessÃ£o WebRTC foi encerrada.".to_owned())
     }
 
     pub fn handle_signal(&self, kind: SignalKind, payload: String) -> Result<(), String> {
@@ -1164,6 +1408,11 @@ struct PeerSession {
     encoder_stop: Option<Arc<AtomicBool>>,
     encoder_task: Option<TokioJoinHandle<Result<(), String>>>,
     sample_writer_task: Option<TokioJoinHandle<()>>,
+    rtcp_feedback_task: Option<TokioJoinHandle<()>>,
+    #[allow(dead_code)] // Usado pelo teste loopback para emitir o PLI de diagnóstico.
+    remote_track: RemoteTrackStore,
+    #[allow(dead_code)] // Usado pelo teste loopback para limitar pedidos explícitos de PLI.
+    keyframe_request_limiter: KeyframeRequestLimiter,
 }
 
 #[derive(Clone)]
@@ -1171,6 +1420,7 @@ struct PeerEvents {
     events: std_mpsc::Sender<ScreenShareEvent>,
     context: egui::Context,
     remote_frame: RemoteFrameStore,
+    remote_track: RemoteTrackStore,
     remote_frame_sequence: Arc<AtomicU64>,
     metrics: Arc<SharedMetrics>,
     stun_server: Option<String>,
@@ -1392,8 +1642,16 @@ impl PeerConnectionEventHandler for PeerEvents {
         let remote_frame = Arc::clone(&self.remote_frame);
         let sequence = Arc::clone(&self.remote_frame_sequence);
         let metrics = Arc::clone(&self.metrics);
+        *self
+            .remote_track
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&track));
         tokio::spawn(async move {
-            let (decoder_tx, decoder_rx) = std_mpsc::sync_channel::<Vec<u8>>(8);
+            let (decoder_tx, decoder_rx) = std_mpsc::sync_channel::<QueuedAccessUnit>(8);
+            let decoder_generation = Arc::new(AtomicU64::new(0));
+            let worker_generation = Arc::clone(&decoder_generation);
+            let (keyframe_request_tx, mut keyframe_request_rx) = mpsc::channel::<()>(1);
+            let worker_keyframe_request_tx = keyframe_request_tx.clone();
             let worker_events = events.clone();
             let worker_context = context.clone();
             let worker_remote_frame = Arc::clone(&remote_frame);
@@ -1404,9 +1662,23 @@ impl PeerConnectionEventHandler for PeerEvents {
                 .spawn(move || {
                     let mut decoder: Option<ActiveH264Decoder> = None;
                     let mut using_cpu_pending_sps = false;
-                    let mut cpu_waiting_for_idr = false;
+                    let mut cpu_waiting_for_idr = true;
                     let mut hardware_frames_without_output = 0u32;
-                    while let Ok(access_unit) = decoder_rx.recv() {
+                    let mut generation_seen = 0_u64;
+                    while let Ok(queued) = decoder_rx.recv() {
+                        let current_generation = worker_generation.load(Ordering::Relaxed);
+                        if queued.generation != current_generation {
+                            worker_metrics.record_drop_waiting_for_idr();
+                            continue;
+                        }
+                        if queued.generation != generation_seen {
+                            generation_seen = queued.generation;
+                            decoder = None;
+                            using_cpu_pending_sps = false;
+                            cpu_waiting_for_idr = true;
+                            hardware_frames_without_output = 0;
+                        }
+                        let access_unit = queued.bytes;
                         let has_sps_and_idr = {
                             let nals = annex_b_nal_types(&access_unit);
                             nals.contains(&7) && nals.contains(&8) && nals.contains(&5)
@@ -1449,7 +1721,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                                     );
                                                     decoder = Some(ActiveH264Decoder::OpenH264(cpu));
                                                     using_cpu_pending_sps = false;
-                                                    cpu_waiting_for_idr = false;
+                                                    cpu_waiting_for_idr = true;
                                                 }
                                                 Err(cpu_error) => {
                                                     tracing::error!(error = %cpu_error, "Falha ao iniciar decodificador H.264 de CPU");
@@ -1493,7 +1765,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                         Some("Aceleração Media Foundation está disponível apenas no Windows.".to_owned()),
                                     );
                                     decoder = Some(ActiveH264Decoder::OpenH264(cpu));
-                                    cpu_waiting_for_idr = !has_sps_and_idr;
+                                    cpu_waiting_for_idr = true;
                                 }
                                 Err(error) => {
                                     let _ = worker_events.send(ScreenShareEvent::Error(format!(
@@ -1504,13 +1776,10 @@ impl PeerConnectionEventHandler for PeerEvents {
                             }
                         }
 
-                        if cpu_waiting_for_idr {
-                            if has_sps_and_idr {
-                                cpu_waiting_for_idr = false;
-                            } else {
-                                worker_metrics.record_assembled_access_unit(&access_unit);
-                                continue;
-                            }
+                        if !should_decode_access_unit(&mut cpu_waiting_for_idr, &access_unit) {
+                            worker_metrics.record_assembled_access_unit(&access_unit);
+                            worker_metrics.record_drop_waiting_for_idr();
+                            continue;
                         }
 
                         if let Some(active_decoder) = decoder.as_mut() {
@@ -1524,12 +1793,25 @@ impl PeerConnectionEventHandler for PeerEvents {
                                 &worker_sequence,
                                 &worker_metrics,
                             );
-                            #[cfg(windows)]
+                            let decode_failed = hardware_error.is_some();
+                            let mut decoder_entered_resync = false;
                             if hardware_error
-                                .as_deref()
-                                .is_some_and(is_hardware_device_failure)
+                                .as_ref()
+                                .is_some_and(|failure| !failure.hardware_decoder)
                             {
-                                let reason = hardware_error.unwrap_or_default();
+                                // Keep the CPU decoder alive; an IDR with parameter sets can
+                                // restore its references after the incomplete/damaged frame.
+                                decoder_entered_resync = true;
+                            }
+                            #[cfg(windows)]
+                            if hardware_error.as_ref().is_some_and(|failure| {
+                                failure.hardware_decoder
+                                    && is_hardware_device_failure(&failure.detail)
+                            }) {
+                                let reason = hardware_error
+                                    .as_ref()
+                                    .map(|failure| failure.detail.clone())
+                                    .unwrap_or_default();
                                 tracing::warn!(fallback_reason = %reason, "Falha do dispositivo DXVA; mudando para OpenH264 na CPU");
                                 match Decoder::new() {
                                     Ok(cpu) => {
@@ -1540,6 +1822,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                         decoder = Some(ActiveH264Decoder::OpenH264(cpu));
                                         using_cpu_pending_sps = false;
                                         cpu_waiting_for_idr = true;
+                                        decoder_entered_resync = true;
                                     }
                                     Err(error) => {
                                         let _ = worker_events.send(ScreenShareEvent::Error(format!(
@@ -1567,6 +1850,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                             using_cpu_pending_sps = false;
                                             hardware_frames_without_output = 0;
                                             cpu_waiting_for_idr = true;
+                                            decoder_entered_resync = true;
                                         }
                                         Err(error) => {
                                             let _ = worker_events.send(ScreenShareEvent::Error(format!(
@@ -1578,6 +1862,19 @@ impl PeerConnectionEventHandler for PeerEvents {
                                 }
                             } else {
                                 hardware_frames_without_output = 0;
+                            }
+
+                            if decode_failed || decoder_entered_resync {
+                                let generation = begin_stream_resync(
+                                    &worker_generation,
+                                    &worker_metrics,
+                                    &worker_keyframe_request_tx,
+                                );
+                                generation_seen = generation;
+                                cpu_waiting_for_idr = true;
+                                if !decoder_entered_resync {
+                                    decoder = None;
+                                }
                             }
                         }
                     }
@@ -1591,20 +1888,46 @@ impl PeerConnectionEventHandler for PeerEvents {
             }
             let mut assembler = H264AccessUnitAssembler::default();
             let mut previous_sequence = None;
+            let mut keyframe_request_limiter = KeyframeRequestLimiter::default();
             let mut flush_pending = tokio::time::interval(Duration::from_millis(10));
             flush_pending.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
                     _ = flush_pending.tick() => {}
+                    request = keyframe_request_rx.recv() => {
+                        if request.is_some() {
+                            send_picture_loss_indication(
+                                track.as_ref(),
+                                &metrics,
+                                &mut keyframe_request_limiter,
+                            ).await;
+                        }
+                    }
                     event = track.poll() => {
                         let Some(event) = event else { break };
                         match event {
                             TrackRemoteEvent::OnRtpPacket(packet) => {
                                 metrics.received_packets.fetch_add(1, Ordering::Relaxed);
-                                metrics.record_received_packet(&packet, &mut previous_sequence);
+                                if metrics.record_received_packet(&packet, &mut previous_sequence) {
+                                    tracing::debug!(
+                                        "Lacuna na sequência RTP; descartando unidades pendentes e pedindo novo IDR"
+                                    );
+                                    assembler.frames.clear();
+                                    begin_stream_resync(
+                                        &decoder_generation,
+                                        &metrics,
+                                        &keyframe_request_tx,
+                                    );
+                                    context.request_repaint();
+                                }
                                 if let Some(error) = assembler.push(packet) {
                                     metrics.record_assembly_error(error);
+                                    begin_stream_resync(
+                                        &decoder_generation,
+                                        &metrics,
+                                        &keyframe_request_tx,
+                                    );
                                     context.request_repaint();
                                 }
                             }
@@ -1616,12 +1939,20 @@ impl PeerConnectionEventHandler for PeerEvents {
 
                 for result in assembler.take_ready(Instant::now()) {
                     match result {
-                        Ok(access_unit) => match decoder_tx.try_send(access_unit) {
+                        Ok(access_unit) => match decoder_tx.try_send(QueuedAccessUnit {
+                            generation: decoder_generation.load(Ordering::Relaxed),
+                            bytes: access_unit,
+                        }) {
                             Ok(()) => {}
                             Err(std_mpsc::TrySendError::Full(_)) => {
                                 metrics.record_assembly_error(
                                     "worker de decodificação atrasado; quadro H.264 descartado"
                                         .to_owned(),
+                                );
+                                begin_stream_resync(
+                                    &decoder_generation,
+                                    &metrics,
+                                    &keyframe_request_tx,
                                 );
                                 context.request_repaint();
                             }
@@ -1634,6 +1965,11 @@ impl PeerConnectionEventHandler for PeerEvents {
                         },
                         Err(error) => {
                             metrics.record_assembly_error(error);
+                            begin_stream_resync(
+                                &decoder_generation,
+                                &metrics,
+                                &keyframe_request_tx,
+                            );
                             context.request_repaint();
                         }
                     }
@@ -1648,6 +1984,7 @@ async fn run_session(
     events: std_mpsc::Sender<ScreenShareEvent>,
     context: egui::Context,
     remote_frame: RemoteFrameStore,
+    remote_track: RemoteTrackStore,
     udp_address: String,
     stun_server: Option<String>,
     turn_credentials: Option<TurnCredentials>,
@@ -1774,6 +2111,7 @@ async fn run_session(
                     &events,
                     context.clone(),
                     Arc::clone(&remote_frame),
+                    Arc::clone(&remote_track),
                     Arc::clone(&remote_frame_sequence),
                     Arc::clone(&metrics),
                     &udp_address,
@@ -1801,6 +2139,7 @@ async fn run_session(
                         &events,
                         context.clone(),
                         Arc::clone(&remote_frame),
+                        Arc::clone(&remote_track),
                         Arc::clone(&remote_frame_sequence),
                         Arc::clone(&metrics),
                         &udp_address,
@@ -1888,6 +2227,24 @@ async fn run_session(
                 }
                 _ => {}
             },
+            #[cfg(test)]
+            Command::RequestKeyFrameForTest => {
+                if let Some(peer) = active_peer.as_mut() {
+                    let track = peer
+                        .remote_track
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if let Some(track) = track {
+                        send_picture_loss_indication(
+                            track.as_ref(),
+                            &peer.metrics,
+                            &mut peer.keyframe_request_limiter,
+                        )
+                        .await;
+                    }
+                }
+            }
             Command::Stop => break,
         }
             }
@@ -1934,6 +2291,7 @@ async fn create_peer(
     events: &std_mpsc::Sender<ScreenShareEvent>,
     context: egui::Context,
     remote_frame: RemoteFrameStore,
+    remote_track: RemoteTrackStore,
     remote_frame_sequence: Arc<AtomicU64>,
     metrics: Arc<SharedMetrics>,
     udp_address: &str,
@@ -1947,7 +2305,10 @@ async fn create_peer(
             channels: 0,
             sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
                 .to_owned(),
-            rtcp_feedback: vec![],
+            rtcp_feedback: vec![RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: "pli".to_owned(),
+            }],
         },
         payload_type: VIDEO_PAYLOAD_TYPE,
         ..Default::default()
@@ -1958,10 +2319,12 @@ async fn create_peer(
         .map_err(|error| format!("Não foi possível registrar H.264 no WebRTC: {error}"))?;
     let interceptors = register_default_interceptors(Registry::new(), &mut media_engine)
         .map_err(|error| format!("Não foi possível preparar o WebRTC: {error}"))?;
+    let interceptors = interceptors.with(Slot::Custom(14_000), PliForwarder::default());
     let handler = Arc::new(PeerEvents {
         events: events.clone(),
         context,
         remote_frame,
+        remote_track,
         remote_frame_sequence,
         metrics,
         stun_server: stun_server.map(str::to_owned),
@@ -2026,6 +2389,7 @@ async fn create_sender(
     events: &std_mpsc::Sender<ScreenShareEvent>,
     context: egui::Context,
     remote_frame: RemoteFrameStore,
+    remote_track: RemoteTrackStore,
     remote_frame_sequence: Arc<AtomicU64>,
     metrics: Arc<SharedMetrics>,
     udp_address: &str,
@@ -2036,6 +2400,7 @@ async fn create_sender(
         events,
         context,
         remote_frame,
+        Arc::clone(&remote_track),
         remote_frame_sequence,
         Arc::clone(&metrics),
         udp_address,
@@ -2049,7 +2414,10 @@ async fn create_sender(
         channels: 0,
         sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
             .to_owned(),
-        rtcp_feedback: vec![],
+        rtcp_feedback: vec![RTCPFeedback {
+            typ: "nack".to_owned(),
+            parameter: "pli".to_owned(),
+        }],
     };
     let ssrc = unique_ssrc();
     let track = Arc::new(
@@ -2104,10 +2472,18 @@ async fn create_sender(
     let (sample_tx, sample_rx) = mpsc::channel::<EncodedFrame>(1);
     let encoder_stop = Arc::new(AtomicBool::new(false));
     let encoder_stop_worker = Arc::clone(&encoder_stop);
+    let force_keyframe = Arc::new(AtomicBool::new(false));
+    let encoder_force_keyframe = Arc::clone(&force_keyframe);
     let encoder_events = events.clone();
     let encoder_metrics = Arc::clone(&metrics);
     let encoder_task = tokio::task::spawn_blocking(move || {
-        match encode_latest_frames(source, sample_tx, encoder_stop_worker, encoder_metrics) {
+        match encode_latest_frames(
+            source,
+            sample_tx,
+            encoder_stop_worker,
+            encoder_metrics,
+            encoder_force_keyframe,
+        ) {
             Ok(()) => Ok(()),
             Err(error) => {
                 let _ = encoder_events.send(ScreenShareEvent::Error(error.clone()));
@@ -2155,6 +2531,39 @@ async fn create_sender(
         }
     });
 
+    let feedback_track = Arc::clone(&track);
+    let feedback_metrics = Arc::clone(&metrics);
+    let feedback_force_keyframe = Arc::clone(&force_keyframe);
+    let rtcp_feedback_task = tokio::spawn(async move {
+        loop {
+            let Some(event) = feedback_track.poll().await else {
+                // TrackLocal::poll returns None while the track is not bound yet. This
+                // task starts before SDP negotiation, so retry until WebRTC binds it.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            };
+            let packets = match event {
+                TrackLocalEvent::OnRtcpPacket(packets) => packets,
+                _ => continue,
+            };
+            let pli_count = packets
+                .iter()
+                .filter(|packet| packet.as_any().is::<PictureLossIndication>())
+                .count();
+            if pli_count == 0 {
+                continue;
+            }
+            for _ in 0..pli_count {
+                feedback_metrics.record_pli_received();
+            }
+            feedback_force_keyframe.store(true, Ordering::Relaxed);
+            tracing::debug!(
+                pli_packets = pli_count,
+                "Pedido PLI recebido; será solicitado IDR ao codificador"
+            );
+        }
+    });
+
     let _ = events.send(ScreenShareEvent::State(
         "Oferta enviada; aguardando conexão P2P com o participante.".to_owned(),
     ));
@@ -2169,6 +2578,9 @@ async fn create_sender(
         encoder_stop: Some(encoder_stop),
         encoder_task: Some(encoder_task),
         sample_writer_task: Some(sample_writer_task),
+        rtcp_feedback_task: Some(rtcp_feedback_task),
+        remote_track,
+        keyframe_request_limiter: KeyframeRequestLimiter::default(),
     })
 }
 
@@ -2177,6 +2589,7 @@ async fn create_receiver(
     events: &std_mpsc::Sender<ScreenShareEvent>,
     context: egui::Context,
     remote_frame: RemoteFrameStore,
+    remote_track: RemoteTrackStore,
     remote_frame_sequence: Arc<AtomicU64>,
     metrics: Arc<SharedMetrics>,
     udp_address: &str,
@@ -2187,6 +2600,7 @@ async fn create_receiver(
         events,
         context,
         remote_frame,
+        Arc::clone(&remote_track),
         remote_frame_sequence,
         Arc::clone(&metrics),
         udp_address,
@@ -2234,6 +2648,9 @@ async fn create_receiver(
         encoder_stop: None,
         encoder_task: None,
         sample_writer_task: None,
+        rtcp_feedback_task: None,
+        remote_track,
+        keyframe_request_limiter: KeyframeRequestLimiter::default(),
     })
 }
 
@@ -2255,6 +2672,9 @@ async fn close_peer(mut peer: PeerSession) {
     if let Some(writer) = peer.sample_writer_task.take() {
         writer.abort();
     }
+    if let Some(feedback) = peer.rtcp_feedback_task.take() {
+        feedback.abort();
+    }
     if let Some(encoder) = peer.encoder_task.take() {
         let _ = timeout(Duration::from_secs(2), encoder).await;
     }
@@ -2266,6 +2686,7 @@ fn encode_latest_frames(
     samples: mpsc::Sender<EncodedFrame>,
     stop: Arc<AtomicBool>,
     metrics: Arc<SharedMetrics>,
+    force_keyframe: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let mut encoder: Option<ActiveH264Encoder> = None;
     let mut hardware_warmup_frames = 0u32;
@@ -2326,6 +2747,29 @@ fn encode_latest_frames(
                 let reason = "Media Foundation está disponível apenas no Windows.".to_owned();
                 metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
                 encoder = Some(ActiveH264Encoder::OpenH264(openh264_encoder()?));
+            }
+        }
+
+        if force_keyframe.swap(false, Ordering::Relaxed) {
+            match encoder.as_mut() {
+                Some(ActiveH264Encoder::OpenH264(cpu)) => {
+                    cpu.force_intra_frame();
+                    tracing::debug!("OpenH264 recebeu solicitação para gerar um IDR");
+                }
+                #[cfg(windows)]
+                Some(ActiveH264Encoder::MediaFoundation(hardware)) => {
+                    match hardware.force_keyframe() {
+                        Ok(true) => tracing::debug!("Media Foundation aceitou solicitação de IDR"),
+                        Ok(false) => tracing::warn!(
+                            "O codificador de hardware não oferece controle de quadro-chave; aguardando IDR periódico"
+                        ),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "O codificador de hardware recusou pedido de IDR; aguardando IDR periódico"
+                        ),
+                    }
+                }
+                None => {}
             }
         }
 
@@ -2521,9 +2965,12 @@ mod tests {
 
     use super::{
         Encoder, FRAME_DURATION, H264ForwardDecision, H264ForwardingGate, H264FrameKind,
-        LatestFrame, PreviewFrame, ScreenShareEvent, ScreenShareSession, annex_b_nal_types,
-        classify_h264_access_unit, encode_frame, should_log_aggregate_error, validate_stun_uri,
+        KeyframeRequestLimiter, LatestFrame, PreviewFrame, RtpPacket, ScreenShareEvent,
+        ScreenShareSession, annex_b_nal_types, assemble_h264_access_unit,
+        classify_h264_access_unit, encode_frame, should_decode_access_unit,
+        should_log_aggregate_error, validate_stun_uri,
     };
+    use bytes::Bytes;
 
     fn annex_b_access_unit(nals: &[&[u8]]) -> Vec<u8> {
         let mut access_unit = Vec::new();
@@ -2532,6 +2979,94 @@ mod tests {
             access_unit.extend_from_slice(nal);
         }
         access_unit
+    }
+
+    fn rtp_packet(sequence: u16, timestamp: u32, marker: bool, payload: &[u8]) -> RtpPacket {
+        RtpPacket {
+            header: rtc::rtp::header::Header {
+                sequence_number: sequence,
+                timestamp,
+                marker,
+                ..Default::default()
+            },
+            payload: Bytes::copy_from_slice(payload),
+        }
+    }
+
+    #[test]
+    fn h264_reassembly_restores_packet_order_and_rejects_incomplete_frames() {
+        let reordered = assemble_h264_access_unit(vec![
+            rtp_packet(11, 100, true, &[0x41, 0x99, 0x05, 0x01]),
+            rtp_packet(10, 100, false, &[0x65, 0x88, 0x84, 0x21]),
+        ])
+        .unwrap();
+        assert_eq!(annex_b_nal_types(&reordered), vec![5, 1]);
+
+        assert!(
+            assemble_h264_access_unit(vec![
+                rtp_packet(10, 101, false, &[0x65, 0x88, 0x84, 0x21]),
+                rtp_packet(12, 101, true, &[0x41, 0x99, 0x05, 0x01]),
+            ])
+            .is_err()
+        );
+        assert!(
+            assemble_h264_access_unit(vec![rtp_packet(10, 102, false, &[0x65, 0x88, 0x84, 0x21],)])
+                .is_err()
+        );
+        assert!(
+            assemble_h264_access_unit(vec![rtp_packet(
+                10,
+                103,
+                true,
+                &[28, 0x85, 0x88, 0x99, 0x22],
+            )])
+            .is_err()
+        );
+        assert!(
+            assemble_h264_access_unit(vec![rtp_packet(
+                10,
+                104,
+                true,
+                &[28, 0x45, 0x88, 0x99, 0x22],
+            )])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn decoder_recovery_gate_drops_delta_frames_until_sps_pps_idr() {
+        let sps = [0x67, 0x64, 0x00, 0x1f];
+        let pps = [0x68, 0x00];
+        let idr = [0x65, 0x88];
+        let delta = [0x41, 0x99];
+        let mut waiting_for_idr = true;
+
+        assert!(!should_decode_access_unit(
+            &mut waiting_for_idr,
+            &annex_b_access_unit(&[&delta])
+        ));
+        assert!(!should_decode_access_unit(
+            &mut waiting_for_idr,
+            &annex_b_access_unit(&[&sps, &pps])
+        ));
+        assert!(should_decode_access_unit(
+            &mut waiting_for_idr,
+            &annex_b_access_unit(&[&sps, &pps, &idr])
+        ));
+        assert!(!waiting_for_idr);
+        assert!(should_decode_access_unit(
+            &mut waiting_for_idr,
+            &annex_b_access_unit(&[&delta])
+        ));
+    }
+
+    #[test]
+    fn keyframe_requests_are_rate_limited() {
+        let mut limiter = KeyframeRequestLimiter::default();
+        let now = Instant::now();
+        assert!(limiter.allow(now));
+        assert!(!limiter.allow(now + Duration::from_millis(500)));
+        assert!(limiter.allow(now + Duration::from_millis(750)));
     }
 
     #[test]
@@ -2769,7 +3304,7 @@ mod tests {
     }
 
     #[test]
-    fn loopback_webrtc_negotiates_transfers_idr_and_delta_frames_and_closes() {
+    fn loopback_webrtc_requests_pli_and_recovers_with_another_decodable_idr() {
         let context = egui::Context::default();
         let sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
         let receiver = ScreenShareSession::new_loopback(context).unwrap();
@@ -2785,6 +3320,8 @@ mod tests {
         let mut sequence = 1;
         let mut next_frame = Instant::now() + FRAME_DURATION;
         let mut received_frame = None;
+        let mut pli_requested = false;
+        let mut idr_frames_before_pli = 0;
         while Instant::now() < deadline {
             for event in std::iter::from_fn(|| sender.try_recv()) {
                 match event {
@@ -2814,8 +3351,22 @@ mod tests {
             if let Some(frame) = receiver.latest_remote_frame() {
                 received_frame = Some((frame.width, frame.height));
             }
+            let sender_metrics = sender.metrics();
             let receiver_metrics = receiver.metrics();
-            if receiver_metrics.decoded_frames >= 2 && receiver_metrics.decoded_delta_frames >= 1 {
+            if !pli_requested
+                && sender_metrics.sent_idr_frames >= 1
+                && receiver_metrics.decoded_delta_frames >= 1
+            {
+                idr_frames_before_pli = sender_metrics.sent_idr_frames;
+                receiver.request_keyframe_for_test().unwrap();
+                pli_requested = true;
+            }
+            if pli_requested
+                && sender_metrics.pli_requests_received >= 1
+                && sender_metrics.sent_idr_frames > idr_frames_before_pli
+                && receiver_metrics.decoded_idr_frames >= 2
+                && receiver_metrics.decoded_delta_frames >= 1
+            {
                 break;
             }
             if Instant::now() >= next_frame {
@@ -2851,6 +3402,28 @@ mod tests {
             sender_metrics
         );
         assert!(
+            pli_requested && sender_metrics.pli_requests_received >= 1,
+            "loopback deve entregar o PLI ao emissor; sender metrics: {:?}",
+            sender_metrics
+        );
+        assert!(
+            sender_metrics.sent_idr_frames > idr_frames_before_pli,
+            "o emissor deve enviar outro IDR depois do PLI; sender metrics: {:?}",
+            sender_metrics
+        );
+        assert!(
+            receiver_metrics.decoded_idr_frames >= 2,
+            "o receptor deve decodificar o IDR de recuperaÃ§Ã£o; receiver metrics: {:?}",
+            receiver_metrics
+        );
+        assert!(
+            receiver_metrics.pli_requests_sent >= 1
+                && receiver_metrics.keyframe_resyncs >= 1
+                && receiver_metrics.last_recovery_time_millis.is_some(),
+            "a recuperaÃ§Ã£o deve registrar PLI, ressincronizaÃ§Ã£o e tempo atÃ© o IDR: {:?}",
+            receiver_metrics
+        );
+        assert!(
             sender_metrics.sent_delta_frames >= 1,
             "loopback deve enviar quadros P; sender metrics: {:?}",
             sender_metrics
@@ -2865,9 +3438,9 @@ mod tests {
             "loopback deve decodificar o IDR e pelo menos um quadro P; receiver metrics: {:?}",
             receiver_metrics
         );
-        assert_eq!(
-            receiver_metrics.decode_errors, 0,
-            "loopback não deve produzir erros H.264; receiver metrics: {:?}",
+        assert!(
+            receiver_metrics.decode_errors <= receiver_metrics.keyframe_resyncs,
+            "H.264 errors must trigger resync; receiver metrics: {:?}",
             receiver_metrics
         );
     }

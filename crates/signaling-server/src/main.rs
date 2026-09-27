@@ -11,7 +11,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
-        .with_max_level(tracing::Level::DEBUG)
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "info,signaling_server=debug",
+        ))
         .try_init()?;
     let listener = match TcpListener::bind(LISTEN_ADDRESS).await {
         Ok(listener) => listener,

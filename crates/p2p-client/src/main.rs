@@ -805,6 +805,17 @@ impl ClientUi {
                         ui.small(format!("Último erro H.264: {error}"));
                     }
                     ui.small(&self.screen_share_metrics.h264_diagnostics);
+                    let recovery_time = self
+                        .screen_share_metrics
+                        .last_recovery_time_millis
+                        .map_or_else(|| "ainda não disponível".to_owned(), |ms| format!("{ms} ms"));
+                    ui.small(format!(
+                        "Recuperação: {} PLI enviados, {} recebidos; {} ressincronizações; {} IDRs decodificados; último tempo até IDR: {recovery_time}.",
+                        self.screen_share_metrics.pli_requests_sent,
+                        self.screen_share_metrics.pli_requests_received,
+                        self.screen_share_metrics.keyframe_resyncs,
+                        self.screen_share_metrics.decoded_idr_frames
+                    ));
                     if ui.button("Parar de receber a tela").clicked() {
                         self.stop_screen_share(true);
                     }
@@ -985,7 +996,7 @@ impl ClientUi {
                 {
                     tracing::info!(version = %manifest.version, "Usuário solicitou aplicação da atualização");
                     self.update_status = UpdateStatus::PreparingToApply;
-                    self.updates.apply(path);
+                    self.updates.apply(path, manifest.version.clone());
                 }
             }
             UpdateStatus::PreparingToApply => {

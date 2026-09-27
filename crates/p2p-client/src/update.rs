@@ -23,6 +23,22 @@ const RELEASE_ASSET_NAME: &str = "p2p-client.exe";
 const RELEASE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const UPDATE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const UPDATE_DIRECTORY: &str = "P2P-Voz-e-tela\\updates";
+const BUILD_VERSION_MARKER_PREFIX: &[u8] = b"P2P_VOZ_E_TELA_BUILD_VERSION=";
+const MAX_BUILD_VERSION_BYTES: usize = 64;
+
+#[used]
+static EMBEDDED_BUILD_VERSION_MARKER: &[u8] = concat!(
+    "P2P_VOZ_E_TELA_BUILD_VERSION=",
+    env!("CARGO_PKG_VERSION"),
+    "\0"
+)
+.as_bytes();
+
+pub fn build_version_marker() -> &'static str {
+    std::str::from_utf8(EMBEDDED_BUILD_VERSION_MARKER)
+        .expect("version marker is valid UTF-8")
+        .trim_end_matches('\0')
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateManifest {
@@ -109,10 +125,10 @@ impl UpdateManager {
         }
     }
 
-    pub fn apply(&mut self, downloaded: PathBuf) {
+    pub fn apply(&mut self, downloaded: PathBuf, expected_version: String) {
         let sender = self.channel();
         thread::spawn(move || {
-            let result = stage_and_launch(downloaded);
+            let result = stage_and_launch(downloaded, expected_version);
             match result {
                 Ok(()) => {
                     let _ = sender.send(UpdateEvent::ApplyStarted);
@@ -508,12 +524,83 @@ fn validate_downloaded_file(
     if file.read_exact(&mut signature).is_err() || signature != *b"MZ" {
         return Err("O arquivo baixado não parece ser um executável Windows.".to_owned());
     }
+    let actual_version = read_embedded_build_version(path)?;
+    if actual_version != manifest.version {
+        return Err(format!(
+            "O release anuncia a versao {}, mas o executavel baixado identifica-se como {}. O arquivo nao sera aplicado.",
+            manifest.version, actual_version
+        ));
+    }
     Ok(())
 }
 
-fn stage_and_launch(downloaded: PathBuf) -> Result<(), String> {
+fn read_embedded_build_version(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| {
+        format!("Nao foi possivel abrir o executavel para conferir a versao: {error}")
+    })?;
+    let mut read_buffer = [0_u8; 64 * 1024];
+    let mut pending = Vec::with_capacity(read_buffer.len());
+    let mut marker_found = false;
+
+    loop {
+        let read = file.read(&mut read_buffer).map_err(|error| {
+            format!("Nao foi possivel ler o executavel para conferir a versao: {error}")
+        })?;
+        if read == 0 {
+            break;
+        }
+        pending.extend_from_slice(&read_buffer[..read]);
+
+        if !marker_found {
+            if let Some(marker_at) = find_subslice(&pending, BUILD_VERSION_MARKER_PREFIX) {
+                pending.drain(..marker_at + BUILD_VERSION_MARKER_PREFIX.len());
+                marker_found = true;
+            } else {
+                let keep = BUILD_VERSION_MARKER_PREFIX.len().saturating_sub(1);
+                if pending.len() > keep {
+                    let remove = pending.len() - keep;
+                    pending.drain(..remove);
+                }
+                continue;
+            }
+        }
+
+        if let Some(end) = pending.iter().position(|byte| *byte == 0) {
+            let version = std::str::from_utf8(&pending[..end])
+                .map_err(|_| "O marcador de versao do executavel nao e UTF-8 valido.".to_owned())?;
+            parse_version(version)?;
+            return Ok(version.to_owned());
+        }
+        if pending.len() > MAX_BUILD_VERSION_BYTES {
+            return Err("O marcador de versao do executavel esta malformado.".to_owned());
+        }
+    }
+
+    if marker_found {
+        Err("O marcador de versao do executavel esta incompleto.".to_owned())
+    } else {
+        Err(
+            "O executavel nao contem o marcador interno de versao; atualizacao recusada."
+                .to_owned(),
+        )
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn stage_and_launch(downloaded: PathBuf, expected_version: String) -> Result<(), String> {
     if !downloaded.is_file() {
         return Err("O executável baixado não foi encontrado.".to_owned());
+    }
+    let downloaded_version = read_embedded_build_version(&downloaded)?;
+    if downloaded_version != expected_version {
+        return Err(format!(
+            "A atualizacao esperava a versao {expected_version}, mas o arquivo baixado contem {downloaded_version}."
+        ));
     }
     let target = std::env::current_exe()
         .map_err(|error| format!("Não foi possível localizar o aplicativo atual: {error}"))?;
@@ -539,7 +626,8 @@ fn stage_and_launch(downloaded: PathBuf) -> Result<(), String> {
         .arg(&target)
         .arg(&staged)
         .arg(process_id.to_string())
-        .arg(&downloaded);
+        .arg(&downloaded)
+        .arg(&expected_version);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -573,13 +661,18 @@ pub fn helper_arguments(args: &[OsString]) -> Option<i32> {
 }
 
 fn run_helper(args: &[OsString]) -> i32 {
-    if args.len() != 5 {
+    if args.len() != 6 {
         show_update_error("Os argumentos do aplicador de atualização estão incompletos.");
         return 2;
     }
     let target = PathBuf::from(&args[1]);
     let staged = PathBuf::from(&args[2]);
     let downloaded = PathBuf::from(&args[4]);
+    let expected_version = args[5].to_string_lossy().into_owned();
+    if parse_version(&expected_version).is_err() {
+        show_update_error("A versao esperada pelo aplicador de atualizacao e invalida.");
+        return 2;
+    }
     let process_id = match args[3].to_string_lossy().parse::<u32>() {
         Ok(value) => value,
         Err(_) => {
@@ -596,7 +689,7 @@ fn run_helper(args: &[OsString]) -> i32 {
         return 1;
     }
 
-    match replace_and_restart(&target, &staged) {
+    match replace_and_restart(&target, &staged, &expected_version) {
         Ok(()) => {
             let _ = fs::remove_file(downloaded);
             0
@@ -670,8 +763,17 @@ fn replace_files(target: &Path, staged: &Path) -> Result<PathBuf, String> {
     Ok(backup)
 }
 
-fn replace_and_restart(target: &Path, staged: &Path) -> Result<(), String> {
+fn replace_and_restart(target: &Path, staged: &Path, expected_version: &str) -> Result<(), String> {
+    let staged_version = read_embedded_build_version(staged)?;
+    if staged_version != expected_version {
+        return Err(format!(
+            "O arquivo preparado contem a versao {staged_version}, mas era esperada {expected_version}. A versao instalada foi preservada."
+        ));
+    }
+
     let backup = replace_files(target, staged)?;
+    verify_installed_version_or_restore(target, &backup, expected_version)?;
+
     if let Err(error) = launch_target(target) {
         let _ = fs::remove_file(target);
         let restore = fs::rename(&backup, target);
@@ -687,6 +789,35 @@ fn replace_and_restart(target: &Path, staged: &Path) -> Result<(), String> {
     }
     tracing::info!("Atualização aplicada e aplicativo reiniciado");
     Ok(())
+}
+
+fn verify_installed_version_or_restore(
+    target: &Path,
+    backup: &Path,
+    expected_version: &str,
+) -> Result<(), String> {
+    match read_embedded_build_version(target) {
+        Ok(installed_version) if installed_version == expected_version => Ok(()),
+        result => {
+            let detail = match result {
+                Ok(installed_version) => format!(
+                    "Apos a substituicao, o executavel identifica-se como {installed_version}, mas era esperada a versao {expected_version}."
+                ),
+                Err(error) => {
+                    format!("Nao foi possivel verificar o executavel apos a substituicao: {error}")
+                }
+            };
+            let _ = fs::remove_file(target);
+            match fs::rename(backup, target) {
+                Ok(()) => Err(format!(
+                    "{detail} A versao anterior foi restaurada; o aplicativo nao sera reiniciado."
+                )),
+                Err(restore_error) => Err(format!(
+                    "{detail} A restauracao falhou ({restore_error}); a copia de recuperacao permanece ao lado do aplicativo."
+                )),
+            }
+        }
+    }
 }
 
 fn launch_target(target: &Path) -> io::Result<()> {
@@ -727,8 +858,9 @@ fn show_update_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpdateManifest, compare_versions, looks_like_html, parse_github_release, replace_files,
-        validate_downloaded_file, validate_https_url, validate_manifest,
+        BUILD_VERSION_MARKER_PREFIX, UpdateManifest, compare_versions, looks_like_html,
+        parse_github_release, read_embedded_build_version, replace_files, validate_downloaded_file,
+        validate_https_url, validate_manifest, verify_installed_version_or_restore,
     };
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -752,6 +884,16 @@ mod tests {
             size_bytes: 123,
             sha256: "a".repeat(64),
         }
+    }
+
+    fn executable_stub(version: &str) -> Vec<u8> {
+        [
+            b"MZfake executable".as_slice(),
+            BUILD_VERSION_MARKER_PREFIX,
+            version.as_bytes(),
+            b"\0",
+        ]
+        .concat()
     }
 
     #[test]
@@ -817,6 +959,22 @@ mod tests {
     }
 
     #[test]
+    fn version_mismatch_after_replacement_restores_the_previous_executable() {
+        let directory = test_directory();
+        let target = directory.join("app.exe");
+        let backup = directory.join("app.exe.backup");
+        fs::write(&target, executable_stub("1.0.2")).unwrap();
+        fs::write(&backup, executable_stub("1.0.1")).unwrap();
+
+        let error = verify_installed_version_or_restore(&target, &backup, "1.0.3").unwrap_err();
+
+        assert!(error.contains("restaurada") || error.contains("restaurado"));
+        assert_eq!(read_embedded_build_version(&target).unwrap(), "1.0.1");
+        assert!(!backup.exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn failed_replacement_restores_the_previous_executable() {
         let directory = test_directory();
         let target = directory.join("app.exe");
@@ -834,11 +992,11 @@ mod tests {
     fn downloaded_payload_must_match_size_hash_and_windows_executable_signature() {
         let directory = test_directory();
         let path = directory.join("download.exe");
-        let bytes = b"MZfake executable";
-        fs::write(&path, bytes).unwrap();
+        let bytes = executable_stub("1.0.1");
+        fs::write(&path, &bytes).unwrap();
         let mut value = manifest();
         value.size_bytes = bytes.len() as u64;
-        value.sha256 = format!("{:x}", Sha256::digest(bytes));
+        value.sha256 = format!("{:x}", Sha256::digest(&bytes));
 
         assert!(validate_downloaded_file(&path, &value, bytes.len() as u64, &value.sha256).is_ok());
         assert!(validate_downloaded_file(&path, &value, 1, &value.sha256).is_err());
@@ -846,10 +1004,42 @@ mod tests {
             validate_downloaded_file(&path, &value, bytes.len() as u64, &"0".repeat(64)).is_err()
         );
 
-        fs::write(&path, b"<html>not an executable</html>").unwrap();
+        let wrong_version = executable_stub("1.0.2");
+        fs::write(&path, &wrong_version).unwrap();
+        value.size_bytes = wrong_version.len() as u64;
+        value.sha256 = format!("{:x}", Sha256::digest(&wrong_version));
         assert!(
-            validate_downloaded_file(&path, &value, bytes.len() as u64, &value.sha256).is_err()
+            validate_downloaded_file(&path, &value, wrong_version.len() as u64, &value.sha256)
+                .unwrap_err()
+                .contains("1.0.2")
         );
+
+        fs::write(&path, b"MZ executable without build marker").unwrap();
+        value.size_bytes = fs::metadata(&path).unwrap().len();
+        let no_marker = fs::read(&path).unwrap();
+        value.sha256 = format!("{:x}", Sha256::digest(&no_marker));
+        assert!(
+            validate_downloaded_file(&path, &value, no_marker.len() as u64, &value.sha256).is_err()
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn build_version_marker_must_be_present_and_well_formed() {
+        let directory = test_directory();
+        let path = directory.join("version.exe");
+        fs::write(&path, executable_stub("1.2.3")).unwrap();
+        assert_eq!(read_embedded_build_version(&path).unwrap(), "1.2.3");
+
+        fs::write(
+            &path,
+            [b"MZ".as_slice(), BUILD_VERSION_MARKER_PREFIX, b"bad\0"].concat(),
+        )
+        .unwrap();
+        assert!(read_embedded_build_version(&path).is_err());
+
+        fs::write(&path, b"MZ without marker").unwrap();
+        assert!(read_embedded_build_version(&path).is_err());
         let _ = fs::remove_dir_all(directory);
     }
 }

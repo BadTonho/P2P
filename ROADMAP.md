@@ -85,6 +85,8 @@ Usar o servidor da sala apenas para trocar pedido, oferta, resposta, candidatos 
 
 **Validação manual:** transmissão do PC principal para o notebook confirmada, com 104 quadros decodificados e zero erros H.264; cancelamento do seletor confirmado. A transmissão inversa não foi validada porque o notebook tem hardware limitado.
 
+**Recuperação de vídeo:** quadros RTP incompletos são descartados; após perda ou falha de decodificação, o receptor aguarda um IDR com SPS/PPS e envia PLI com limite de frequência. O emissor solicita um IDR ao codec; se o codificador de hardware não aceitar, os IDRs periódicos continuam como alternativa. Os diagnósticos agregam perdas, pedidos PLI, IDRs e o tempo até a recuperação. O teste WebRTC local cobre PLI, novo IDR e decodificação; ainda falta validar a recuperação de perda entre dois computadores físicos.
+
 **Ainda falta validar:** fechar a janela capturada, testar o encerramento da sessão e confirmar que o servidor nunca recebe quadros de vídeo. Também falta validar com firewall e adaptadores que as pessoas realmente usarão. O teste inverso pode ser feito depois com outro computador mais potente.
 
 ### Etapa 6 — Conectar participantes em casas diferentes (teste controlado)
@@ -123,7 +125,7 @@ Tratar encerramento do compartilhamento, desconexões, acesso às salas e estado
 
 **Instalador e preferências:** o setup por usuário instala em `%LOCALAPPDATA%\Programs\P2P-Voz-e-tela`, sem exigir administrador. O aplicativo salva preferências em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json`; atualizações preservam o arquivo e a desinstalação o remove. Códigos de sala e credenciais temporárias não são persistidos. O script `scripts/build-installer.ps1` compila o `.exe` e o instalador Inno Setup localmente.
 
-**Primeira publicação:** a versão do workspace permanece 1.0.0 e será a primeira versão pública com o atualizador GitHub.
+**Versão:** a publicação inicial foi 1.0.0; a próxima compilação planejada passa a ser 1.0.6.
 
 **Falta validar:** instalar o setup, conferir a persistência das preferências e a remoção na desinstalação. Publicar os dois assets (`p2p-client.exe` e `P2P-Voz-e-tela-Setup.exe`) em um GitHub Release e validar uma atualização futura e a recuperação após falha. Também falta validar manualmente os cenários de rede da Etapa 7 entre duas casas, incluindo a rota TURN.
 

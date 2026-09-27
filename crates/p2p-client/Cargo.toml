@@ -28,7 +28,7 @@ time = { version = "0.3.55", features = ["formatting"] }
 turn-server = { version = "=4.1.5", default-features = false, features = ["udp"] }
 tracing = "0.1"
 tracing-log = "0.2"
-tracing-subscriber = { version = "0.3.23", features = ["fmt", "time"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "time"] }
 webrtc = "0.21"
 windows-capture = "2.0.1"
 
@@ -41,4 +41,6 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
 ] }

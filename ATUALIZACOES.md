@@ -20,7 +20,7 @@ Ao desinstalar, o instalador remove o arquivo de preferências. O aplicativo nã
 
 ## Validação e segurança
 
-O app baixa o executável por HTTPS e confere o tamanho, o SHA-256 informado pela API do GitHub e a assinatura PE (`MZ`). O aplicador auxiliar mantém uma cópia de recuperação e tenta restaurar a versão anterior se a substituição ou inicialização falhar.
+O app baixa o executável por HTTPS e confere o tamanho, o SHA-256 informado pela API do GitHub, a assinatura PE (`MZ`) e um marcador de versão embutido no build. O marcador deve corresponder à tag do release; o aplicador confere novamente a versão depois da substituição e restaura a cópia anterior se ela não corresponder ou se o novo app não iniciar. Essas verificações detectam arquivos incompatíveis ou corrompidos, mas não autenticam quem publicou o arquivo.
 
 Não há assinatura digital. O SHA-256 detecta corrupção durante o download, mas não prova a identidade do publicador se o repositório ou a conta do GitHub forem comprometidos. Um repositório e seus releases públicos podem ser vistos e baixados por qualquer pessoa.
 

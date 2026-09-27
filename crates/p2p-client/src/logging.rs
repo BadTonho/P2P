@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use time::{Date, Duration, OffsetDateTime};
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::time::UtcTime;
 
@@ -64,6 +65,16 @@ struct SharedLogWriter {
 struct RollingSink {
     path: PathBuf,
     file: Option<File>,
+    duplicate_packet_warnings: u64,
+}
+
+fn default_log_filter() -> EnvFilter {
+    EnvFilter::new("info,p2p_client=debug")
+}
+
+fn is_duplicate_packet_warning(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    (line.contains("warn") || line.contains("warning")) && line.contains("duplicat")
 }
 
 fn install_subscriber<S>(subscriber: S) -> Result<(), String>
@@ -106,7 +117,7 @@ impl LoggingState {
             let subscriber = tracing_subscriber::fmt()
                 .with_ansi(false)
                 .with_timer(UtcTime::rfc_3339())
-                .with_max_level(tracing::Level::DEBUG)
+                .with_env_filter(default_log_filter())
                 .finish();
             if let Err(error) = install_subscriber(subscriber) {
                 state.startup_message = Some(format!(
@@ -131,7 +142,7 @@ impl LoggingState {
             .with_thread_ids(true)
             .with_thread_names(true)
             .with_timer(UtcTime::rfc_3339())
-            .with_max_level(tracing::Level::DEBUG)
+            .with_env_filter(default_log_filter())
             .with_writer(writer)
             .finish();
 
@@ -148,6 +159,7 @@ impl LoggingState {
 
         tracing::info!(
             app_version = env!("CARGO_PKG_VERSION"),
+            build_version_marker = crate::update::build_version_marker(),
             os = std::env::consts::OS,
             architecture = std::env::consts::ARCH,
             log_directory = state.log_directory_label(),
@@ -393,10 +405,35 @@ impl RollingSink {
         Ok(Self {
             path,
             file: Some(file),
+            duplicate_packet_warnings: 0,
         })
     }
 
     fn write_line(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let line = String::from_utf8_lossy(bytes);
+        if is_duplicate_packet_warning(&line) {
+            self.duplicate_packet_warnings = self.duplicate_packet_warnings.saturating_add(1);
+            let count = self.duplicate_packet_warnings;
+            if count != 1 && !count.is_power_of_two() {
+                return Ok(());
+            }
+
+            let mut aggregated = bytes.to_vec();
+            if count > 1 {
+                let newline = aggregated.pop().filter(|byte| *byte == b'\n');
+                aggregated.extend_from_slice(
+                    format!(" [avisos duplicados agregados: {count} ocorrencias]").as_bytes(),
+                );
+                if let Some(newline) = newline {
+                    aggregated.push(newline);
+                }
+            }
+            return self.write_raw_line(&aggregated);
+        }
+        self.write_raw_line(bytes)
+    }
+
+    fn write_raw_line(&mut self, bytes: &[u8]) -> io::Result<()> {
         if let Some(file) = &mut self.file {
             file.write_all(bytes)?;
             if !bytes.ends_with(b"\n") {
@@ -405,6 +442,28 @@ impl RollingSink {
             file.flush()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::{default_log_filter, is_duplicate_packet_warning};
+
+    #[test]
+    fn app_debug_is_retained_while_dependencies_use_info_default() {
+        let filter = default_log_filter();
+        let directives = filter.to_string();
+        assert!(directives.contains("p2p_client=debug"));
+        assert!(directives.contains("info"));
+    }
+
+    #[test]
+    fn only_warning_lines_about_duplicates_are_aggregated() {
+        assert!(is_duplicate_packet_warning(
+            "WARN rtc_srtp packet duplicated"
+        ));
+        assert!(!is_duplicate_packet_warning("DEBUG packet duplicated"));
+        assert!(!is_duplicate_packet_warning("WARN ICE candidate failed"));
     }
 }
 
