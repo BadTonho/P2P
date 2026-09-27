@@ -115,9 +115,9 @@ Tratar encerramento do compartilhamento, desconexões, acesso às salas e estado
 
 **Atualizador migrado para GitHub Releases:** em Configurações > Atualizações, o app consulta a API pública do repositório, permite baixar sob demanda e reiniciar para aplicar. O release estável precisa ter uma tag `vMAJOR.MINOR.PATCH` e o asset `p2p-client.exe`; não é necessário incluir chave de API ou manifesto. O download valida HTTPS, tamanho, SHA-256 informado pelo GitHub e formato PE; a substituição usa um aplicador auxiliar com backup e rollback. Não há assinatura digital. As instruções de publicação estão em `ATUALIZACOES.md`.
 
-**Migração necessária:** a versão 1.0.0 já preparada usa o atualizador antigo do Drive. Pessoas com essa versão precisam instalar manualmente uma versão migrada (1.0.1) antes que a pasta e a chave do Drive sejam desativadas. A versão do workspace foi avançada para 1.0.1 para essa primeira publicação pelo GitHub.
+**Primeira publicação:** a versão do workspace permanece 1.0.0 e será a primeira versão pública com o atualizador GitHub.
 
-**Falta publicar e validar:** compilar o release 1.0.1, publicá-lo no GitHub com o asset de nome exato `p2p-client.exe`, instalar essa migração manualmente nos clientes 1.0.0 e validar a atualização entre duas versões e a recuperação após falha. Também falta validar manualmente os cenários de rede da Etapa 7 entre duas casas, incluindo a rota TURN.
+**Falta publicar e validar:** compilar o release 1.0.0, publicá-lo no GitHub com o asset de nome exato `p2p-client.exe` e validar uma atualização futura e a recuperação após falha. Também falta validar manualmente os cenários de rede da Etapa 7 entre duas casas, incluindo a rota TURN.
 
 **Concluída quando:** amigos conseguirem baixar o `.exe`, seguir os passos para conectar-se ao PC anfitrião e compartilhar a tela, e receber versões novas pelo atualizador opcional.
 

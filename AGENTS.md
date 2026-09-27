@@ -7,7 +7,7 @@
 - O app usa a tag, o tamanho, o SHA-256 (`digest`) e o link do asset retornados pela API pública do GitHub. Não é necessário criar nem publicar um manifesto separado.
 - Preserve o download iniciado pelo usuário, a validação HTTPS/tamanho/SHA-256/assinatura PE e o aplicador com backup e rollback. Não registre dados privados ou tokens.
 - Mantenha `ATUALIZACOES.md` alinhado à implementação e ao processo de publicação.
-- O atualizador anterior da versão 1.0.0 consultava o Google Drive. Uma versão GitHub Release precisa ser instalada manualmente uma vez por quem ainda estiver nessa versão; não remova instruções sobre essa migração até ela ser concluída.
+- A primeira versão pública será 1.0.0 com o atualizador do GitHub. Não reintroduza dependência do Google Drive nem instruções de migração do Drive sem pedido explícito.
 
 ## Preparar um release
 
