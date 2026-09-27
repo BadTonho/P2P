@@ -1,23 +1,16 @@
 # Instruções do projeto
 
-## Atualizações pelo Google Drive
+## Atualizações pelo GitHub Releases
 
-- Preserve o atualizador pelo Google Drive em mudanças futuras. Ele deve localizar `update-manifest.json` na pasta pública configurada e aceitar atualizações somente após validar tamanho, SHA-256 e executável Windows.
-- Não substitua a busca na pasta por um link direto de manifesto sem combinar isso com o usuário. O ID padrão da pasta está em `crates/p2p-client/build.rs`; mantenha-o apontando para a pasta de atualizações do projeto.
-- O build usa `P2P_UPDATE_DRIVE_API_KEY` para incluir uma chave restrita à Google Drive API no executável. Nunca escreva o valor da chave em arquivos rastreados, logs, documentação ou mensagens. Use a variável de ambiente apenas durante a compilação e remova-a ao terminar.
-- Se houver um arquivo local `Chave.md` ignorado pelo Git, ele pode ser usado como fonte local da chave para a compilação. Leia seu conteúdo sem exibi-lo, copie apenas o valor necessário para a variável de ambiente temporária e não altere nem rastreie esse arquivo. Se o formato não for claro, peça confirmação antes de usá-lo.
-- Não distribua um build de release sem a chave configurada: ele ficaria sem a verificação automática do Drive. Se a chave não estiver disponível no ambiente ou no contexto autorizado da tarefa, explique que ela é necessária antes de gerar o executável de distribuição.
-- Mantenha `ATUALIZACOES.md` alinhado com a implementação e com o processo de publicação.
+- O atualizador consulta o último GitHub Release público em `https://api.github.com/repos/BadTonho/P2P/releases/latest`. Não adicione tokens, chaves de API ou credenciais ao executável.
+- Cada release estável precisa ter uma tag numérica `vMAJOR.MINOR.PATCH` e exatamente um asset chamado `p2p-client.exe`. A versão da tag deve corresponder à versão do workspace no `Cargo.toml` da raiz.
+- O app usa a tag, o tamanho, o SHA-256 (`digest`) e o link do asset retornados pela API pública do GitHub. Não é necessário criar nem publicar um manifesto separado.
+- Preserve o download iniciado pelo usuário, a validação HTTPS/tamanho/SHA-256/assinatura PE e o aplicador com backup e rollback. Não registre dados privados ou tokens.
+- Mantenha `ATUALIZACOES.md` alinhado à implementação e ao processo de publicação.
+- O atualizador anterior da versão 1.0.0 consultava o Google Drive. Uma versão GitHub Release precisa ser instalada manualmente uma vez por quem ainda estiver nessa versão; não remova instruções sobre essa migração até ela ser concluída.
 
-## Preparar uma versão para enviar ao Drive
+## Preparar um release
 
-Quando o usuário pedir para preparar o instalador, executável ou versão para subir no Google Drive, gere **os dois artefatos**: o executável Windows e `update-manifest.json`. Neste projeto, a distribuição combinada até agora é um `.exe` avulso, sem instalador separado; não crie um instalador MSI ou similar sem pedido específico.
+Quando o usuário pedir para preparar uma versão para o GitHub, gere o executável Windows `target/release/p2p-client.exe`, confira sua versão, tamanho e SHA-256 e explique como anexá-lo a um GitHub Release público com o nome exato `p2p-client.exe`. Não gere `update-manifest.json`; a API do GitHub fornece os metadados usados pelo app. Não crie instalador MSI ou similar sem pedido específico.
 
-1. Use a versão definida em `[workspace.package]` no `Cargo.toml` da raiz e compile `p2p-client` em `release`, com a chave do Drive disponível somente como variável de ambiente.
-2. Prepare o executável final `p2p-client.exe` e gere o manifesto a partir desse arquivo exato. O campo `version` deve corresponder à versão compilada; `size_bytes` e `sha256` devem ser calculados sobre os bytes finais do executável.
-3. O manifesto deve se chamar exatamente `update-manifest.json` e conter `version`, `download_url`, `size_bytes` e `sha256`, seguindo `update-manifest.example.json`.
-4. `download_url` precisa usar o link direto `https://drive.google.com/uc?export=download&id=ID_REAL_DO_EXECUTAVEL`. Se o ID do executável no Drive já for conhecido, use-o. Para versões futuras, prefira enviar uma nova versão do mesmo arquivo no Drive para preservar o ID.
-5. Se o ID do executável ainda não existir porque o usuário vai subir o arquivo depois, gere o executável e um manifesto claramente marcado como **rascunho** com placeholder no `download_url`; explique que o manifesto só estará pronto para publicar depois que o usuário enviar o executável e fornecer o ID/link do Drive. Não apresente um placeholder como manifesto final.
-6. Entregue os caminhos dos dois artefatos e os passos de upload. Deixe claro que o manifesto e o executável precisam ser enviados à pasta configurada e que deve haver apenas um `update-manifest.json` nela.
-
-Consulte `ATUALIZACOES.md` antes de alterar o formato, a publicação ou o mecanismo de atualização.
+Antes de preparar uma versão, consulte `ATUALIZACOES.md`. Não publique nem crie releases externos sem autorização explícita.

@@ -44,9 +44,9 @@ STUN ajuda a procurar uma rota direta e não retransmite mídia. TURN retransmit
 
 - Se não conectar à sala, confira o endereço, o código, TCP 9000, o encaminhamento do roteador e o firewall do anfitrião.
 - Se a sala conectar, mas o vídeo não, confira a mensagem ICE, a URI STUN e as portas UDP. O anfitrião também deve conferir UDP 3478 e UDP 50000–50100 quando TURN estiver ativo.
-- **Configurações > Atualizações** permite verificar, baixar e aplicar uma versão. Amigos com uma versão antiga sem o atualizador precisam receber o `.exe` 1.0.0 manualmente primeiro.
+- **Configurações > Atualizações** permite verificar, baixar e aplicar uma versão do GitHub Releases. Quem ainda usa o `.exe` 1.0.0 com o atualizador antigo precisa instalar manualmente a versão migrada uma vez.
 - Use **Exportar logs** para salvar diagnóstico local. Os logs podem incluir endereços IP e nomes de adaptadores; revise o arquivo antes de compartilhar.
 
-## Atualizações publicadas pelo Drive
+## Atualizações publicadas pelo GitHub
 
-O atualizador procura `update-manifest.json` na pasta pública do projeto. Consulte [ATUALIZACOES.md](ATUALIZACOES.md) para enviar o executável e o manifesto. O arquivo local gerado para a versão 1.0.0 é um rascunho até ser atualizado com o ID real do executável no Drive.
+O atualizador consulta o último release público do [repositório no GitHub](https://github.com/BadTonho/P2P/releases/latest) e procura o asset `p2p-client.exe`. Consulte [ATUALIZACOES.md](ATUALIZACOES.md) para publicar uma nova versão. Não é necessário criar ou enviar um manifesto separado.

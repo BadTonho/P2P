@@ -12,19 +12,19 @@ use std::time::{Duration, Instant};
 use reqwest::blocking::{Client, Response};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::redirect::Policy;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const DRIVE_FOLDER_ID: &str = env!("P2P_UPDATE_DRIVE_FOLDER_ID");
-const DRIVE_API_KEY: &str = env!("P2P_UPDATE_DRIVE_API_KEY");
-const DRIVE_FILES_API_URL: &str = "https://www.googleapis.com/drive/v3/files";
-const DRIVE_FILE_DOWNLOAD_URL: &str = "https://drive.google.com/uc";
-const MANIFEST_NAME: &str = "update-manifest.json";
-const MANIFEST_MAX_BYTES: u64 = 64 * 1024;
+const GITHUB_OWNER: &str = "BadTonho";
+const GITHUB_REPOSITORY: &str = "P2P";
+const GITHUB_RELEASE_API_URL: &str = "https://api.github.com/repos/BadTonho/P2P/releases/latest";
+const GITHUB_RELEASES_PAGE_URL: &str = "https://github.com/BadTonho/P2P/releases/latest";
+const RELEASE_ASSET_NAME: &str = "p2p-client.exe";
+const RELEASE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const UPDATE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const UPDATE_DIRECTORY: &str = "P2P-Voz-e-tela\\updates";
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateManifest {
     pub version: String,
     pub download_url: String,
@@ -71,37 +71,18 @@ impl UpdateManager {
         self.sender.as_ref().expect("update event sender").clone()
     }
 
-    pub fn is_configured() -> bool {
-        !DRIVE_FOLDER_ID.trim().is_empty() && !DRIVE_API_KEY.trim().is_empty()
-    }
-
-    pub fn configuration_message() -> &'static str {
-        if DRIVE_FOLDER_ID.trim().is_empty() {
-            "A pasta de atualizações do Google Drive não está configurada nesta compilação."
-        } else {
-            "A pasta do Google Drive já está configurada, mas falta compilar com P2P_UPDATE_DRIVE_API_KEY. Os amigos não precisam fazer login no Google."
-        }
-    }
-
-    pub fn drive_folder_url() -> String {
-        format!("https://drive.google.com/drive/folders/{DRIVE_FOLDER_ID}")
+    pub fn releases_page_url() -> &'static str {
+        GITHUB_RELEASES_PAGE_URL
     }
 
     pub fn check(&mut self) {
         let sender = self.channel();
-        if !Self::is_configured() {
-            let _ = sender.send(UpdateEvent::CheckFinished(Err(
-                Self::configuration_message().to_owned(),
-            )));
-            return;
-        }
-
         tracing::info!(
             current_version = env!("CARGO_PKG_VERSION"),
             "Verificando atualizações"
         );
         thread::spawn(move || {
-            let result = check_for_update(DRIVE_FOLDER_ID, DRIVE_API_KEY);
+            let result = check_for_update();
             match &result {
                 Ok(Some(manifest)) => tracing::info!(
                     version = %manifest.version,
@@ -150,6 +131,7 @@ impl UpdateManager {
 
 fn new_http_client() -> Result<Client, String> {
     Client::builder()
+        .user_agent(concat!("P2P-Voz-e-tela/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(600))
         .redirect(Policy::limited(10))
@@ -170,31 +152,36 @@ fn validate_https_url(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn check_for_update(folder_id: &str, api_key: &str) -> Result<Option<UpdateManifest>, String> {
-    validate_drive_folder_id(folder_id)?;
-    if api_key.trim().is_empty() {
-        return Err(UpdateManager::configuration_message().to_owned());
-    }
+fn check_for_update() -> Result<Option<UpdateManifest>, String> {
     let client = new_http_client()?;
-    let manifest_file = find_manifest_file(&client, folder_id, api_key)?;
-    let manifest_url = drive_file_download_url(&manifest_file)?;
     let response = client
-        .get(manifest_url)
+        .get(GITHUB_RELEASE_API_URL)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
         .map_err(|error| sanitized_request_error(&error))?;
-    let response = validate_response(response, MANIFEST_MAX_BYTES, "manifesto")?;
+    if response.status().as_u16() == 404 {
+        return Err(
+            "Ainda não há um GitHub Release público com atualização para este aplicativo."
+                .to_owned(),
+        );
+    }
+    if response.status().as_u16() == 403 {
+        return Err("O GitHub limitou ou recusou a consulta pública de releases. Aguarde alguns minutos e tente novamente.".to_owned());
+    }
+    let response = validate_response(response, RELEASE_MAX_BYTES, "informações do release")?;
     if is_html(&response) {
-        return Err("O Drive respondeu com uma página HTML em vez do manifesto. Confira o link de download e a permissão 'Qualquer pessoa com o link'.".to_owned());
+        return Err("O GitHub respondeu com HTML em vez dos dados do release.".to_owned());
     }
     let mut bytes = Vec::new();
     response
-        .take(MANIFEST_MAX_BYTES + 1)
+        .take(RELEASE_MAX_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| "Não foi possível ler o manifesto de atualização.".to_owned())?;
-    if bytes.len() as u64 > MANIFEST_MAX_BYTES {
-        return Err("O manifesto de atualização excede o limite de tamanho.".to_owned());
+        .map_err(|_| "Não foi possível ler as informações do GitHub Release.".to_owned())?;
+    if bytes.len() as u64 > RELEASE_MAX_BYTES {
+        return Err("As informações do GitHub Release excedem o limite de tamanho.".to_owned());
     }
-    let manifest = parse_manifest(&bytes)?;
+    let manifest = parse_github_release(&bytes)?;
 
     match compare_versions(&manifest.version, env!("CARGO_PKG_VERSION"))? {
         std::cmp::Ordering::Greater => Ok(Some(manifest)),
@@ -203,115 +190,77 @@ fn check_for_update(folder_id: &str, api_key: &str) -> Result<Option<UpdateManif
 }
 
 #[derive(Debug, Deserialize)]
-struct DriveFileList {
+struct GithubRelease {
+    tag_name: String,
     #[serde(default)]
-    files: Vec<DriveFile>,
+    assets: Vec<GithubReleaseAsset>,
 }
 
 #[derive(Debug, Deserialize)]
-struct DriveFile {
-    id: String,
+struct GithubReleaseAsset {
     name: String,
-    #[serde(rename = "mimeType")]
-    mime_type: String,
-    #[serde(rename = "resourceKey")]
-    resource_key: Option<String>,
+    browser_download_url: String,
+    size: u64,
+    digest: Option<String>,
 }
 
-fn validate_drive_folder_id(folder_id: &str) -> Result<(), String> {
-    if folder_id.is_empty()
-        || !folder_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
-        return Err("O ID da pasta pública do Google Drive está inválido.".to_owned());
-    }
-    Ok(())
-}
+fn parse_github_release(bytes: &[u8]) -> Result<UpdateManifest, String> {
+    let release: GithubRelease = serde_json::from_slice(bytes)
+        .map_err(|_| "O GitHub não retornou dados válidos de release.".to_owned())?;
+    let version = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name)
+        .to_owned();
+    parse_version(&version)?;
 
-fn find_manifest_file(
-    client: &Client,
-    folder_id: &str,
-    api_key: &str,
-) -> Result<DriveFile, String> {
-    let query = format!(
-        "'{}' in parents and name = '{}' and trashed = false",
-        folder_id, MANIFEST_NAME
-    );
-    let response = client
-        .get(DRIVE_FILES_API_URL)
-        .header("x-goog-api-key", api_key)
-        .query(&[
-            ("q", query.as_str()),
-            ("fields", "files(id,name,mimeType,resourceKey)"),
-            ("pageSize", "10"),
-            ("supportsAllDrives", "true"),
-            ("includeItemsFromAllDrives", "true"),
-        ])
-        .send()
-        .map_err(|error| sanitized_request_error(&error))?;
-    if response.status().as_u16() == 401 || response.status().as_u16() == 403 {
-        return Err("O Google Drive recusou a listagem da pasta. Confira se a Drive API está habilitada, se a chave é válida e se ela está restrita à Drive API.".to_owned());
-    }
-    if response.status().as_u16() == 404 {
-        return Err(
-            "A pasta configurada não foi encontrada ou não permite acesso público.".to_owned(),
-        );
-    }
-    let response = validate_response(
-        response,
-        MANIFEST_MAX_BYTES,
-        "resultado da pasta de atualizações",
-    )?;
-    if is_html(&response) {
-        return Err(
-            "O Google Drive respondeu com HTML ao listar a pasta de atualizações.".to_owned(),
-        );
-    }
-    let mut bytes = Vec::new();
-    response
-        .take(MANIFEST_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| {
-            "Não foi possível ler a lista de arquivos da pasta de atualizações.".to_owned()
-        })?;
-    if bytes.len() as u64 > MANIFEST_MAX_BYTES {
-        return Err("A resposta da pasta de atualizações excede o limite de tamanho.".to_owned());
-    }
-    let file_list: DriveFileList = serde_json::from_slice(&bytes).map_err(|_| {
-        "Não foi possível listar a pasta. Confira se a Drive API está habilitada, se a chave está correta e se a pasta permite acesso a qualquer pessoa com o link.".to_owned()
-    })?;
-    let mut matching = file_list.files.into_iter().filter(|file| {
-        file.name == MANIFEST_NAME && !file.mime_type.starts_with("application/vnd.google-apps.")
-    });
-    let Some(file) = matching.next() else {
+    let mut assets = release
+        .assets
+        .into_iter()
+        .filter(|asset| asset.name == RELEASE_ASSET_NAME);
+    let Some(asset) = assets.next() else {
         return Err(format!(
-            "A pasta configurada ainda não contém o arquivo {MANIFEST_NAME}."
+            "O último release não contém o arquivo {RELEASE_ASSET_NAME}."
         ));
     };
-    if matching.next().is_some() {
+    if assets.next().is_some() {
         return Err(format!(
-            "Há mais de um arquivo {MANIFEST_NAME} na pasta. Deixe apenas um com esse nome."
+            "O último release contém mais de um arquivo {RELEASE_ASSET_NAME}."
         ));
     }
-    if file.id.is_empty() {
-        return Err("O Google Drive encontrou o manifesto, mas não informou seu ID.".to_owned());
-    }
-    Ok(file)
+    let sha256 = asset
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .ok_or_else(|| "O GitHub não informou o SHA-256 do executável publicado.".to_owned())?
+        .to_owned();
+    let manifest = UpdateManifest {
+        version,
+        download_url: asset.browser_download_url,
+        size_bytes: asset.size,
+        sha256,
+    };
+    validate_manifest(&manifest)?;
+    validate_release_asset_url(&manifest.download_url)?;
+    Ok(manifest)
 }
 
-fn drive_file_download_url(file: &DriveFile) -> Result<reqwest::Url, String> {
-    let mut url = reqwest::Url::parse(DRIVE_FILE_DOWNLOAD_URL)
-        .map_err(|_| "Não foi possível preparar o link do manifesto no Google Drive.".to_owned())?;
+fn validate_release_asset_url(value: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "O link do executável no GitHub Release é inválido.".to_owned())?;
+    let expected_prefix = format!("/{GITHUB_OWNER}/{GITHUB_REPOSITORY}/releases/download/");
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !url.path().starts_with(&expected_prefix)
+        || !url.path().ends_with(&format!("/{RELEASE_ASSET_NAME}"))
     {
-        let mut query = url.query_pairs_mut();
-        query.append_pair("export", "download");
-        query.append_pair("id", &file.id);
-        if let Some(resource_key) = file.resource_key.as_deref() {
-            query.append_pair("resourcekey", resource_key);
-        }
+        return Err(
+            "O link do executável não pertence aos releases HTTPS deste repositório.".to_owned(),
+        );
     }
-    Ok(url)
+    Ok(())
 }
 
 fn validate_response(
@@ -326,7 +275,9 @@ fn validate_response(
         ));
     }
     if response.url().scheme() != "https" {
-        return Err("O redirecionamento do Drive deixou de usar HTTPS.".to_owned());
+        return Err(
+            "O redirecionamento do servidor de atualizações deixou de usar HTTPS.".to_owned(),
+        );
     }
     if response
         .content_length()
@@ -356,28 +307,15 @@ fn looks_like_html(bytes: &[u8]) -> bool {
     prefix.starts_with("<!doctype html") || prefix.starts_with("<html")
 }
 
-fn parse_manifest(bytes: &[u8]) -> Result<UpdateManifest, String> {
-    if looks_like_html(bytes) {
-        return Err("O Drive respondeu com uma página HTML em vez do manifesto. Confira o link de download e a permissão 'Qualquer pessoa com o link'.".to_owned());
-    }
-    let json_bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
-    let text = std::str::from_utf8(json_bytes)
-        .map_err(|_| "O manifesto de atualização não está em UTF-8 válido.".to_owned())?;
-    let manifest: UpdateManifest = serde_json::from_str(text)
-        .map_err(|_| "O manifesto de atualização não contém JSON válido.".to_owned())?;
-    validate_manifest(&manifest)?;
-    Ok(manifest)
-}
-
 fn validate_manifest(manifest: &UpdateManifest) -> Result<(), String> {
     parse_version(&manifest.version)?;
     validate_https_url(&manifest.download_url)?;
     if manifest.size_bytes == 0 || manifest.size_bytes > UPDATE_MAX_BYTES {
-        return Err("O tamanho informado no manifesto está fora do limite aceito.".to_owned());
+        return Err("O tamanho informado pelo GitHub está fora do limite aceito.".to_owned());
     }
     if manifest.sha256.len() != 64 || !manifest.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err("O SHA-256 do manifesto precisa ter 64 caracteres hexadecimais.".to_owned());
+        return Err("O SHA-256 do release precisa ter 64 caracteres hexadecimais.".to_owned());
     }
     Ok(())
 }
@@ -386,15 +324,15 @@ fn parse_version(value: &str) -> Result<[u64; 3], String> {
     let mut parts = value.split('.');
     let parsed = [parts.next(), parts.next(), parts.next()];
     if parts.next().is_some() {
-        return Err("A versão deve usar o formato numérico MAJOR.MINOR.PATCH.".to_owned());
+        return Err("A tag do release deve conter uma versão MAJOR.MINOR.PATCH, opcionalmente iniciada por v.".to_owned());
     }
     let mut version = [0; 3];
     for (index, part) in parsed.into_iter().enumerate() {
         let Some(part) = part else {
-            return Err("A versão deve usar o formato numérico MAJOR.MINOR.PATCH.".to_owned());
+            return Err("A tag do release deve conter uma versão MAJOR.MINOR.PATCH, opcionalmente iniciada por v.".to_owned());
         };
         if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err("A versão deve usar o formato numérico MAJOR.MINOR.PATCH.".to_owned());
+            return Err("A tag do release deve conter uma versão MAJOR.MINOR.PATCH, opcionalmente iniciada por v.".to_owned());
         }
         version[index] = part
             .parse()
@@ -469,7 +407,9 @@ fn download_update_file(
         .map_err(|error| sanitized_request_error(&error))?;
     let mut response = validate_response(response, UPDATE_MAX_BYTES, "executável")?;
     if is_html(&response) {
-        return Err("O Drive respondeu com uma página HTML. Verifique se o link permite baixar o arquivo sem login e sem confirmação.".to_owned());
+        return Err(
+            "O GitHub respondeu com uma página HTML em vez do executável do release.".to_owned(),
+        );
     }
 
     let directory = update_directory()?;
@@ -522,7 +462,9 @@ fn download_update_file(
     drop(file);
 
     if looks_like_html(&prefix) {
-        return Err("O Drive respondeu com uma página HTML. Verifique se o link permite baixar o arquivo sem login e sem confirmação.".to_owned());
+        return Err(
+            "O GitHub respondeu com uma página HTML em vez do executável do release.".to_owned(),
+        );
     }
 
     let actual_hash = format!("{:x}", hasher.finalize());
@@ -558,7 +500,7 @@ fn validate_downloaded_file(
         ));
     }
     if !actual_hash.eq_ignore_ascii_case(&manifest.sha256) {
-        return Err("O SHA-256 baixado não corresponde ao manifesto.".to_owned());
+        return Err("O SHA-256 baixado não corresponde ao valor informado pelo GitHub.".to_owned());
     }
     let mut file = File::open(path)
         .map_err(|error| format!("Não foi possível conferir o executável baixado: {error}"))?;
@@ -785,7 +727,7 @@ fn show_update_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpdateManifest, compare_versions, looks_like_html, parse_manifest, replace_files,
+        UpdateManifest, compare_versions, looks_like_html, parse_github_release, replace_files,
         validate_downloaded_file, validate_https_url, validate_manifest,
     };
     use sha2::{Digest, Sha256};
@@ -804,8 +746,9 @@ mod tests {
 
     fn manifest() -> UpdateManifest {
         UpdateManifest {
-            version: "0.1.1".to_owned(),
-            download_url: "https://drive.google.com/uc?export=download&id=example".to_owned(),
+            version: "1.0.1".to_owned(),
+            download_url: "https://github.com/BadTonho/P2P/releases/download/v1.0.1/p2p-client.exe"
+                .to_owned(),
             size_bytes: 123,
             sha256: "a".repeat(64),
         }
@@ -820,23 +763,32 @@ mod tests {
 
     #[test]
     fn accepts_only_https_links_without_embedded_credentials() {
-        assert!(validate_https_url("https://drive.google.com/file?id=x").is_ok());
-        assert!(validate_https_url("http://drive.google.com/file?id=x").is_err());
-        assert!(validate_https_url("https://user:pass@drive.google.com/file?id=x").is_err());
+        assert!(validate_https_url("https://github.com/BadTonho/P2P/releases/latest").is_ok());
+        assert!(validate_https_url("http://github.com/BadTonho/P2P/releases/latest").is_err());
+        assert!(
+            validate_https_url("https://user:pass@github.com/BadTonho/P2P/releases/latest")
+                .is_err()
+        );
     }
 
     #[test]
-    fn parses_manifest_with_a_powershell_utf8_bom_and_rejects_drive_html() {
-        let body = serde_json::to_vec(&manifest()).unwrap();
-        let mut with_bom = vec![0xef, 0xbb, 0xbf];
-        with_bom.extend_from_slice(&body);
-        assert_eq!(parse_manifest(&with_bom).unwrap(), manifest());
-        assert!(looks_like_html(b" <!doctype html><html>Drive error"));
-        assert!(parse_manifest(b"<html>login</html>").is_err());
+    fn parses_github_release_asset_and_uses_its_digest() {
+        let body = br#"{
+            "tag_name":"v1.0.1",
+            "assets":[{
+                "name":"p2p-client.exe",
+                "browser_download_url":"https://github.com/BadTonho/P2P/releases/download/v1.0.1/p2p-client.exe",
+                "size":123,
+                "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        }"#;
+        assert_eq!(parse_github_release(body).unwrap(), manifest());
+        assert!(looks_like_html(b" <!doctype html><html>GitHub error"));
+        assert!(parse_github_release(b"<html>login</html>").is_err());
     }
 
     #[test]
-    fn rejects_invalid_manifest_fields() {
+    fn rejects_invalid_release_fields() {
         let mut value = manifest();
         assert!(validate_manifest(&value).is_ok());
         value.size_bytes = 0;

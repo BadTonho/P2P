@@ -113,11 +113,11 @@ O aplicativo gera credenciais temporárias para cada sala e as envia ao outro pa
 
 Tratar encerramento do compartilhamento, desconexões, acesso às salas e estados de captura. Distribuir o aplicativo como um executável `.exe` solto, sem instalador, e documentar o compartilhamento do endereço de rede e do código da sala.
 
-**Atualizador implementado:** em Configurações > Atualizações, o app procura `update-manifest.json` na pasta do Google Drive configurada, permite baixar sob demanda e reiniciar para aplicar. A pasta do projeto já está definida como padrão; a compilação distribuída precisa incluir uma API key restrita à Google Drive API para localizar o arquivo público sem login dos amigos. O download valida HTTPS, tamanho, SHA-256 e formato PE; a substituição usa um aplicador auxiliar com backup e rollback. Não há assinatura digital; o SHA-256 detecta corrupção, não autentica o publicador. As instruções de publicação estão em `ATUALIZACOES.md`.
+**Atualizador migrado para GitHub Releases:** em Configurações > Atualizações, o app consulta a API pública do repositório, permite baixar sob demanda e reiniciar para aplicar. O release estável precisa ter uma tag `vMAJOR.MINOR.PATCH` e o asset `p2p-client.exe`; não é necessário incluir chave de API ou manifesto. O download valida HTTPS, tamanho, SHA-256 informado pelo GitHub e formato PE; a substituição usa um aplicador auxiliar com backup e rollback. Não há assinatura digital. As instruções de publicação estão em `ATUALIZACOES.md`.
 
-**Preparado localmente:** versão do workspace definida como 1.0.0; guia de uso para anfitrião e convidados em `COMO_USAR.md`; executável de release e manifesto local de rascunho com tamanho e SHA-256 do executável. O link no manifesto ainda precisa ser substituído pelo ID real do executável no Drive.
+**Migração necessária:** a versão 1.0.0 já preparada usa o atualizador antigo do Drive. Pessoas com essa versão precisam instalar manualmente uma versão migrada (1.0.1) antes que a pasta e a chave do Drive sejam desativadas. A versão do workspace foi avançada para 1.0.1 para essa primeira publicação pelo GitHub.
 
-**Falta publicar e validar:** enviar o executável ao Drive, completar e enviar o manifesto, testar o download anônimo e a aplicação entre duas versões e confirmar a recuperação após falha. Também falta validar manualmente os cenários de rede da Etapa 7 entre duas casas, incluindo a rota TURN.
+**Falta publicar e validar:** compilar o release 1.0.1, publicá-lo no GitHub com o asset de nome exato `p2p-client.exe`, instalar essa migração manualmente nos clientes 1.0.0 e validar a atualização entre duas versões e a recuperação após falha. Também falta validar manualmente os cenários de rede da Etapa 7 entre duas casas, incluindo a rota TURN.
 
 **Concluída quando:** amigos conseguirem baixar o `.exe`, seguir os passos para conectar-se ao PC anfitrião e compartilhar a tela, e receber versões novas pelo atualizador opcional.
 

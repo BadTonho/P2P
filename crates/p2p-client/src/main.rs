@@ -37,7 +37,6 @@ enum SettingsCategory {
 enum UpdateStatus {
     #[default]
     Checking,
-    Unconfigured,
     UpToDate,
     Available(UpdateManifest),
     Downloading {
@@ -174,11 +173,7 @@ impl ClientUi {
                     self.update_status = UpdateStatus::UpToDate;
                 }
                 UpdateEvent::CheckFinished(Err(error)) => {
-                    self.update_status = if UpdateManager::is_configured() {
-                        UpdateStatus::Failed(error)
-                    } else {
-                        UpdateStatus::Unconfigured
-                    };
+                    self.update_status = UpdateStatus::Failed(error);
                 }
                 UpdateEvent::DownloadProgress {
                     version, received, ..
@@ -811,103 +806,90 @@ impl ClientUi {
     fn show_update_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Atualizações");
         ui.label(format!("Versão instalada: {}", env!("CARGO_PKG_VERSION")));
-        ui.hyperlink_to(
-            "Abrir pasta configurada no Google Drive",
-            UpdateManager::drive_folder_url(),
-        );
-        ui.small("O app procura nessa pasta o arquivo update-manifest.json.");
+        ui.hyperlink_to("Abrir GitHub Releases", UpdateManager::releases_page_url());
+        ui.small("O app consulta o último release público e procura o arquivo p2p-client.exe.");
         ui.add_space(8.0);
 
-        if !UpdateManager::is_configured() {
-            ui.colored_label(
-                egui::Color32::from_rgb(190, 95, 35),
-                UpdateManager::configuration_message(),
-            );
-        } else {
-            match self.update_status.clone() {
-                UpdateStatus::Checking => {
-                    ui.label("Verificando se há uma versão nova…");
+        match self.update_status.clone() {
+            UpdateStatus::Checking => {
+                ui.label("Verificando se há uma versão nova…");
+            }
+            UpdateStatus::UpToDate => {
+                ui.label("Você está usando a versão mais recente.");
+            }
+            UpdateStatus::Available(manifest) => {
+                ui.label(format!("A versão {} está disponível.", manifest.version));
+                if self.room_code.is_some() {
+                    ui.small("Saia da sala para baixar a atualização.");
                 }
-                UpdateStatus::Unconfigured => {
-                    ui.label(UpdateManager::configuration_message());
-                }
-                UpdateStatus::UpToDate => {
-                    ui.label("Você está usando a versão mais recente.");
-                }
-                UpdateStatus::Available(manifest) => {
-                    ui.label(format!("A versão {} está disponível.", manifest.version));
-                    if self.room_code.is_some() {
-                        ui.small("Saia da sala para baixar a atualização.");
-                    }
-                    if ui
-                        .add_enabled(
-                            self.room_code.is_none(),
-                            egui::Button::new("Baixar atualização"),
-                        )
-                        .clicked()
-                    {
-                        tracing::info!(version = %manifest.version, "Usuário iniciou download de atualização");
-                        self.updates.download(manifest.clone());
-                        self.update_status = UpdateStatus::Downloading {
-                            manifest,
-                            received: 0,
-                        };
-                    }
-                }
-                UpdateStatus::Downloading { manifest, received } => {
-                    let progress = if manifest.size_bytes == 0 {
-                        0.0
-                    } else {
-                        received as f32 / manifest.size_bytes as f32
+                if ui
+                    .add_enabled(
+                        self.room_code.is_none(),
+                        egui::Button::new("Baixar atualização"),
+                    )
+                    .clicked()
+                {
+                    tracing::info!(version = %manifest.version, "Usuário iniciou download de atualização");
+                    self.updates.download(manifest.clone());
+                    self.update_status = UpdateStatus::Downloading {
+                        manifest,
+                        received: 0,
                     };
-                    ui.add(
-                        egui::ProgressBar::new(progress.clamp(0.0, 1.0)).text(format!(
-                            "Baixando {}: {} de {}",
-                            manifest.version,
-                            format_bytes(received),
-                            format_bytes(manifest.size_bytes)
-                        )),
-                    );
-                    if ui.button("Cancelar download").clicked() {
-                        self.updates.cancel_download();
-                        self.update_status = UpdateStatus::CancellingDownload(manifest);
-                    }
-                    if self.room_code.is_some() {
-                        ui.small("O download será cancelado porque há uma sala ativa.");
-                    }
                 }
-                UpdateStatus::CancellingDownload(_) => {
-                    ui.label("Cancelando o download…");
+            }
+            UpdateStatus::Downloading { manifest, received } => {
+                let progress = if manifest.size_bytes == 0 {
+                    0.0
+                } else {
+                    received as f32 / manifest.size_bytes as f32
+                };
+                ui.add(
+                    egui::ProgressBar::new(progress.clamp(0.0, 1.0)).text(format!(
+                        "Baixando {}: {} de {}",
+                        manifest.version,
+                        format_bytes(received),
+                        format_bytes(manifest.size_bytes)
+                    )),
+                );
+                if ui.button("Cancelar download").clicked() {
+                    self.updates.cancel_download();
+                    self.update_status = UpdateStatus::CancellingDownload(manifest);
                 }
-                UpdateStatus::Downloaded { manifest, path } => {
-                    ui.label(format!(
-                        "A versão {} foi baixada e validada.",
-                        manifest.version
-                    ));
-                    if self.room_code.is_some() {
-                        ui.small("Saia da sala antes de reiniciar para aplicar a atualização.");
-                    }
-                    if ui
-                        .add_enabled(
-                            self.room_code.is_none(),
-                            egui::Button::new("Reiniciar para atualizar"),
-                        )
-                        .clicked()
-                    {
-                        tracing::info!(version = %manifest.version, "Usuário solicitou aplicação da atualização");
-                        self.update_status = UpdateStatus::PreparingToApply;
-                        self.updates.apply(path);
-                    }
+                if self.room_code.is_some() {
+                    ui.small("O download será cancelado porque há uma sala ativa.");
                 }
-                UpdateStatus::PreparingToApply => {
-                    ui.label("Preparando a atualização ao lado do aplicativo…");
+            }
+            UpdateStatus::CancellingDownload(_) => {
+                ui.label("Cancelando o download…");
+            }
+            UpdateStatus::Downloaded { manifest, path } => {
+                ui.label(format!(
+                    "A versão {} foi baixada e validada.",
+                    manifest.version
+                ));
+                if self.room_code.is_some() {
+                    ui.small("Saia da sala antes de reiniciar para aplicar a atualização.");
                 }
-                UpdateStatus::Applying => {
-                    ui.label("O aplicativo será fechado e reaberto com a nova versão.");
+                if ui
+                    .add_enabled(
+                        self.room_code.is_none(),
+                        egui::Button::new("Reiniciar para atualizar"),
+                    )
+                    .clicked()
+                {
+                    tracing::info!(version = %manifest.version, "Usuário solicitou aplicação da atualização");
+                    self.update_status = UpdateStatus::PreparingToApply;
+                    self.updates.apply(path);
                 }
-                UpdateStatus::Failed(error) => {
-                    ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
-                }
+            }
+            UpdateStatus::PreparingToApply => {
+                ui.label("Preparando a atualização ao lado do aplicativo…");
+            }
+            UpdateStatus::Applying => {
+                ui.label("O aplicativo será fechado e reaberto com a nova versão.");
+            }
+            UpdateStatus::Failed(error) => {
+                ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
             }
         }
 
@@ -926,7 +908,7 @@ impl ClientUi {
         );
         if ui
             .add_enabled(
-                UpdateManager::is_configured() && !operation_running,
+                !operation_running,
                 egui::Button::new("Verificar atualizações"),
             )
             .clicked()
@@ -936,7 +918,7 @@ impl ClientUi {
             self.updates.check();
         }
         ui.separator();
-        ui.small("O download usa HTTPS e valida tamanho e SHA-256. Não há assinatura digital: essas verificações detectam corrupção, mas não confirmam quem publicou os arquivos.");
+        ui.small("O download usa HTTPS e valida tamanho e SHA-256 informados pelo GitHub. Não há assinatura digital: essas verificações detectam corrupção, mas não autenticam o publicador.");
         ui.small("As atualizações só são baixadas e aplicadas por sua escolha; o app não faz isso enquanto você está em uma sala.");
     }
 
