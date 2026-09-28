@@ -267,6 +267,36 @@ impl ClientUi {
         )
     }
 
+    fn show_notice(ui: &mut egui::Ui, prefix: &str, message: &str) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(prefix).strong());
+            ui.label(message);
+        });
+    }
+
+    fn apply_monochrome_style(ui: &mut egui::Ui) {
+        let dark_mode = ui.visuals().dark_mode;
+        let (selection_fill, selection_stroke, foreground) = if dark_mode {
+            (
+                egui::Color32::from_gray(66),
+                egui::Color32::from_gray(210),
+                egui::Color32::from_gray(225),
+            )
+        } else {
+            (
+                egui::Color32::from_gray(220),
+                egui::Color32::from_gray(55),
+                egui::Color32::from_gray(45),
+            )
+        };
+        let visuals = ui.visuals_mut();
+        visuals.selection.bg_fill = selection_fill;
+        visuals.selection.stroke = egui::Stroke::new(1.0, selection_stroke);
+        visuals.hyperlink_color = foreground;
+        visuals.warn_fg_color = foreground;
+        visuals.error_fg_color = foreground;
+    }
+
     fn preferences_snapshot(&self) -> AppSettings {
         let mut settings = AppSettings::default();
         settings.server_url = self.server_url.clone();
@@ -308,6 +338,7 @@ impl ClientUi {
     }
 
     fn show(&mut self, ui: &mut egui::Ui) {
+        Self::apply_monochrome_style(ui);
         let context = ui.ctx().clone();
         let preferences_before_frame = self.preferences_snapshot();
         if self.microphone.is_some()
@@ -372,35 +403,19 @@ impl ClientUi {
                 self.export_logs();
             }
 
-            ui.horizontal_wrapped(|ui| {
-                ui.small(format!(
-                    "Log desta execução: {}",
-                    self.logging.current_log_file_label()
-                ));
-                if let Some(path) = self.logging.current_log_file() {
-                    if ui.small_button("Copiar caminho").clicked() {
-                        ui.ctx().copy_text(path.display().to_string());
-                    }
-                }
-                open_logs_directory = ui.small_button("Abrir pasta de logs").clicked();
-            });
-            if open_logs_directory {
-                self.open_logs_directory();
-            }
-
             if let Some(error) = self.logging.take_write_error() {
                 self.logging.export_message = Some(format!(
                     "Falha ao gravar logs: {error}. Confira a pasta de logs abaixo."
                 ));
             }
             if let Some(message) = &self.logging.startup_message {
-                ui.colored_label(egui::Color32::from_rgb(190, 95, 35), message);
+                Self::show_notice(ui, "Aviso:", message);
             }
             if let Some(message) = &self.logging.export_message {
-                ui.small(message);
+                Self::show_notice(ui, "Logs:", message);
             }
             if let Some(message) = self.settings_error.clone() {
-                ui.colored_label(egui::Color32::from_rgb(190, 95, 35), message);
+                Self::show_notice(ui, "Preferências:", &message);
                 if ui.button("Tentar salvar preferências").clicked() {
                     self.save_preferences();
                 }
@@ -419,7 +434,7 @@ impl ClientUi {
             };
             if let Some(notice) = update_notice {
                 ui.horizontal(|ui| {
-                    ui.colored_label(egui::Color32::from_rgb(85, 170, 110), notice);
+                    ui.label(egui::RichText::new(notice).strong());
                     if ui.button("Ver atualização").clicked() {
                         open_update_settings = true;
                     }
@@ -445,6 +460,10 @@ impl ClientUi {
                 self.show_home(ui);
             }
             self.show_handoff_panel(ui, &context);
+            self.show_diagnostics(ui, &mut open_logs_directory);
+            if open_logs_directory {
+                self.open_logs_directory();
+            }
         });
 
         if self.preferences_snapshot() != preferences_before_frame {
@@ -470,7 +489,7 @@ impl ClientUi {
         }
 
         ui.horizontal(|ui| {
-            ui.heading("Modo ao criar:");
+            ui.heading("Modo da sala");
             ui.selectable_value(
                 &mut self.create_room_mode,
                 RoomMode::Local,
@@ -482,47 +501,80 @@ impl ClientUi {
                 "Internet (teste)",
             );
         });
+        ui.add_space(4.0);
 
         if self.create_room_mode == RoomMode::Local {
             ui.group(|ui| {
                 ui.heading("Rede de controle da sala");
-                ui.label("Todos os participantes mantêm uma conexão direta de controle pela porta TCP 9001.");
-                ui.small("Permita TCP 9001 e UDP 9002 no firewall e escolha o adaptador pelo qual os outros participantes alcançam este PC. A mesma escolha vale para a malha de controle e para a mídia: use Radmin VPN se entrar pelo endereço Radmin; use Ethernet/Wi-Fi se entrar pela rede local.");
+                ui.label("Escolha o endereço que seu amigo consegue alcançar.");
                 self.show_control_address_picker(ui);
-                ui.checkbox(&mut self.may_host, "Permitir que este computador seja escolhido para hospedar futuramente");
-                ui.small("Opcional: isso não impede entrar na sala nem compartilhar a tela. Só permite que este PC assuma a hospedagem se o anfitrião sair.");
-                ui.small("Para a sucessão funcionar, a malha TCP 9001 também precisa conectar entre os participantes.");
+                ui.checkbox(
+                    &mut self.may_host,
+                    "Permitir que este computador seja escolhido para hospedar futuramente",
+                );
+                ui.collapsing("Requisitos de rede", |ui| {
+                    ui.label("A interface selecionada será usada para controle e vídeo.");
+                    ui.label("Libere TCP 9001 e UDP 9002 no firewall do Windows.");
+                    ui.label("Use Radmin VPN quando o amigo entrar pelo endereço Radmin; use Ethernet/Wi-Fi na rede local.");
+                    ui.label("A permissão para hospedar só permite assumir a sala se o anfitrião sair.");
+                });
             });
         } else {
             ui.group(|ui| {
                 ui.heading("Teste controlado pela internet");
-                ui.label("A sala aceitará somente você e mais uma pessoa. O anfitrião precisa permanecer online; não há sucessão pela internet.");
-                ui.small("O anfitrião encaminha TCP 9000 no roteador para este PC e permite a porta no firewall do Windows. CGNAT pode impedir conexões de entrada.");
+                ui.label("Até duas pessoas. O anfitrião precisa permanecer online.");
                 ui.checkbox(
                     &mut self.use_turn_on_create,
                     "Usar TURN como alternativa se a conexão direta falhar",
                 );
-                if self.use_turn_on_create {
-                    ui.small("O TURN usa UDP 3478 e UDP 50000–50100. Encaminhe essa porta e essa faixa no roteador para este PC e permita-as no firewall.");
-                    ui.small("A tela continuará P2P quando possível; se o caminho direto falhar, o PC anfitrião retransmitirá a mídia e usará mais banda.");
-                } else {
-                    ui.small("Sem TURN, a tela só conecta quando o ICE encontra um caminho direto UDP usando STUN.");
-                }
-                ui.colored_label(
-                    egui::Color32::from_rgb(190, 95, 35),
-                    "A sinalização usa ws:// sem criptografia ou autenticação. Credenciais temporárias do TURN também passam por esse canal. Use apenas testes controlados com pessoas conhecidas; não use para distribuição regular.",
+                Self::show_notice(
+                    ui,
+                    "Atenção:",
+                    "A sinalização usa ws:// sem criptografia ou autenticação. As credenciais TURN também passam por esse canal. Use apenas em testes controlados com pessoas conhecidas.",
                 );
-                ui.small("Configure o IPv4 público ou nome DDNS e a URI STUN em Configurações > Conexão antes de criar a sala. O endereço público também será usado pelo TURN.");
+                ui.collapsing("Endereço e portas", |ui| {
+                    ui.label("Configure o IPv4 público ou nome DDNS e a URI STUN em Configurações > Conexão.");
+                    ui.label("Encaminhe TCP 9000 no roteador e libere a porta no firewall. CGNAT pode impedir conexões de entrada.");
+                    if self.use_turn_on_create {
+                        ui.label("TURN usa UDP 3478 e UDP 50000–50100; encaminhe e libere essas portas.");
+                        ui.label("A tela permanece direta quando possível; retransmitida, ela consome a banda do anfitrião.");
+                    } else {
+                        ui.label("Sem TURN, a tela depende de o ICE encontrar um caminho UDP direto usando STUN.");
+                    }
+                });
             });
         }
-        ui.add_space(12.0);
 
+        ui.add_space(10.0);
+        if ui.available_width() >= 620.0 {
+            ui.columns(2, |columns| {
+                self.show_create_room_card(&mut columns[0]);
+                self.show_join_room_card(&mut columns[1]);
+            });
+        } else {
+            self.show_create_room_card(ui);
+            ui.add_space(8.0);
+            self.show_join_room_card(ui);
+        }
+
+        if self.connecting {
+            ui.label("Conectando ao servidor de sinalização…");
+        }
+        if let Some(status) = &self.connection_status {
+            ui.label(status);
+        }
+        if let Some(error) = &self.connection_error {
+            Self::show_notice(ui, "Erro de conexão:", error);
+        }
+        ui.collapsing("Como entrar", |ui| {
+            ui.label("Em Configurações > Conexão, informe o IPv4 ou nome DDNS compartilhado pelo anfitrião.");
+        });
+    }
+
+    fn show_create_room_card(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
-            ui.heading("Criar uma sala");
-            ui.label(
-                "Crie uma sala hospedada neste computador e compartilhe o código com seu amigo.",
-            );
-
+            ui.heading("Criar sala");
+            ui.label("Hospede neste computador e compartilhe o código com seu amigo.");
             if ui
                 .add_enabled(
                     !self.connecting && !self.update_blocks_room_actions(),
@@ -533,18 +585,18 @@ impl ClientUi {
                 self.start_hosting();
             }
         });
+    }
 
-        ui.add_space(12.0);
-
+    fn show_join_room_card(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.heading("Entrar em uma sala");
             ui.label("Digite o código da sala:");
-
             ui.horizontal(|ui| {
+                let field_width = (ui.available_width() - 72.0).max(100.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.join_code)
                         .hint_text("Código da sala")
-                        .desired_width(220.0),
+                        .desired_width(field_width),
                 );
 
                 let has_code = !self.join_code.trim().is_empty()
@@ -559,17 +611,204 @@ impl ClientUi {
                 }
             });
         });
+    }
 
-        if self.connecting {
-            ui.label("Conectando ao servidor de sinalizacao...");
+    fn show_diagnostics(&self, ui: &mut egui::Ui, open_logs_directory: &mut bool) {
+        egui::CollapsingHeader::new("Diagnóstico")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label("Log desta execução");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(self.logging.current_log_file_label());
+                    if let Some(path) = self.logging.current_log_file() {
+                        if ui.small_button("Copiar caminho").clicked() {
+                            ui.ctx().copy_text(path.display().to_string());
+                        }
+                    }
+                    if ui.small_button("Abrir pasta de logs").clicked() {
+                        *open_logs_directory = true;
+                    }
+                });
+
+                if self.room_code.is_some() {
+                    ui.separator();
+                    self.show_screen_diagnostics(ui);
+                }
+            });
+    }
+
+    fn show_screen_diagnostics(&self, ui: &mut egui::Ui) {
+        ui.heading("Transmissão de tela");
+        if let Some(address) = self.host_addresses.get(self.selected_host_address) {
+            ui.label(format!(
+                "Adaptador de mídia UDP 9002: {} ({})",
+                address.ipv4, address.adapter
+            ));
         }
-        if let Some(status) = &self.connection_status {
-            ui.label(status);
+        if self.room_mode == RoomMode::InternetTest {
+            ui.label("Rede: TCP 9000 para sinalização; UDP 9002 para mídia direta.");
+            ui.label(format!("STUN: {}", self.stun_server_url));
+            if self.hosting_locally {
+                ui.label(if self.turn_server.is_some() {
+                    "TURN ativo neste PC; encaminhe UDP 3478 e UDP 50000–50100."
+                } else {
+                    "TURN desativado pelo anfitrião; a tela depende de P2P direto."
+                });
+            } else if self.turn_config_received {
+                ui.label(
+                    if self
+                        .turn_room_config
+                        .as_ref()
+                        .is_some_and(|config| config.turn.is_some())
+                    {
+                        "O anfitrião habilitou TURN como alternativa."
+                    } else {
+                        "O anfitrião desativou TURN; a tela depende de P2P direto."
+                    },
+                );
+            } else {
+                ui.label("Aguardando a configuração de rede enviada pelo anfitrião.");
+            }
+            ui.label("Teste controlado: ws:// não criptografa a sinalização ou as credenciais temporárias do TURN.");
+        } else {
+            ui.label(
+                "Rede local/Radmin: libere TCP 9001 e UDP 9002 no firewall dos participantes.",
+            );
         }
-        if let Some(error) = &self.connection_error {
-            ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+
+        if !self.screen_pipeline_summary.is_empty() {
+            ui.label(&self.screen_pipeline_summary);
         }
-        ui.small("Para entrar, informe em Configurações > Conexão o IPv4 ou nome DDNS compartilhado pelo anfitrião.");
+        if !self.screen_share_metrics.encoder_backend.is_empty()
+            || !self.screen_share_metrics.decoder_backend.is_empty()
+        {
+            ui.label(format!(
+                "Encoder: {}. Decoder: {}. Preferência: {}.",
+                self.screen_share_metrics.encoder_backend,
+                self.screen_share_metrics.decoder_backend,
+                self.screen_share_metrics.decoder_preference
+            ));
+            if let Some(reason) = &self.screen_share_metrics.encoder_fallback_reason {
+                ui.label(format!("Fallback do encoder: {reason}"));
+            }
+            if let Some(reason) = &self.screen_share_metrics.decoder_fallback_reason {
+                ui.label(format!("Fallback do decoder: {reason}"));
+            }
+        }
+
+        match &self.screen_share_role {
+            ScreenShareRole::Sending { .. } => {
+                ui.label(format!(
+                    "Sessão {} · SSRC {} · H.264: {} entradas, {} produzidos, {} enviados (IDR {}, P {}), {} descartados antes do IDR.",
+                    self.screen_share_metrics.session_id,
+                    self.screen_share_metrics.track_ssrc.unwrap_or_default(),
+                    self.screen_share_metrics.encoder_input_frames,
+                    self.screen_share_metrics.encoded_frames,
+                    self.screen_share_metrics.sent_frames,
+                    self.screen_share_metrics.sent_idr_frames,
+                    self.screen_share_metrics.sent_delta_frames,
+                    self.screen_share_metrics.dropped_before_initial_idr
+                ));
+                ui.label(&self.screen_share_metrics.selected_ice_pair);
+                ui.label(format!(
+                    "RTP enviado: {} pacotes, {} bytes.",
+                    self.screen_share_metrics.outbound_rtp_packets,
+                    self.screen_share_metrics.outbound_rtp_bytes
+                ));
+                ui.label(&self.screen_share_metrics.rtc_outbound_summary);
+                ui.label(&self.screen_share_metrics.h264_diagnostics);
+            }
+            ScreenShareRole::Receiving { .. } => {
+                ui.label(format!(
+                    "Sessão {} · SSRC {} · recebidos {}, montados {}, entradas no decoder {}, decodificados {}, publicados {}, atualizações da prévia {}, erros H.264 {}.",
+                    self.screen_share_metrics.session_id,
+                    self.screen_share_metrics.track_ssrc.unwrap_or_default(),
+                    self.screen_share_metrics.received_packets,
+                    self.screen_share_metrics.received_delta_frames,
+                    self.screen_share_metrics.decoder_input_frames,
+                    self.screen_share_metrics.decoded_frames,
+                    self.screen_share_metrics.published_frames,
+                    self.screen_share_metrics.ui_texture_updates,
+                    self.screen_share_metrics.decode_errors
+                ));
+                ui.label(&self.screen_share_metrics.selected_ice_pair);
+                ui.label(format!(
+                    "RTP recebido: {} pacotes, {} bytes; perda {}, jitter {:.1} ms.",
+                    self.screen_share_metrics.inbound_rtp_packets,
+                    self.screen_share_metrics.inbound_rtp_bytes,
+                    self.screen_share_metrics.inbound_rtp_lost,
+                    self.screen_share_metrics.inbound_rtp_jitter_ms
+                ));
+                ui.label(&self.screen_share_metrics.rtc_inbound_summary);
+                if let Some(error) = &self.screen_share_metrics.last_decode_error {
+                    ui.label(format!("Último erro H.264: {error}"));
+                }
+                ui.label(&self.screen_share_metrics.h264_diagnostics);
+                let recovery_time = self
+                    .screen_share_metrics
+                    .last_recovery_time_millis
+                    .map_or_else(
+                        || "ainda não disponível".to_owned(),
+                        |ms| format!("{ms} ms"),
+                    );
+                ui.label(format!(
+                    "Recuperação: PLI enviado/recebido {}/{}, fila cheia {}, ressincronizações {}, IDRs decodificados {}, último tempo até IDR {}.",
+                    self.screen_share_metrics.pli_requests_sent,
+                    self.screen_share_metrics.pli_requests_received,
+                    self.screen_share_metrics.pli_queue_overflow,
+                    self.screen_share_metrics.keyframe_resyncs,
+                    self.screen_share_metrics.decoded_idr_frames,
+                    recovery_time
+                ));
+            }
+            ScreenShareRole::Idle | ScreenShareRole::Requesting { .. } => {}
+        }
+
+        if !matches!(&self.screen_share_role, ScreenShareRole::Idle)
+            || self.screen_share_metrics.local_ice_candidates > 0
+            || self.screen_share_metrics.remote_ice_candidates > 0
+            || self.screen_share_status.is_some()
+        {
+            ui.label(format!(
+                "ICE: {} candidatos locais ({} STUN, {} TURN), {} do amigo ({} STUN, {} TURN).",
+                self.screen_share_metrics.local_ice_candidates,
+                self.screen_share_metrics.local_srflx_candidates,
+                self.screen_share_metrics.local_relay_candidates,
+                self.screen_share_metrics.remote_ice_candidates,
+                self.screen_share_metrics.remote_srflx_candidates,
+                self.screen_share_metrics.remote_relay_candidates
+            ));
+        }
+
+        if self.room_mode == RoomMode::Local && !self.control_queue.is_empty() {
+            ui.separator();
+            ui.label("Fila de sucessão · métricas dos enlaces");
+            let mut queue = self.control_queue.clone();
+            queue.sort_by(|left, right| {
+                right
+                    .eligible
+                    .cmp(&left.eligible)
+                    .then_with(|| left.loss_percent.total_cmp(&right.loss_percent))
+                    .then_with(|| left.jitter_ms.total_cmp(&right.jitter_ms))
+                    .then_with(|| left.latency_ms.total_cmp(&right.latency_ms))
+                    .then_with(|| left.participant.order.cmp(&right.participant.order))
+            });
+            for (index, candidate) in queue.iter().enumerate() {
+                ui.label(format!(
+                    "{}. {} — perda {:.1}%, jitter {:.1} ms, latência {:.1} ms{}",
+                    index + 1,
+                    candidate.participant.display_name,
+                    candidate.loss_percent,
+                    candidate.jitter_ms,
+                    candidate.latency_ms,
+                    if candidate.eligible {
+                        ""
+                    } else {
+                        " (inelegível)"
+                    }
+                ));
+            }
+        }
     }
 
     fn show_room(&mut self, ui: &mut egui::Ui) {
@@ -595,7 +834,7 @@ impl ClientUi {
                     .unwrap_or("Conectado ao servidor."),
             );
             if let Some(error) = &self.connection_error {
-                ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+                Self::show_notice(ui, "Erro de conexão:", error);
             }
             if !self.participants.is_empty() {
                 ui.separator();
@@ -627,12 +866,12 @@ impl ClientUi {
                 } else if participants.iter().all(|participant| !participant.may_host) {
                     ui.small("Ninguém autorizou a hospedagem automática. Isso não bloqueia a entrada; só significa que a sala termina se o anfitrião sair.");
                 } else {
-                    ui.small("A fila será ordenada pela estabilidade dos canais diretos.");
+                ui.small("A fila considera a estabilidade dos enlaces diretos; os detalhes estão em Diagnóstico.");
                 }
             }
             if self.room_mode == RoomMode::Local && !self.control_queue.is_empty() {
                 ui.separator();
-                ui.label("Fila atual (perda, jitter e latência dos enlaces)");
+                ui.label("Fila de sucessão");
                 let mut queue = self.control_queue.clone();
                 queue.sort_by(|left, right| {
                     right.eligible.cmp(&left.eligible)
@@ -643,12 +882,9 @@ impl ClientUi {
                 });
                 for (index, candidate) in queue.iter().enumerate() {
                     ui.label(format!(
-                        "{}. {} — perda {:.1}%, jitter {:.1} ms, latência {:.1} ms{}",
+                        "{}. {}{}",
                         index + 1,
                         candidate.participant.display_name,
-                        candidate.loss_percent,
-                        candidate.jitter_ms,
-                        candidate.latency_ms,
                         if candidate.eligible { "" } else { " (inelegível)" }
                     ));
                 }
@@ -682,22 +918,17 @@ impl ClientUi {
                         }
                     }
                     Err(_) => {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(190, 55, 55),
+                        Self::show_notice(
+                            ui,
+                            "Endereço necessário:",
                             "Configure o IPv4 público ou DDNS em Configurações > Conexão.",
                         );
                     }
                 }
-                ui.small("O roteador precisa encaminhar TCP 9000 para este PC; libere também o aplicativo no firewall.");
-                if self.turn_server.is_some() {
-                    ui.small("TURN ativo neste PC: encaminhe UDP 3478 e UDP 50000–50100 para este PC e permita essas portas no firewall.");
-                } else {
-                    ui.small("Nesta sala, o TURN está desativado; a tela depende de uma conexão direta.");
-                }
             } else if self.hosting_locally {
                 ui.separator();
                 ui.heading("Endereço para seu amigo");
-                ui.label("Escolha o adaptador que seu amigo consegue alcançar, como sua rede local ou Radmin VPN.");
+                ui.label("Escolha o endereço que seu amigo consegue alcançar.");
                 self.show_host_address_picker(ui);
             }
             if let Some(status) = &self.diagnostic_status {
@@ -709,71 +940,31 @@ impl ClientUi {
 
         ui.group(|ui| {
             ui.heading("Prévia local da tela");
-            ui.label("A prévia fica na memória. Ao iniciar o compartilhamento, a tela tenta P2P direto; se o anfitrião habilitou TURN e o caminho direto falhar, poderá ser retransmitida pelo PC anfitrião.");
-            if let Some(address) = self.host_addresses.get(self.selected_host_address) {
-                ui.small(format!(
-                    "A mídia UDP 9002 usará {} ({}) neste PC.",
-                    address.ipv4, address.adapter
-                ));
-            }
+            ui.label("A prévia fica na memória. A tela só é enviada ao iniciar o compartilhamento.");
             if self.room_mode == RoomMode::InternetTest {
-                ui.small("O vídeo direto usa UDP 9002. TURN usa UDP 3478 e UDP 50000–50100 no PC anfitrião; o roteador e o firewall precisam permitir essas portas.");
-                ui.small("Teste controlado: a sinalização usa ws:// sem criptografia nem autenticação. Credenciais TURN temporárias passam por esse canal. Somente duas pessoas; o anfitrião precisa permanecer online.");
-                ui.small(format!("STUN configurado: {}", self.stun_server_url));
-                if self.hosting_locally {
-                    ui.small(if self.turn_server.is_some() {
-                        "Este PC está hospedando o TURN desta sala; ele só retransmite a mídia se ICE não conseguir uma rota direta."
-                    } else {
-                        "O anfitrião desativou TURN para esta sala; a conexão depende de P2P direto."
-                    });
-                } else if self.turn_config_received {
-                    ui.small(if self.turn_room_config.as_ref().is_some_and(|config| config.turn.is_some()) {
-                        "O anfitrião habilitou TURN como alternativa; a rota escolhida será indicada quando a conexão WebRTC iniciar."
-                    } else {
-                        "O anfitrião desativou TURN; esta sala depende de P2P direto."
-                    });
-                } else {
-                    ui.small("Aguardando a configuração de rede enviada pelo anfitrião…");
-                }
-            } else {
-                ui.small("O vídeo P2P usa UDP 9002. Os dois PCs precisam permitir o aplicativo ou essa porta no firewall do Windows, na rede privada.");
-                ui.small("Nesta etapa, os PCs precisam estar na mesma rede local ou na mesma Radmin VPN. Conexões entre redes diferentes pela internet ainda não estão disponíveis.");
-            }
-            if !self.screen_share_metrics.encoder_backend.is_empty()
-                || !self.screen_share_metrics.decoder_backend.is_empty()
-            {
-                ui.small(format!(
-                    "Encoder deste PC: {}. Decoder ativo neste PC: {}.",
-                    self.screen_share_metrics.encoder_backend,
-                    self.screen_share_metrics.decoder_backend
-                ));
-                ui.small(format!(
-                    "Preferência do decoder neste PC: {}.",
-                    self.screen_share_metrics.decoder_preference
-                ));
-                if let Some(reason) = &self.screen_share_metrics.encoder_fallback_reason {
-                    ui.small(format!("Fallback do codificador: {reason}"));
-                }
-                if let Some(reason) = &self.screen_share_metrics.decoder_fallback_reason {
-                    ui.small(format!("Fallback do decodificador: {reason}"));
-                }
+                Self::show_notice(
+                    ui,
+                    "Teste controlado:",
+                    "ws:// não criptografa a sinalização; use com pessoas conhecidas.",
+                );
             }
 
             if self.screen_capture.is_some() {
                 let backend = self.screen_capture.as_ref().map(ScreenCapture::backend_name).unwrap_or("desconhecido");
-                ui.label(format!("Captura de tela ativa — {backend}."));
+                ui.label(format!("Captura ativa · {backend}"));
                 if let Some(reason) = self
                     .screen_capture
                     .as_ref()
                     .and_then(ScreenCapture::fallback_reason)
                 {
-                    ui.small(format!("Fallback da captura/prévia: {reason}"));
+                    Self::show_notice(ui, "Fallback da captura:", &reason);
                 }
                 if ui.button("Parar captura da tela").clicked() {
                     self.stop_screen_capture();
                 }
                 if let Some(texture) = &self.screen_texture {
-                    ui.add(egui::Image::new((texture.id(), texture.size_vec2())).max_width(640.0));
+                    let preview_width = ui.available_width().min(800.0);
+                    ui.add(egui::Image::new((texture.id(), texture.size_vec2())).max_width(preview_width));
                 } else {
                     ui.label("Aguardando o primeiro quadro…");
                 }
@@ -828,11 +1019,8 @@ impl ClientUi {
                 }
             }
 
-            if !self.screen_pipeline_summary.is_empty() {
-                ui.small(&self.screen_pipeline_summary);
-            }
             if let Some(status) = &self.screen_status {
-                ui.label(status);
+                Self::show_notice(ui, "Captura:", status);
             }
 
             match self.screen_share_role.clone() {
@@ -870,28 +1058,6 @@ impl ClientUi {
                         "transmitindo a tela.",
                         "Pedido aceito; negociando a conexão WebRTC da tela.",
                     ));
-                    ui.small(format!(
-                        "Diagnóstico da sessão {} — SSRC {}",
-                        self.screen_share_metrics.session_id,
-                        self.screen_share_metrics.track_ssrc.unwrap_or_default()
-                    ));
-                    ui.small(format!(
-                        "H.264: {} entradas no encoder, {} quadros produzidos; enviados {} (IDR {}, P {}), descartados antes do IDR {}.",
-                        self.screen_share_metrics.encoder_input_frames,
-                        self.screen_share_metrics.encoded_frames,
-                        self.screen_share_metrics.sent_frames,
-                        self.screen_share_metrics.sent_idr_frames,
-                        self.screen_share_metrics.sent_delta_frames,
-                        self.screen_share_metrics.dropped_before_initial_idr
-                    ));
-                    ui.small(&self.screen_share_metrics.selected_ice_pair);
-                    ui.small(format!(
-                        "RTP enviado pela pilha WebRTC: {} pacotes, {} bytes.",
-                        self.screen_share_metrics.outbound_rtp_packets,
-                        self.screen_share_metrics.outbound_rtp_bytes
-                    ));
-                    ui.small(&self.screen_share_metrics.rtc_outbound_summary);
-                    ui.small(&self.screen_share_metrics.h264_diagnostics);
                     if ui.button("Parar compartilhamento").clicked() {
                         self.stop_screen_share(true);
                     }
@@ -901,73 +1067,29 @@ impl ClientUi {
                         "aguardando ou recebendo vídeo.",
                         "Pedido aceito; negociando a conexão WebRTC da tela.",
                     ));
-                    ui.small(format!(
-                        "Diagnóstico da sessão {} — SSRC {}",
-                        self.screen_share_metrics.session_id,
-                        self.screen_share_metrics.track_ssrc.unwrap_or_default()
-                    ));
-                    ui.small(format!(
-                        "Vídeo: {} pacotes recebidos, {} quadros P montados, {} entradas no decoder, {} quadros decodificados, {} quadros publicados, {} atualizações da prévia, {} erros H.264.",
-                        self.screen_share_metrics.received_packets,
-                        self.screen_share_metrics.received_delta_frames,
-                        self.screen_share_metrics.decoder_input_frames,
-                        self.screen_share_metrics.decoded_frames,
-                        self.screen_share_metrics.published_frames,
-                        self.screen_share_metrics.ui_texture_updates,
-                        self.screen_share_metrics.decode_errors
-                    ));
-                    ui.small(&self.screen_share_metrics.selected_ice_pair);
-                    ui.small(format!(
-                        "RTP recebido pela pilha WebRTC: {} pacotes, {} bytes; perda reportada {}, jitter {:.1} ms.",
-                        self.screen_share_metrics.inbound_rtp_packets,
-                        self.screen_share_metrics.inbound_rtp_bytes,
-                        self.screen_share_metrics.inbound_rtp_lost,
-                        self.screen_share_metrics.inbound_rtp_jitter_ms
-                    ));
-                    ui.small(&self.screen_share_metrics.rtc_inbound_summary);
-                    if let Some(error) = &self.screen_share_metrics.last_decode_error {
-                        ui.small(format!("Último erro H.264: {error}"));
+                    if self.screen_share_metrics.decode_errors > 0 {
+                        Self::show_notice(
+                            ui,
+                            "Aviso de vídeo:",
+                            &format!(
+                                "{} erros H.264 nesta sessão; veja Diagnóstico.",
+                                self.screen_share_metrics.decode_errors
+                            ),
+                        );
                     }
-                    ui.small(&self.screen_share_metrics.h264_diagnostics);
-                    let recovery_time = self
-                        .screen_share_metrics
-                        .last_recovery_time_millis
-                        .map_or_else(|| "ainda não disponível".to_owned(), |ms| format!("{ms} ms"));
-                    ui.small(format!(
-                        "Recuperação: {} PLI enviados, {} recebidos (fila cheia: {}); {} ressincronizações; {} IDRs decodificados; último tempo até IDR: {recovery_time}.",
-                        self.screen_share_metrics.pli_requests_sent,
-                        self.screen_share_metrics.pli_requests_received,
-                        self.screen_share_metrics.pli_queue_overflow,
-                        self.screen_share_metrics.keyframe_resyncs,
-                        self.screen_share_metrics.decoded_idr_frames
-                    ));
                     if ui.button("Parar de receber a tela").clicked() {
                         self.stop_screen_share(true);
                     }
                     if let Some(texture) = &self.remote_screen_texture {
-                        ui.add(egui::Image::new((texture.id(), texture.size_vec2())).max_width(640.0));
+                        let preview_width = ui.available_width().min(800.0);
+                        ui.add(egui::Image::new((texture.id(), texture.size_vec2())).max_width(preview_width));
                     } else {
                         ui.label("Aguardando o primeiro quadro da tela remota…");
                     }
                 }
             }
             if let Some(status) = &self.screen_share_status {
-                ui.small(status);
-            }
-            if !matches!(&self.screen_share_role, ScreenShareRole::Idle)
-                || self.screen_share_metrics.local_ice_candidates > 0
-                || self.screen_share_metrics.remote_ice_candidates > 0
-                || self.screen_share_status.is_some()
-            {
-                ui.small(format!(
-                    "Última tentativa ICE: {} candidatos locais ({} STUN, {} TURN), {} do amigo ({} STUN, {} TURN).",
-                    self.screen_share_metrics.local_ice_candidates,
-                    self.screen_share_metrics.local_srflx_candidates,
-                    self.screen_share_metrics.local_relay_candidates,
-                    self.screen_share_metrics.remote_ice_candidates,
-                    self.screen_share_metrics.remote_srflx_candidates,
-                    self.screen_share_metrics.remote_relay_candidates
-                ));
+                ui.label(status);
             }
         });
 
@@ -1014,40 +1136,52 @@ impl ClientUi {
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Configurações do aplicativo");
+        ui.heading("Configurações");
         ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.set_min_width(130.0);
-                ui.heading("Categorias");
-                let selected = self.settings_category == SettingsCategory::Audio;
-                if ui.selectable_label(selected, "Áudio").clicked() {
-                    self.select_settings_category(SettingsCategory::Audio);
-                }
-                let selected = self.settings_category == SettingsCategory::Connection;
-                if ui.selectable_label(selected, "Conexão").clicked() {
-                    self.select_settings_category(SettingsCategory::Connection);
-                }
-                let selected = self.settings_category == SettingsCategory::Video;
-                if ui.selectable_label(selected, "Vídeo").clicked() {
-                    self.select_settings_category(SettingsCategory::Video);
-                }
-                let selected = self.settings_category == SettingsCategory::Updates;
-                if ui.selectable_label(selected, "Atualizações").clicked() {
-                    self.select_settings_category(SettingsCategory::Updates);
-                }
+        if ui.available_width() >= 620.0 {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_min_width(132.0);
+                    self.show_settings_categories(ui, false);
+                });
+                ui.separator();
+                ui.vertical(|ui| self.show_settings_content(ui));
             });
-
+        } else {
+            self.show_settings_categories(ui, true);
             ui.separator();
+            self.show_settings_content(ui);
+        }
+    }
 
-            ui.vertical(|ui| match self.settings_category {
-                SettingsCategory::Audio => self.show_audio_settings(ui),
-                SettingsCategory::Connection => self.show_connection_settings(ui),
-                SettingsCategory::Video => self.show_video_settings(ui),
-                SettingsCategory::Updates => self.show_update_settings(ui),
-            });
-        });
+    fn show_settings_categories(&mut self, ui: &mut egui::Ui, horizontal: bool) {
+        let mut show = |ui: &mut egui::Ui| {
+            for (category, label) in [
+                (SettingsCategory::Audio, "Áudio"),
+                (SettingsCategory::Connection, "Conexão"),
+                (SettingsCategory::Video, "Vídeo"),
+                (SettingsCategory::Updates, "Atualizações"),
+            ] {
+                let selected = self.settings_category == category;
+                if ui.selectable_label(selected, label).clicked() {
+                    self.select_settings_category(category);
+                }
+            }
+        };
+        if horizontal {
+            ui.horizontal_wrapped(|ui| show(ui));
+        } else {
+            ui.vertical(|ui| show(ui));
+        }
+    }
+
+    fn show_settings_content(&mut self, ui: &mut egui::Ui) {
+        match self.settings_category {
+            SettingsCategory::Audio => self.show_audio_settings(ui),
+            SettingsCategory::Connection => self.show_connection_settings(ui),
+            SettingsCategory::Video => self.show_video_settings(ui),
+            SettingsCategory::Updates => self.show_update_settings(ui),
+        }
     }
 
     fn show_update_settings(&mut self, ui: &mut egui::Ui) {
@@ -1136,7 +1270,7 @@ impl ClientUi {
                 ui.label("O aplicativo será fechado e reaberto com a nova versão.");
             }
             UpdateStatus::Failed(error) => {
-                ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+                Self::show_notice(ui, "Erro de atualização:", &error);
             }
         }
 
@@ -1171,52 +1305,58 @@ impl ClientUi {
 
     fn show_connection_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Conexão");
-        ui.label("Adaptador local usado pelas conexões diretas:");
-        self.show_control_address_picker(ui);
-        ui.small("O IPv4 selecionado será usado tanto pela malha TCP 9001 quanto pelo vídeo WebRTC em UDP 9002. Se a interface escolhida ficar indisponível, selecione outra e tente novamente.");
-        ui.separator();
-        ui.label("Endereço IPv4 ou nome DDNS do anfitrião (a porta é sempre 9000):");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.server_url)
-                .hint_text("IP público ou minha-sala.ddns.net")
-                .desired_width(340.0),
-        );
-        match signaling_ws_url(&self.server_url) {
-            Ok(url) => {
-                ui.horizontal(|ui| {
-                    ui.label(format!("Endereço para conectar: {url}"));
-                    if ui.button("Copiar endereço").clicked() {
-                        ui.ctx().copy_text(url);
-                    }
-                });
+        ui.group(|ui| {
+            ui.label("Adaptador para controle e mídia");
+            self.show_control_address_picker(ui);
+            ui.small("O endereço escolhido vale para TCP 9001 e UDP 9002.");
+        });
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.label("Endereço do anfitrião · porta 9000");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.server_url)
+                    .hint_text("IP público ou minha-sala.ddns.net")
+                    .desired_width(ui.available_width().min(420.0)),
+            );
+            match signaling_ws_url(&self.server_url) {
+                Ok(url) => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.monospace(&url);
+                        if ui.button("Copiar endereço").clicked() {
+                            ui.ctx().copy_text(url);
+                        }
+                    });
+                }
+                Err(error) if !self.server_url.trim().is_empty() => {
+                    Self::show_notice(ui, "Endereço inválido:", &error);
+                }
+                Err(_) => {}
             }
-            Err(error) if !self.server_url.trim().is_empty() => {
-                ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+        });
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.label("Servidor STUN");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.stun_server_url)
+                    .hint_text("stun:stun.l.google.com:19302")
+                    .desired_width(ui.available_width().min(420.0)),
+            );
+            if let Err(error) = screen_sharing::validate_stun_uri(&self.stun_server_url) {
+                Self::show_notice(ui, "URI inválida:", &error);
             }
-            Err(_) => {}
-        }
-        ui.small("No modo Internet, configure aqui o IPv4 público ou nome DDNS deste PC para copiar e enviar ao amigo. Não há detecção automática do IP público.");
-        ui.small("No modo Rede local/Radmin, informe o IPv4 da rede local ou VPN que o anfitrião compartilhou.");
-        ui.small("Os valores ficam somente na memória enquanto o aplicativo estiver aberto.");
-        ui.colored_label(
-            egui::Color32::from_rgb(190, 95, 35),
-            "Esta versão usa ws:// sem criptografia nem autenticação. No modo Internet, faça somente testes controlados com pessoas conhecidas; wss:// e proteção de acesso ficam para antes da distribuição.",
-        );
-        ui.separator();
-        ui.heading("STUN para conexão direta de mídia");
-        ui.label("Uma única URI stun: para tentar conexão direta. O TURN é configurado automaticamente pelo anfitrião ao criar uma sala Internet.");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.stun_server_url)
-                .hint_text("stun:stun.l.google.com:19302")
-                .desired_width(340.0),
-        );
-        if let Err(error) = screen_sharing::validate_stun_uri(&self.stun_server_url) {
-            ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
-        }
-        ui.small("STUN ajuda os PCs a tentar encontrar um caminho UDP direto; não retransmite vídeo. TURN pode ser habilitado pelo anfitrião como alternativa.");
-        ui.small("O servidor integrado continua apenas na sinalização TCP 9000. Para receber pela internet, encaminhe essa porta no roteador e permita o app no firewall.");
-        ui.small("Quando TURN estiver habilitado, o anfitrião também encaminha UDP 3478 e UDP 50000–50100. CGNAT impede conexões de entrada também para o TURN.");
-        ui.small("Não é necessário manter um notebook separado ligado.");
+            ui.small("STUN ajuda a encontrar uma conexão direta; não retransmite vídeo.");
+        });
+
+        ui.collapsing("Ajuda de conexão", |ui| {
+            ui.label("Na rede local/Radmin, informe o endereço compartilhado pelo anfitrião.");
+            ui.label("Na Internet, informe o IPv4 público ou DDNS do anfitrião; o app não detecta o IP público.");
+            ui.label("Para hospedar na Internet, encaminhe TCP 9000 e libere a porta no firewall. TURN também requer UDP 3478 e UDP 50000–50100; CGNAT pode impedir conexões de entrada.");
+            ui.label("TURN é configurado pelo anfitrião. Não é necessário manter um notebook separado ligado.");
+            ui.label("ws:// não criptografa a sinalização nem autentica os participantes. Use apenas testes controlados com pessoas conhecidas.");
+            ui.label("O endereço fica salvo nas preferências locais deste aplicativo.");
+        });
     }
 
     fn show_audio_settings(&mut self, ui: &mut egui::Ui) {
@@ -1246,20 +1386,22 @@ impl ClientUi {
             ui.small("O ganho altera apenas o som ouvido. Valores altos podem distorcer.");
 
             if let Some(error) = &self.microphone_error {
-                ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+                Self::show_notice(ui, "Erro do microfone:", error);
             }
             if let Some(error) = &self.microphone_monitor_error {
-                ui.colored_label(egui::Color32::from_rgb(190, 95, 35), error);
+                Self::show_notice(ui, "Retorno de áudio:", error);
             }
             if self.microphone_audio_warning {
-                ui.colored_label(
-                    egui::Color32::from_rgb(190, 95, 35),
+                Self::show_notice(
+                    ui,
+                    "Aviso:",
                     "O retorno teve cortes por falta ou excesso de amostras. Pare e inicie o teste novamente.",
                 );
             }
             if self.microphone_clipping_warning {
-                ui.colored_label(
-                    egui::Color32::from_rgb(190, 95, 35),
+                Self::show_notice(
+                    ui,
+                    "Aviso:",
                     "O retorno está distorcendo; reduza o ganho.",
                 );
             }
@@ -2628,7 +2770,7 @@ impl ClientUi {
             ));
             ui.small("Este IPv4 também será usado para vincular o vídeo WebRTC na porta UDP 9002.");
         } else if let Some(error) = &self.host_addresses_error {
-            ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+            Self::show_notice(ui, "Erro de adaptador:", error);
         } else {
             ui.label("Nenhum IPv4 ativo disponível para a conexão direta de controle.");
         }
@@ -2671,7 +2813,7 @@ impl ClientUi {
                 }
             });
         } else if let Some(error) = &self.host_addresses_error {
-            ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
+            Self::show_notice(ui, "Erro de adaptador:", error);
         } else {
             ui.label("Nenhum IPv4 ativo foi encontrado. O servidor ainda pode funcionar em redes acessíveis por outro endereço.");
         }
@@ -3325,10 +3467,7 @@ impl ClientUi {
         if let Some(error) = self.handoff_error.clone() {
             ui.add_space(10.0);
             ui.group(|ui| {
-                ui.colored_label(
-                    egui::Color32::from_rgb(190, 55, 55),
-                    format!("Transferência: {error}"),
-                );
+                Self::show_notice(ui, "Transferência:", &error);
                 ui.horizontal(|ui| {
                     if self.hosting_locally
                         && self.peer_connected
