@@ -25,6 +25,7 @@ UninstallDisplayIcon={app}\p2p-client.exe
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\crates\p2p-client\assets\p2p-client.ico
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=yes

@@ -3522,13 +3522,27 @@ fn main() -> eframe::Result {
 
     tracing::info!("Interface gráfica sendo inicializada");
 
-    eframe::run_ui_native(
-        "P2P - Voz e tela",
-        eframe::NativeOptions::default(),
-        move |ui, _frame| {
-            egui::CentralPanel::default().show(ui, |ui| app.show(ui));
-        },
-    )
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_icon(application_icon()),
+        ..Default::default()
+    };
+
+    eframe::run_ui_native("P2P - Voz e tela", native_options, move |ui, _frame| {
+        egui::CentralPanel::default().show(ui, |ui| app.show(ui));
+    })
+}
+
+fn application_icon() -> egui::IconData {
+    let icon = image::load_from_memory(include_bytes!("../assets/p2p-icon.png"))
+        .expect("ícone PNG do aplicativo inválido")
+        .resize_exact(64, 64, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    let (width, height) = icon.dimensions();
+    egui::IconData {
+        rgba: icon.into_raw(),
+        width,
+        height,
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {

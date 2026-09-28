@@ -3401,6 +3401,7 @@ dependencies = [
  "cpal",
  "eframe",
  "futures-util",
+ "image",
  "ipconfig",
  "openh264",
  "rand 0.9.5",
