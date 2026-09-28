@@ -20,7 +20,7 @@ use eframe::egui;
 use logging::{DiagnosticSnapshot, LoggingState, safe_signaling_endpoint, safe_stun_endpoint};
 use screen_capture::{MonitorOption, PendingScreenCapture, ScreenCapture};
 use screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
-use settings::AppSettings;
+use settings::{AppSettings, VideoDecoderPreference};
 use signaling_client::{SignalingClient, SignalingEvent};
 use signaling_protocol::{ParticipantInfo, RoomMode, SignalKind};
 use turn_relay::{TurnCredentials, TurnRelayServer, TurnRoomConfig};
@@ -33,6 +33,7 @@ enum SettingsCategory {
     #[default]
     Audio,
     Connection,
+    Video,
     Updates,
 }
 
@@ -108,6 +109,7 @@ struct ClientUi {
     microphone_level: f32,
     microphone_level_dbfs: f32,
     monitor_gain_db: f32,
+    video_decoder_preference: VideoDecoderPreference,
     microphone_error: Option<String>,
     microphone_monitor_error: Option<String>,
     microphone_audio_warning: bool,
@@ -270,6 +272,7 @@ impl ClientUi {
         settings.server_url = self.server_url.clone();
         settings.stun_server_url = self.stun_server_url.clone();
         settings.monitor_gain_db = self.monitor_gain_db;
+        settings.video_decoder_preference = self.video_decoder_preference;
         settings.create_room_mode = self.create_room_mode;
         settings.use_turn_on_create = self.use_turn_on_create;
         settings.may_host = self.may_host;
@@ -281,6 +284,7 @@ impl ClientUi {
         self.server_url = preferences.server_url;
         self.stun_server_url = preferences.stun_server_url;
         self.monitor_gain_db = preferences.monitor_gain_db;
+        self.video_decoder_preference = preferences.video_decoder_preference;
         self.create_room_mode = preferences.create_room_mode;
         self.use_turn_on_create = preferences.use_turn_on_create;
         self.may_host = preferences.may_host;
@@ -739,9 +743,13 @@ impl ClientUi {
                 || !self.screen_share_metrics.decoder_backend.is_empty()
             {
                 ui.small(format!(
-                    "Codec local: {}. Codec remoto: {}.",
+                    "Encoder deste PC: {}. Decoder ativo neste PC: {}.",
                     self.screen_share_metrics.encoder_backend,
                     self.screen_share_metrics.decoder_backend
+                ));
+                ui.small(format!(
+                    "Preferência do decoder neste PC: {}.",
+                    self.screen_share_metrics.decoder_preference
                 ));
                 if let Some(reason) = &self.screen_share_metrics.encoder_fallback_reason {
                     ui.small(format!("Fallback do codificador: {reason}"));
@@ -1021,6 +1029,10 @@ impl ClientUi {
                 if ui.selectable_label(selected, "Conexão").clicked() {
                     self.select_settings_category(SettingsCategory::Connection);
                 }
+                let selected = self.settings_category == SettingsCategory::Video;
+                if ui.selectable_label(selected, "Vídeo").clicked() {
+                    self.select_settings_category(SettingsCategory::Video);
+                }
                 let selected = self.settings_category == SettingsCategory::Updates;
                 if ui.selectable_label(selected, "Atualizações").clicked() {
                     self.select_settings_category(SettingsCategory::Updates);
@@ -1032,6 +1044,7 @@ impl ClientUi {
             ui.vertical(|ui| match self.settings_category {
                 SettingsCategory::Audio => self.show_audio_settings(ui),
                 SettingsCategory::Connection => self.show_connection_settings(ui),
+                SettingsCategory::Video => self.show_video_settings(ui),
                 SettingsCategory::Updates => self.show_update_settings(ui),
             });
         });
@@ -1270,6 +1283,34 @@ impl ClientUi {
 
             ui.small("Se o acesso estiver bloqueado: Configurações > Privacidade e segurança > Microfone (no Windows 10, Privacidade > Microfone) > permitir acesso a aplicativos de área de trabalho.");
         });
+    }
+
+    fn show_video_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Vídeo");
+        ui.label("Escolha como decodificar a tela recebida:");
+
+        ui.radio_value(
+            &mut self.video_decoder_preference,
+            VideoDecoderPreference::Automatic,
+            "Automático",
+        );
+        ui.small("Começa com DXVA; após 2 s de aquecimento, muda para OpenH264 se publicar menos de 80% das entradas em uma janela de 3 s.");
+
+        ui.radio_value(
+            &mut self.video_decoder_preference,
+            VideoDecoderPreference::PreferDxva,
+            "Preferir DXVA",
+        );
+        ui.small("Mantém o decoder da GPU mesmo com FPS baixo. Usa CPU se DXVA estiver indisponível ou falhar.");
+
+        ui.radio_value(
+            &mut self.video_decoder_preference,
+            VideoDecoderPreference::Cpu,
+            "CPU (OpenH264)",
+        );
+        ui.small("Decodifica com o processador e não tenta inicializar o DXVA.");
+        ui.separator();
+        ui.small("A preferência é salva neste computador e vale na próxima sessão de compartilhamento. O decoder ativo e o motivo de fallback aparecem no diagnóstico da sala.");
     }
 
     fn open_settings(&mut self) {
@@ -1622,6 +1663,7 @@ impl ClientUi {
                     bind_ipv4,
                     self.stun_server_for_room(),
                     self.turn_credentials_for_room(),
+                    self.video_decoder_preference,
                 ) {
                     Ok(session) => {
                         let metrics = session.metrics();
@@ -1688,6 +1730,7 @@ impl ClientUi {
                     bind_ipv4,
                     self.stun_server_for_room(),
                     self.turn_credentials_for_room(),
+                    self.video_decoder_preference,
                 ) {
                     Ok(session) => {
                         if let Some(capture) = self.screen_capture.as_ref() {
@@ -1913,6 +1956,7 @@ impl ClientUi {
                     encoder_backend = %metrics.encoder_backend,
                     encoder_fallback = metrics.encoder_fallback_reason.as_deref().unwrap_or(""),
                     decoder_backend = %metrics.decoder_backend,
+                    decoder_preference = %metrics.decoder_preference,
                     decoder_fallback = metrics.decoder_fallback_reason.as_deref().unwrap_or(""),
                     encoded = metrics.encoded_frames,
                     sent = metrics.sent_frames,

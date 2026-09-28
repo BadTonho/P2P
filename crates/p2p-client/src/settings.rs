@@ -11,6 +11,25 @@ const SETTINGS_FILE: &str = "settings.json";
 const SETTINGS_SCHEMA_VERSION: u32 = 1;
 const MAX_SETTINGS_BYTES: u64 = 128 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoDecoderPreference {
+    #[default]
+    Automatic,
+    PreferDxva,
+    Cpu,
+}
+
+impl VideoDecoderPreference {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Automatic => "Automático",
+            Self::PreferDxva => "Preferir DXVA",
+            Self::Cpu => "CPU (OpenH264)",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -22,6 +41,7 @@ pub struct AppSettings {
     pub use_turn_on_create: bool,
     pub may_host: bool,
     pub control_ipv4: Option<Ipv4Addr>,
+    pub video_decoder_preference: VideoDecoderPreference,
 }
 
 impl Default for AppSettings {
@@ -35,6 +55,7 @@ impl Default for AppSettings {
             use_turn_on_create: true,
             may_host: false,
             control_ipv4: None,
+            video_decoder_preference: VideoDecoderPreference::Automatic,
         }
     }
 }
@@ -209,6 +230,7 @@ mod tests {
             create_room_mode: RoomMode::InternetTest,
             may_host: true,
             control_ipv4: Some(Ipv4Addr::new(26, 10, 20, 30)),
+            video_decoder_preference: VideoDecoderPreference::PreferDxva,
             ..AppSettings::default()
         };
 
@@ -230,6 +252,23 @@ mod tests {
         assert_eq!(loaded, AppSettings::default());
         assert!(warning.is_some());
         fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn settings_without_decoder_preference_default_to_automatic() {
+        let mut stored =
+            serde_json::to_value(AppSettings::default()).expect("settings should serialize");
+        stored
+            .as_object_mut()
+            .expect("settings should serialize as an object")
+            .remove("video_decoder_preference");
+
+        let loaded: AppSettings =
+            serde_json::from_value(stored).expect("older settings files should remain compatible");
+        assert_eq!(
+            loaded.video_decoder_preference,
+            VideoDecoderPreference::Automatic
+        );
     }
 
     #[test]

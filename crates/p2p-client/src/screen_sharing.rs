@@ -51,6 +51,7 @@ use webrtc::runtime::TokioRuntime;
 use crate::logging::safe_stun_endpoint;
 use crate::mf_video;
 use crate::screen_capture::{LatestFrame, PreviewFrame};
+use crate::settings::VideoDecoderPreference;
 use crate::turn_relay::TurnCredentials;
 
 const VIDEO_PAYLOAD_TYPE: PayloadType = 102;
@@ -59,6 +60,12 @@ const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 30);
 const ENCODER_PACING_JITTER_TOLERANCE: Duration = Duration::from_micros(1_000);
 const STATIC_FRAME_REPEAT_INTERVAL: Duration = Duration::from_secs(1);
 const DXVA_FIRST_OUTPUT_WATCHDOG: Duration = Duration::from_millis(750);
+const DXVA_ADAPTIVE_WARMUP: Duration = Duration::from_secs(2);
+const DXVA_ADAPTIVE_WINDOW: Duration = Duration::from_secs(3);
+const DXVA_ADAPTIVE_MIN_INPUTS: usize = 45;
+const DXVA_ADAPTIVE_MIN_OUTPUT_RATIO: f64 = 0.80;
+const MAX_CACHED_GOP_ACCESS_UNITS: usize = 240;
+const MAX_CACHED_GOP_BYTES: usize = 16 * 1024 * 1024;
 const RTP_REORDER_DELAY: Duration = Duration::from_millis(40);
 const MAX_RTP_FRAME_AGE: Duration = Duration::from_millis(200);
 const MAX_PENDING_RTP_FRAMES: usize = 8;
@@ -217,6 +224,7 @@ pub struct ScreenShareMetrics {
     pub encoder_fallback_reason: Option<String>,
     pub decoder_backend: String,
     pub decoder_fallback_reason: Option<String>,
+    pub decoder_preference: String,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -380,6 +388,7 @@ struct SharedMetrics {
     encoder_fallback_reason: Mutex<Option<String>>,
     decoder_backend: Mutex<String>,
     decoder_fallback_reason: Mutex<Option<String>>,
+    decoder_preference: Mutex<String>,
     connected_at: Mutex<Option<Instant>>,
     selected_ice_pair: Mutex<String>,
     selected_pair_key: Mutex<String>,
@@ -538,6 +547,11 @@ impl SharedMetrics {
                 .clone(),
             decoder_fallback_reason: self
                 .decoder_fallback_reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            decoder_preference: self
+                .decoder_preference
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
@@ -1780,6 +1794,122 @@ fn dxva_watchdog_expired(last_input_at: Option<Instant>, now: Instant) -> bool {
         .is_some_and(|last| now.saturating_duration_since(last) >= DXVA_FIRST_OUTPUT_WATCHDOG)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DxvaThroughputSnapshot {
+    inputs: usize,
+    outputs: usize,
+    output_ratio: f64,
+}
+
+fn should_use_adaptive_decoder_fallback(preference: VideoDecoderPreference) -> bool {
+    preference == VideoDecoderPreference::Automatic
+}
+
+fn should_try_hardware_decoder(
+    preference: VideoDecoderPreference,
+    hardware_disabled: bool,
+    decoder_missing: bool,
+    cpu_waiting_for_sps: bool,
+    access_unit_has_sps_idr: bool,
+) -> bool {
+    preference != VideoDecoderPreference::Cpu
+        && !hardware_disabled
+        && (decoder_missing || (cpu_waiting_for_sps && access_unit_has_sps_idr))
+}
+
+#[derive(Default)]
+struct DxvaThroughputMonitor {
+    first_input_at: Option<Instant>,
+    measurement_started_at: Option<Instant>,
+    samples: VecDeque<(Instant, bool)>,
+}
+
+impl DxvaThroughputMonitor {
+    fn observe(&mut self, now: Instant, produced_output: bool) -> Option<DxvaThroughputSnapshot> {
+        let first_input_at = *self.first_input_at.get_or_insert(now);
+        if now.saturating_duration_since(first_input_at) < DXVA_ADAPTIVE_WARMUP {
+            return None;
+        }
+
+        let measurement_started_at = *self.measurement_started_at.get_or_insert(now);
+        self.samples.push_back((now, produced_output));
+        while self
+            .samples
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) > DXVA_ADAPTIVE_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+
+        if now.saturating_duration_since(measurement_started_at) < DXVA_ADAPTIVE_WINDOW
+            || self.samples.len() < DXVA_ADAPTIVE_MIN_INPUTS
+        {
+            return None;
+        }
+
+        let inputs = self.samples.len();
+        let outputs = self.samples.iter().filter(|(_, output)| *output).count();
+        let output_ratio = outputs as f64 / inputs as f64;
+        (output_ratio < DXVA_ADAPTIVE_MIN_OUTPUT_RATIO).then_some(DxvaThroughputSnapshot {
+            inputs,
+            outputs,
+            output_ratio,
+        })
+    }
+}
+
+#[derive(Default)]
+struct CachedH264Gop {
+    idr: Option<Vec<u8>>,
+    following: VecDeque<Vec<u8>>,
+    byte_len: usize,
+    complete: bool,
+}
+
+impl CachedH264Gop {
+    fn start_at_idr(&mut self, idr: Vec<u8>) {
+        self.byte_len = idr.len();
+        self.idr = Some(idr);
+        self.following.clear();
+        self.complete = self.byte_len <= MAX_CACHED_GOP_BYTES;
+    }
+
+    fn push_delta(&mut self, access_unit: &[u8]) {
+        if !self.complete
+            || classify_h264_access_unit(&annex_b_nal_types(access_unit))
+                != Some(H264FrameKind::Delta)
+        {
+            return;
+        }
+
+        self.byte_len = self.byte_len.saturating_add(access_unit.len());
+        if self.following.len() >= MAX_CACHED_GOP_ACCESS_UNITS
+            || self.byte_len > MAX_CACHED_GOP_BYTES
+        {
+            self.complete = false;
+            self.following.clear();
+            return;
+        }
+        self.following.push_back(access_unit.to_vec());
+    }
+
+    fn invalidate_delta_chain(&mut self) {
+        self.complete = false;
+        self.following.clear();
+    }
+
+    fn replay_chain(&self) -> Option<Vec<&[u8]>> {
+        if !self.complete {
+            return None;
+        }
+        let idr = self.idr.as_deref()?;
+        let mut chain = Vec::with_capacity(1 + self.following.len());
+        chain.push(idr);
+        chain.extend(self.following.iter().map(Vec::as_slice));
+        Some(chain)
+    }
+}
+
 #[derive(Default)]
 struct H264ForwardingGate {
     sps: Option<Vec<u8>>,
@@ -1992,6 +2122,7 @@ impl ScreenShareSession {
         bind_ipv4: Ipv4Addr,
         stun_server: Option<String>,
         turn_credentials: Option<TurnCredentials>,
+        decoder_preference: VideoDecoderPreference,
     ) -> Result<Self, String> {
         if let Some(server) = stun_server.as_deref() {
             if let Err(error) = validate_stun_uri(server) {
@@ -2004,12 +2135,19 @@ impl ScreenShareSession {
             format!("{bind_ipv4}:{MEDIA_UDP_PORT}"),
             stun_server,
             turn_credentials,
+            decoder_preference,
         )
     }
 
     #[cfg(test)]
     fn new_loopback(context: egui::Context) -> Result<Self, String> {
-        Self::with_udp_address(context, "127.0.0.1:0".to_owned(), None, None)
+        Self::with_udp_address(
+            context,
+            "127.0.0.1:0".to_owned(),
+            None,
+            None,
+            VideoDecoderPreference::Automatic,
+        )
     }
 
     fn with_udp_address(
@@ -2017,10 +2155,12 @@ impl ScreenShareSession {
         udp_address: String,
         stun_server: Option<String>,
         turn_credentials: Option<TurnCredentials>,
+        decoder_preference: VideoDecoderPreference,
     ) -> Result<Self, String> {
         tracing::info!(
             udp_address = %udp_address,
             stun_endpoint = %stun_server.as_deref().map(safe_stun_endpoint).unwrap_or_else(|| "(não configurado)".to_owned()),
+            decoder_preference = decoder_preference.label(),
             "Criando sessão WebRTC para compartilhamento de tela"
         );
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
@@ -2029,6 +2169,11 @@ impl ScreenShareSession {
         let remote_track = Arc::new(Mutex::new(None));
         let mut initial_metrics = SharedMetrics::default();
         initial_metrics.session_id = NEXT_SCREEN_SHARE_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        *initial_metrics
+            .decoder_preference
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            decoder_preference.label().to_owned();
         *initial_metrics
             .selected_ice_pair
             .lock()
@@ -2079,6 +2224,7 @@ impl ScreenShareSession {
                     stun_server,
                     turn_credentials,
                     worker_metrics,
+                    decoder_preference,
                 ));
             })
             .map_err(|error| format!("Não foi possível iniciar a sessão de tela: {error}"))?;
@@ -2186,6 +2332,7 @@ struct PeerEvents {
     metrics: Arc<SharedMetrics>,
     stun_server: Option<String>,
     turn_enabled: bool,
+    decoder_preference: VideoDecoderPreference,
 }
 
 #[async_trait::async_trait]
@@ -2414,6 +2561,7 @@ impl PeerConnectionEventHandler for PeerEvents {
         let remote_frame = Arc::clone(&self.remote_frame);
         let sequence = Arc::clone(&self.remote_frame_sequence);
         let metrics = Arc::clone(&self.metrics);
+        let decoder_preference = self.decoder_preference;
         *self
             .remote_track
             .lock()
@@ -2429,6 +2577,7 @@ impl PeerConnectionEventHandler for PeerEvents {
             let worker_remote_frame = Arc::clone(&remote_frame);
             let worker_sequence = Arc::clone(&sequence);
             let worker_metrics = Arc::clone(&metrics);
+            let worker_decoder_preference = decoder_preference;
             let worker = thread::Builder::new()
                 .name("p2p-h264-decoder".to_owned())
                 .spawn(move || {
@@ -2440,8 +2589,11 @@ impl PeerConnectionEventHandler for PeerEvents {
                     let mut cached_sps = None;
                     let mut cached_pps = None;
                     let mut cached_idr = None;
+                    let mut cached_gop = CachedH264Gop::default();
+                    let mut dxva_throughput = DxvaThroughputMonitor::default();
                     let mut last_hardware_input_at: Option<Instant> = None;
-                    let mut hardware_decoder_disabled = false;
+                    let mut hardware_decoder_disabled =
+                        worker_decoder_preference == VideoDecoderPreference::Cpu;
                     loop {
                         let watchdog_wait = if matches!(
                             decoder.as_ref(),
@@ -2546,6 +2698,8 @@ impl PeerConnectionEventHandler for PeerEvents {
                             cpu_waiting_for_idr = true;
                             hardware_frames_without_output = 0;
                             last_hardware_input_at = None;
+                            dxva_throughput = DxvaThroughputMonitor::default();
+                            cached_gop.invalidate_delta_chain();
                         }
                         let access_unit = queued.bytes;
                         if let Some(idr) = update_cached_idr(
@@ -2553,7 +2707,10 @@ impl PeerConnectionEventHandler for PeerEvents {
                             &mut cached_sps,
                             &mut cached_pps,
                         ) {
-                            cached_idr = Some(idr);
+                            cached_idr = Some(idr.clone());
+                            cached_gop.start_at_idr(idr);
+                        } else {
+                            cached_gop.push_delta(&access_unit);
                         }
                         let has_sps_and_idr = {
                             let nals = annex_b_nal_types(&access_unit);
@@ -2561,10 +2718,68 @@ impl PeerConnectionEventHandler for PeerEvents {
                         };
 
                         #[cfg(windows)]
-                        let should_try_hardware = !hardware_decoder_disabled
-                            && (decoder.is_none() || (using_cpu_pending_sps && has_sps_and_idr));
+                        let should_try_hardware = should_try_hardware_decoder(
+                            worker_decoder_preference,
+                            hardware_decoder_disabled,
+                            decoder.is_none(),
+                            using_cpu_pending_sps,
+                            has_sps_and_idr,
+                        );
                         #[cfg(not(windows))]
                         let should_try_hardware = false;
+
+                        #[cfg(windows)]
+                        if decoder.is_none()
+                            && (worker_decoder_preference == VideoDecoderPreference::Cpu
+                                || hardware_decoder_disabled)
+                        {
+                            match Decoder::new() {
+                                Ok(cpu) => {
+                                    let fallback_reason = if worker_decoder_preference
+                                        == VideoDecoderPreference::Cpu
+                                    {
+                                        None
+                                    } else {
+                                        Some(
+                                            worker_metrics
+                                                .decoder_fallback_reason
+                                                .lock()
+                                                .unwrap_or_else(
+                                                    std::sync::PoisonError::into_inner,
+                                                )
+                                                .clone()
+                                                .unwrap_or_else(|| {
+                                                    "DXVA foi desativado após uma falha anterior.".to_owned()
+                                                }),
+                                        )
+                                    };
+                                    worker_metrics.set_decoder_backend(
+                                        if worker_decoder_preference
+                                            == VideoDecoderPreference::Cpu
+                                        {
+                                            "CPU — OpenH264 (selecionado)".to_owned()
+                                        } else {
+                                            "CPU — OpenH264 (fallback)".to_owned()
+                                        },
+                                        fallback_reason,
+                                    );
+                                    tracing::info!(
+                                        screen_share_session = worker_metrics.session_id,
+                                        decoder_preference = worker_decoder_preference.label(),
+                                        "Decoder OpenH264 selecionado pelo usuário"
+                                    );
+                                    decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                    using_cpu_pending_sps = false;
+                                    cpu_waiting_for_idr = true;
+                                }
+                                Err(error) => {
+                                    let _ = worker_events.send(ScreenShareEvent::Error(format!(
+                                        "Não foi possível iniciar o decoder OpenH264 selecionado: {error}"
+                                    )));
+                                    return;
+                                }
+                            }
+                        }
 
                         if should_try_hardware {
                             #[cfg(windows)]
@@ -2766,6 +2981,133 @@ impl PeerConnectionEventHandler for PeerEvents {
                                     decoder = None;
                                 }
                             }
+
+                            if should_use_adaptive_decoder_fallback(worker_decoder_preference)
+                                && hardware_error.is_none()
+                                && matches!(
+                                    decoder.as_ref(),
+                                    Some(ActiveH264Decoder::MediaFoundation(_))
+                                )
+                            {
+                                let produced_output = worker_metrics
+                                    .decoded_frames
+                                    .load(Ordering::Relaxed)
+                                    > decoded_before;
+                                if let Some(window) =
+                                    dxva_throughput.observe(Instant::now(), produced_output)
+                                {
+                                    let reason = format!(
+                                        "DXVA publicou {}/{} quadros na janela de 3 s ({:.0}%); abaixo de 80%. Mudando para OpenH264 na CPU.",
+                                        window.outputs,
+                                        window.inputs,
+                                        window.output_ratio * 100.0
+                                    );
+                                    tracing::warn!(
+                                        screen_share_session = worker_metrics.session_id,
+                                        decoder_inputs = window.inputs,
+                                        decoder_outputs = window.outputs,
+                                        output_ratio = window.output_ratio,
+                                        fallback_reason = %reason,
+                                        cached_gop_complete = cached_gop.complete,
+                                        "Fallback adaptativo de DXVA para OpenH264"
+                                    );
+                                    hardware_decoder_disabled = true;
+                                    match Decoder::new() {
+                                        Ok(cpu) => {
+                                            worker_metrics.set_decoder_backend(
+                                                "CPU — OpenH264 (fallback adaptativo)".to_owned(),
+                                                Some(reason),
+                                            );
+                                            decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                            using_cpu_pending_sps = false;
+                                            hardware_frames_without_output = 0;
+                                            last_hardware_input_at = None;
+                                            cpu_waiting_for_idr = true;
+
+                                            let complete_chain = cached_gop.replay_chain();
+                                            let can_continue_from_cache = complete_chain.is_some();
+                                            let mut replay = complete_chain.unwrap_or_default();
+                                            if replay.is_empty() {
+                                                if let Some(idr) = cached_idr.as_deref() {
+                                                    replay.push(idr);
+                                                }
+                                            }
+
+                                            let decoded_before_replay = worker_metrics
+                                                .decoded_frames
+                                                .load(Ordering::Relaxed);
+                                            let mut replay_failed = false;
+                                            let mut replayed_access_units = 0_u64;
+                                            for cached_access_unit in replay {
+                                                if !should_decode_access_unit(
+                                                    &mut cpu_waiting_for_idr,
+                                                    cached_access_unit,
+                                                ) {
+                                                    replay_failed = true;
+                                                    break;
+                                                }
+                                                worker_metrics.record_decoder_input();
+                                                replayed_access_units += 1;
+                                                let Some(active_decoder) = decoder.as_mut() else {
+                                                    replay_failed = true;
+                                                    break;
+                                                };
+                                                if let Some(failure) = decode_h264_access_unit(
+                                                    cached_access_unit,
+                                                    active_decoder,
+                                                    &worker_context,
+                                                    &worker_remote_frame,
+                                                    &worker_sequence,
+                                                    &worker_metrics,
+                                                ) {
+                                                    tracing::warn!(
+                                                        error = %failure.detail,
+                                                        "OpenH264 falhou ao reconstruir a referência H.264 em cache"
+                                                    );
+                                                    replay_failed = true;
+                                                    break;
+                                                }
+                                            }
+
+                                            let replay_published = worker_metrics
+                                                .decoded_frames
+                                                .load(Ordering::Relaxed)
+                                                > decoded_before_replay;
+                                            if !can_continue_from_cache
+                                                || replay_failed
+                                                || !replay_published
+                                            {
+                                                let generation = begin_stream_resync(
+                                                    &worker_generation,
+                                                    &worker_metrics,
+                                                    &worker_keyframe_request_tx,
+                                                    PliReason::DecodeError,
+                                                );
+                                                generation_seen = generation;
+                                                cpu_waiting_for_idr = true;
+                                                tracing::info!(
+                                                    screen_share_session = worker_metrics.session_id,
+                                                    cached_idr_replayed = replay_published,
+                                                    cached_gop_complete = can_continue_from_cache,
+                                                    "Solicitado IDR novo para completar fallback do decoder"
+                                                );
+                                            } else {
+                                                tracing::info!(
+                                                    screen_share_session = worker_metrics.session_id,
+                                                    replayed_access_units,
+                                                    "OpenH264 retomou a cadeia H.264 a partir do GOP em cache"
+                                                );
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let _ = worker_events.send(ScreenShareEvent::Error(format!(
+                                                "DXVA ficou abaixo da taxa recebida e OpenH264 não pôde iniciar: {error}"
+                                            )));
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 });
@@ -2896,6 +3238,7 @@ async fn run_session(
     stun_server: Option<String>,
     turn_credentials: Option<TurnCredentials>,
     metrics: Arc<SharedMetrics>,
+    decoder_preference: VideoDecoderPreference,
 ) {
     let mut active_peer: Option<PeerSession> = None;
     let mut ice_before_peer = Vec::new();
@@ -3055,6 +3398,7 @@ async fn run_session(
                     &udp_address,
                     stun_server.as_deref(),
                     turn_credentials.as_ref(),
+                    decoder_preference,
                 )
                 .await
                 {
@@ -3083,6 +3427,7 @@ async fn run_session(
                         &udp_address,
                         stun_server.as_deref(),
                         turn_credentials.as_ref(),
+                        decoder_preference,
                     )
                     .await
                     {
@@ -3415,6 +3760,7 @@ async fn create_peer(
     udp_address: &str,
     stun_server: Option<&str>,
     turn_credentials: Option<&TurnCredentials>,
+    decoder_preference: VideoDecoderPreference,
 ) -> Result<Arc<dyn PeerConnection>, String> {
     let video_codec = RTCRtpCodecParameters {
         rtp_codec: RTCRtpCodec {
@@ -3447,6 +3793,7 @@ async fn create_peer(
         metrics,
         stun_server: stun_server.map(str::to_owned),
         turn_enabled: turn_credentials.is_some(),
+        decoder_preference,
     });
     let mut configuration = RTCConfigurationBuilder::new();
     let mut ice_servers = Vec::new();
@@ -3513,6 +3860,7 @@ async fn create_sender(
     udp_address: &str,
     stun_server: Option<&str>,
     turn_credentials: Option<&TurnCredentials>,
+    decoder_preference: VideoDecoderPreference,
 ) -> Result<PeerSession, String> {
     let connection = create_peer(
         events,
@@ -3524,6 +3872,7 @@ async fn create_sender(
         udp_address,
         stun_server,
         turn_credentials,
+        decoder_preference,
     )
     .await?;
     let codec = RTCRtpCodec {
@@ -3736,6 +4085,7 @@ async fn create_receiver(
     udp_address: &str,
     stun_server: Option<&str>,
     turn_credentials: Option<&TurnCredentials>,
+    decoder_preference: VideoDecoderPreference,
 ) -> Result<PeerSession, String> {
     let connection = create_peer(
         events,
@@ -3747,6 +4097,7 @@ async fn create_receiver(
         udp_address,
         stun_server,
         turn_credentials,
+        decoder_preference,
     )
     .await?;
     let offer =
@@ -4167,15 +4518,19 @@ mod tests {
     use openh264::formats::YUVSource;
 
     use super::{
-        ActiveH264Decoder, DXVA_FIRST_OUTPUT_WATCHDOG, ENCODER_PACING_JITTER_TOLERANCE, Encoder,
-        FRAME_DURATION, H264ForwardDecision, H264ForwardingGate, H264FrameKind,
-        KeyframeRequestLimiter, LatestFrame, LatestFramePacer, MediaRoute, PreviewFrame, RtpPacket,
-        RtpSequenceTracker, ScreenShareEvent, ScreenShareSession, annex_b_nal_types,
-        assemble_h264_access_unit, classify_h264_access_unit, dxva_watchdog_expired, encode_frame,
+        ActiveH264Decoder, CachedH264Gop, DXVA_ADAPTIVE_MIN_INPUTS, DXVA_ADAPTIVE_MIN_OUTPUT_RATIO,
+        DXVA_ADAPTIVE_WARMUP, DXVA_ADAPTIVE_WINDOW, DXVA_FIRST_OUTPUT_WATCHDOG,
+        DxvaThroughputMonitor, ENCODER_PACING_JITTER_TOLERANCE, Encoder, FRAME_DURATION,
+        H264ForwardDecision, H264ForwardingGate, H264FrameKind, KeyframeRequestLimiter,
+        LatestFrame, LatestFramePacer, MediaRoute, PreviewFrame, RtpPacket, RtpSequenceTracker,
+        ScreenShareEvent, ScreenShareSession, annex_b_nal_types, assemble_h264_access_unit,
+        classify_h264_access_unit, dxva_watchdog_expired, encode_frame,
         media_route_from_candidate_types, media_route_label, peer_stats_snapshot,
         rtp_jitter_ticks_to_ms, should_decode_access_unit, should_log_aggregate_error,
-        update_cached_idr, validate_stun_uri,
+        should_try_hardware_decoder, should_use_adaptive_decoder_fallback, update_cached_idr,
+        validate_stun_uri,
     };
+    use crate::settings::VideoDecoderPreference;
     use bytes::Bytes;
     use rtc::peer_connection::transport::RTCIceCandidateType;
     use rtc::statistics::report::RTCStatsReport;
@@ -4316,6 +4671,127 @@ mod tests {
             Some(received_at),
             received_at + DXVA_FIRST_OUTPUT_WATCHDOG
         ));
+    }
+
+    #[test]
+    fn adaptive_dxva_fallback_waits_for_warmup_and_full_window() {
+        let start = Instant::now();
+        let mut monitor = DxvaThroughputMonitor::default();
+        assert!(monitor.observe(start, false).is_none());
+        assert!(
+            monitor
+                .observe(
+                    start + DXVA_ADAPTIVE_WARMUP - Duration::from_nanos(1),
+                    false
+                )
+                .is_none()
+        );
+        assert!(
+            monitor
+                .observe(start + DXVA_ADAPTIVE_WARMUP, false)
+                .is_none()
+        );
+        assert!(
+            monitor
+                .observe(
+                    start + DXVA_ADAPTIVE_WARMUP + DXVA_ADAPTIVE_WINDOW - Duration::from_nanos(1),
+                    false,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn decoder_preferences_choose_hardware_cpu_and_adaptive_policy() {
+        assert!(should_try_hardware_decoder(
+            VideoDecoderPreference::Automatic,
+            false,
+            true,
+            false,
+            false
+        ));
+        assert!(should_try_hardware_decoder(
+            VideoDecoderPreference::PreferDxva,
+            false,
+            true,
+            false,
+            false
+        ));
+        assert!(!should_try_hardware_decoder(
+            VideoDecoderPreference::Cpu,
+            false,
+            true,
+            false,
+            false
+        ));
+        assert!(!should_try_hardware_decoder(
+            VideoDecoderPreference::Automatic,
+            true,
+            true,
+            false,
+            false
+        ));
+        assert!(should_use_adaptive_decoder_fallback(
+            VideoDecoderPreference::Automatic
+        ));
+        assert!(!should_use_adaptive_decoder_fallback(
+            VideoDecoderPreference::PreferDxva
+        ));
+        assert!(!should_use_adaptive_decoder_fallback(
+            VideoDecoderPreference::Cpu
+        ));
+    }
+
+    #[test]
+    fn adaptive_dxva_fallback_requires_45_samples_and_less_than_80_percent_output() {
+        let start = Instant::now();
+        let mut too_few = DxvaThroughputMonitor::default();
+        assert!(too_few.observe(start, true).is_none());
+        for index in 1..=20 {
+            let elapsed =
+                DXVA_ADAPTIVE_WARMUP + Duration::from_millis(150 * index) + Duration::from_nanos(1);
+            assert!(too_few.observe(start + elapsed, false).is_none());
+        }
+
+        let mut slow = DxvaThroughputMonitor::default();
+        let mut decision = None;
+        for index in 0..=180 {
+            let at = start + Duration::from_nanos(33_333_333 * index);
+            decision = slow.observe(at, index % 2 == 0).or(decision);
+        }
+        let decision = decision.expect("DXVA abaixo do limite deve acionar fallback");
+        assert!(decision.inputs >= DXVA_ADAPTIVE_MIN_INPUTS);
+        assert!(decision.output_ratio < DXVA_ADAPTIVE_MIN_OUTPUT_RATIO);
+        assert!(decision.outputs < decision.inputs);
+
+        let mut healthy = DxvaThroughputMonitor::default();
+        for index in 0..=180 {
+            let at = start + Duration::from_nanos(33_333_333 * index);
+            assert!(healthy.observe(at, true).is_none());
+        }
+    }
+
+    #[test]
+    fn cached_gop_preserves_the_idr_and_delta_frame_chain_for_cpu_fallback() {
+        let sps = [0x67, 0x64, 0x00, 0x1f];
+        let pps = [0x68, 0x00];
+        let idr = [0x65, 0x88, 0x84];
+        let delta_one = [0x41, 0x9a];
+        let delta_two = [0x41, 0x9b];
+        let mut gop = CachedH264Gop::default();
+        gop.start_at_idr(annex_b_access_unit(&[&sps, &pps, &idr]));
+        gop.push_delta(&annex_b_access_unit(&[&delta_one]));
+        gop.push_delta(&annex_b_access_unit(&[&delta_two]));
+
+        let chain = gop
+            .replay_chain()
+            .expect("GOP completo deve ser reutilizável");
+        assert_eq!(annex_b_nal_types(chain[0]), [7, 8, 5]);
+        assert_eq!(annex_b_nal_types(chain[1]), [1]);
+        assert_eq!(annex_b_nal_types(chain[2]), [1]);
+
+        gop.invalidate_delta_chain();
+        assert!(gop.replay_chain().is_none());
     }
 
     #[test]
