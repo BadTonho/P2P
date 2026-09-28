@@ -664,28 +664,14 @@ async fn serve_websocket(
     connection_id: ConnectionId,
     rooms: SharedRooms,
 ) {
-    let (mut websocket_sender, mut websocket_receiver) = websocket.split();
-    let (outgoing, mut outgoing_messages) = mpsc::unbounded_channel::<OutboundMessage>();
+    let (websocket_sender, mut websocket_receiver) = websocket.split();
+    let (outgoing, outgoing_messages) = mpsc::unbounded_channel::<OutboundMessage>();
 
-    let writer = tokio::spawn(async move {
-        while let Some(outgoing) = outgoing_messages.recv().await {
-            let message = match outgoing {
-                OutboundMessage::Protocol(message) => match serde_json::to_string(&message) {
-                    Ok(json) => WebSocketMessage::Text(json.into()),
-                    Err(error) => {
-                        tracing::error!(connection_id, error = %error, "Falha ao serializar resposta do servidor");
-                        continue;
-                    }
-                },
-                OutboundMessage::Control(message) => message,
-            };
-            if let Err(error) = websocket_sender.send(message).await {
-                tracing::warn!(connection_id, error = %error, "Falha ao enviar resposta pelo WebSocket");
-                break;
-            }
-        }
-        let _ = websocket_sender.close().await;
-    });
+    let writer = tokio::spawn(write_outgoing_messages(
+        websocket_sender,
+        outgoing_messages,
+        connection_id,
+    ));
 
     while let Some(frame) = websocket_receiver.next().await {
         let frame = match frame {
@@ -740,6 +726,44 @@ async fn serve_websocket(
     }
     drop(outgoing);
     let _ = writer.await;
+}
+
+async fn write_outgoing_messages<S>(
+    mut websocket_sender: S,
+    mut outgoing_messages: mpsc::UnboundedReceiver<OutboundMessage>,
+    connection_id: ConnectionId,
+) where
+    S: futures_util::Sink<WebSocketMessage> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let mut close_sent = false;
+    while let Some(outgoing) = outgoing_messages.recv().await {
+        let is_close = matches!(
+            &outgoing,
+            OutboundMessage::Control(WebSocketMessage::Close(_))
+        );
+        let message = match outgoing {
+            OutboundMessage::Protocol(message) => match serde_json::to_string(&message) {
+                Ok(json) => WebSocketMessage::Text(json.into()),
+                Err(error) => {
+                    tracing::error!(connection_id, error = %error, "Falha ao serializar resposta do servidor");
+                    continue;
+                }
+            },
+            OutboundMessage::Control(message) => message,
+        };
+        if let Err(error) = websocket_sender.send(message).await {
+            tracing::warn!(connection_id, error = %error, "Falha ao enviar resposta pelo WebSocket");
+            break;
+        }
+        if is_close {
+            close_sent = true;
+            break;
+        }
+    }
+    if !close_sent {
+        let _ = websocket_sender.close().await;
+    }
 }
 
 async fn handle_client_message(
@@ -885,8 +909,75 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
     use tokio_tungstenite::{WebSocketStream, connect_async};
 
-    use super::{OutboundMessage, RoomRegistry, TransferReservation, handle_connection, serve};
+    use super::{
+        OutboundMessage, RoomRegistry, TransferReservation, handle_connection, serve,
+        write_outgoing_messages,
+    };
     use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage, SignalKind};
+
+    struct RecordingSink(Arc<std::sync::Mutex<Vec<WebSocketMessage>>>);
+
+    impl futures_util::Sink<WebSocketMessage> for RecordingSink {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            item: WebSocketMessage,
+        ) -> Result<(), Self::Error> {
+            self.get_mut()
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_writer_stops_after_close_and_drops_queued_messages() {
+        let (outgoing, receiver) = mpsc::unbounded_channel();
+        outgoing
+            .send(OutboundMessage::Control(WebSocketMessage::Close(None)))
+            .unwrap();
+        outgoing
+            .send(OutboundMessage::Protocol(ServerMessage::RoomLeft))
+            .unwrap();
+        drop(outgoing);
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        write_outgoing_messages(RecordingSink(Arc::clone(&sent)), receiver, 22).await;
+
+        let sent = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            sent.len(),
+            1,
+            "nenhuma mensagem pode ser enviada após Close"
+        );
+        assert!(matches!(sent.first(), Some(WebSocketMessage::Close(_))));
+    }
 
     fn server_message(receiver: &mut mpsc::UnboundedReceiver<OutboundMessage>) -> ServerMessage {
         match receiver.try_recv().expect("expected a server message") {

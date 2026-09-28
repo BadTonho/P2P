@@ -56,6 +56,8 @@ use crate::turn_relay::TurnCredentials;
 const VIDEO_PAYLOAD_TYPE: PayloadType = 102;
 const VIDEO_CLOCK_RATE: u32 = 90_000;
 const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 30);
+const STATIC_FRAME_REPEAT_INTERVAL: Duration = Duration::from_secs(1);
+const DXVA_FIRST_OUTPUT_WATCHDOG: Duration = Duration::from_millis(750);
 const RTP_REORDER_DELAY: Duration = Duration::from_millis(40);
 const MAX_RTP_FRAME_AGE: Duration = Duration::from_millis(200);
 const MAX_PENDING_RTP_FRAMES: usize = 8;
@@ -218,6 +220,8 @@ pub struct ScreenShareMetrics {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScreenSharePerformanceSnapshot {
+    pub new_capture_frames: u64,
+    pub repeated_capture_frames: u64,
     pub encoder_input_frames: u64,
     pub encoded_frames: u64,
     pub encoded_idr_frames: u64,
@@ -344,6 +348,8 @@ struct SharedMetrics {
     interval_pli_requests_sent: AtomicU64,
     interval_pli_requests_received: AtomicU64,
     interval_encoder_input_frames: AtomicU64,
+    interval_new_capture_frames: AtomicU64,
+    interval_repeated_capture_frames: AtomicU64,
     interval_encoded_frames: AtomicU64,
     interval_encoded_idr_frames: AtomicU64,
     interval_encoded_delta_frames: AtomicU64,
@@ -719,6 +725,17 @@ impl SharedMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_capture_frame_for_encoder(&self, repeated: bool) {
+        if repeated {
+            self.interval_repeated_capture_frames
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.interval_new_capture_frames
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_encoder_input_frame();
+    }
+
     fn record_drop_before_initial_idr(&self) {
         self.dropped_before_initial_idr
             .fetch_add(1, Ordering::Relaxed);
@@ -986,6 +1003,10 @@ impl SharedMetrics {
 
     fn take_performance_snapshot(&self) -> ScreenSharePerformanceSnapshot {
         ScreenSharePerformanceSnapshot {
+            new_capture_frames: self.interval_new_capture_frames.swap(0, Ordering::Relaxed),
+            repeated_capture_frames: self
+                .interval_repeated_capture_frames
+                .swap(0, Ordering::Relaxed),
             encoder_input_frames: self
                 .interval_encoder_input_frames
                 .swap(0, Ordering::Relaxed),
@@ -1615,6 +1636,81 @@ fn annex_b_nal_types(data: &[u8]) -> Vec<u8> {
         .into_iter()
         .filter_map(|nal| nal.first().map(|header| header & 0x1f))
         .collect()
+}
+
+#[derive(Default)]
+struct LatestFramePacer {
+    last_sequence: Option<u64>,
+    last_encoded_at: Option<Instant>,
+}
+
+impl LatestFramePacer {
+    /// Returns `Some(true)` for a new captured frame and `Some(false)` for a
+    /// one-second repeat of the latest image. `None` means keep waiting.
+    fn should_encode(&self, sequence: u64, now: Instant) -> Option<bool> {
+        let Some(last_encoded_at) = self.last_encoded_at else {
+            return Some(true);
+        };
+        let elapsed = now.saturating_duration_since(last_encoded_at);
+        if self.last_sequence != Some(sequence) {
+            if elapsed < FRAME_DURATION {
+                return None;
+            }
+            Some(true)
+        } else if elapsed >= STATIC_FRAME_REPEAT_INTERVAL {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    fn record_encoded(&mut self, sequence: u64, now: Instant) {
+        self.last_sequence = Some(sequence);
+        self.last_encoded_at = Some(now);
+    }
+}
+
+fn update_cached_idr(
+    access_unit: &[u8],
+    cached_sps: &mut Option<Vec<u8>>,
+    cached_pps: &mut Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let nals = annex_b_nals(access_unit);
+    for nal in &nals {
+        match nal.first().map(|header| header & 0x1f) {
+            Some(7) => *cached_sps = Some(nal.to_vec()),
+            Some(8) => *cached_pps = Some(nal.to_vec()),
+            _ => {}
+        }
+    }
+    let (Some(sps), Some(pps)) = (cached_sps.as_deref(), cached_pps.as_deref()) else {
+        return None;
+    };
+    if !nals
+        .iter()
+        .any(|nal| nal.first().is_some_and(|header| header & 0x1f == 5))
+    {
+        return None;
+    }
+
+    let mut cached = Vec::with_capacity(access_unit.len() + sps.len() + pps.len() + 8);
+    cached.extend_from_slice(&[0, 0, 0, 1]);
+    cached.extend_from_slice(sps);
+    cached.extend_from_slice(&[0, 0, 0, 1]);
+    cached.extend_from_slice(pps);
+    for nal in nals {
+        let nal_type = nal.first().map(|header| header & 0x1f);
+        if nal_type != Some(7) && nal_type != Some(8) {
+            cached.extend_from_slice(&[0, 0, 0, 1]);
+            cached.extend_from_slice(nal);
+        }
+    }
+    Some(cached)
+}
+
+fn dxva_watchdog_expired(last_input_at: Option<Instant>, now: Instant) -> bool {
+    last_input_at
+        .is_some_and(|last| now.saturating_duration_since(last) >= DXVA_FIRST_OUTPUT_WATCHDOG)
 }
 
 #[derive(Default)]
@@ -2272,7 +2368,101 @@ impl PeerConnectionEventHandler for PeerEvents {
                     let mut cpu_waiting_for_idr = true;
                     let mut hardware_frames_without_output = 0u32;
                     let mut generation_seen = 0_u64;
-                    while let Ok(queued) = decoder_rx.recv() {
+                    let mut cached_sps = None;
+                    let mut cached_pps = None;
+                    let mut cached_idr = None;
+                    let mut last_hardware_input_at: Option<Instant> = None;
+                    loop {
+                        let watchdog_wait = if matches!(
+                            decoder.as_ref(),
+                            Some(ActiveH264Decoder::MediaFoundation(_))
+                        ) && hardware_frames_without_output > 0
+                        {
+                            last_hardware_input_at
+                                .map(|last| DXVA_FIRST_OUTPUT_WATCHDOG.saturating_sub(last.elapsed()))
+                                .unwrap_or(DXVA_FIRST_OUTPUT_WATCHDOG)
+                        } else {
+                            Duration::from_secs(60)
+                        };
+                        let queued = match decoder_rx.recv_timeout(watchdog_wait) {
+                            Ok(queued) => queued,
+                            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                                if !matches!(
+                                    decoder.as_ref(),
+                                    Some(ActiveH264Decoder::MediaFoundation(_))
+                                ) || hardware_frames_without_output == 0
+                                    || !dxva_watchdog_expired(last_hardware_input_at, Instant::now())
+                                {
+                                    continue;
+                                }
+
+                                let reason = format!(
+                                    "DXVA recebeu quadro(s), mas não publicou imagem em {} ms; usando OpenH264 na CPU.",
+                                    DXVA_FIRST_OUTPUT_WATCHDOG.as_millis()
+                                );
+                                tracing::warn!(fallback_reason = %reason, cached_idr = cached_idr.is_some(), "Watchdog do primeiro quadro DXVA acionado");
+                                match Decoder::new() {
+                                    Ok(cpu) => {
+                                        worker_metrics.set_decoder_backend(
+                                            "CPU — OpenH264".to_owned(),
+                                            Some(reason),
+                                        );
+                                        decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                        using_cpu_pending_sps = false;
+                                        hardware_frames_without_output = 0;
+                                        last_hardware_input_at = None;
+                                        cpu_waiting_for_idr = true;
+
+                                        if let Some(idr) = cached_idr.as_deref() {
+                                            let before = worker_metrics.decoded_frames.load(Ordering::Relaxed);
+                                            if should_decode_access_unit(&mut cpu_waiting_for_idr, idr) {
+                                                worker_metrics.record_decoder_input();
+                                                if let Some(active_decoder) = decoder.as_mut() {
+                                                    let failure = decode_h264_access_unit(
+                                                        idr,
+                                                        active_decoder,
+                                                        &worker_context,
+                                                        &worker_remote_frame,
+                                                        &worker_sequence,
+                                                        &worker_metrics,
+                                                    );
+                                                    if let Some(failure) = failure {
+                                                        tracing::warn!(error = %failure.detail, "OpenH264 não conseguiu publicar o IDR em cache; solicitando outro quadro-chave");
+                                                    }
+                                                }
+                                            }
+                                            if worker_metrics.decoded_frames.load(Ordering::Relaxed) == before {
+                                                let generation = begin_stream_resync(
+                                                    &worker_generation,
+                                                    &worker_metrics,
+                                                    &worker_keyframe_request_tx,
+                                                    PliReason::DecodeError,
+                                                );
+                                                generation_seen = generation;
+                                                cpu_waiting_for_idr = true;
+                                            }
+                                        } else {
+                                            let generation = begin_stream_resync(
+                                                &worker_generation,
+                                                &worker_metrics,
+                                                &worker_keyframe_request_tx,
+                                                PliReason::DecodeError,
+                                            );
+                                            generation_seen = generation;
+                                            cpu_waiting_for_idr = true;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let _ = worker_events.send(ScreenShareEvent::Error(format!(
+                                            "DXVA não publicou imagem e OpenH264 não pôde iniciar: {error}"
+                                        )));
+                                        return;
+                                    }
+                                }
+                                continue;
+                            }
+                        };
                         let current_generation = worker_generation.load(Ordering::Relaxed);
                         if queued.generation != current_generation {
                             worker_metrics.record_drop_waiting_for_idr();
@@ -2284,8 +2474,16 @@ impl PeerConnectionEventHandler for PeerEvents {
                             using_cpu_pending_sps = false;
                             cpu_waiting_for_idr = true;
                             hardware_frames_without_output = 0;
+                            last_hardware_input_at = None;
                         }
                         let access_unit = queued.bytes;
+                        if let Some(idr) = update_cached_idr(
+                            &access_unit,
+                            &mut cached_sps,
+                            &mut cached_pps,
+                        ) {
+                            cached_idr = Some(idr);
+                        }
                         let has_sps_and_idr = {
                             let nals = annex_b_nal_types(&access_unit);
                             nals.contains(&7) && nals.contains(&8) && nals.contains(&5)
@@ -2389,6 +2587,10 @@ impl PeerConnectionEventHandler for PeerEvents {
                         }
 
                         if let Some(active_decoder) = decoder.as_mut() {
+                            let decoding_on_hardware = matches!(
+                                active_decoder,
+                                ActiveH264Decoder::MediaFoundation(_)
+                            );
                             worker_metrics.record_decoder_input();
                             let decoded_before =
                                 worker_metrics.decoded_frames.load(Ordering::Relaxed);
@@ -2443,6 +2645,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                             if matches!(decoder.as_ref(), Some(ActiveH264Decoder::MediaFoundation(_)))
                                 && worker_metrics.decoded_frames.load(Ordering::Relaxed) == decoded_before
                             {
+                                last_hardware_input_at = Some(Instant::now());
                                 hardware_frames_without_output = hardware_frames_without_output.saturating_add(1);
                                 if hardware_frames_without_output >= 5 {
                                     let reason = "DXVA recebeu 5 quadros H.264 sem produzir imagem; usando OpenH264 na CPU.".to_owned();
@@ -2456,6 +2659,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                             decoder = Some(ActiveH264Decoder::OpenH264(cpu));
                                             using_cpu_pending_sps = false;
                                             hardware_frames_without_output = 0;
+                                            last_hardware_input_at = None;
                                             cpu_waiting_for_idr = true;
                                             decoder_entered_resync = true;
                                         }
@@ -2468,7 +2672,10 @@ impl PeerConnectionEventHandler for PeerEvents {
                                     }
                                 }
                             } else {
-                                hardware_frames_without_output = 0;
+                                if decoding_on_hardware {
+                                    hardware_frames_without_output = 0;
+                                    last_hardware_input_at = None;
+                                }
                             }
 
                             if decode_failed || decoder_entered_resync {
@@ -2660,6 +2867,17 @@ async fn run_session(
                                 MediaRoute::Turn => "Conexão retransmitida pelo servidor TURN do anfitrião.",
                             };
                             let _ = events.send(ScreenShareEvent::State(label.to_owned()));
+                        }
+                    } else {
+                        let previous = peer.metrics.route.swap(0, Ordering::Relaxed);
+                        if previous != 0 {
+                            tracing::info!(
+                                screen_share_session = peer.metrics.session_id,
+                                "Metadados da rota ICE indisponíveis; classificação atualizada para desconhecida"
+                            );
+                            let _ = events.send(ScreenShareEvent::State(
+                                "Conexão P2P ativa; rota da mídia desconhecida nos metadados ICE.".to_owned(),
+                            ));
                         }
                     }
                     if pair_changed {
@@ -2904,7 +3122,8 @@ async fn run_session(
 
 fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
     let mut snapshot = PeerStatsSnapshot {
-        selected_pair_summary: "Par ICE selecionado: indisponível".to_owned(),
+        selected_pair_summary: "Par ICE selecionado: desconhecido (metadados indisponíveis)"
+            .to_owned(),
         outbound_summary: "RTP de saída: estatísticas ainda indisponíveis".to_owned(),
         inbound_summary: "RTP de entrada: estatísticas ainda indisponíveis".to_owned(),
         ..PeerStatsSnapshot::default()
@@ -2948,8 +3167,8 @@ fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
             snapshot.pair_packets_discarded_on_send = pair.packets_discarded_on_send;
             snapshot.pair_rtt_ms = pair.current_round_trip_time * 1000.0;
             snapshot.selected_pair_summary = format!(
-                "ICE {:?}: local {}/{}/{}:{} ({local_adapter}) -> remoto {}/{}/{}:{}; par {}/{} pacotes e {}/{} bytes; descartados no envio {}; RTT {:.1} ms",
-                route,
+                "ICE {}: local {}/{}/{}:{} ({local_adapter}) -> remoto {}/{}/{}:{}; par {}/{} pacotes e {}/{} bytes; descartados no envio {}; RTT {:.1} ms",
+                media_route_label(route),
                 local
                     .map(|candidate| format!("{:?}", candidate.candidate_type))
                     .unwrap_or_else(|| "?".to_owned()),
@@ -2972,6 +3191,11 @@ fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
                 pair.bytes_received,
                 pair.packets_discarded_on_send,
                 snapshot.pair_rtt_ms,
+            );
+        } else {
+            snapshot.selected_pair_key = selected_pair_id.to_owned();
+            snapshot.selected_pair_summary = format!(
+                "Par ICE selecionado: desconhecido (ID {selected_pair_id}; metadados do par ainda indisponíveis)"
             );
         }
     }
@@ -3012,7 +3236,7 @@ fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
         snapshot.inbound_packets = received.packets_received;
         snapshot.inbound_bytes = inbound.bytes_received;
         snapshot.inbound_packets_lost = received.packets_lost;
-        snapshot.inbound_jitter_ms = received.jitter * 1000.0;
+        snapshot.inbound_jitter_ms = rtp_jitter_ticks_to_ms(received.jitter, 90_000.0);
         snapshot.inbound_frames_received = inbound.frames_received;
         snapshot.inbound_frames_decoded = inbound.frames_decoded;
         snapshot.inbound_frames_rendered = inbound.frames_rendered;
@@ -3054,6 +3278,22 @@ fn media_route_from_candidate_types(
             MediaRoute::Direct
         },
     )
+}
+
+fn media_route_label(route: Option<MediaRoute>) -> &'static str {
+    match route {
+        Some(MediaRoute::Direct) => "Direto (P2P)",
+        Some(MediaRoute::Turn) => "Retransmitido (TURN)",
+        None => "desconhecido",
+    }
+}
+
+fn rtp_jitter_ticks_to_ms(jitter_ticks: f64, clock_rate_hz: f64) -> f64 {
+    if clock_rate_hz.is_finite() && clock_rate_hz > 0.0 && jitter_ticks.is_finite() {
+        jitter_ticks * 1000.0 / clock_rate_hz
+    } else {
+        0.0
+    }
 }
 
 fn adapter_name_for_ip(address: &str) -> String {
@@ -3515,7 +3755,7 @@ fn encode_latest_frames(
     let mut encoder: Option<ActiveH264Encoder> = None;
     let mut hardware_warmup_frames = 0u32;
     let mut forwarding_gate = H264ForwardingGate::default();
-    let mut last_sequence = None;
+    let mut pacer = LatestFramePacer::default();
     let mut next_frame = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
@@ -3540,12 +3780,11 @@ fn encode_latest_frames(
         let Some(frame) = frame else {
             continue;
         };
-        if last_sequence == Some(frame.sequence) {
+        let Some(is_new_capture_frame) = pacer.should_encode(frame.sequence, Instant::now()) else {
             continue;
-        }
-        last_sequence = Some(frame.sequence);
+        };
         validate_encoder_frame(&frame)?;
-        metrics.record_encoder_input_frame();
+        metrics.record_capture_frame_for_encoder(is_new_capture_frame);
         if encoder.is_none() {
             #[cfg(windows)]
             {
@@ -3600,6 +3839,7 @@ fn encode_latest_frames(
         let active = encoder
             .as_mut()
             .expect("codificador inicializado antes de codificar");
+        pacer.record_encoded(frame.sequence, Instant::now());
         let hardware_failure = match active {
             ActiveH264Encoder::OpenH264(cpu) => {
                 let encode_started_at = Instant::now();
@@ -3788,16 +4028,146 @@ mod tests {
     use openh264::formats::YUVSource;
 
     use super::{
-        Encoder, FRAME_DURATION, H264ForwardDecision, H264ForwardingGate, H264FrameKind,
-        KeyframeRequestLimiter, LatestFrame, MediaRoute, PreviewFrame, RtpPacket,
-        RtpSequenceTracker, ScreenShareEvent, ScreenShareSession, annex_b_nal_types,
-        assemble_h264_access_unit, classify_h264_access_unit, encode_frame,
-        media_route_from_candidate_types, peer_stats_snapshot, should_decode_access_unit,
-        should_log_aggregate_error, validate_stun_uri,
+        ActiveH264Decoder, DXVA_FIRST_OUTPUT_WATCHDOG, Encoder, FRAME_DURATION,
+        H264ForwardDecision, H264ForwardingGate, H264FrameKind, KeyframeRequestLimiter,
+        LatestFrame, LatestFramePacer, MediaRoute, PreviewFrame, RtpPacket, RtpSequenceTracker,
+        ScreenShareEvent, ScreenShareSession, annex_b_nal_types, assemble_h264_access_unit,
+        classify_h264_access_unit, dxva_watchdog_expired, encode_frame,
+        media_route_from_candidate_types, media_route_label, peer_stats_snapshot,
+        rtp_jitter_ticks_to_ms, should_decode_access_unit, should_log_aggregate_error,
+        update_cached_idr, validate_stun_uri,
     };
     use bytes::Bytes;
     use rtc::peer_connection::transport::RTCIceCandidateType;
     use rtc::statistics::report::RTCStatsReport;
+
+    #[test]
+    fn frame_pacer_sends_new_frames_at_up_to_30_fps_and_repeats_static_at_1_fps() {
+        let start = Instant::now();
+        let mut pacer = LatestFramePacer::default();
+        assert_eq!(pacer.should_encode(1, start), Some(true));
+        pacer.record_encoded(1, start);
+        assert_eq!(
+            pacer.should_encode(2, start + FRAME_DURATION - Duration::from_nanos(1)),
+            None,
+            "não pode exceder 30 FPS"
+        );
+        assert_eq!(
+            pacer.should_encode(2, start + FRAME_DURATION),
+            Some(true),
+            "o quadro novo deve ser enviado assim que o intervalo permitir"
+        );
+        pacer.record_encoded(2, start + FRAME_DURATION);
+        assert_eq!(
+            pacer.should_encode(2, start + FRAME_DURATION + Duration::from_millis(999)),
+            None
+        );
+        assert_eq!(
+            pacer.should_encode(2, start + FRAME_DURATION + Duration::from_secs(1)),
+            Some(false),
+            "imagem estática deve ser repetida a cada segundo"
+        );
+    }
+
+    #[test]
+    fn cached_idr_keeps_parameter_sets_and_watchdog_expires_after_750ms() {
+        let sps = [0x67, 0x64, 0x00, 0x1f];
+        let pps = [0x68, 0x00];
+        let idr = [0x65, 0x88, 0x84];
+        let mut cached_sps = None;
+        let mut cached_pps = None;
+        assert!(
+            update_cached_idr(
+                &annex_b_access_unit(&[&sps, &pps]),
+                &mut cached_sps,
+                &mut cached_pps,
+            )
+            .is_none()
+        );
+        let cached = update_cached_idr(
+            &annex_b_access_unit(&[&idr]),
+            &mut cached_sps,
+            &mut cached_pps,
+        )
+        .unwrap();
+        assert_eq!(annex_b_nal_types(&cached), [7, 8, 5]);
+
+        let received_at = Instant::now();
+        assert!(!dxva_watchdog_expired(
+            Some(received_at),
+            received_at + DXVA_FIRST_OUTPUT_WATCHDOG - Duration::from_nanos(1)
+        ));
+        assert!(dxva_watchdog_expired(
+            Some(received_at),
+            received_at + DXVA_FIRST_OUTPUT_WATCHDOG
+        ));
+    }
+
+    #[test]
+    fn cpu_fallback_can_publish_the_cached_initial_idr_without_new_network_frames() {
+        let mut encoder = super::openh264_encoder().unwrap();
+        let source = PreviewFrame {
+            sequence: 1,
+            width: 320,
+            height: 240,
+            rgba: (0..320 * 240 * 4)
+                .map(|index| ((index * 17) % 251) as u8)
+                .collect(),
+        };
+        let encoded = encode_frame(&mut encoder, &source).unwrap();
+        let mut cached_sps = None;
+        let mut cached_pps = None;
+        let cached_idr = update_cached_idr(&encoded, &mut cached_sps, &mut cached_pps)
+            .expect("primeiro quadro OpenH264 deve conter SPS/PPS/IDR");
+        let received_at = Instant::now();
+        assert!(dxva_watchdog_expired(
+            Some(received_at),
+            received_at + DXVA_FIRST_OUTPUT_WATCHDOG
+        ));
+
+        let mut waiting_for_idr = true;
+        assert!(should_decode_access_unit(&mut waiting_for_idr, &cached_idr));
+        let mut decoder = ActiveH264Decoder::OpenH264(Decoder::new().unwrap());
+        let remote_frame = Arc::new(Mutex::new(None));
+        let sequence = std::sync::atomic::AtomicU64::new(0);
+        let metrics = super::SharedMetrics::default();
+        let failure = super::decode_h264_access_unit(
+            &cached_idr,
+            &mut decoder,
+            &egui::Context::default(),
+            &remote_frame,
+            &sequence,
+            &metrics,
+        );
+
+        assert!(
+            failure.is_none(),
+            "fallback de CPU deve decodificar o IDR em cache"
+        );
+        let published = remote_frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(published.is_some(), "o IDR em cache deve chegar à prévia");
+        assert_eq!(
+            metrics
+                .decoded_frames
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .published_frames
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn rtp_jitter_ticks_are_converted_to_milliseconds() {
+        assert!((rtp_jitter_ticks_to_ms(317.0, 90_000.0) - 3.522_222_2).abs() < 0.001);
+        assert_eq!(rtp_jitter_ticks_to_ms(10.0, 0.0), 0.0);
+    }
 
     fn annex_b_access_unit(nals: &[&[u8]]) -> Vec<u8> {
         let mut access_unit = Vec::new();
@@ -3901,10 +4271,16 @@ mod tests {
             Some(MediaRoute::Turn)
         );
         assert_eq!(media_route_from_candidate_types(None, None), None);
+        assert_eq!(media_route_label(Some(MediaRoute::Direct)), "Direto (P2P)");
+        assert_eq!(
+            media_route_label(Some(MediaRoute::Turn)),
+            "Retransmitido (TURN)"
+        );
+        assert_eq!(media_route_label(None), "desconhecido");
 
         let unavailable = peer_stats_snapshot(&RTCStatsReport::default());
         assert_eq!(unavailable.route, None);
-        assert!(unavailable.selected_pair_summary.contains("indisponível"));
+        assert!(unavailable.selected_pair_summary.contains("desconhecido"));
     }
 
     #[test]

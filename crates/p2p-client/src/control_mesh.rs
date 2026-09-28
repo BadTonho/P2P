@@ -17,6 +17,8 @@ const PROBE_PERIOD: Duration = Duration::from_secs(1);
 const PROBE_WINDOW: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const HOST_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_LINK_STARTUP_GRACE: Duration = Duration::from_secs(15);
+const EMPTY_ELECTION_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(10);
 const UNSTABLE_LOSS_PERCENT: f32 = 20.0;
 const HEALTHY_LOSS_PERCENT: f32 = 5.0;
@@ -306,6 +308,8 @@ struct MeshState {
     room_code: String,
     roster: Vec<ParticipantInfo>,
     known_since: HashMap<String, Instant>,
+    connected_once: HashSet<String>,
+    link_lost_since: HashMap<String, Instant>,
     leader_id: String,
     leader_address: String,
     epoch: u64,
@@ -319,6 +323,8 @@ struct MeshState {
     leader_last_seen: Instant,
     leader_control_seen: bool,
     last_unstable_notice: Option<Instant>,
+    eligibility_revision: u64,
+    empty_election_retry: Option<(Instant, u64)>,
 }
 
 type SharedState = std::sync::Arc<Mutex<MeshState>>;
@@ -349,6 +355,8 @@ async fn run_mesh(
         room_code,
         roster: Vec::new(),
         known_since: HashMap::new(),
+        connected_once: HashSet::new(),
+        link_lost_since: HashMap::new(),
         leader_id,
         leader_address,
         epoch: 0,
@@ -362,6 +370,8 @@ async fn run_mesh(
         leader_last_seen: Instant::now(),
         leader_control_seen: leader_is_local,
         last_unstable_notice: None,
+        eligibility_revision: 0,
+        empty_election_retry: None,
     }));
     let _ = events.send(ControlEvent::Ready);
     tracing::info!("Listener da malha de controle pronto");
@@ -392,10 +402,21 @@ async fn run_mesh(
                             state.local = local.clone();
                         }
                         let known_ids = participants.iter().map(|participant| participant.id.as_str()).collect::<HashSet<_>>();
+                        let roster_changed = participants.len() != state.roster.len()
+                            || participants.iter().zip(&state.roster).any(|(new, old)| {
+                                new.id != old.id
+                                    || new.may_host != old.may_host
+                                    || new.control_address != old.control_address
+                            });
+                        if roster_changed {
+                            state.eligibility_revision = state.eligibility_revision.wrapping_add(1);
+                        }
                         for participant in &participants {
                             state.known_since.entry(participant.id.clone()).or_insert_with(Instant::now);
                         }
                         state.known_since.retain(|id, _| known_ids.contains(id.as_str()));
+                        state.connected_once.retain(|id| known_ids.contains(id.as_str()));
+                        state.link_lost_since.retain(|id, _| known_ids.contains(id.as_str()));
                         state.links.retain(|id, _| known_ids.contains(id.as_str()));
                         state.remote_status.retain(|id, _| known_ids.contains(id.as_str()));
                         tracing::info!(participants = participants.len(), leader_address = %leader_address, "Lista da sala sincronizada na malha de controle");
@@ -576,6 +597,8 @@ where
             state.roster.push(remote.clone());
         }
         state.connecting.remove(&remote.id);
+        state.connected_once.insert(remote.id.clone());
+        state.link_lost_since.remove(&remote.id);
         state.links.insert(
             remote.id.clone(),
             PeerLink {
@@ -607,6 +630,13 @@ where
                             if participant_id == state.leader_id {
                                 state.leader_last_seen = now;
                                 state.leader_control_seen = true;
+                            }
+                            let eligibility_changed = state
+                                .remote_status
+                                .get(&participant_id)
+                                .is_none_or(|(_, previous, _)| *previous != eligible);
+                            if eligibility_changed {
+                                state.eligibility_revision = state.eligibility_revision.wrapping_add(1);
                             }
                             state.remote_status.insert(participant_id, (metrics, eligible, now));
                             if epoch > state.epoch || (epoch == state.epoch && canonical_precedes(&state, &leader_id)) {
@@ -721,7 +751,12 @@ where
     }
     let mut state = state.lock().await;
     state.links.remove(&remote.id);
-    state.remote_status.remove(&remote.id);
+    state
+        .link_lost_since
+        .insert(remote.id.clone(), Instant::now());
+    if state.remote_status.remove(&remote.id).is_some() {
+        state.eligibility_revision = state.eligibility_revision.wrapping_add(1);
+    }
     Ok(())
 }
 
@@ -976,10 +1011,7 @@ fn own_worst_metrics(state: &mut MeshState, now: Instant) -> Metrics {
             && !(ignore_timed_out_leader && participant.id == state.leader_id)
     }) {
         if !state.links.contains_key(&participant.id)
-            && state
-                .known_since
-                .get(&participant.id)
-                .is_some_and(|since| now.duration_since(*since) >= HOST_TIMEOUT)
+            && control_link_timeout_elapsed(state, &participant.id, now)
         {
             metrics.push(Metrics {
                 loss_percent: 100.0,
@@ -998,6 +1030,21 @@ fn own_worst_metrics(state: &mut MeshState, now: Instant) -> Metrics {
         samples: 0,
         consecutive_losses: 0,
     })
+}
+
+fn control_link_timeout_elapsed(state: &MeshState, participant_id: &str, now: Instant) -> bool {
+    if state.connected_once.contains(participant_id) {
+        state
+            .link_lost_since
+            .get(participant_id)
+            .or_else(|| state.known_since.get(participant_id))
+            .is_some_and(|since| now.duration_since(*since) >= HOST_TIMEOUT)
+    } else {
+        state
+            .known_since
+            .get(participant_id)
+            .is_some_and(|since| now.duration_since(*since) >= CONTROL_LINK_STARTUP_GRACE)
+    }
 }
 
 fn compare_queue_entries(left: &QueueEntry, right: &QueueEntry) -> std::cmp::Ordering {
@@ -1024,12 +1071,22 @@ async fn initiate_election(
     end_if_no_candidate: bool,
     departing_id: Option<String>,
 ) {
-    let (epoch, candidates, leader_id, departing_id) = {
+    let (epoch, candidates, leader_id, departing_id, election_revision) = {
         let mut state = state.lock().await;
         if state.election.is_some() {
             return;
         }
         let now = Instant::now();
+        if !orderly
+            && state
+                .empty_election_retry
+                .is_some_and(|(last_attempt, revision)| {
+                    revision == state.eligibility_revision
+                        && now.duration_since(last_attempt) < EMPTY_ELECTION_RETRY_INTERVAL
+                })
+        {
+            return;
+        }
         let own = own_worst_metrics(&mut state, now);
         let local_eligible = state.local.may_host
             && !state.local.control_address.is_empty()
@@ -1080,6 +1137,9 @@ async fn initiate_election(
             .into_iter()
             .map(|entry| entry.participant.id)
             .collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            state.empty_election_retry = None;
+        }
         let epoch = state.epoch.saturating_add(1);
         state.epoch = epoch;
         state.election = Some(Election {
@@ -1089,7 +1149,13 @@ async fn initiate_election(
             deadline: now + CANDIDATE_TIMEOUT,
             departing_id: departing_id.clone(),
         });
-        (epoch, candidates, state.leader_id.clone(), departing_id)
+        (
+            epoch,
+            candidates,
+            state.leader_id.clone(),
+            departing_id,
+            state.eligibility_revision,
+        )
     };
     if orderly {
         broadcast(
@@ -1108,7 +1174,12 @@ async fn initiate_election(
         "Eleição de anfitrião iniciada"
     );
     if candidates.is_empty() {
-        state.lock().await.election = None;
+        let mut mesh = state.lock().await;
+        mesh.election = None;
+        if !orderly {
+            mesh.empty_election_retry = Some((Instant::now(), election_revision));
+        }
+        drop(mesh);
         if end_if_no_candidate {
             tracing::error!(
                 epoch,
@@ -1339,9 +1410,10 @@ fn canonical_precedes(state: &MeshState, incoming_leader_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlEvent, ControlMesh, Election, HOST_TIMEOUT, MeshState, Metrics, PeerLink, PeerStats,
-        Probe, QueueEntry, compare_queue_entries, fail_current_candidate, initiate_election,
-        own_worst_metrics,
+        CONTROL_LINK_STARTUP_GRACE, ControlEvent, ControlMesh, EMPTY_ELECTION_RETRY_INTERVAL,
+        Election, HOST_TIMEOUT, MeshState, Metrics, PeerLink, PeerStats, Probe, QueueEntry,
+        compare_queue_entries, control_link_timeout_elapsed, fail_current_candidate,
+        initiate_election, own_worst_metrics,
     };
     use signaling_protocol::ParticipantInfo;
     use std::collections::{HashMap, HashSet, VecDeque};
@@ -1429,6 +1501,8 @@ mod tests {
             room_code: "SAMECODE".to_owned(),
             roster,
             known_since: HashMap::new(),
+            connected_once: HashSet::new(),
+            link_lost_since: HashMap::new(),
             leader_id: host.id,
             leader_address: "ws://192.168.1.1:9000".to_owned(),
             epoch: 0,
@@ -1449,6 +1523,8 @@ mod tests {
             leader_last_seen: now,
             leader_control_seen: true,
             last_unstable_notice: None,
+            eligibility_revision: 0,
+            empty_election_retry: None,
         }
     }
 
@@ -1499,6 +1575,40 @@ mod tests {
 
         assert!(metrics.loss_percent < 20.0);
         assert!(metrics.consecutive_losses < 5);
+    }
+
+    #[test]
+    fn first_control_link_has_fifteen_second_grace_but_reconnected_links_keep_five_second_timeout()
+    {
+        let now = Instant::now();
+        let local = participant("local", 2, true);
+        let remote = participant("remote", 3, true);
+        let mut state = test_state(local, false);
+        state.roster.push(remote.clone());
+        state.known_since.insert(remote.id.clone(), now);
+        assert!(!control_link_timeout_elapsed(
+            &state,
+            &remote.id,
+            now + HOST_TIMEOUT
+        ));
+        assert!(control_link_timeout_elapsed(
+            &state,
+            &remote.id,
+            now + CONTROL_LINK_STARTUP_GRACE
+        ));
+
+        state.connected_once.insert(remote.id.clone());
+        state.link_lost_since.insert(remote.id.clone(), now);
+        assert!(!control_link_timeout_elapsed(
+            &state,
+            &remote.id,
+            now + HOST_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(control_link_timeout_elapsed(
+            &state,
+            &remote.id,
+            now + HOST_TIMEOUT
+        ));
     }
 
     #[test]
@@ -1583,6 +1693,51 @@ mod tests {
             event_rx.try_recv().unwrap(),
             ControlEvent::RoomEnded
         ));
+    }
+
+    #[tokio::test]
+    async fn empty_election_is_suppressed_until_eligibility_changes_or_ten_seconds_pass() {
+        let local = participant("local", 2, false);
+        let state = Arc::new(Mutex::new(test_state(local, false)));
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+
+        initiate_election(&state, &event_tx, false, false, None).await;
+        let first_epoch = state.lock().await.epoch;
+        initiate_election(&state, &event_tx, false, false, None).await;
+        assert_eq!(state.lock().await.epoch, first_epoch);
+
+        {
+            let mut state = state.lock().await;
+            state.eligibility_revision = state.eligibility_revision.wrapping_add(1);
+        }
+        initiate_election(&state, &event_tx, false, false, None).await;
+        assert!(state.lock().await.epoch > first_epoch);
+
+        {
+            let mut state = state.lock().await;
+            state.empty_election_retry = Some((
+                Instant::now() - EMPTY_ELECTION_RETRY_INTERVAL,
+                state.eligibility_revision,
+            ));
+        }
+        let before_safety_retry = state.lock().await.epoch;
+        initiate_election(&state, &event_tx, false, false, None).await;
+        assert!(state.lock().await.epoch > before_safety_retry);
+
+        let ending_state = Arc::new(Mutex::new(test_state(
+            participant("ending", 2, false),
+            false,
+        )));
+        let (ending_events_tx, ending_events_rx) = std::sync::mpsc::channel();
+        initiate_election(&ending_state, &ending_events_tx, false, true, None).await;
+        assert!(matches!(
+            ending_events_rx.try_recv().unwrap(),
+            ControlEvent::RoomEnded
+        ));
+        let ended_epoch = ending_state.lock().await.epoch;
+        initiate_election(&ending_state, &ending_events_tx, false, true, None).await;
+        assert_eq!(ending_state.lock().await.epoch, ended_epoch);
+        assert!(ending_events_rx.try_recv().is_err());
     }
 
     #[test]

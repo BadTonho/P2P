@@ -1808,6 +1808,8 @@ impl ClientUi {
                     capture_skipped = capture_performance.skipped_frames,
                     capture_readback_avg_ms = average_ms(capture_performance.readback_nanos, capture_performance.processed_frames),
                     capture_resize_avg_ms = average_ms(capture_performance.resize_nanos, capture_performance.processed_frames),
+                    encoder_new_capture_frames = performance.new_capture_frames,
+                    encoder_repeated_capture_frames = performance.repeated_capture_frames,
                     encoder_input_frames = performance.encoder_input_frames,
                     encode_fps = performance.encoded_frames as f64 / interval_seconds,
                     encoded_frames = performance.encoded_frames,
