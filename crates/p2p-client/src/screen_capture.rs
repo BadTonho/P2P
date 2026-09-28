@@ -191,6 +191,7 @@ struct DxgiCaptureWorker {
 pub struct PendingScreenCapture {
     result: Receiver<PickResult>,
     picker_owner: Option<PickerThreadOwner>,
+    preview_enabled: Arc<AtomicBool>,
 }
 
 struct PickerThreadOwner {
@@ -205,7 +206,7 @@ struct PickerSelection {
 }
 
 impl PendingScreenCapture {
-    pub fn begin() -> Result<Self, String> {
+    pub fn begin(preview_enabled: Arc<AtomicBool>) -> Result<Self, String> {
         let (result_tx, result) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         // windows-capture initializes WinRT in MTA mode; the eframe UI thread may use another mode.
@@ -252,6 +253,7 @@ impl PendingScreenCapture {
                 release: Some(release_tx),
                 thread: Some(picker_thread),
             }),
+            preview_enabled,
         })
     }
 
@@ -274,8 +276,12 @@ impl PendingScreenCapture {
                     return Some(Err("Os recursos do seletor já foram liberados.".to_owned()));
                 };
                 Some(
-                    ScreenCapture::start_selected(PickerSelection { item, size, owner }, context)
-                        .map(Some),
+                    ScreenCapture::start_selected(
+                        PickerSelection { item, size, owner },
+                        context,
+                        Arc::clone(&self.preview_enabled),
+                    )
+                    .map(Some),
                 )
             }
             Ok(None) => {
@@ -337,7 +343,11 @@ impl ScreenCapture {
             .collect()
     }
 
-    pub fn start_monitor(index: usize, context: egui::Context) -> Result<Self, String> {
+    pub fn start_monitor(
+        index: usize,
+        context: egui::Context,
+        preview_enabled: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
         let monitor = Monitor::from_index(index + 1).map_err(|error| {
             format!("NÃ£o foi possÃ­vel localizar o monitor selecionado: {error}")
         })?;
@@ -350,6 +360,7 @@ impl ScreenCapture {
         let worker_frame = latest_frame.clone();
         let worker_performance = Arc::clone(&performance);
         let worker_fallback_reason = Arc::clone(&fallback_reason);
+        let worker_preview_enabled = Arc::clone(&preview_enabled);
         let thread = thread::Builder::new()
             .name("dxgi-monitor-capture".to_owned())
             .spawn(move || {
@@ -360,6 +371,7 @@ impl ScreenCapture {
                     worker_performance,
                     worker_fallback_reason,
                     worker_stop,
+                    worker_preview_enabled,
                 )
             })
             .map_err(|error| format!("NÃ£o foi possÃ­vel iniciar a thread DXGI: {error}"))?;
@@ -383,7 +395,11 @@ impl ScreenCapture {
         })
     }
 
-    fn start_selected(selected: PickerSelection, context: egui::Context) -> Result<Self, String> {
+    fn start_selected(
+        selected: PickerSelection,
+        context: egui::Context,
+        preview_enabled: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
         let size = selected.size;
         if size.0 <= 0 || size.1 <= 0 {
             tracing::error!(
@@ -411,6 +427,7 @@ impl ScreenCapture {
                 latest_frame: latest_frame.clone(),
                 performance: Arc::clone(&performance),
                 source_closed: Arc::clone(&source_closed),
+                preview_enabled,
             },
         );
         let control = ScreenFrameHandler::start_free_threaded(settings).map_err(|error| {
@@ -529,6 +546,7 @@ struct HandlerFlags {
     latest_frame: LatestFrame,
     performance: Arc<CapturePerformanceCounters>,
     source_closed: Arc<AtomicBool>,
+    preview_enabled: Arc<AtomicBool>,
 }
 
 // windows-capture's picker wrapper owns an HWND guard and is therefore not Send.
@@ -551,6 +569,7 @@ struct ScreenFrameHandler {
     latest_frame: LatestFrame,
     performance: Arc<CapturePerformanceCounters>,
     source_closed: Arc<AtomicBool>,
+    preview_enabled: Arc<AtomicBool>,
     scratch: Vec<u8>,
     sequence: u64,
     frame_rate_limiter: FrameRateLimiter,
@@ -589,6 +608,7 @@ fn capture_dxgi_monitor(
     performance: Arc<CapturePerformanceCounters>,
     fallback_reason: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
+    preview_enabled: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let mut duplication = DxgiDuplicationApi::new_options(monitor, &[DxgiDuplicationFormat::Bgra8])
         .map_err(|error| format!("DXGI Desktop Duplication nÃ£o iniciou: {error}"))?;
@@ -691,6 +711,7 @@ fn capture_dxgi_monitor(
             None => None,
         };
         let next_sequence = sequence.wrapping_add(1);
+        let wants_preview = preview_enabled.load(Ordering::Relaxed);
         let mut readback_nanos = 0;
         let mut resize_nanos = 0;
         let (preview_rgba, cpu_nv12) = if let Some(surface) = gpu_surface.as_ref() {
@@ -698,48 +719,58 @@ fn capture_dxgi_monitor(
             match surface.readback_nv12() {
                 Ok((nv12, stride)) => {
                     readback_nanos += started_at.elapsed().as_nanos() as u64;
-                    let started_at = Instant::now();
-                    match surface.to_rgba(&nv12, stride) {
-                        Ok(rgba) => {
-                            resize_nanos += started_at.elapsed().as_nanos() as u64;
-                            gpu_preview_fallback_logged = false;
-                            let mut reason = fallback_reason
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if reason
-                                .as_deref()
-                                .is_some_and(|value| value.starts_with("Prévia GPU:"))
-                            {
-                                *reason = None;
+                    let cpu_nv12 = Some(Arc::new(CpuNv12Frame {
+                        bytes: Arc::new(nv12),
+                        stride,
+                    }));
+                    if wants_preview {
+                        let started_at = Instant::now();
+                        match surface.to_rgba(
+                            &cpu_nv12.as_ref().expect("NV12 frame was created").bytes,
+                            stride,
+                        ) {
+                            Ok(rgba) => {
+                                resize_nanos += started_at.elapsed().as_nanos() as u64;
+                                gpu_preview_fallback_logged = false;
+                                let mut reason = fallback_reason
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if reason
+                                    .as_deref()
+                                    .is_some_and(|value| value.starts_with("Prévia GPU:"))
+                                {
+                                    *reason = None;
+                                }
+                                (Some(rgba), cpu_nv12)
                             }
-                            (
-                                Some(rgba),
-                                Some(Arc::new(CpuNv12Frame {
-                                    bytes: Arc::new(nv12),
-                                    stride,
-                                })),
-                            )
-                        }
-                        Err(error) => {
-                            resize_nanos += started_at.elapsed().as_nanos() as u64;
-                            if !gpu_preview_fallback_logged {
-                                tracing::warn!(error = %error, "Falha ao converter a prévia NV12; usando cópia BGRA do DXGI");
-                                gpu_preview_fallback_logged = true;
+                            Err(error) => {
+                                resize_nanos += started_at.elapsed().as_nanos() as u64;
+                                if !gpu_preview_fallback_logged {
+                                    tracing::warn!(error = %error, "Falha ao converter a prévia NV12; usando cópia BGRA do DXGI");
+                                    gpu_preview_fallback_logged = true;
+                                }
+                                *fallback_reason
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+                                    format!(
+                                        "Prévia GPU: falha na conversão para a imagem local: {error}"
+                                    ),
+                                );
+                                (None, cpu_nv12)
                             }
-                            *fallback_reason
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(format!(
-                                    "Prévia GPU: falha na conversão para a imagem local: {error}"
-                                ));
-                            (
-                                None,
-                                Some(Arc::new(CpuNv12Frame {
-                                    bytes: Arc::new(nv12),
-                                    stride,
-                                })),
-                            )
                         }
+                    } else {
+                        gpu_preview_fallback_logged = false;
+                        let mut reason = fallback_reason
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if reason
+                            .as_deref()
+                            .is_some_and(|value| value.starts_with("Prévia GPU:"))
+                        {
+                            *reason = None;
+                        }
+                        (None, cpu_nv12)
                     }
                 }
                 Err(error) => {
@@ -761,6 +792,7 @@ fn capture_dxgi_monitor(
         };
         let rgba = match preview_rgba {
             Some(rgba) => rgba,
+            None if !wants_preview && cpu_nv12.is_some() => Vec::new(),
             None => {
                 let started_at = Instant::now();
                 let buffer = frame.buffer().map_err(|error| {
@@ -843,6 +875,7 @@ impl GraphicsCaptureApiHandler for ScreenFrameHandler {
             latest_frame: context.flags.latest_frame,
             performance: context.flags.performance,
             source_closed: context.flags.source_closed,
+            preview_enabled: context.flags.preview_enabled,
             scratch: Vec::new(),
             sequence: 0,
             frame_rate_limiter: FrameRateLimiter::default(),
@@ -895,7 +928,9 @@ impl GraphicsCaptureApiHandler for ScreenFrameHandler {
         self.performance
             .processed_frames
             .fetch_add(1, Ordering::Relaxed);
-        self.context.request_repaint();
+        if self.preview_enabled.load(Ordering::Relaxed) {
+            self.context.request_repaint();
+        }
         Ok(())
     }
 
@@ -937,9 +972,19 @@ fn downsample_rgba(bytes: &[u8], width: u32, height: u32, sequence: u64) -> Prev
 
 fn same_preview_pixels(previous: Option<&PreviewFrame>, candidate: &PreviewFrame) -> bool {
     previous.is_some_and(|previous| {
-        previous.width == candidate.width
-            && previous.height == candidate.height
-            && previous.rgba == candidate.rgba
+        if previous.width != candidate.width || previous.height != candidate.height {
+            return false;
+        }
+        if !previous.rgba.is_empty() || !candidate.rgba.is_empty() {
+            return previous.rgba == candidate.rgba;
+        }
+        #[cfg(windows)]
+        if let (Some(previous), Some(candidate)) =
+            (previous.cpu_nv12.as_ref(), candidate.cpu_nv12.as_ref())
+        {
+            return previous.stride == candidate.stride && previous.bytes == candidate.bytes;
+        }
+        false
     })
 }
 
@@ -1060,5 +1105,39 @@ mod tests {
         assert!(same_preview_pixels(Some(&first), &identical));
         assert!(!same_preview_pixels(Some(&first), &changed));
         assert!(!same_preview_pixels(None, &first));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hidden_preview_uses_nv12_to_detect_static_dxgi_frames() {
+        use std::sync::Arc;
+
+        use super::CpuNv12Frame;
+
+        let first = PreviewFrame {
+            sequence: 1,
+            width: 2,
+            height: 2,
+            rgba: Vec::new(),
+            gpu_nv12: None,
+            cpu_nv12: Some(Arc::new(CpuNv12Frame {
+                bytes: Arc::new(vec![16, 16, 16, 16, 128, 128]),
+                stride: 2,
+            })),
+        };
+        let identical = PreviewFrame {
+            sequence: 2,
+            ..first.clone()
+        };
+        let changed = PreviewFrame {
+            cpu_nv12: Some(Arc::new(CpuNv12Frame {
+                bytes: Arc::new(vec![32, 16, 16, 16, 128, 128]),
+                stride: 2,
+            })),
+            ..identical.clone()
+        };
+
+        assert!(same_preview_pixels(Some(&first), &identical));
+        assert!(!same_preview_pixels(Some(&first), &changed));
     }
 }

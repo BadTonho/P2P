@@ -1443,6 +1443,14 @@ mod windows_backend {
         Ok(rgba)
     }
 
+    pub(crate) fn cpu_nv12_to_rgba(
+        frame: &CpuNv12Frame,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, String> {
+        nv12_to_rgba(&frame.bytes, width as usize, height as usize, frame.stride)
+    }
+
     fn clamp_color(value: i32) -> u8 {
         value.clamp(0, 255) as u8
     }
@@ -1642,7 +1650,8 @@ mod windows_backend {
 
 #[cfg(windows)]
 pub(crate) use windows_backend::{
-    GpuNv12Processor, GpuNv12Surface, HardwareDecoder, HardwareEncoder, sps_dimensions,
+    GpuNv12Processor, GpuNv12Surface, HardwareDecoder, HardwareEncoder, cpu_nv12_to_rgba,
+    sps_dimensions,
 };
 
 #[cfg(not(windows))]

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -4480,8 +4481,13 @@ fn validate_encoder_frame(frame: &PreviewFrame) -> Result<(), String> {
         .checked_mul(frame.height as usize)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| "O tamanho do quadro da tela é inválido.".to_owned())?;
-    if frame.rgba.len() != expected_len {
-        return Err("O quadro da tela tem um tamanho de imagem inválido.".to_owned());
+    let rgba_is_valid = frame.rgba.len() == expected_len;
+    #[cfg(windows)]
+    let cpu_encoder_input_available = frame.cpu_nv12.is_some();
+    #[cfg(not(windows))]
+    let cpu_encoder_input_available = false;
+    if !rgba_is_valid && !cpu_encoder_input_available {
+        return Err("O quadro da tela não contém uma entrada válida para o encoder.".to_owned());
     }
     Ok(())
 }
@@ -4489,7 +4495,30 @@ fn validate_encoder_frame(frame: &PreviewFrame) -> Result<(), String> {
 fn encode_frame(encoder: &mut Encoder, frame: &PreviewFrame) -> Result<Vec<u8>, String> {
     validate_encoder_frame(frame)?;
 
-    let rgba = RgbaSliceU8::new(&frame.rgba, (frame.width as usize, frame.height as usize));
+    let expected_len = frame.width as usize * frame.height as usize * 4;
+    let rgba_bytes: Cow<'_, [u8]> = if frame.rgba.len() == expected_len {
+        Cow::Borrowed(&frame.rgba)
+    } else {
+        #[cfg(windows)]
+        {
+            let input = frame.cpu_nv12.as_deref().ok_or_else(|| {
+                "O quadro sem prévia não contém entrada NV12 para OpenH264.".to_owned()
+            })?;
+            Cow::Owned(mf_video::cpu_nv12_to_rgba(
+                input,
+                frame.width,
+                frame.height,
+            )?)
+        }
+        #[cfg(not(windows))]
+        {
+            return Err("O quadro da tela tem um tamanho de imagem inválido.".to_owned());
+        }
+    };
+    let rgba = RgbaSliceU8::new(
+        rgba_bytes.as_ref(),
+        (frame.width as usize, frame.height as usize),
+    );
     let yuv = YUVBuffer::from_rgba8_source(rgba);
     encoder
         .encode(&yuv)
@@ -5204,6 +5233,34 @@ mod tests {
         assert!(decoded.is_some());
         let (width, height) = decoded.unwrap().dimensions();
         assert_eq!((width, height), (320, 240));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cpu_encoder_fallback_builds_rgba_from_nv12_without_local_preview() {
+        let width = 320u32;
+        let height = 240u32;
+        let y_plane_len = width as usize * height as usize;
+        let mut nv12 = vec![16; y_plane_len];
+        nv12.resize(y_plane_len + y_plane_len / 2, 128);
+        let frame = PreviewFrame {
+            sequence: 1,
+            width,
+            height,
+            rgba: Vec::new(),
+            gpu_nv12: None,
+            cpu_nv12: Some(Arc::new(crate::screen_capture::CpuNv12Frame {
+                bytes: Arc::new(nv12),
+                stride: width as usize,
+            })),
+        };
+
+        let mut encoder = Encoder::new().unwrap();
+        let encoded = encode_frame(&mut encoder, &frame).unwrap();
+        assert!(!encoded.is_empty());
+        let mut decoder = Decoder::new().unwrap();
+        let decoded = decoder.decode(&encoded).unwrap().unwrap();
+        assert_eq!(decoded.dimensions(), (width as usize, height as usize));
     }
 
     #[test]

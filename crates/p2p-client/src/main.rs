@@ -12,6 +12,10 @@ mod turn_relay;
 mod update;
 
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use audio_capture::MicrophoneTest;
@@ -121,6 +125,8 @@ struct ClientUi {
     selected_monitor: usize,
     dxgi_capture_error: Option<String>,
     screen_texture: Option<egui::TextureHandle>,
+    show_local_preview: bool,
+    capture_preview_enabled: Arc<AtomicBool>,
     screen_status: Option<String>,
     screen_pipeline_summary: String,
     screen_share_session: Option<ScreenShareSession>,
@@ -303,6 +309,7 @@ impl ClientUi {
         settings.stun_server_url = self.stun_server_url.clone();
         settings.monitor_gain_db = self.monitor_gain_db;
         settings.video_decoder_preference = self.video_decoder_preference;
+        settings.show_local_preview = self.show_local_preview;
         settings.create_room_mode = self.create_room_mode;
         settings.use_turn_on_create = self.use_turn_on_create;
         settings.may_host = self.may_host;
@@ -315,6 +322,9 @@ impl ClientUi {
         self.stun_server_url = preferences.stun_server_url;
         self.monitor_gain_db = preferences.monitor_gain_db;
         self.video_decoder_preference = preferences.video_decoder_preference;
+        self.show_local_preview = preferences.show_local_preview;
+        self.capture_preview_enabled
+            .store(self.show_local_preview, Ordering::Relaxed);
         self.create_room_mode = preferences.create_room_mode;
         self.use_turn_on_create = preferences.use_turn_on_create;
         self.may_host = preferences.may_host;
@@ -342,7 +352,9 @@ impl ClientUi {
         let context = ui.ctx().clone();
         let preferences_before_frame = self.preferences_snapshot();
         if self.microphone.is_some()
-            || self.screen_capture.is_some()
+            || (self.screen_capture.is_some()
+                && self.show_local_preview
+                && matches!(&self.screen_share_role, ScreenShareRole::Sending { .. }))
             || self.screen_picker.is_some()
             || self.screen_share_session.is_some()
             || self.connecting
@@ -357,114 +369,133 @@ impl ClientUi {
                     | UpdateStatus::Applying
             )
         {
-            ui.ctx().request_repaint_after(Duration::from_millis(100));
+            context.request_repaint_after(Duration::from_millis(100));
         }
         self.refresh_microphone();
         self.refresh_monitors();
-        self.refresh_screen(ui.ctx());
-        self.refresh_signaling(ui.ctx());
+        self.refresh_screen(&context);
+        self.refresh_signaling(&context);
         self.refresh_turn_state();
-        self.refresh_screen_share(ui.ctx());
-        self.refresh_control_mesh(ui.ctx());
-        self.refresh_updates(ui.ctx());
-        self.handle_window_close(ui.ctx());
+        self.refresh_screen_share(&context);
+        self.refresh_control_mesh(&context);
+        self.refresh_updates(&context);
+        self.handle_window_close(&context);
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let mut open_settings = false;
-            let mut open_update_settings = false;
-            let mut close_settings = false;
-            let mut export_logs = false;
-            let mut open_logs_directory = false;
-            let settings_open = self.settings_open;
-
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.add_space(16.0);
-                    ui.heading("P2P - Voz e tela");
-                    ui.label("Salas locais ou teste pela internet; compartilhamento de tela P2P, sem áudio");
-                });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    export_logs = ui.button("Exportar logs").clicked();
-                    if settings_open {
-                        close_settings = ui.button("Voltar").clicked();
-                    } else {
-                        open_settings = ui
-                            .add_enabled(
-                                self.screen_picker.is_none(),
-                                egui::Button::new("Configurações"),
-                            )
-                            .clicked();
-                    }
+        let mut open_settings = false;
+        let mut close_settings = false;
+        let mut export_logs = false;
+        egui::Panel::top("app-header")
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)))
+            .show(ui, |ui| {
+                Self::apply_monochrome_style(ui);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.heading("P2P - Voz e tela");
+                        ui.label(
+                            "Salas locais ou teste pela internet; compartilhamento de tela P2P, sem áudio",
+                        );
+                    });
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            export_logs = ui.button("Exportar logs").clicked();
+                            if self.settings_open {
+                                close_settings = ui.button("Voltar").clicked();
+                            } else {
+                                open_settings = ui
+                                    .add_enabled(
+                                        self.screen_picker.is_none(),
+                                        egui::Button::new("Configurações"),
+                                    )
+                                    .clicked();
+                            }
+                        },
+                    );
                 });
             });
 
-            if export_logs {
-                self.export_logs();
-            }
+        if export_logs {
+            self.export_logs();
+        }
+        if open_settings {
+            self.open_settings();
+        } else if close_settings {
+            self.close_settings();
+        }
 
-            if let Some(error) = self.logging.take_write_error() {
-                self.logging.export_message = Some(format!(
-                    "Falha ao gravar logs: {error}. Confira a pasta de logs abaixo."
-                ));
-            }
-            if let Some(message) = &self.logging.startup_message {
-                Self::show_notice(ui, "Aviso:", message);
-            }
-            if let Some(message) = &self.logging.export_message {
-                Self::show_notice(ui, "Logs:", message);
-            }
-            if let Some(message) = self.settings_error.clone() {
-                Self::show_notice(ui, "Preferências:", &message);
-                if ui.button("Tentar salvar preferências").clicked() {
-                    self.save_preferences();
-                }
-            }
-
-            let update_notice = match &self.update_status {
-                UpdateStatus::Available(manifest) => Some(format!(
-                    "A versão {} está disponível.",
-                    manifest.version
-                )),
-                UpdateStatus::Downloaded { manifest, .. } => Some(format!(
-                    "A versão {} foi baixada; reinicie para aplicar.",
-                    manifest.version
-                )),
-                _ => None,
-            };
-            if let Some(notice) = update_notice {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(notice).strong());
-                    if ui.button("Ver atualização").clicked() {
-                        open_update_settings = true;
-                    }
+        if self.room_code.is_some() && !self.settings_open {
+            egui::Panel::bottom("room-controls")
+                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)))
+                .show(ui, |ui| {
+                    Self::apply_monochrome_style(ui);
+                    self.show_room_toolbar(ui);
                 });
-            }
+        }
 
-            ui.add_space(20.0);
+        let mut open_update_settings = false;
+        let mut open_logs_directory = false;
+        egui::CentralPanel::default().show(ui, |ui| {
+            Self::apply_monochrome_style(ui);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if let Some(error) = self.logging.take_write_error() {
+                    self.logging.export_message = Some(format!(
+                        "Falha ao gravar logs: {error}. Confira a pasta de logs em Diagnóstico."
+                    ));
+                }
+                if let Some(message) = &self.logging.startup_message {
+                    Self::show_notice(ui, "Aviso:", message);
+                }
+                if let Some(message) = &self.logging.export_message {
+                    Self::show_notice(ui, "Logs:", message);
+                }
+                if let Some(message) = self.settings_error.clone() {
+                    Self::show_notice(ui, "Preferências:", &message);
+                    if ui.button("Tentar salvar preferências").clicked() {
+                        self.save_preferences();
+                    }
+                }
 
-            if open_update_settings {
-                self.open_settings();
-                self.settings_category = SettingsCategory::Updates;
-            } else if open_settings {
-                self.open_settings();
-            } else if close_settings {
-                self.close_settings();
-            }
+                let update_notice = match &self.update_status {
+                    UpdateStatus::Available(manifest) => {
+                        Some(format!("A versão {} está disponível.", manifest.version))
+                    }
+                    UpdateStatus::Downloaded { manifest, .. } => Some(format!(
+                        "A versão {} foi baixada; reinicie para aplicar.",
+                        manifest.version
+                    )),
+                    _ => None,
+                };
+                if let Some(notice) = update_notice {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(notice).strong());
+                        if ui.button("Ver atualização").clicked() {
+                            open_update_settings = true;
+                        }
+                    });
+                }
+                ui.add_space(12.0);
 
-            if self.settings_open {
-                self.show_settings(ui);
-            } else if self.room_code.is_some() {
-                self.show_room(ui);
-            } else {
-                self.show_home(ui);
-            }
-            self.show_handoff_panel(ui, &context);
-            self.show_diagnostics(ui, &mut open_logs_directory);
-            if open_logs_directory {
-                self.open_logs_directory();
-            }
+                if open_update_settings {
+                    self.open_settings();
+                    self.settings_category = SettingsCategory::Updates;
+                }
+                if !self.settings_open && self.room_code.is_some() {
+                    self.show_handoff_panel(ui, &context);
+                }
+                if self.settings_open {
+                    self.show_settings(ui);
+                } else if self.room_code.is_some() {
+                    self.show_room(ui);
+                } else {
+                    self.show_home(ui);
+                }
+
+                self.show_diagnostics(ui, &mut open_logs_directory);
+            });
         });
+        if open_logs_directory {
+            self.open_logs_directory();
+        }
 
         if self.preferences_snapshot() != preferences_before_frame {
             self.settings_dirty = true;
@@ -812,91 +843,175 @@ impl ClientUi {
     }
 
     fn show_room(&mut self, ui: &mut egui::Ui) {
-        let code = self.room_code.clone().unwrap_or_default();
+        let mut participants = self.participants.clone();
+        participants.sort_by_key(|participant| participant.order);
 
-        ui.group(|ui| {
+        ui.horizontal(|ui| {
             ui.heading("Sala");
-            ui.horizontal(|ui| {
-                ui.label(format!("Código: {code}"));
-                if ui.button("Copiar código").clicked() {
-                    ui.ctx().copy_text(code.clone());
-                    self.code_copied = true;
-                }
-            });
-
-            if self.code_copied {
-                ui.label("Código copiado para a área de transferência.");
-            }
-
-            ui.label(
-                self.connection_status
-                    .as_deref()
-                    .unwrap_or("Conectado ao servidor."),
-            );
-            if let Some(error) = &self.connection_error {
-                Self::show_notice(ui, "Erro de conexão:", error);
-            }
-            if !self.participants.is_empty() {
-                ui.separator();
-                ui.heading(if self.room_mode == RoomMode::InternetTest {
-                    "Participantes da sala de teste"
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(if self.peer_connected {
+                    "Conectado"
                 } else {
-                    "Participantes e fila de sucessão"
+                    "Aguardando participante"
                 });
-                let mut participants = self.participants.clone();
-                participants.sort_by_key(|participant| participant.order);
-                for participant in &participants {
-                    ui.label(format!(
-                        "{} — ordem {}, {}",
-                        participant.display_name,
-                        participant.order,
-                        if self.room_mode == RoomMode::InternetTest {
-                            "sucessão desativada no modo Internet"
-                        } else if participant.id == self.current_leader_id {
-                            "anfitrião atual"
-                        } else if participant.may_host {
-                            "autorizado a hospedar"
-                        } else {
-                            "não autorizado a assumir"
+                ui.label(if self.room_mode == RoomMode::InternetTest {
+                    "Internet · até 2 pessoas"
+                } else {
+                    "Rede local / Radmin · até 8 pessoas"
+                });
+            });
+        });
+
+        if self.room_mode == RoomMode::InternetTest {
+            Self::show_notice(
+                ui,
+                "Teste controlado:",
+                "A sinalização usa ws:// sem criptografia ou autenticação. Use apenas com pessoas conhecidas.",
+            );
+        }
+        if let Some(error) = &self.connection_error {
+            Self::show_notice(ui, "Erro de conexão:", error);
+        }
+        if let Some(status) = &self.screen_share_status {
+            Self::show_notice(ui, "Compartilhamento:", status);
+        }
+        if let Some(status) = &self.screen_status {
+            Self::show_notice(ui, "Captura:", status);
+        }
+        match &self.screen_share_role {
+            ScreenShareRole::Sending { .. } => {
+                ui.label(self.screen_route_status(
+                    "transmitindo a tela.",
+                    "Compartilhamento aceito; negociando a conexão WebRTC.",
+                ));
+            }
+            ScreenShareRole::Receiving { .. } => {
+                ui.label(self.screen_route_status(
+                    "recebendo a tela.",
+                    "Compartilhamento aceito; negociando a conexão WebRTC.",
+                ));
+            }
+            ScreenShareRole::Requesting { .. } => {
+                ui.label("Pedido de compartilhamento enviado; aguardando resposta.");
+            }
+            ScreenShareRole::Idle => {}
+        }
+        if self.screen_share_metrics.decode_errors > 0
+            && matches!(&self.screen_share_role, ScreenShareRole::Receiving { .. })
+        {
+            Self::show_notice(
+                ui,
+                "Aviso de vídeo:",
+                &format!(
+                    "{} erros H.264 nesta sessão; veja Diagnóstico.",
+                    self.screen_share_metrics.decode_errors
+                ),
+            );
+        }
+
+        egui::CollapsingHeader::new("Detalhes da sala")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Código: {}", self.room_code.as_deref().unwrap_or("")));
+                    if ui.button("Copiar código").clicked() {
+                        if let Some(code) = &self.room_code {
+                            ui.ctx().copy_text(code.clone());
+                            self.code_copied = true;
                         }
-                    ));
+                    }
+                });
+                if self.code_copied {
+                    ui.small("Código copiado para a área de transferência.");
+                }
+                ui.label(
+                    self.connection_status
+                        .as_deref()
+                        .unwrap_or("Conectado ao servidor."),
+                );
+                ui.label(if self.hosting_locally {
+                    "Este computador está hospedando a sala."
+                } else {
+                    "Você entrou na sala hospedada por outro participante."
+                });
+
+                ui.separator();
+                ui.heading("Convite");
+                if self.hosting_locally && self.room_mode == RoomMode::InternetTest {
+                    match signaling_ws_url(&self.server_url) {
+                        Ok(url) => {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.monospace(&url);
+                                if ui.button("Copiar endereço").clicked() {
+                                    ui.ctx().copy_text(url);
+                                }
+                            });
+                        }
+                        Err(_) => Self::show_notice(
+                            ui,
+                            "Endereço necessário:",
+                            "Configure o IPv4 público ou DDNS em Configurações > Conexão.",
+                        ),
+                    }
+                } else if self.hosting_locally {
+                    ui.label("Escolha o endereço que seu amigo consegue alcançar.");
+                    self.show_host_address_picker(ui);
+                } else {
+                    ui.label("Use o endereço informado pelo anfitrião em Configurações > Conexão.");
+                }
+
+                ui.separator();
+                ui.heading("Participantes e sucessão");
+                if participants.is_empty() {
+                    ui.label("Aguardando participantes…");
+                } else {
+                    for participant in &participants {
+                        ui.label(format!(
+                            "{} — ordem {}, {}",
+                            participant.display_name,
+                            participant.order,
+                            if self.room_mode == RoomMode::InternetTest {
+                                "sucessão desativada no modo Internet"
+                            } else if participant.id == self.current_leader_id {
+                                "anfitrião atual"
+                            } else if participant.may_host {
+                                "autorizado a hospedar"
+                            } else {
+                                "não autorizado a assumir"
+                            }
+                        ));
+                    }
                 }
                 if self.room_mode == RoomMode::InternetTest {
                     ui.small("Esta sala aceita duas pessoas e termina quando o anfitrião sai ou perde a conexão.");
                 } else if participants.iter().all(|participant| !participant.may_host) {
-                    ui.small("Ninguém autorizou a hospedagem automática. Isso não bloqueia a entrada; só significa que a sala termina se o anfitrião sair.");
-                } else {
-                ui.small("A fila considera a estabilidade dos enlaces diretos; os detalhes estão em Diagnóstico.");
+                    ui.small("Ninguém autorizou hospedagem automática; a sala termina se o anfitrião sair.");
                 }
-            }
-            if self.room_mode == RoomMode::Local && !self.control_queue.is_empty() {
-                ui.separator();
-                ui.label("Fila de sucessão");
-                let mut queue = self.control_queue.clone();
-                queue.sort_by(|left, right| {
-                    right.eligible.cmp(&left.eligible)
-                        .then_with(|| left.loss_percent.total_cmp(&right.loss_percent))
-                        .then_with(|| left.jitter_ms.total_cmp(&right.jitter_ms))
-                        .then_with(|| left.latency_ms.total_cmp(&right.latency_ms))
-                        .then_with(|| left.participant.order.cmp(&right.participant.order))
-                });
-                for (index, candidate) in queue.iter().enumerate() {
-                    ui.label(format!(
-                        "{}. {}{}",
-                        index + 1,
-                        candidate.participant.display_name,
-                        if candidate.eligible { "" } else { " (inelegível)" }
-                    ));
+                if self.room_mode == RoomMode::Local {
+                    if let Some(status) = &self.control_status {
+                        ui.small(status);
+                    }
+                    let mut queue = self.control_queue.clone();
+                    queue.sort_by(|left, right| {
+                        right
+                            .eligible
+                            .cmp(&left.eligible)
+                            .then_with(|| left.loss_percent.total_cmp(&right.loss_percent))
+                            .then_with(|| left.jitter_ms.total_cmp(&right.jitter_ms))
+                            .then_with(|| left.latency_ms.total_cmp(&right.latency_ms))
+                            .then_with(|| left.participant.order.cmp(&right.participant.order))
+                    });
+                    for (index, candidate) in queue.iter().enumerate() {
+                        ui.label(format!(
+                            "{}. {}{}",
+                            index + 1,
+                            candidate.participant.display_name,
+                            if candidate.eligible { "" } else { " (inelegível)" }
+                        ));
+                    }
                 }
-            }
-            if self.room_mode == RoomMode::Local {
-                if let Some(status) = &self.control_status {
-                ui.small(status);
-                }
-            }
-            if self.peer_connected {
-                ui.label("Seu amigo está conectado.");
-                if ui.button("Testar sinalização").clicked() {
+
+                if self.peer_connected && ui.button("Testar sinalização").clicked() {
                     self.diagnostic_status = Some("Enviando sinal de diagnóstico…".to_owned());
                     if let Some(signaling) = &self.signaling {
                         if let Err(error) = signaling.send_diagnostic() {
@@ -904,126 +1019,145 @@ impl ClientUi {
                         }
                     }
                 }
-            } else {
-                ui.label("Aguardando seu amigo entrar na sala…");
-            }
-            if self.hosting_locally && self.room_mode == RoomMode::InternetTest {
-                ui.separator();
-                ui.heading("Endereço para seu amigo");
-                match signaling_ws_url(&self.server_url) {
-                    Ok(url) => {
-                        ui.label(&url);
-                        if ui.button("Copiar endereço do servidor").clicked() {
-                            ui.ctx().copy_text(url);
-                        }
-                    }
-                    Err(_) => {
-                        Self::show_notice(
-                            ui,
-                            "Endereço necessário:",
-                            "Configure o IPv4 público ou DDNS em Configurações > Conexão.",
-                        );
+                if let Some(status) = &self.diagnostic_status {
+                    ui.small(status);
+                }
+                if self.hosting_locally && self.room_mode == RoomMode::Local {
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            !self.ending_room_explicitly,
+                            egui::Button::new(if self.ending_room_explicitly {
+                                "Encerrando sala…"
+                            } else {
+                                "Encerrar sala sem sucessor"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.end_room_explicitly(ui.ctx());
                     }
                 }
-            } else if self.hosting_locally {
-                ui.separator();
-                ui.heading("Endereço para seu amigo");
-                ui.label("Escolha o endereço que seu amigo consegue alcançar.");
-                self.show_host_address_picker(ui);
-            }
-            if let Some(status) = &self.diagnostic_status {
-                ui.small(status);
+            });
+
+        ui.add_space(8.0);
+        ui.heading("Participantes");
+        if participants.is_empty() {
+            ui.label("Aguardando participantes…");
+        } else {
+            egui::ScrollArea::horizontal()
+                .id_salt("room-participants")
+                .max_height(48.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for participant in &participants {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(150.0);
+                                ui.label(&participant.display_name);
+                            });
+                        }
+                    });
+                });
+        }
+
+        ui.add_space(8.0);
+        let stage_width = ui.available_width();
+        let stage_height = ui.available_height().clamp(280.0, 680.0);
+        egui::Frame::group(ui.style()).show(ui, |stage| {
+            stage.set_min_size(egui::vec2(stage_width, stage_height));
+            match &self.screen_share_role {
+                ScreenShareRole::Receiving { .. } => {
+                    if let Some(texture) = &self.remote_screen_texture {
+                        let available = stage.available_size();
+                        let source = texture.size_vec2();
+                        let scale = (available.x / source.x)
+                            .min(available.y / source.y)
+                            .min(1.0);
+                        let image_size = source * scale.max(0.01);
+                        stage.vertical_centered(|ui| {
+                            ui.add_space(((stage_height - image_size.y) * 0.5).max(0.0));
+                            ui.add(
+                                egui::Image::new((texture.id(), source))
+                                    .fit_to_exact_size(image_size),
+                            );
+                        });
+                    } else {
+                        stage.vertical_centered(|ui| {
+                            ui.add_space(stage_height * 0.4);
+                            ui.heading("Conectando à tela do participante…");
+                            ui.label("A imagem aparecerá aqui quando o primeiro quadro chegar.");
+                        });
+                    }
+                }
+                ScreenShareRole::Sending { .. } if self.show_local_preview => {
+                    if let Some(texture) = &self.screen_texture {
+                        let available = stage.available_size();
+                        let source = texture.size_vec2();
+                        let scale = (available.x / source.x)
+                            .min(available.y / source.y)
+                            .min(1.0);
+                        let image_size = source * scale.max(0.01);
+                        stage.vertical_centered(|ui| {
+                            ui.add_space(((stage_height - image_size.y) * 0.5).max(0.0));
+                            ui.add(
+                                egui::Image::new((texture.id(), source))
+                                    .fit_to_exact_size(image_size),
+                            );
+                        });
+                    } else {
+                        stage.vertical_centered(|ui| {
+                            ui.add_space(stage_height * 0.4);
+                            ui.heading("Você está compartilhando");
+                            ui.label("Preparando sua prévia local…");
+                        });
+                    }
+                }
+                ScreenShareRole::Sending { .. } => {
+                    stage.vertical_centered(|ui| {
+                        ui.add_space(stage_height * 0.4);
+                        ui.heading("Você está compartilhando");
+                        ui.label("Prévia local desativada para economizar recursos.");
+                    });
+                }
+                ScreenShareRole::Requesting { .. } => {
+                    stage.vertical_centered(|ui| {
+                        ui.add_space(stage_height * 0.4);
+                        ui.heading("Solicitação enviada");
+                        ui.label("Aguardando resposta do outro participante…");
+                    });
+                }
+                ScreenShareRole::Idle if self.peer_connected => {
+                    stage.vertical_centered(|ui| {
+                        ui.add_space(stage_height * 0.4);
+                        ui.heading("Sala pronta");
+                        ui.label("Compartilhe sua tela para começar.");
+                    });
+                }
+                ScreenShareRole::Idle => {
+                    stage.vertical_centered(|ui| {
+                        ui.add_space(stage_height * 0.4);
+                        ui.heading("Aguardando seu amigo");
+                        ui.label("A tela compartilhada aparecerá aqui.");
+                    });
+                }
             }
         });
 
-        ui.add_space(12.0);
+        if let Some(reason) = self
+            .screen_capture
+            .as_ref()
+            .and_then(ScreenCapture::fallback_reason)
+        {
+            Self::show_notice(ui, "Fallback da captura:", &reason);
+        }
+    }
 
-        ui.group(|ui| {
-            ui.heading("Prévia local da tela");
-            ui.label("A prévia fica na memória. A tela só é enviada ao iniciar o compartilhamento.");
-            if self.room_mode == RoomMode::InternetTest {
-                Self::show_notice(
-                    ui,
-                    "Teste controlado:",
-                    "ws:// não criptografa a sinalização; use com pessoas conhecidas.",
-                );
-            }
+    fn show_room_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            self.show_screen_source_menu(ui);
 
-            if self.screen_capture.is_some() {
-                let backend = self.screen_capture.as_ref().map(ScreenCapture::backend_name).unwrap_or("desconhecido");
-                ui.label(format!("Captura ativa · {backend}"));
-                if let Some(reason) = self
-                    .screen_capture
-                    .as_ref()
-                    .and_then(ScreenCapture::fallback_reason)
-                {
-                    Self::show_notice(ui, "Fallback da captura:", &reason);
-                }
-                if ui.button("Parar captura da tela").clicked() {
-                    self.stop_screen_capture();
-                }
-                if let Some(texture) = &self.screen_texture {
-                    let preview_width = ui.available_width().min(800.0);
-                    ui.add(egui::Image::new((texture.id(), texture.size_vec2())).max_width(preview_width));
-                } else {
-                    ui.label("Aguardando o primeiro quadro…");
-                }
-            } else if self.screen_picker.is_some() {
-                ui.label("Aguardando o seletor do Windows...");
-            } else {
-                if !self.available_monitors.is_empty() {
-                    let selected = self.selected_monitor.min(self.available_monitors.len() - 1);
-                    self.selected_monitor = selected;
-                    egui::ComboBox::from_label("Monitor para captura DXGI")
-                        .selected_text(format!(
-                            "{} ({}×{})",
-                            self.available_monitors[selected].name,
-                            self.available_monitors[selected].width,
-                            self.available_monitors[selected].height
-                        ))
-                        .show_ui(ui, |ui| {
-                            for (index, monitor) in self.available_monitors.iter().enumerate() {
-                                ui.selectable_value(
-                                    &mut self.selected_monitor,
-                                    index,
-                                    format!("{} ({}×{})", monitor.name, monitor.width, monitor.height),
-                                );
-                            }
-                        });
-                    if ui.button("Capturar monitor por DXGI (sem borda amarela)").clicked() {
-                        self.dxgi_capture_error = None;
-                        match ScreenCapture::start_monitor(self.selected_monitor, ui.ctx().clone()) {
-                            Ok(capture) => {
-                                self.screen_capture = Some(capture);
-                                self.screen_status = Some("Captura DXGI ativa. A captura de monitor nÃ£o usa a borda de privacidade do Windows Graphics Capture.".to_owned());
-                            }
-                            Err(error) => {
-                                tracing::error!(error = %error, monitor_index = self.selected_monitor + 1, "Falha ao iniciar captura DXGI; Windows Graphics Capture estÃ¡ disponÃ­vel como alternativa");
-                                self.dxgi_capture_error = Some(error.clone());
-                                self.screen_status = Some(format!("NÃ£o foi possÃ­vel capturar este monitor por DXGI: {error}"));
-                            }
-                        }
-                    }
-                } else {
-                    ui.label("Nenhum monitor DXGI disponÃ­vel.");
-                }
-                ui.small("A captura de janela usa Windows Graphics Capture e exibe a borda amarela de privacidade do Windows.");
-                if ui.button("Selecionar janela ou monitor pelo Windows (borda amarela)").clicked() {
-                    self.select_screen(ui.ctx());
-                }
-                if self.dxgi_capture_error.is_some() {
-                    ui.small("Como alternativa, selecione o monitor no seletor do Windows; ele mostrarÃ¡ a borda amarela.");
-                    if ui.button("Tentar Windows Graphics Capture (borda amarela)").clicked() {
-                        self.select_screen(ui.ctx());
-                    }
-                }
-            }
-
-            if let Some(status) = &self.screen_status {
-                Self::show_notice(ui, "Captura:", status);
-            }
-
-            match self.screen_share_role.clone() {
+            let share_role = self.screen_share_role.clone();
+            match share_role {
                 ScreenShareRole::Idle => {
                     let allowed = self.participants.len() == 2
                         && self.peer_connected
@@ -1031,110 +1165,145 @@ impl ClientUi {
                         && self.screen_capture.is_some()
                         && self.screen_share_session.is_none();
                     if ui
-                        .add_enabled(allowed, egui::Button::new("Compartilhar tela com meu amigo"))
+                        .add_enabled(allowed, egui::Button::new("Compartilhar tela"))
                         .clicked()
                     {
                         self.request_screen_share(ui.ctx());
                     }
-                    if self.participants.len() > 2 {
-                        ui.small("O compartilhamento de tela está limitado a salas de duas pessoas nesta etapa.");
-                    } else if self.screen_capture.is_none() {
-                        ui.small("Selecione uma tela ou janela para habilitar o compartilhamento.");
-                    } else if !self.peer_connected {
-                        ui.small("Aguardando o outro participante entrar na sala.");
-                    } else if !self.turn_configuration_ready() {
-                        ui.small("Aguardando a configuração de mídia do anfitrião.");
-                    }
                 }
                 ScreenShareRole::Requesting { .. } => {
-                    ui.label("Pedido de compartilhamento enviado; aguardando resposta do amigo.");
                     if ui.button("Cancelar pedido").clicked() {
                         self.stop_screen_share(true);
-                        self.screen_share_status = Some("Pedido de compartilhamento cancelado.".to_owned());
+                        self.screen_share_status =
+                            Some("Pedido de compartilhamento cancelado.".to_owned());
                     }
                 }
-                ScreenShareRole::Sending { .. } => {
-                    ui.label(self.screen_route_status(
-                        "transmitindo a tela.",
-                        "Pedido aceito; negociando a conexão WebRTC da tela.",
-                    ));
+                ScreenShareRole::Sending { .. } | ScreenShareRole::Receiving { .. } => {
                     if ui.button("Parar compartilhamento").clicked() {
                         self.stop_screen_share(true);
                     }
                 }
-                ScreenShareRole::Receiving { .. } => {
-                    ui.label(self.screen_route_status(
-                        "aguardando ou recebendo vídeo.",
-                        "Pedido aceito; negociando a conexão WebRTC da tela.",
-                    ));
-                    if self.screen_share_metrics.decode_errors > 0 {
-                        Self::show_notice(
-                            ui,
-                            "Aviso de vídeo:",
-                            &format!(
-                                "{} erros H.264 nesta sessão; veja Diagnóstico.",
-                                self.screen_share_metrics.decode_errors
-                            ),
-                        );
-                    }
-                    if ui.button("Parar de receber a tela").clicked() {
-                        self.stop_screen_share(true);
-                    }
-                    if let Some(texture) = &self.remote_screen_texture {
-                        let preview_width = ui.available_width().min(800.0);
-                        ui.add(egui::Image::new((texture.id(), texture.size_vec2())).max_width(preview_width));
-                    } else {
-                        ui.label("Aguardando o primeiro quadro da tela remota…");
-                    }
+            }
+
+            if matches!(&self.screen_share_role, ScreenShareRole::Sending { .. }) {
+                let preview_changed = ui
+                    .checkbox(&mut self.show_local_preview, "Mostrar minha prévia")
+                    .changed();
+                if preview_changed {
+                    self.capture_preview_enabled
+                        .store(self.show_local_preview, Ordering::Relaxed);
+                    tracing::info!(
+                        enabled = self.show_local_preview,
+                        "Prévia local de compartilhamento alterada"
+                    );
                 }
             }
-            if let Some(status) = &self.screen_share_status {
-                ui.label(status);
-            }
-        });
 
-        ui.add_space(12.0);
-        if ui
-            .add_enabled(
-                self.screen_picker.is_none() && self.outgoing_transfer.is_none(),
-                egui::Button::new(
-                    if self.hosting_locally
-                        && self.peer_connected
-                        && self.room_mode == RoomMode::Local
-                    {
-                        "Sair e transferir automaticamente"
-                    } else if self.hosting_locally
-                        && self.peer_connected
-                        && self.room_mode == RoomMode::InternetTest
-                    {
-                        "Encerrar sala e sair"
-                    } else {
-                        "Sair da sala"
-                    },
-                ),
-            )
-            .clicked()
-        {
-            self.request_leave(ui.ctx());
-        }
-
-        if self.hosting_locally
-            && self.room_mode == RoomMode::Local
-            && ui
+            let label =
+                if self.hosting_locally && self.peer_connected && self.room_mode == RoomMode::Local
+                {
+                    "Sair e transferir"
+                } else if self.hosting_locally
+                    && self.peer_connected
+                    && self.room_mode == RoomMode::InternetTest
+                {
+                    "Encerrar sala"
+                } else {
+                    "Sair da sala"
+                };
+            if ui
                 .add_enabled(
-                    !self.ending_room_explicitly,
-                    egui::Button::new(if self.ending_room_explicitly {
-                        "Encerrando sala…"
-                    } else {
-                        "Encerrar sala sem sucessor"
-                    }),
+                    self.screen_picker.is_none() && self.outgoing_transfer.is_none(),
+                    egui::Button::new(label),
                 )
                 .clicked()
-        {
-            self.end_room_explicitly(ui.ctx());
-        }
+            {
+                self.request_leave(ui.ctx());
+            }
+        });
     }
 
+    fn show_screen_source_menu(&mut self, ui: &mut egui::Ui) {
+        let label = if let Some(capture) = &self.screen_capture {
+            format!("Fonte: {}", capture.backend_name())
+        } else if self.screen_picker.is_some() {
+            "Selecionando tela…".to_owned()
+        } else {
+            "Capturar tela".to_owned()
+        };
+        ui.menu_button(label, |ui| {
+            if self.screen_capture.is_some() {
+                if ui.button("Parar captura da tela").clicked() {
+                    self.stop_screen_capture();
+                    ui.close();
+                }
+                return;
+            }
+            if self.screen_picker.is_some() {
+                ui.label("Aguardando o seletor do Windows…");
+                return;
+            }
+
+            if !self.available_monitors.is_empty() {
+                let selected = self.selected_monitor.min(self.available_monitors.len() - 1);
+                self.selected_monitor = selected;
+                egui::ComboBox::from_id_salt("room-monitor-source")
+                    .selected_text(format!(
+                        "{} ({}×{})",
+                        self.available_monitors[selected].name,
+                        self.available_monitors[selected].width,
+                        self.available_monitors[selected].height
+                    ))
+                    .show_ui(ui, |ui| {
+                        for (index, monitor) in self.available_monitors.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut self.selected_monitor,
+                                index,
+                                format!(
+                                    "{} ({}×{})",
+                                    monitor.name, monitor.width, monitor.height
+                                ),
+                            );
+                        }
+                    });
+                if ui.button("Capturar monitor por DXGI").clicked() {
+                    self.dxgi_capture_error = None;
+                    match ScreenCapture::start_monitor(
+                        self.selected_monitor,
+                        ui.ctx().clone(),
+                        Arc::clone(&self.capture_preview_enabled),
+                    ) {
+                        Ok(capture) => {
+                            self.screen_capture = Some(capture);
+                            self.screen_status = Some(
+                                "Captura DXGI ativa; o app não adiciona a borda de captura do Windows."
+                                    .to_owned(),
+                            );
+                            tracing::info!(monitor_index = self.selected_monitor + 1, "Captura DXGI iniciada pela barra da sala");
+                            ui.close();
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %error, monitor_index = self.selected_monitor + 1, "Falha ao iniciar captura DXGI; Windows Graphics Capture está disponível como alternativa");
+                            self.dxgi_capture_error = Some(error.clone());
+                            self.screen_status = Some(format!(
+                                "Não foi possível capturar este monitor por DXGI: {error}"
+                            ));
+                        }
+                    }
+                }
+            } else {
+                ui.label("Nenhum monitor DXGI disponível.");
+            }
+            ui.small("A captura de janela usa a borda amarela de privacidade do Windows.");
+            if ui.button("Selecionar janela ou monitor pelo Windows").clicked() {
+                self.select_screen(ui.ctx());
+                ui.close();
+            }
+            if self.dxgi_capture_error.is_some() {
+                ui.small("O seletor do Windows pode ser usado como alternativa.");
+            }
+        });
+    }
     fn show_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Configurações");
         ui.add_space(8.0);
@@ -1571,7 +1740,7 @@ impl ClientUi {
     fn select_screen(&mut self, _context: &egui::Context) {
         tracing::info!("Usuário abriu o seletor de tela ou janela do Windows");
         self.screen_status = None;
-        match PendingScreenCapture::begin() {
+        match PendingScreenCapture::begin(Arc::clone(&self.capture_preview_enabled)) {
             Ok(picker) => {
                 self.screen_picker = Some(picker);
                 self.screen_status =
@@ -1583,6 +1752,14 @@ impl ClientUi {
         }
     }
     fn refresh_screen(&mut self, context: &egui::Context) {
+        let preview_active = self.show_local_preview
+            && matches!(&self.screen_share_role, ScreenShareRole::Sending { .. });
+        self.capture_preview_enabled
+            .store(preview_active, Ordering::Relaxed);
+        if !preview_active {
+            self.screen_texture = None;
+        }
+
         let picker_result = if self.settings_open {
             self.screen_picker = None;
             None
@@ -1616,7 +1793,10 @@ impl ClientUi {
             return;
         };
 
-        if let Some(frame) = capture.latest_frame() {
+        if preview_active
+            && let Some(frame) = capture.latest_frame()
+            && !frame.rgba.is_empty()
+        {
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
                 &frame.rgba,
@@ -2255,6 +2435,7 @@ impl ClientUi {
     }
 
     fn stop_screen_share(&mut self, announce: bool) {
+        let was_sending = matches!(&self.screen_share_role, ScreenShareRole::Sending { .. });
         let request_id = match &self.screen_share_role {
             ScreenShareRole::Requesting { request_id }
             | ScreenShareRole::Sending { request_id }
@@ -2296,6 +2477,10 @@ impl ClientUi {
         self.screen_share_role = ScreenShareRole::Idle;
         self.remote_screen_texture = None;
         self.remote_screen_sequence = 0;
+        if was_sending {
+            self.screen_texture = None;
+            self.capture_preview_enabled.store(false, Ordering::Relaxed);
+        }
         if was_active {
             self.screen_share_status = Some("Compartilhamento de tela encerrado.".to_owned());
         }
@@ -3879,7 +4064,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_ui_native("P2P - Voz e tela", native_options, move |ui, _frame| {
-        egui::CentralPanel::default().show(ui, |ui| app.show(ui));
+        app.show(ui);
     })
 }
 
