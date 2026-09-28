@@ -1,7 +1,8 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -64,6 +65,9 @@ const INTERNET_PEER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const FIRST_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(750);
+const RTP_SEQUENCE_HISTORY: usize = 4096;
+
+static NEXT_SCREEN_SHARE_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
 struct PliForwarder {
@@ -163,6 +167,8 @@ pub fn validate_stun_uri(input: &str) -> Result<String, String> {
 
 #[derive(Clone, Debug, Default)]
 pub struct ScreenShareMetrics {
+    pub session_id: u64,
+    pub track_ssrc: Option<u32>,
     pub p2p_connected: bool,
     pub route: Option<MediaRoute>,
     pub local_ice_candidates: u64,
@@ -183,12 +189,27 @@ pub struct ScreenShareMetrics {
     pub decoded_delta_frames: u64,
     pub decoded_idr_frames: u64,
     pub decode_errors: u64,
+    pub decoder_input_frames: u64,
+    pub decoder_no_output_frames: u64,
+    pub decoder_queue_drops: u64,
+    pub published_frames: u64,
+    pub ui_texture_updates: u64,
     pub pli_requests_sent: u64,
     pub pli_requests_received: u64,
+    pub pli_queue_overflow: u64,
     pub keyframe_resyncs: u64,
     pub last_recovery_time_millis: Option<u64>,
     pub last_decode_error: Option<String>,
     pub h264_diagnostics: String,
+    pub selected_ice_pair: String,
+    pub rtc_outbound_summary: String,
+    pub rtc_inbound_summary: String,
+    pub outbound_rtp_packets: u64,
+    pub outbound_rtp_bytes: u64,
+    pub inbound_rtp_packets: u64,
+    pub inbound_rtp_bytes: u64,
+    pub inbound_rtp_lost: i64,
+    pub inbound_rtp_jitter_ms: f64,
     pub encoder_backend: String,
     pub encoder_fallback_reason: Option<String>,
     pub decoder_backend: String,
@@ -199,6 +220,8 @@ pub struct ScreenShareMetrics {
 pub struct ScreenSharePerformanceSnapshot {
     pub encoder_input_frames: u64,
     pub encoded_frames: u64,
+    pub encoded_idr_frames: u64,
+    pub encoded_delta_frames: u64,
     pub sent_frames: u64,
     pub dropped_before_initial_idr: u64,
     pub sent_idr_frames: u64,
@@ -209,6 +232,32 @@ pub struct ScreenSharePerformanceSnapshot {
     pub queue_wait_samples: u64,
     pub write_sample_nanos: u64,
     pub write_sample_samples: u64,
+    pub write_sample_bytes: u64,
+    pub write_sample_failures: u64,
+    pub outbound_rtp_packets: u64,
+    pub outbound_rtp_bytes: u64,
+    pub inbound_rtp_packets: u64,
+    pub inbound_rtp_bytes: u64,
+    pub inbound_rtp_lost_delta: i64,
+    pub received_packets: u64,
+    pub observed_sequence_gaps: u64,
+    pub recovered_reordered_packets: u64,
+    pub unmatched_out_of_order_packets: u64,
+    pub duplicate_packets: u64,
+    pub confirmed_missing_packets: u64,
+    pub late_after_confirmed_packets: u64,
+    pub sequence_gap_resyncs: u64,
+    pub assembled_access_units: u64,
+    pub assembly_errors: u64,
+    pub decoder_input_frames: u64,
+    pub decoder_no_output_frames: u64,
+    pub decoder_queue_drops: u64,
+    pub decode_errors: u64,
+    pub decoded_frames: u64,
+    pub published_frames: u64,
+    pub ui_texture_updates: u64,
+    pub pli_requests_sent: u64,
+    pub pli_requests_received: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,8 +266,40 @@ pub enum MediaRoute {
     Turn,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PeerStatsSnapshot {
+    selected_pair_key: String,
+    selected_pair_summary: String,
+    route: Option<MediaRoute>,
+    pair_packets_sent: u64,
+    pair_packets_received: u64,
+    pair_bytes_sent: u64,
+    pair_bytes_received: u64,
+    pair_packets_discarded_on_send: u32,
+    pair_rtt_ms: f64,
+    outbound_packets: u64,
+    outbound_bytes: u64,
+    outbound_frames_encoded: u32,
+    outbound_frames_sent: u32,
+    outbound_ssrc: u32,
+    inbound_packets: u64,
+    inbound_bytes: u64,
+    inbound_packets_lost: i64,
+    inbound_jitter_ms: f64,
+    inbound_frames_received: u32,
+    inbound_frames_decoded: u32,
+    inbound_frames_rendered: u32,
+    inbound_frames_dropped: u32,
+    inbound_packets_discarded: u64,
+    inbound_ssrc: u32,
+    outbound_summary: String,
+    inbound_summary: String,
+}
+
 #[derive(Default)]
 struct SharedMetrics {
+    session_id: u64,
+    track_ssrc: AtomicU64,
     p2p_connected: AtomicBool,
     route: AtomicU64,
     local_ice_candidates: AtomicU64,
@@ -238,8 +319,34 @@ struct SharedMetrics {
     decoded_delta_frames: AtomicU64,
     decoded_idr_frames: AtomicU64,
     decode_errors: AtomicU64,
+    decoder_no_output_frames: AtomicU64,
+    decoder_queue_drops: AtomicU64,
+    published_frames: AtomicU64,
+    decoder_input_frames: AtomicU64,
+    ui_texture_updates: AtomicU64,
+    interval_received_packets: AtomicU64,
+    interval_observed_sequence_gaps: AtomicU64,
+    interval_recovered_reordered_packets: AtomicU64,
+    interval_unmatched_out_of_order_packets: AtomicU64,
+    interval_duplicate_packets: AtomicU64,
+    interval_confirmed_missing_packets: AtomicU64,
+    interval_late_after_confirmed_packets: AtomicU64,
+    interval_sequence_gap_resyncs: AtomicU64,
+    interval_assembled_access_units: AtomicU64,
+    interval_assembly_errors: AtomicU64,
+    interval_decoder_input_frames: AtomicU64,
+    interval_decoder_no_output_frames: AtomicU64,
+    interval_decoder_queue_drops: AtomicU64,
+    interval_decode_errors: AtomicU64,
+    interval_decoded_frames: AtomicU64,
+    interval_published_frames: AtomicU64,
+    interval_ui_texture_updates: AtomicU64,
+    interval_pli_requests_sent: AtomicU64,
+    interval_pli_requests_received: AtomicU64,
     interval_encoder_input_frames: AtomicU64,
     interval_encoded_frames: AtomicU64,
+    interval_encoded_idr_frames: AtomicU64,
+    interval_encoded_delta_frames: AtomicU64,
     interval_sent_frames: AtomicU64,
     interval_dropped_before_initial_idr: AtomicU64,
     interval_sent_idr_frames: AtomicU64,
@@ -250,12 +357,24 @@ struct SharedMetrics {
     interval_queue_wait_samples: AtomicU64,
     interval_write_sample_nanos: AtomicU64,
     interval_write_sample_samples: AtomicU64,
+    interval_write_sample_bytes: AtomicU64,
+    interval_write_sample_failures: AtomicU64,
+    interval_outbound_rtp_packets: AtomicU64,
+    interval_outbound_rtp_bytes: AtomicU64,
+    interval_inbound_rtp_packets: AtomicU64,
+    interval_inbound_rtp_bytes: AtomicU64,
+    interval_inbound_rtp_lost: AtomicI64,
     last_decode_error: Mutex<Option<String>>,
     encoder_backend: Mutex<String>,
     encoder_fallback_reason: Mutex<Option<String>>,
     decoder_backend: Mutex<String>,
     decoder_fallback_reason: Mutex<Option<String>>,
     connected_at: Mutex<Option<Instant>>,
+    selected_ice_pair: Mutex<String>,
+    selected_pair_key: Mutex<String>,
+    rtc_outbound_summary: Mutex<String>,
+    rtc_inbound_summary: Mutex<String>,
+    rtc_stats: Mutex<PeerStatsSnapshot>,
     h264_flow: Mutex<H264FlowDiagnostics>,
 }
 
@@ -275,17 +394,37 @@ struct H264FlowDiagnostics {
     received_fu_a_end: u64,
     sequence_gaps: u64,
     out_of_order_packets: u64,
+    duplicate_packets: u64,
+    recovered_reordered_packets: u64,
+    confirmed_missing_packets: u64,
+    late_after_confirmed_packets: u64,
+    sequence_gap_resyncs: u64,
     assembled_access_units: u64,
     assembled_with_sps: u64,
     assembled_with_pps: u64,
     assembled_with_idr: u64,
     assembled_delta_frames: u64,
     assembly_errors: u64,
+    marker_timeouts: u64,
+    sequence_hole_errors: u64,
+    fragment_errors: u64,
+    pending_frame_evictions: u64,
+    other_assembly_errors: u64,
     pli_requests_sent: u64,
     pli_requests_received: u64,
+    pli_sequence_gap: u64,
+    pli_assembly_error: u64,
+    pli_decode_error: u64,
+    pli_queue_overflow: u64,
+    pli_explicit: u64,
     keyframe_resyncs: u64,
     dropped_while_waiting_for_idr: u64,
+    decoder_no_output_frames: u64,
+    decoder_queue_drops: u64,
     resync_started_at: Option<Instant>,
+    last_idr_assembled_recovery_ms: Option<u64>,
+    last_idr_decoded_recovery_ms: Option<u64>,
+    last_idr_published_recovery_ms: Option<u64>,
     recovery_count: u64,
     recovery_time_millis_total: u128,
     last_recovery_time_millis: Option<u64>,
@@ -300,7 +439,17 @@ impl SharedMetrics {
             .h264_flow
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rtc_stats = self
+            .rtc_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         ScreenShareMetrics {
+            session_id: self.session_id,
+            track_ssrc: match self.track_ssrc.load(Ordering::Relaxed) {
+                0 => None,
+                ssrc => Some(ssrc as u32),
+            },
             p2p_connected: self.p2p_connected.load(Ordering::Relaxed),
             route: match self.route.load(Ordering::Relaxed) {
                 1 => Some(MediaRoute::Direct),
@@ -325,8 +474,14 @@ impl SharedMetrics {
             decoded_delta_frames: self.decoded_delta_frames.load(Ordering::Relaxed),
             decoded_idr_frames: self.decoded_idr_frames.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
+            decoder_input_frames: self.decoder_input_frames.load(Ordering::Relaxed),
+            decoder_no_output_frames: self.decoder_no_output_frames.load(Ordering::Relaxed),
+            decoder_queue_drops: self.decoder_queue_drops.load(Ordering::Relaxed),
+            published_frames: self.published_frames.load(Ordering::Relaxed),
+            ui_texture_updates: self.ui_texture_updates.load(Ordering::Relaxed),
             pli_requests_sent: h264_flow.pli_requests_sent,
             pli_requests_received: h264_flow.pli_requests_received,
+            pli_queue_overflow: h264_flow.pli_queue_overflow,
             keyframe_resyncs: h264_flow.keyframe_resyncs,
             last_recovery_time_millis: h264_flow.last_recovery_time_millis,
             last_decode_error: self
@@ -334,6 +489,27 @@ impl SharedMetrics {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
+            selected_ice_pair: self
+                .selected_ice_pair
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            rtc_outbound_summary: self
+                .rtc_outbound_summary
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            rtc_inbound_summary: self
+                .rtc_inbound_summary
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            outbound_rtp_packets: rtc_stats.outbound_packets,
+            outbound_rtp_bytes: rtc_stats.outbound_bytes,
+            inbound_rtp_packets: rtc_stats.inbound_packets,
+            inbound_rtp_bytes: rtc_stats.inbound_bytes,
+            inbound_rtp_lost: rtc_stats.inbound_packets_lost,
+            inbound_rtp_jitter_ms: rtc_stats.inbound_jitter_ms,
             encoder_backend: self
                 .encoder_backend
                 .lock()
@@ -355,7 +531,7 @@ impl SharedMetrics {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
             h264_diagnostics: format!(
-                "Codificado SPS/PPS/IDR/P {}/{}/{}/{}, última saída {}; RTP SPS/PPS/IDR/P {}/{}/{}/{}, single/STAP-A/FU-A início/fim {}/{}/{}/{}, lacunas/reordenação {}/{}; quadros montados: {} (IDR {}, P {}), com SPS/PPS {}/{}, erros de montagem {}; último quadro: {}{}.",
+                "codificador SPS/PPS/IDR/P {}/{}/{}/{}, última saída {}; recepção NAL SPS/PPS/IDR/P {}/{}/{}/{}, pacotes single/STAP-A/FU-A início/fim {}/{}/{}/{}; saltos observados {}, reordenação recuperada {}, fora de ordem {}, duplicatas {}, perdas confirmadas {}, tardios após confirmação {}, resyncs por salto {}; unidades completas {} (IDR {}, P {}), com SPS/PPS {}/{}, erros de montagem {} [marcador {}, lacuna {}, fragmentação {}, limite {}, outros {}]; última unidade: {}{}; PLI enviado/recebido {}/{}, motivos salto/montagem/decodificação/fila/manual {}/{}/{}/{}/{}, resyncs {}, descartes até IDR {}, recuperação IDR (montado/decodificado/publicado) {:?}/{:?}/{:?} ms.",
                 h264_flow.encoded_sps,
                 h264_flow.encoded_pps,
                 h264_flow.encoded_idr,
@@ -370,33 +546,41 @@ impl SharedMetrics {
                 h264_flow.received_fu_a_start,
                 h264_flow.received_fu_a_end,
                 h264_flow.sequence_gaps,
+                h264_flow.recovered_reordered_packets,
                 h264_flow.out_of_order_packets,
+                h264_flow.duplicate_packets,
+                h264_flow.confirmed_missing_packets,
+                h264_flow.late_after_confirmed_packets,
+                h264_flow.sequence_gap_resyncs,
                 h264_flow.assembled_access_units,
                 h264_flow.assembled_with_idr,
                 h264_flow.assembled_delta_frames,
                 h264_flow.assembled_with_sps,
                 h264_flow.assembled_with_pps,
                 h264_flow.assembly_errors,
+                h264_flow.marker_timeouts,
+                h264_flow.sequence_hole_errors,
+                h264_flow.fragment_errors,
+                h264_flow.pending_frame_evictions,
+                h264_flow.other_assembly_errors,
                 h264_flow.last_access_unit,
                 h264_flow
                     .last_assembly_error
                     .as_ref()
                     .map(|error| format!("; último erro de montagem: {error}"))
                     .unwrap_or_default(),
-            ) + &format!(
-                " PLI sent/received {}/{}, keyframe resyncs {}, frames dropped until IDR {}, IDR recovery {} ms last / {} ms avg ({} recoveries).",
                 h264_flow.pli_requests_sent,
                 h264_flow.pli_requests_received,
+                h264_flow.pli_sequence_gap,
+                h264_flow.pli_assembly_error,
+                h264_flow.pli_decode_error,
+                h264_flow.pli_queue_overflow,
+                h264_flow.pli_explicit,
                 h264_flow.keyframe_resyncs,
                 h264_flow.dropped_while_waiting_for_idr,
-                h264_flow.last_recovery_time_millis.unwrap_or_default(),
-                if h264_flow.recovery_count == 0 {
-                    0
-                } else {
-                    (h264_flow.recovery_time_millis_total / u128::from(h264_flow.recovery_count))
-                        as u64
-                },
-                h264_flow.recovery_count,
+                h264_flow.last_idr_assembled_recovery_ms,
+                h264_flow.last_idr_decoded_recovery_ms,
+                h264_flow.last_idr_published_recovery_ms,
             ),
         }
     }
@@ -423,11 +607,93 @@ impl SharedMetrics {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = fallback;
     }
 
+    fn set_track_ssrc(&self, ssrc: u32) {
+        self.track_ssrc.store(u64::from(ssrc), Ordering::Relaxed);
+    }
+
+    fn update_transport_diagnostics(
+        &self,
+        snapshot: PeerStatsSnapshot,
+        previous: &mut Option<PeerStatsSnapshot>,
+    ) -> bool {
+        let changed = {
+            let mut key = self
+                .selected_pair_key
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let changed = *key != snapshot.selected_pair_key;
+            *key = snapshot.selected_pair_key.clone();
+            changed
+        };
+        *self
+            .selected_ice_pair
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            snapshot.selected_pair_summary.clone();
+        *self
+            .rtc_outbound_summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot.outbound_summary.clone();
+        *self
+            .rtc_inbound_summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot.inbound_summary.clone();
+        if let Some(previous) = previous.as_ref() {
+            self.interval_outbound_rtp_packets.fetch_add(
+                snapshot
+                    .outbound_packets
+                    .saturating_sub(previous.outbound_packets),
+                Ordering::Relaxed,
+            );
+            self.interval_outbound_rtp_bytes.fetch_add(
+                snapshot
+                    .outbound_bytes
+                    .saturating_sub(previous.outbound_bytes),
+                Ordering::Relaxed,
+            );
+            self.interval_inbound_rtp_packets.fetch_add(
+                snapshot
+                    .inbound_packets
+                    .saturating_sub(previous.inbound_packets),
+                Ordering::Relaxed,
+            );
+            self.interval_inbound_rtp_bytes.fetch_add(
+                snapshot
+                    .inbound_bytes
+                    .saturating_sub(previous.inbound_bytes),
+                Ordering::Relaxed,
+            );
+            self.interval_inbound_rtp_lost.fetch_add(
+                snapshot
+                    .inbound_packets_lost
+                    .saturating_sub(previous.inbound_packets_lost),
+                Ordering::Relaxed,
+            );
+        }
+        *self
+            .rtc_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot.clone();
+        *previous = Some(snapshot);
+        changed
+    }
+
     fn record_encoded_access_unit(&self, data: &[u8]) {
         let nals = annex_b_nal_types(data);
-        if classify_h264_access_unit(&nals).is_some() {
-            self.encoded_frames.fetch_add(1, Ordering::Relaxed);
-            self.interval_encoded_frames.fetch_add(1, Ordering::Relaxed);
+        match classify_h264_access_unit(&nals) {
+            Some(H264FrameKind::Idr) => {
+                self.encoded_frames.fetch_add(1, Ordering::Relaxed);
+                self.interval_encoded_frames.fetch_add(1, Ordering::Relaxed);
+                self.interval_encoded_idr_frames
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Some(H264FrameKind::Delta) => {
+                self.encoded_frames.fetch_add(1, Ordering::Relaxed);
+                self.interval_encoded_frames.fetch_add(1, Ordering::Relaxed);
+                self.interval_encoded_delta_frames
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
         }
         let mut flow = self
             .h264_flow
@@ -477,11 +743,7 @@ impl SharedMetrics {
         }
     }
 
-    fn record_received_packet(
-        &self,
-        packet: &rtc::rtp::packet::Packet,
-        previous_sequence: &mut Option<u16>,
-    ) -> bool {
+    fn record_received_packet(&self, packet: &rtc::rtp::packet::Packet) {
         let payload = &packet.payload;
         let packet_type = payload.first().map(|byte| byte & 0x1f);
         let nals = rtp_payload_nal_types(payload);
@@ -489,22 +751,6 @@ impl SharedMetrics {
             .h264_flow
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let mut sequence_gap_detected = false;
-        if let Some(previous) = *previous_sequence {
-            let distance = packet.header.sequence_number.wrapping_sub(previous);
-            if (2..0x8000).contains(&distance) {
-                flow.sequence_gaps += u64::from(distance - 1);
-                sequence_gap_detected = true;
-                *previous_sequence = Some(packet.header.sequence_number);
-            } else if distance == 0 || distance >= 0x8000 {
-                flow.out_of_order_packets += 1;
-            } else {
-                *previous_sequence = Some(packet.header.sequence_number);
-            }
-        } else {
-            *previous_sequence = Some(packet.header.sequence_number);
-        }
 
         match packet_type {
             Some(24) => flow.received_stap_a += 1,
@@ -526,10 +772,45 @@ impl SharedMetrics {
                 _ => {}
             }
         }
-        sequence_gap_detected
+    }
+
+    fn record_sequence_update(&self, update: RtpSequenceUpdate) {
+        self.interval_observed_sequence_gaps
+            .fetch_add(update.observed_gap_packets, Ordering::Relaxed);
+        self.interval_recovered_reordered_packets
+            .fetch_add(update.recovered_reordered_packets, Ordering::Relaxed);
+        self.interval_unmatched_out_of_order_packets
+            .fetch_add(update.unmatched_out_of_order_packets, Ordering::Relaxed);
+        self.interval_duplicate_packets
+            .fetch_add(update.duplicate_packets, Ordering::Relaxed);
+        self.interval_confirmed_missing_packets
+            .fetch_add(update.confirmed_missing_packets, Ordering::Relaxed);
+        self.interval_late_after_confirmed_packets
+            .fetch_add(update.late_after_confirmed_packets, Ordering::Relaxed);
+        let mut flow = self
+            .h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        flow.sequence_gaps += update.observed_gap_packets;
+        flow.recovered_reordered_packets += update.recovered_reordered_packets;
+        flow.out_of_order_packets += update.unmatched_out_of_order_packets;
+        flow.duplicate_packets += update.duplicate_packets;
+        flow.confirmed_missing_packets += update.confirmed_missing_packets;
+        flow.late_after_confirmed_packets += update.late_after_confirmed_packets;
+    }
+
+    fn record_sequence_gap_resync(&self) {
+        self.interval_sequence_gap_resyncs
+            .fetch_add(1, Ordering::Relaxed);
+        self.h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sequence_gap_resyncs += 1;
     }
 
     fn record_assembled_access_unit(&self, data: &[u8]) -> String {
+        self.interval_assembled_access_units
+            .fetch_add(1, Ordering::Relaxed);
         let nals = annex_b_nal_types(data);
         let description = describe_nal_types(&nals, data.len());
         let mut flow = self
@@ -549,12 +830,11 @@ impl SharedMetrics {
         if contains_idr {
             flow.assembled_with_idr += 1;
         }
-        if contains_idr && contains_sps && contains_pps {
-            if let Some(started_at) = flow.resync_started_at.take() {
+        if contains_idr {
+            if let Some(started_at) = flow.resync_started_at {
                 let elapsed = started_at.elapsed().as_millis();
-                flow.recovery_count += 1;
-                flow.recovery_time_millis_total += elapsed;
-                flow.last_recovery_time_millis = Some(elapsed.min(u128::from(u64::MAX)) as u64);
+                flow.last_idr_assembled_recovery_ms =
+                    Some(elapsed.min(u128::from(u64::MAX)) as u64);
             }
         }
         if !contains_idr && nals.iter().any(|nal_type| (1..=4).contains(nal_type)) {
@@ -564,30 +844,89 @@ impl SharedMetrics {
         description
     }
 
+    fn record_idr_decoded(&self) {
+        let mut flow = self
+            .h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(started_at) = flow.resync_started_at {
+            let elapsed = started_at.elapsed().as_millis();
+            flow.last_idr_decoded_recovery_ms = Some(elapsed.min(u128::from(u64::MAX)) as u64);
+        }
+    }
+
+    fn record_idr_published(&self) {
+        let mut flow = self
+            .h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(started_at) = flow.resync_started_at.take() {
+            let elapsed = started_at.elapsed().as_millis();
+            let elapsed = elapsed.min(u128::from(u64::MAX)) as u64;
+            flow.last_idr_published_recovery_ms = Some(elapsed);
+            flow.last_recovery_time_millis = Some(elapsed);
+            flow.recovery_count += 1;
+            flow.recovery_time_millis_total += u128::from(elapsed);
+        }
+    }
+
     fn record_assembly_error(&self, error: String) {
+        self.interval_assembly_errors
+            .fetch_add(1, Ordering::Relaxed);
         let mut flow = self
             .h264_flow
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         flow.assembly_errors += 1;
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("marcador") {
+            flow.marker_timeouts += 1;
+        } else if lower.contains("sequência")
+            || lower.contains("lacuna")
+            || lower.contains("ausente")
+        {
+            flow.sequence_hole_errors += 1;
+        } else if lower.contains("fu-a") || lower.contains("fragmento") || lower.contains("stap-a")
+        {
+            flow.fragment_errors += 1;
+        } else if lower.contains("limite") || lower.contains("pendentes") {
+            flow.pending_frame_evictions += 1;
+        } else {
+            flow.other_assembly_errors += 1;
+        }
         let count = flow.assembly_errors;
-        flow.last_assembly_error = Some(error);
+        flow.last_assembly_error = Some(error.clone());
         if should_log_aggregate_error(count) {
             tracing::warn!(
+                screen_share_session = self.session_id,
                 assembly_errors = count,
+                reason = %error,
                 "Erro de montagem H.264; resumos repetidos registrados em contagens dobradas"
             );
         }
     }
 
-    fn record_pli_sent(&self) {
-        self.h264_flow
+    fn record_pli_sent(&self, reason: PliReason) {
+        self.interval_pli_requests_sent
+            .fetch_add(1, Ordering::Relaxed);
+        let mut flow = self
+            .h264_flow
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pli_requests_sent += 1;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        flow.pli_requests_sent += 1;
+        match reason {
+            PliReason::SequenceGap => flow.pli_sequence_gap += 1,
+            PliReason::AssemblyError => flow.pli_assembly_error += 1,
+            PliReason::DecodeError => flow.pli_decode_error += 1,
+            PliReason::DecoderQueueFull => flow.pli_queue_overflow += 1,
+            #[cfg(test)]
+            PliReason::Explicit => flow.pli_explicit += 1,
+        }
     }
 
     fn record_pli_received(&self) {
+        self.interval_pli_requests_received
+            .fetch_add(1, Ordering::Relaxed);
         self.h264_flow
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -612,12 +951,49 @@ impl SharedMetrics {
             .dropped_while_waiting_for_idr += 1;
     }
 
+    fn record_decoder_no_output(&self) {
+        self.interval_decoder_no_output_frames
+            .fetch_add(1, Ordering::Relaxed);
+        self.decoder_no_output_frames
+            .fetch_add(1, Ordering::Relaxed);
+        self.h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .decoder_no_output_frames += 1;
+    }
+
+    fn record_decoder_input(&self) {
+        self.decoder_input_frames.fetch_add(1, Ordering::Relaxed);
+        self.interval_decoder_input_frames
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_ui_texture_update(&self) {
+        self.ui_texture_updates.fetch_add(1, Ordering::Relaxed);
+        self.interval_ui_texture_updates
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_decoder_queue_drop(&self) {
+        self.decoder_queue_drops.fetch_add(1, Ordering::Relaxed);
+        self.interval_decoder_queue_drops
+            .fetch_add(1, Ordering::Relaxed);
+        self.h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .decoder_queue_drops += 1;
+    }
+
     fn take_performance_snapshot(&self) -> ScreenSharePerformanceSnapshot {
         ScreenSharePerformanceSnapshot {
             encoder_input_frames: self
                 .interval_encoder_input_frames
                 .swap(0, Ordering::Relaxed),
             encoded_frames: self.interval_encoded_frames.swap(0, Ordering::Relaxed),
+            encoded_idr_frames: self.interval_encoded_idr_frames.swap(0, Ordering::Relaxed),
+            encoded_delta_frames: self
+                .interval_encoded_delta_frames
+                .swap(0, Ordering::Relaxed),
             sent_frames: self.interval_sent_frames.swap(0, Ordering::Relaxed),
             dropped_before_initial_idr: self
                 .interval_dropped_before_initial_idr
@@ -632,6 +1008,56 @@ impl SharedMetrics {
             write_sample_samples: self
                 .interval_write_sample_samples
                 .swap(0, Ordering::Relaxed),
+            write_sample_bytes: self.interval_write_sample_bytes.swap(0, Ordering::Relaxed),
+            write_sample_failures: self
+                .interval_write_sample_failures
+                .swap(0, Ordering::Relaxed),
+            outbound_rtp_packets: self
+                .interval_outbound_rtp_packets
+                .swap(0, Ordering::Relaxed),
+            outbound_rtp_bytes: self.interval_outbound_rtp_bytes.swap(0, Ordering::Relaxed),
+            inbound_rtp_packets: self.interval_inbound_rtp_packets.swap(0, Ordering::Relaxed),
+            inbound_rtp_bytes: self.interval_inbound_rtp_bytes.swap(0, Ordering::Relaxed),
+            inbound_rtp_lost_delta: self.interval_inbound_rtp_lost.swap(0, Ordering::Relaxed),
+            received_packets: self.interval_received_packets.swap(0, Ordering::Relaxed),
+            observed_sequence_gaps: self
+                .interval_observed_sequence_gaps
+                .swap(0, Ordering::Relaxed),
+            recovered_reordered_packets: self
+                .interval_recovered_reordered_packets
+                .swap(0, Ordering::Relaxed),
+            unmatched_out_of_order_packets: self
+                .interval_unmatched_out_of_order_packets
+                .swap(0, Ordering::Relaxed),
+            duplicate_packets: self.interval_duplicate_packets.swap(0, Ordering::Relaxed),
+            confirmed_missing_packets: self
+                .interval_confirmed_missing_packets
+                .swap(0, Ordering::Relaxed),
+            late_after_confirmed_packets: self
+                .interval_late_after_confirmed_packets
+                .swap(0, Ordering::Relaxed),
+            sequence_gap_resyncs: self
+                .interval_sequence_gap_resyncs
+                .swap(0, Ordering::Relaxed),
+            assembled_access_units: self
+                .interval_assembled_access_units
+                .swap(0, Ordering::Relaxed),
+            assembly_errors: self.interval_assembly_errors.swap(0, Ordering::Relaxed),
+            decoder_input_frames: self
+                .interval_decoder_input_frames
+                .swap(0, Ordering::Relaxed),
+            decoder_no_output_frames: self
+                .interval_decoder_no_output_frames
+                .swap(0, Ordering::Relaxed),
+            decoder_queue_drops: self.interval_decoder_queue_drops.swap(0, Ordering::Relaxed),
+            decode_errors: self.interval_decode_errors.swap(0, Ordering::Relaxed),
+            decoded_frames: self.interval_decoded_frames.swap(0, Ordering::Relaxed),
+            published_frames: self.interval_published_frames.swap(0, Ordering::Relaxed),
+            ui_texture_updates: self.interval_ui_texture_updates.swap(0, Ordering::Relaxed),
+            pli_requests_sent: self.interval_pli_requests_sent.swap(0, Ordering::Relaxed),
+            pli_requests_received: self
+                .interval_pli_requests_received
+                .swap(0, Ordering::Relaxed),
         }
     }
 
@@ -640,6 +1066,113 @@ impl SharedMetrics {
             .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
         self.interval_encode_samples.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+#[derive(Default)]
+struct RtpSequenceTracker {
+    highest_sequence: Option<u16>,
+    recent_seen: HashSet<u16>,
+    recent_order: VecDeque<u16>,
+    pending_missing: HashMap<u16, Instant>,
+    confirmed_missing: HashSet<u16>,
+    confirmed_order: VecDeque<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RtpSequenceUpdate {
+    observed_gap_packets: u64,
+    recovered_reordered_packets: u64,
+    unmatched_out_of_order_packets: u64,
+    duplicate_packets: u64,
+    confirmed_missing_packets: u64,
+    late_after_confirmed_packets: u64,
+}
+
+impl RtpSequenceTracker {
+    fn observe(&mut self, sequence: u16, now: Instant) -> RtpSequenceUpdate {
+        let mut update = self.expire(now);
+        if self.recent_seen.contains(&sequence) {
+            update.duplicate_packets += 1;
+            return update;
+        }
+
+        if self.confirmed_missing.remove(&sequence) {
+            update.late_after_confirmed_packets += 1;
+        }
+
+        match self.highest_sequence {
+            None => self.highest_sequence = Some(sequence),
+            Some(highest) => {
+                let distance = sequence.wrapping_sub(highest);
+                if distance == 0 {
+                    update.duplicate_packets += 1;
+                    return update;
+                }
+                if distance < 0x8000 {
+                    if distance > 1 {
+                        update.observed_gap_packets += u64::from(distance - 1);
+                        for offset in 1..distance {
+                            let missing = highest.wrapping_add(offset);
+                            self.pending_missing.entry(missing).or_insert(now);
+                        }
+                    }
+                    self.highest_sequence = Some(sequence);
+                } else if self.pending_missing.remove(&sequence).is_some() {
+                    update.recovered_reordered_packets += 1;
+                } else if update.late_after_confirmed_packets == 0 {
+                    update.unmatched_out_of_order_packets += 1;
+                }
+            }
+        }
+
+        self.remember(sequence);
+        update
+    }
+
+    fn expire(&mut self, now: Instant) -> RtpSequenceUpdate {
+        let expired = self
+            .pending_missing
+            .iter()
+            .filter_map(|(sequence, since)| {
+                (now.saturating_duration_since(*since) >= RTP_REORDER_DELAY).then_some(*sequence)
+            })
+            .collect::<Vec<_>>();
+        for sequence in &expired {
+            self.pending_missing.remove(sequence);
+            self.confirmed_missing.insert(*sequence);
+            self.confirmed_order.push_back(*sequence);
+        }
+        while self.confirmed_order.len() > RTP_SEQUENCE_HISTORY {
+            if let Some(oldest) = self.confirmed_order.pop_front() {
+                self.confirmed_missing.remove(&oldest);
+            }
+        }
+        RtpSequenceUpdate {
+            confirmed_missing_packets: expired.len() as u64,
+            ..RtpSequenceUpdate::default()
+        }
+    }
+
+    fn remember(&mut self, sequence: u16) {
+        if self.recent_seen.insert(sequence) {
+            self.recent_order.push_back(sequence);
+        }
+        while self.recent_order.len() > RTP_SEQUENCE_HISTORY {
+            if let Some(oldest) = self.recent_order.pop_front() {
+                self.recent_seen.remove(&oldest);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PliReason {
+    SequenceGap,
+    AssemblyError,
+    DecodeError,
+    DecoderQueueFull,
+    #[cfg(test)]
+    Explicit,
 }
 
 #[derive(Default)]
@@ -680,12 +1213,17 @@ async fn send_picture_loss_indication(
     track: &dyn TrackRemote,
     metrics: &SharedMetrics,
     limiter: &mut KeyframeRequestLimiter,
+    reason: PliReason,
 ) {
     if !limiter.allow(Instant::now()) {
         return;
     }
     let Some(media_ssrc) = track.ssrcs().await.first().copied() else {
-        tracing::warn!("Nao foi possivel enviar PLI: a faixa remota nao tem SSRC");
+        tracing::warn!(
+            screen_share_session = metrics.session_id,
+            ?reason,
+            "Nao foi possivel enviar PLI: a faixa remota nao tem SSRC"
+        );
         return;
     };
     let pli = PictureLossIndication {
@@ -694,21 +1232,33 @@ async fn send_picture_loss_indication(
     };
     match track.write_rtcp(vec![Box::new(pli)]).await {
         Ok(()) => {
-            metrics.record_pli_sent();
-            tracing::debug!("Pedido RTCP PLI enviado para solicitar um quadro-chave");
+            metrics.record_pli_sent(reason);
+            tracing::debug!(
+                screen_share_session = metrics.session_id,
+                track_ssrc = media_ssrc,
+                ?reason,
+                "Pedido RTCP PLI enviado para solicitar um quadro-chave"
+            );
         }
-        Err(error) => tracing::warn!(error = %error, "Falha ao enviar pedido RTCP PLI"),
+        Err(error) => tracing::warn!(
+            screen_share_session = metrics.session_id,
+            track_ssrc = media_ssrc,
+            ?reason,
+            error = %error,
+            "Falha ao enviar pedido RTCP PLI"
+        ),
     }
 }
 
 fn begin_stream_resync(
     generation: &AtomicU64,
     metrics: &SharedMetrics,
-    keyframe_request_tx: &mpsc::Sender<()>,
+    keyframe_request_tx: &mpsc::Sender<PliReason>,
+    reason: PliReason,
 ) -> u64 {
     let generation = generation.fetch_add(1, Ordering::Relaxed) + 1;
     metrics.record_keyframe_resync();
-    let _ = keyframe_request_tx.try_send(());
+    let _ = keyframe_request_tx.try_send(reason);
     generation
 }
 
@@ -904,7 +1454,8 @@ fn decode_h264_access_unit(
     sequence: &AtomicU64,
     metrics: &SharedMetrics,
 ) -> Option<DecodeFailure> {
-    let sample_diagnostics = metrics.record_assembled_access_unit(access_unit);
+    let nal_types = annex_b_nal_types(access_unit);
+    let sample_diagnostics = describe_nal_types(&nal_types, access_unit.len());
     let decoded = match decoder {
         ActiveH264Decoder::OpenH264(decoder) => decoder
             .decode(access_unit)
@@ -939,12 +1490,17 @@ fn decode_h264_access_unit(
                 return None;
             }
             metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
-            match classify_h264_access_unit(&annex_b_nal_types(access_unit)) {
+            metrics
+                .interval_decoded_frames
+                .fetch_add(1, Ordering::Relaxed);
+            let frame_kind = classify_h264_access_unit(&nal_types);
+            match frame_kind {
                 Some(H264FrameKind::Delta) => {
                     metrics.decoded_delta_frames.fetch_add(1, Ordering::Relaxed);
                 }
                 Some(H264FrameKind::Idr) => {
                     metrics.decoded_idr_frames.fetch_add(1, Ordering::Relaxed);
+                    metrics.record_idr_decoded();
                 }
                 None => {}
             }
@@ -958,22 +1514,36 @@ fn decode_h264_access_unit(
                     height,
                     rgba,
                 }));
+            metrics.published_frames.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .interval_published_frames
+                .fetch_add(1, Ordering::Relaxed);
+            if frame_kind == Some(H264FrameKind::Idr) {
+                metrics.record_idr_published();
+            }
             context.request_repaint();
             None
         }
-        Ok(None) => None,
+        Ok(None) => {
+            metrics.record_decoder_no_output();
+            None
+        }
         Err((detail, native_code)) => {
             #[cfg(windows)]
             let hardware_decoder = matches!(&*decoder, ActiveH264Decoder::MediaFoundation(_));
             #[cfg(not(windows))]
             let hardware_decoder = false;
             let count = metrics.decode_errors.fetch_add(1, Ordering::Relaxed) + 1;
+            metrics
+                .interval_decode_errors
+                .fetch_add(1, Ordering::Relaxed);
             *metrics
                 .last_decode_error
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail.clone());
             if should_log_aggregate_error(count) {
                 tracing::warn!(
+                    screen_share_session = metrics.session_id,
                     decode_errors = count,
                     native_code = native_code.unwrap_or_default(),
                     frame = %sample_diagnostics,
@@ -1293,7 +1863,29 @@ impl ScreenShareSession {
         let (events_tx, events_rx) = std_mpsc::channel();
         let remote_frame = Arc::new(Mutex::new(None));
         let remote_track = Arc::new(Mutex::new(None));
-        let metrics = Arc::new(SharedMetrics::default());
+        let mut initial_metrics = SharedMetrics::default();
+        initial_metrics.session_id = NEXT_SCREEN_SHARE_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        *initial_metrics
+            .selected_ice_pair
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            "Par ICE selecionado: aguardando conexão".to_owned();
+        *initial_metrics
+            .rtc_outbound_summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            "RTP de saída: aguardando faixa".to_owned();
+        *initial_metrics
+            .rtc_inbound_summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            "RTP de entrada: aguardando faixa".to_owned();
+        let metrics = Arc::new(initial_metrics);
+        tracing::info!(
+            screen_share_session = metrics.session_id,
+            udp_address = %udp_address,
+            "Sessão de tela criada para diagnóstico"
+        );
         let worker_remote_frame = Arc::clone(&remote_frame);
         let worker_remote_track = Arc::clone(&remote_track);
         let worker_metrics = Arc::clone(&metrics);
@@ -1377,6 +1969,10 @@ impl ScreenShareSession {
 
     pub fn metrics(&self) -> ScreenShareMetrics {
         self.metrics.snapshot()
+    }
+
+    pub fn record_ui_texture_update(&self) {
+        self.metrics.record_ui_texture_update();
     }
 
     pub fn take_performance_snapshot(&self) -> ScreenSharePerformanceSnapshot {
@@ -1482,6 +2078,7 @@ impl PeerConnectionEventHandler for PeerEvents {
         let is_turn = event.url.starts_with("turn:");
         let is_auth_error = matches!(event.error_code, 401 | 438 | 702);
         tracing::warn!(
+            screen_share_session = self.metrics.session_id,
             ice_error_code = event.error_code,
             turn_server = is_turn,
             turn_enabled = self.turn_enabled,
@@ -1513,7 +2110,7 @@ impl PeerConnectionEventHandler for PeerEvents {
         &self,
         state: webrtc::peer_connection::RTCIceConnectionState,
     ) {
-        tracing::info!(state = ?state, "Estado ICE mudou");
+        tracing::info!(screen_share_session = self.metrics.session_id, state = ?state, "Estado ICE mudou");
         let status = match state {
             webrtc::peer_connection::RTCIceConnectionState::New => {
                 "ICE aguardando candidatos do outro computador.".to_owned()
@@ -1566,6 +2163,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                     )
                 };
                 tracing::error!(
+                    screen_share_session = self.metrics.session_id,
                     local_srflx_candidates =
                         self.metrics.local_srflx_candidates.load(Ordering::Relaxed),
                     remote_srflx_candidates =
@@ -1599,7 +2197,7 @@ impl PeerConnectionEventHandler for PeerEvents {
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        tracing::info!(state = ?state, "Estado da conexão WebRTC mudou");
+        tracing::info!(screen_share_session = self.metrics.session_id, state = ?state, "Estado da conexão WebRTC mudou");
         match state {
             RTCPeerConnectionState::Connected => {
                 self.metrics.p2p_connected.store(true, Ordering::Relaxed);
@@ -1634,7 +2232,16 @@ impl PeerConnectionEventHandler for PeerEvents {
     }
 
     async fn on_track(&self, track: Arc<dyn TrackRemote>) {
+        if let Some(ssrc) = track.ssrcs().await.first().copied() {
+            self.metrics.set_track_ssrc(ssrc);
+            tracing::info!(
+                screen_share_session = self.metrics.session_id,
+                track_ssrc = ssrc,
+                "Faixa RTP de vídeo remota identificada"
+            );
+        }
         tracing::info!(
+            screen_share_session = self.metrics.session_id,
             "Faixa de vídeo remota recebida; iniciando depacketizador e worker de codec"
         );
         let events = self.events.clone();
@@ -1650,7 +2257,7 @@ impl PeerConnectionEventHandler for PeerEvents {
             let (decoder_tx, decoder_rx) = std_mpsc::sync_channel::<QueuedAccessUnit>(8);
             let decoder_generation = Arc::new(AtomicU64::new(0));
             let worker_generation = Arc::clone(&decoder_generation);
-            let (keyframe_request_tx, mut keyframe_request_rx) = mpsc::channel::<()>(1);
+            let (keyframe_request_tx, mut keyframe_request_rx) = mpsc::channel::<PliReason>(1);
             let worker_keyframe_request_tx = keyframe_request_tx.clone();
             let worker_events = events.clone();
             let worker_context = context.clone();
@@ -1777,12 +2384,12 @@ impl PeerConnectionEventHandler for PeerEvents {
                         }
 
                         if !should_decode_access_unit(&mut cpu_waiting_for_idr, &access_unit) {
-                            worker_metrics.record_assembled_access_unit(&access_unit);
                             worker_metrics.record_drop_waiting_for_idr();
                             continue;
                         }
 
                         if let Some(active_decoder) = decoder.as_mut() {
+                            worker_metrics.record_decoder_input();
                             let decoded_before =
                                 worker_metrics.decoded_frames.load(Ordering::Relaxed);
                             let hardware_error = decode_h264_access_unit(
@@ -1869,6 +2476,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                     &worker_generation,
                                     &worker_metrics,
                                     &worker_keyframe_request_tx,
+                                    PliReason::DecodeError,
                                 );
                                 generation_seen = generation;
                                 cpu_waiting_for_idr = true;
@@ -1887,20 +2495,26 @@ impl PeerConnectionEventHandler for PeerEvents {
                 return;
             }
             let mut assembler = H264AccessUnitAssembler::default();
-            let mut previous_sequence = None;
+            let mut sequence_tracker = RtpSequenceTracker::default();
             let mut keyframe_request_limiter = KeyframeRequestLimiter::default();
             let mut flush_pending = tokio::time::interval(Duration::from_millis(10));
             flush_pending.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
-                    _ = flush_pending.tick() => {}
+                    _ = flush_pending.tick() => {
+                        let expired = sequence_tracker.expire(Instant::now());
+                        if expired.confirmed_missing_packets > 0 {
+                            metrics.record_sequence_update(expired);
+                        }
+                    }
                     request = keyframe_request_rx.recv() => {
-                        if request.is_some() {
+                        if let Some(reason) = request {
                             send_picture_loss_indication(
                                 track.as_ref(),
                                 &metrics,
                                 &mut keyframe_request_limiter,
+                                reason,
                             ).await;
                         }
                     }
@@ -1909,15 +2523,23 @@ impl PeerConnectionEventHandler for PeerEvents {
                         match event {
                             TrackRemoteEvent::OnRtpPacket(packet) => {
                                 metrics.received_packets.fetch_add(1, Ordering::Relaxed);
-                                if metrics.record_received_packet(&packet, &mut previous_sequence) {
-                                    tracing::debug!(
-                                        "Lacuna na sequência RTP; descartando unidades pendentes e pedindo novo IDR"
-                                    );
+                                metrics
+                                    .interval_received_packets
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let sequence_update = sequence_tracker.observe(
+                                    packet.header.sequence_number,
+                                    Instant::now(),
+                                );
+                                metrics.record_sequence_update(sequence_update);
+                                metrics.record_received_packet(&packet);
+                                if sequence_update.observed_gap_packets > 0 {
+                                    metrics.record_sequence_gap_resync();
                                     assembler.frames.clear();
                                     begin_stream_resync(
                                         &decoder_generation,
                                         &metrics,
                                         &keyframe_request_tx,
+                                        PliReason::SequenceGap,
                                     );
                                     context.request_repaint();
                                 }
@@ -1927,6 +2549,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                         &decoder_generation,
                                         &metrics,
                                         &keyframe_request_tx,
+                                        PliReason::AssemblyError,
                                     );
                                     context.request_repaint();
                                 }
@@ -1939,36 +2562,38 @@ impl PeerConnectionEventHandler for PeerEvents {
 
                 for result in assembler.take_ready(Instant::now()) {
                     match result {
-                        Ok(access_unit) => match decoder_tx.try_send(QueuedAccessUnit {
-                            generation: decoder_generation.load(Ordering::Relaxed),
-                            bytes: access_unit,
-                        }) {
-                            Ok(()) => {}
-                            Err(std_mpsc::TrySendError::Full(_)) => {
-                                metrics.record_assembly_error(
-                                    "worker de decodificação atrasado; quadro H.264 descartado"
-                                        .to_owned(),
-                                );
-                                begin_stream_resync(
-                                    &decoder_generation,
-                                    &metrics,
-                                    &keyframe_request_tx,
-                                );
-                                context.request_repaint();
+                        Ok(access_unit) => {
+                            metrics.record_assembled_access_unit(&access_unit);
+                            match decoder_tx.try_send(QueuedAccessUnit {
+                                generation: decoder_generation.load(Ordering::Relaxed),
+                                bytes: access_unit,
+                            }) {
+                                Ok(()) => {}
+                                Err(std_mpsc::TrySendError::Full(_)) => {
+                                    metrics.record_decoder_queue_drop();
+                                    begin_stream_resync(
+                                        &decoder_generation,
+                                        &metrics,
+                                        &keyframe_request_tx,
+                                        PliReason::DecoderQueueFull,
+                                    );
+                                    context.request_repaint();
+                                }
+                                Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                                    let _ = events.send(ScreenShareEvent::Error(
+                                        "O worker do decodificador H.264 foi encerrado.".to_owned(),
+                                    ));
+                                    return;
+                                }
                             }
-                            Err(std_mpsc::TrySendError::Disconnected(_)) => {
-                                let _ = events.send(ScreenShareEvent::Error(
-                                    "O worker do decodificador H.264 foi encerrado.".to_owned(),
-                                ));
-                                return;
-                            }
-                        },
+                        }
                         Err(error) => {
                             metrics.record_assembly_error(error);
                             begin_stream_resync(
                                 &decoder_generation,
                                 &metrics,
                                 &keyframe_request_tx,
+                                PliReason::AssemblyError,
                             );
                             context.request_repaint();
                         }
@@ -1996,6 +2621,7 @@ async fn run_session(
     let mut connection_check = tokio::time::interval(CONNECTION_CHECK_INTERVAL);
     connection_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_route_check = Instant::now();
+    let mut previous_peer_stats = None;
 
     loop {
         tokio::select! {
@@ -2011,22 +2637,41 @@ async fn run_session(
                         .connection
                         .get_stats(Instant::now(), StatsSelector::None)
                         .await;
-                    if let Some(route) = selected_media_route(&report) {
+                    let current_stats = peer_stats_snapshot(&report);
+                    let route = current_stats.route;
+                    let pair_changed = peer
+                        .metrics
+                        .update_transport_diagnostics(current_stats, &mut previous_peer_stats);
+                    if let Some(route) = route {
                         let route_code = match route {
                             MediaRoute::Direct => 1,
                             MediaRoute::Turn => 2,
                         };
                         let previous = peer.metrics.route.swap(route_code, Ordering::Relaxed);
                         if previous != route_code {
-                            tracing::info!(?route, "Rota ICE de mídia selecionada");
+                            tracing::info!(
+                                screen_share_session = peer.metrics.session_id,
+                                track_ssrc = peer.metrics.track_ssrc.load(Ordering::Relaxed),
+                                ?route,
+                                "Rota ICE de mídia selecionada"
+                            );
                             let label = match route {
                                 MediaRoute::Direct => "Conexão direta P2P selecionada.",
                                 MediaRoute::Turn => "Conexão retransmitida pelo servidor TURN do anfitrião.",
                             };
                             let _ = events.send(ScreenShareEvent::State(label.to_owned()));
                         }
-                        context.request_repaint();
                     }
+                    if pair_changed {
+                        let diagnostics = peer.metrics.snapshot();
+                        tracing::info!(
+                            screen_share_session = diagnostics.session_id,
+                            track_ssrc = diagnostics.track_ssrc.unwrap_or_default(),
+                            selected_ice_pair = %diagnostics.selected_ice_pair,
+                            "Par ICE de mídia selecionado ou alterado"
+                        );
+                    }
+                    context.request_repaint();
                 }
 
                 let connection_timeout = if stun_server.is_some() || turn_credentials.is_some() {
@@ -2240,6 +2885,7 @@ async fn run_session(
                             track.as_ref(),
                             &peer.metrics,
                             &mut peer.keyframe_request_limiter,
+                            PliReason::Explicit,
                         )
                         .await;
                     }
@@ -2256,7 +2902,14 @@ async fn run_session(
     }
 }
 
-fn selected_media_route(report: &RTCStatsReport) -> Option<MediaRoute> {
+fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
+    let mut snapshot = PeerStatsSnapshot {
+        selected_pair_summary: "Par ICE selecionado: indisponível".to_owned(),
+        outbound_summary: "RTP de saída: estatísticas ainda indisponíveis".to_owned(),
+        inbound_summary: "RTP de entrada: estatísticas ainda indisponíveis".to_owned(),
+        ..PeerStatsSnapshot::default()
+    };
+
     let selected_pair_id = report.iter().find_map(|entry| match entry {
         RTCStatsReportEntry::Transport(transport)
             if !transport.selected_candidate_pair_id.is_empty() =>
@@ -2264,27 +2917,177 @@ fn selected_media_route(report: &RTCStatsReport) -> Option<MediaRoute> {
             Some(transport.selected_candidate_pair_id.as_str())
         }
         _ => None,
-    })?;
-    let pair = match report.get(selected_pair_id)? {
-        RTCStatsReportEntry::IceCandidatePair(pair) => pair,
-        _ => return None,
+    });
+    if let Some(selected_pair_id) = selected_pair_id {
+        if let Some(RTCStatsReportEntry::IceCandidatePair(pair)) = report.get(selected_pair_id) {
+            let local = match report.get(&pair.local_candidate_id) {
+                Some(RTCStatsReportEntry::LocalCandidate(candidate)) => Some(candidate),
+                _ => None,
+            };
+            let remote = match report.get(&pair.remote_candidate_id) {
+                Some(RTCStatsReportEntry::RemoteCandidate(candidate)) => Some(candidate),
+                _ => None,
+            };
+            let route = media_route_from_candidate_types(
+                local.map(|candidate| candidate.candidate_type),
+                remote.map(|candidate| candidate.candidate_type),
+            );
+            let local_addr = local
+                .and_then(|candidate| candidate.address.as_deref())
+                .unwrap_or("indisponível");
+            let remote_addr = remote
+                .and_then(|candidate| candidate.address.as_deref())
+                .unwrap_or("indisponível");
+            let local_adapter = adapter_name_for_ip(local_addr);
+            snapshot.selected_pair_key = selected_pair_id.to_owned();
+            snapshot.route = route;
+            snapshot.pair_packets_sent = pair.packets_sent;
+            snapshot.pair_packets_received = pair.packets_received;
+            snapshot.pair_bytes_sent = pair.bytes_sent;
+            snapshot.pair_bytes_received = pair.bytes_received;
+            snapshot.pair_packets_discarded_on_send = pair.packets_discarded_on_send;
+            snapshot.pair_rtt_ms = pair.current_round_trip_time * 1000.0;
+            snapshot.selected_pair_summary = format!(
+                "ICE {:?}: local {}/{}/{}:{} ({local_adapter}) -> remoto {}/{}/{}:{}; par {}/{} pacotes e {}/{} bytes; descartados no envio {}; RTT {:.1} ms",
+                route,
+                local
+                    .map(|candidate| format!("{:?}", candidate.candidate_type))
+                    .unwrap_or_else(|| "?".to_owned()),
+                local
+                    .map(|candidate| candidate.protocol.as_str())
+                    .unwrap_or("?"),
+                local_addr,
+                local.map(|candidate| candidate.port).unwrap_or_default(),
+                remote
+                    .map(|candidate| format!("{:?}", candidate.candidate_type))
+                    .unwrap_or_else(|| "?".to_owned()),
+                remote
+                    .map(|candidate| candidate.protocol.as_str())
+                    .unwrap_or("?"),
+                remote_addr,
+                remote.map(|candidate| candidate.port).unwrap_or_default(),
+                pair.packets_sent,
+                pair.packets_received,
+                pair.bytes_sent,
+                pair.bytes_received,
+                pair.packets_discarded_on_send,
+                snapshot.pair_rtt_ms,
+            );
+        }
+    }
+
+    if let Some(outbound) = report.iter().find_map(|entry| match entry {
+        RTCStatsReportEntry::OutboundRtp(stats)
+            if stats.sent_rtp_stream_stats.rtp_stream_stats.kind == RtpCodecKind::Video =>
+        {
+            Some(stats)
+        }
+        _ => None,
+    }) {
+        snapshot.outbound_packets = outbound.sent_rtp_stream_stats.packets_sent;
+        snapshot.outbound_bytes = outbound.sent_rtp_stream_stats.bytes_sent;
+        snapshot.outbound_frames_encoded = outbound.frames_encoded;
+        snapshot.outbound_frames_sent = outbound.frames_sent;
+        snapshot.outbound_ssrc = outbound.sent_rtp_stream_stats.rtp_stream_stats.ssrc;
+        snapshot.outbound_summary = format!(
+            "RTP de saída: {} pacotes / {} bytes; frames codificados/enviados {}/{}; SSRC {}; encoder RTC {}",
+            snapshot.outbound_packets,
+            snapshot.outbound_bytes,
+            snapshot.outbound_frames_encoded,
+            snapshot.outbound_frames_sent,
+            snapshot.outbound_ssrc,
+            outbound.encoder_implementation,
+        );
+    }
+
+    if let Some(inbound) = report.iter().find_map(|entry| match entry {
+        RTCStatsReportEntry::InboundRtp(stats)
+            if stats.received_rtp_stream_stats.rtp_stream_stats.kind == RtpCodecKind::Video =>
+        {
+            Some(stats)
+        }
+        _ => None,
+    }) {
+        let received = &inbound.received_rtp_stream_stats;
+        snapshot.inbound_packets = received.packets_received;
+        snapshot.inbound_bytes = inbound.bytes_received;
+        snapshot.inbound_packets_lost = received.packets_lost;
+        snapshot.inbound_jitter_ms = received.jitter * 1000.0;
+        snapshot.inbound_frames_received = inbound.frames_received;
+        snapshot.inbound_frames_decoded = inbound.frames_decoded;
+        snapshot.inbound_frames_rendered = inbound.frames_rendered;
+        snapshot.inbound_frames_dropped = inbound.frames_dropped;
+        snapshot.inbound_packets_discarded = inbound.packets_discarded;
+        snapshot.inbound_ssrc = received.rtp_stream_stats.ssrc;
+        snapshot.inbound_summary = format!(
+            "RTP de entrada: {} pacotes / {} bytes; perda reportada {}; jitter {:.1} ms; frames recebidos/decodificados/renderizados/descartados {}/{}/{}/{}; descartados no jitter buffer {}; SSRC {}; decoder RTC {}",
+            snapshot.inbound_packets,
+            snapshot.inbound_bytes,
+            snapshot.inbound_packets_lost,
+            snapshot.inbound_jitter_ms,
+            snapshot.inbound_frames_received,
+            snapshot.inbound_frames_decoded,
+            snapshot.inbound_frames_rendered,
+            snapshot.inbound_frames_dropped,
+            snapshot.inbound_packets_discarded,
+            snapshot.inbound_ssrc,
+            inbound.decoder_implementation,
+        );
+    }
+
+    snapshot
+}
+
+fn media_route_from_candidate_types(
+    local: Option<rtc::peer_connection::transport::RTCIceCandidateType>,
+    remote: Option<rtc::peer_connection::transport::RTCIceCandidateType>,
+) -> Option<MediaRoute> {
+    use rtc::peer_connection::transport::RTCIceCandidateType;
+
+    let (Some(local), Some(remote)) = (local, remote) else {
+        return None;
     };
-    let relay_candidate_type = rtc::peer_connection::transport::RTCIceCandidateType::Relay;
-    let local_is_relay = matches!(
-        report.get(&pair.local_candidate_id),
-        Some(RTCStatsReportEntry::LocalCandidate(candidate))
-            if candidate.candidate_type == relay_candidate_type
-    );
-    let remote_is_relay = matches!(
-        report.get(&pair.remote_candidate_id),
-        Some(RTCStatsReportEntry::RemoteCandidate(candidate))
-            if candidate.candidate_type == relay_candidate_type
-    );
-    Some(if local_is_relay || remote_is_relay {
-        MediaRoute::Turn
-    } else {
-        MediaRoute::Direct
-    })
+    Some(
+        if local == RTCIceCandidateType::Relay || remote == RTCIceCandidateType::Relay {
+            MediaRoute::Turn
+        } else {
+            MediaRoute::Direct
+        },
+    )
+}
+
+fn adapter_name_for_ip(address: &str) -> String {
+    let Ok(ip) = address.parse::<IpAddr>() else {
+        return "adaptador não identificado".to_owned();
+    };
+    #[cfg(windows)]
+    {
+        static ADAPTERS: OnceLock<HashMap<IpAddr, String>> = OnceLock::new();
+        let adapters = ADAPTERS.get_or_init(|| {
+            ipconfig::get_adapters()
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|adapter| {
+                    let name = adapter.friendly_name().to_owned();
+                    adapter
+                        .ip_addresses()
+                        .iter()
+                        .copied()
+                        .map(move |address| (address, name.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        });
+        return adapters
+            .get(&ip)
+            .cloned()
+            .unwrap_or_else(|| "adaptador não identificado".to_owned());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ip;
+        "adaptador não identificado".to_owned()
+    }
 }
 
 async fn create_peer(
@@ -2501,8 +3304,16 @@ async fn create_sender(
             ));
             return;
         };
+        writer_metrics.set_track_ssrc(ssrc);
+        tracing::info!(
+            screen_share_session = writer_metrics.session_id,
+            track_ssrc = ssrc,
+            "Faixa RTP de vídeo local identificada"
+        );
         let mut sample_rx = sample_rx;
         while let Some(encoded_frame) = sample_rx.recv().await {
+            let sample_bytes = encoded_frame.bytes.len() as u64;
+            let frame_kind = encoded_frame.kind;
             let sample = Sample {
                 data: Bytes::from(encoded_frame.bytes),
                 duration: FRAME_DURATION,
@@ -2521,12 +3332,25 @@ async fn create_sender(
                 .interval_write_sample_samples
                 .fetch_add(1, Ordering::Relaxed);
             if let Err(error) = write_result {
+                writer_metrics
+                    .interval_write_sample_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    screen_share_session = writer_metrics.session_id,
+                    track_ssrc = ssrc,
+                    ?frame_kind,
+                    error = %error,
+                    "TrackLocal recusou amostra H.264 antes do envio RTP"
+                );
                 let _ = writer_events.send(ScreenShareEvent::Error(format!(
                     "Falha ao enviar um quadro H.264 pela conexão P2P: {error}"
                 )));
                 break;
             } else {
-                writer_metrics.record_sent_frame(encoded_frame.kind);
+                writer_metrics
+                    .interval_write_sample_bytes
+                    .fetch_add(sample_bytes, Ordering::Relaxed);
+                writer_metrics.record_sent_frame(frame_kind);
             }
         }
     });
@@ -2965,12 +3789,15 @@ mod tests {
 
     use super::{
         Encoder, FRAME_DURATION, H264ForwardDecision, H264ForwardingGate, H264FrameKind,
-        KeyframeRequestLimiter, LatestFrame, PreviewFrame, RtpPacket, ScreenShareEvent,
-        ScreenShareSession, annex_b_nal_types, assemble_h264_access_unit,
-        classify_h264_access_unit, encode_frame, should_decode_access_unit,
+        KeyframeRequestLimiter, LatestFrame, MediaRoute, PreviewFrame, RtpPacket,
+        RtpSequenceTracker, ScreenShareEvent, ScreenShareSession, annex_b_nal_types,
+        assemble_h264_access_unit, classify_h264_access_unit, encode_frame,
+        media_route_from_candidate_types, peer_stats_snapshot, should_decode_access_unit,
         should_log_aggregate_error, validate_stun_uri,
     };
     use bytes::Bytes;
+    use rtc::peer_connection::transport::RTCIceCandidateType;
+    use rtc::statistics::report::RTCStatsReport;
 
     fn annex_b_access_unit(nals: &[&[u8]]) -> Vec<u8> {
         let mut access_unit = Vec::new();
@@ -2991,6 +3818,141 @@ mod tests {
             },
             payload: Bytes::copy_from_slice(payload),
         }
+    }
+
+    #[test]
+    fn rtp_sequence_tracker_separates_reordering_duplicates_and_confirmed_loss() {
+        let start = Instant::now();
+        let mut tracker = RtpSequenceTracker::default();
+
+        assert_eq!(tracker.observe(10, start), Default::default());
+        assert_eq!(tracker.observe(11, start), Default::default());
+        assert_eq!(
+            tracker.observe(11, start),
+            super::RtpSequenceUpdate {
+                duplicate_packets: 1,
+                ..Default::default()
+            }
+        );
+
+        assert_eq!(
+            tracker.observe(13, start),
+            super::RtpSequenceUpdate {
+                observed_gap_packets: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            tracker.observe(12, start + Duration::from_millis(20)),
+            super::RtpSequenceUpdate {
+                recovered_reordered_packets: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            tracker.expire(start + Duration::from_millis(41)),
+            Default::default(),
+            "o pacote reordenado preencheu a lacuna dentro dos 40 ms"
+        );
+
+        let mut lost_tracker = RtpSequenceTracker::default();
+        lost_tracker.observe(20, start);
+        lost_tracker.observe(22, start);
+        assert_eq!(
+            lost_tracker.expire(start + Duration::from_millis(40)),
+            super::RtpSequenceUpdate {
+                confirmed_missing_packets: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            lost_tracker.observe(21, start + Duration::from_millis(41)),
+            super::RtpSequenceUpdate {
+                late_after_confirmed_packets: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn rtp_sequence_tracker_handles_u16_wrap_without_false_gap() {
+        let start = Instant::now();
+        let mut tracker = RtpSequenceTracker::default();
+        tracker.observe(u16::MAX - 1, start);
+        assert_eq!(tracker.observe(u16::MAX, start), Default::default());
+        assert_eq!(tracker.observe(0, start), Default::default());
+        assert_eq!(tracker.observe(1, start), Default::default());
+    }
+
+    #[test]
+    fn selected_media_route_diagnostics_distinguish_direct_turn_and_missing_stats() {
+        assert_eq!(
+            media_route_from_candidate_types(
+                Some(RTCIceCandidateType::Host),
+                Some(RTCIceCandidateType::Host)
+            ),
+            Some(MediaRoute::Direct)
+        );
+        assert_eq!(
+            media_route_from_candidate_types(
+                Some(RTCIceCandidateType::Relay),
+                Some(RTCIceCandidateType::Srflx)
+            ),
+            Some(MediaRoute::Turn)
+        );
+        assert_eq!(media_route_from_candidate_types(None, None), None);
+
+        let unavailable = peer_stats_snapshot(&RTCStatsReport::default());
+        assert_eq!(unavailable.route, None);
+        assert!(unavailable.selected_pair_summary.contains("indisponível"));
+    }
+
+    #[test]
+    fn media_interval_snapshot_reports_each_video_pipeline_stage() {
+        let metrics = super::SharedMetrics::default();
+        metrics
+            .interval_received_packets
+            .store(12, std::sync::atomic::Ordering::Relaxed);
+        metrics.record_sequence_update(super::RtpSequenceUpdate {
+            observed_gap_packets: 2,
+            recovered_reordered_packets: 1,
+            unmatched_out_of_order_packets: 1,
+            duplicate_packets: 1,
+            confirmed_missing_packets: 1,
+            late_after_confirmed_packets: 1,
+        });
+        metrics.record_sequence_gap_resync();
+        metrics.record_assembled_access_unit(&annex_b_access_unit(&[
+            &[0x67, 1],
+            &[0x68, 1],
+            &[0x65, 1],
+        ]));
+        metrics.record_assembly_error("lacuna de sequência no quadro".to_owned());
+        metrics.record_decoder_input();
+        metrics.record_decoder_no_output();
+        metrics.record_decoder_queue_drop();
+        metrics.record_pli_sent(super::PliReason::SequenceGap);
+        metrics.record_pli_received();
+        metrics.record_ui_texture_update();
+
+        let interval = metrics.take_performance_snapshot();
+        assert_eq!(interval.received_packets, 12);
+        assert_eq!(interval.observed_sequence_gaps, 2);
+        assert_eq!(interval.recovered_reordered_packets, 1);
+        assert_eq!(interval.unmatched_out_of_order_packets, 1);
+        assert_eq!(interval.duplicate_packets, 1);
+        assert_eq!(interval.confirmed_missing_packets, 1);
+        assert_eq!(interval.late_after_confirmed_packets, 1);
+        assert_eq!(interval.sequence_gap_resyncs, 1);
+        assert_eq!(interval.assembled_access_units, 1);
+        assert_eq!(interval.assembly_errors, 1);
+        assert_eq!(interval.decoder_input_frames, 1);
+        assert_eq!(interval.decoder_no_output_frames, 1);
+        assert_eq!(interval.decoder_queue_drops, 1);
+        assert_eq!(interval.pli_requests_sent, 1);
+        assert_eq!(interval.pli_requests_received, 1);
+        assert_eq!(interval.ui_texture_updates, 1);
+        assert_eq!(metrics.take_performance_snapshot().received_packets, 0);
     }
 
     #[test]

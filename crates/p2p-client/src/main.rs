@@ -775,6 +775,11 @@ impl ClientUi {
                         "Pedido aceito; negociando a conexão WebRTC da tela.",
                     ));
                     ui.small(format!(
+                        "Diagnóstico da sessão {} — SSRC {}",
+                        self.screen_share_metrics.session_id,
+                        self.screen_share_metrics.track_ssrc.unwrap_or_default()
+                    ));
+                    ui.small(format!(
                         "H.264: {} entradas no encoder, {} quadros produzidos; enviados {} (IDR {}, P {}), descartados antes do IDR {}.",
                         self.screen_share_metrics.encoder_input_frames,
                         self.screen_share_metrics.encoded_frames,
@@ -783,6 +788,13 @@ impl ClientUi {
                         self.screen_share_metrics.sent_delta_frames,
                         self.screen_share_metrics.dropped_before_initial_idr
                     ));
+                    ui.small(&self.screen_share_metrics.selected_ice_pair);
+                    ui.small(format!(
+                        "RTP enviado pela pilha WebRTC: {} pacotes, {} bytes.",
+                        self.screen_share_metrics.outbound_rtp_packets,
+                        self.screen_share_metrics.outbound_rtp_bytes
+                    ));
+                    ui.small(&self.screen_share_metrics.rtc_outbound_summary);
                     ui.small(&self.screen_share_metrics.h264_diagnostics);
                     if ui.button("Parar compartilhamento").clicked() {
                         self.stop_screen_share(true);
@@ -794,13 +806,29 @@ impl ClientUi {
                         "Pedido aceito; negociando a conexão WebRTC da tela.",
                     ));
                     ui.small(format!(
-                        "Vídeo: {} pacotes recebidos, {} quadros decodificados ({} P montados, {} P decodificados), {} erros H.264.",
+                        "Diagnóstico da sessão {} — SSRC {}",
+                        self.screen_share_metrics.session_id,
+                        self.screen_share_metrics.track_ssrc.unwrap_or_default()
+                    ));
+                    ui.small(format!(
+                        "Vídeo: {} pacotes recebidos, {} quadros P montados, {} entradas no decoder, {} quadros decodificados, {} quadros publicados, {} atualizações da prévia, {} erros H.264.",
                         self.screen_share_metrics.received_packets,
-                        self.screen_share_metrics.decoded_frames,
                         self.screen_share_metrics.received_delta_frames,
-                        self.screen_share_metrics.decoded_delta_frames,
+                        self.screen_share_metrics.decoder_input_frames,
+                        self.screen_share_metrics.decoded_frames,
+                        self.screen_share_metrics.published_frames,
+                        self.screen_share_metrics.ui_texture_updates,
                         self.screen_share_metrics.decode_errors
                     ));
+                    ui.small(&self.screen_share_metrics.selected_ice_pair);
+                    ui.small(format!(
+                        "RTP recebido pela pilha WebRTC: {} pacotes, {} bytes; perda reportada {}, jitter {:.1} ms.",
+                        self.screen_share_metrics.inbound_rtp_packets,
+                        self.screen_share_metrics.inbound_rtp_bytes,
+                        self.screen_share_metrics.inbound_rtp_lost,
+                        self.screen_share_metrics.inbound_rtp_jitter_ms
+                    ));
+                    ui.small(&self.screen_share_metrics.rtc_inbound_summary);
                     if let Some(error) = &self.screen_share_metrics.last_decode_error {
                         ui.small(format!("Último erro H.264: {error}"));
                     }
@@ -810,9 +838,10 @@ impl ClientUi {
                         .last_recovery_time_millis
                         .map_or_else(|| "ainda não disponível".to_owned(), |ms| format!("{ms} ms"));
                     ui.small(format!(
-                        "Recuperação: {} PLI enviados, {} recebidos; {} ressincronizações; {} IDRs decodificados; último tempo até IDR: {recovery_time}.",
+                        "Recuperação: {} PLI enviados, {} recebidos (fila cheia: {}); {} ressincronizações; {} IDRs decodificados; último tempo até IDR: {recovery_time}.",
                         self.screen_share_metrics.pli_requests_sent,
                         self.screen_share_metrics.pli_requests_received,
+                        self.screen_share_metrics.pli_queue_overflow,
                         self.screen_share_metrics.keyframe_resyncs,
                         self.screen_share_metrics.decoded_idr_frames
                     ));
@@ -1484,6 +1513,12 @@ impl ClientUi {
                     self.turn_credentials_for_room(),
                 ) {
                     Ok(session) => {
+                        let metrics = session.metrics();
+                        tracing::info!(
+                            screen_share_session = metrics.session_id,
+                            role = "receiver",
+                            "Receptor de compartilhamento preparado"
+                        );
                         self.screen_share_session = Some(session);
                         self.screen_share_metrics = ScreenShareMetrics::default();
                         self.last_screen_metrics_log_at = Some(Instant::now());
@@ -1544,6 +1579,12 @@ impl ClientUi {
                             self.screen_share_status = Some(error);
                             return;
                         }
+                        let metrics = session.metrics();
+                        tracing::info!(
+                            screen_share_session = metrics.session_id,
+                            role = "sender",
+                            "Emissor de compartilhamento preparado"
+                        );
                         self.screen_share_session = Some(session);
                         self.last_screen_metrics_log_at = Some(Instant::now());
                         self.screen_share_role = ScreenShareRole::Sending { request_id };
@@ -1699,6 +1740,17 @@ impl ClientUi {
                     }
                 };
                 tracing::info!(
+                    screen_share_session = metrics.session_id,
+                    role = match &self.screen_share_role {
+                        ScreenShareRole::Sending { .. } => "sender",
+                        ScreenShareRole::Receiving { .. } => "receiver",
+                        ScreenShareRole::Requesting { .. } => "requesting",
+                        ScreenShareRole::Idle => "idle",
+                    },
+                    track_ssrc = metrics.track_ssrc.unwrap_or_default(),
+                    selected_ice_pair = %metrics.selected_ice_pair,
+                    rtc_outbound = %metrics.rtc_outbound_summary,
+                    rtc_inbound = %metrics.rtc_inbound_summary,
                     p2p_connected = metrics.p2p_connected,
                     local_ice = metrics.local_ice_candidates,
                     remote_ice = metrics.remote_ice_candidates,
@@ -1713,9 +1765,41 @@ impl ClientUi {
                     sent = metrics.sent_frames,
                     received_delta_frames = metrics.received_delta_frames,
                     decoded_delta_frames = metrics.decoded_delta_frames,
-                    received_packets = metrics.received_packets,
+                    received_packets_total = metrics.received_packets,
+                    received_packets_interval = performance.received_packets,
+                    sequence_gap_packets_interval = performance.observed_sequence_gaps,
+                    reordered_packets_recovered_interval = performance.recovered_reordered_packets,
+                    unmatched_out_of_order_interval = performance.unmatched_out_of_order_packets,
+                    duplicate_packets_interval = performance.duplicate_packets,
+                    confirmed_missing_packets_interval = performance.confirmed_missing_packets,
+                    late_after_confirmed_packets_interval = performance.late_after_confirmed_packets,
+                    sequence_gap_resyncs_interval = performance.sequence_gap_resyncs,
+                    rtc_rtp_loss_delta = performance.inbound_rtp_lost_delta,
+                    assembled_access_units_interval = performance.assembled_access_units,
+                    assembly_errors_interval = performance.assembly_errors,
                     decoded = metrics.decoded_frames,
                     decode_errors = metrics.decode_errors,
+                    decode_errors_interval = performance.decode_errors,
+                    decoded_interval = performance.decoded_frames,
+                    pli_sent_interval = performance.pli_requests_sent,
+                    pli_received_interval = performance.pli_requests_received,
+                    pli_queue_overflow = metrics.pli_queue_overflow,
+                    rtc_rtp_out_packets = metrics.outbound_rtp_packets,
+                    rtc_rtp_out_bytes = metrics.outbound_rtp_bytes,
+                    rtc_rtp_in_packets = metrics.inbound_rtp_packets,
+                    rtc_rtp_in_bytes = metrics.inbound_rtp_bytes,
+                    rtc_rtp_in_lost = metrics.inbound_rtp_lost,
+                    rtc_rtp_in_jitter_ms = metrics.inbound_rtp_jitter_ms,
+                    decoder_input_frames = metrics.decoder_input_frames,
+                    decoder_input_interval = performance.decoder_input_frames,
+                    decoder_no_output_frames = metrics.decoder_no_output_frames,
+                    decoder_no_output_interval = performance.decoder_no_output_frames,
+                    decoder_queue_drops = metrics.decoder_queue_drops,
+                    decoder_queue_drops_interval = performance.decoder_queue_drops,
+                    published_frames = metrics.published_frames,
+                    published_interval = performance.published_frames,
+                    ui_texture_updates = metrics.ui_texture_updates,
+                    ui_texture_updates_interval = performance.ui_texture_updates,
                     h264 = %metrics.h264_diagnostics,
                     last_decode_error = metrics.last_decode_error.as_deref().unwrap_or(""),
                     interval_seconds,
@@ -1727,6 +1811,8 @@ impl ClientUi {
                     encoder_input_frames = performance.encoder_input_frames,
                     encode_fps = performance.encoded_frames as f64 / interval_seconds,
                     encoded_frames = performance.encoded_frames,
+                    encoded_idr_frames = performance.encoded_idr_frames,
+                    encoded_delta_frames = performance.encoded_delta_frames,
                     encode_avg_ms = average_ms(performance.encode_nanos, performance.encode_samples),
                     send_fps = performance.sent_frames as f64 / interval_seconds,
                     send_frames = performance.sent_frames,
@@ -1735,6 +1821,12 @@ impl ClientUi {
                     sent_delta_frames = performance.sent_delta_frames,
                     send_queue_wait_avg_ms = average_ms(performance.queue_wait_nanos, performance.queue_wait_samples),
                     write_sample_avg_ms = average_ms(performance.write_sample_nanos, performance.write_sample_samples),
+                    write_sample_bytes = performance.write_sample_bytes,
+                    write_sample_failures = performance.write_sample_failures,
+                    rtc_rtp_out_packets_delta = performance.outbound_rtp_packets,
+                    rtc_rtp_out_bytes_delta = performance.outbound_rtp_bytes,
+                    rtc_rtp_in_packets_delta = performance.inbound_rtp_packets,
+                    rtc_rtp_in_bytes_delta = performance.inbound_rtp_bytes,
                     "Resumo periódico da mídia de compartilhamento"
                 );
                 self.last_screen_metrics_log_at = Some(logged_at);
@@ -1745,29 +1837,33 @@ impl ClientUi {
             .as_ref()
             .map(|session| std::iter::from_fn(|| session.try_recv()).collect::<Vec<_>>())
             .unwrap_or_default();
+        let screen_share_session = self.screen_share_metrics.session_id;
         let mut stop_session = false;
         for event in events {
             match event {
                 ScreenShareEvent::Signal { kind, payload } => {
-                    tracing::debug!(signal_kind = ?kind, "Sinal de negociação de tela gerado; conteúdo omitido");
+                    tracing::debug!(screen_share_session, signal_kind = ?kind, "Sinal de negociação de tela gerado; conteúdo omitido");
                     let result = self.send_screen_share_signal(kind, payload);
                     if let Err(error) = result {
-                        tracing::error!(error = %error, "Falha ao encaminhar sinal de tela pela sinalização");
+                        tracing::error!(screen_share_session, error = %error, "Falha ao encaminhar sinal de tela pela sinalização");
                         self.screen_share_status = Some(error);
                         stop_session = true;
                     }
                 }
                 ScreenShareEvent::State(status) => {
-                    tracing::info!(state = %status, "Estado WebRTC de compartilhamento alterado");
+                    tracing::info!(screen_share_session, state = %status, "Estado WebRTC de compartilhamento alterado");
                     self.screen_share_status = Some(status)
                 }
                 ScreenShareEvent::Error(error) => {
-                    tracing::error!(error = %error, "Erro na sessão WebRTC de compartilhamento");
+                    tracing::error!(screen_share_session, error = %error, "Erro na sessão WebRTC de compartilhamento");
                     self.screen_share_status = Some(error);
                     stop_session = true;
                 }
                 ScreenShareEvent::ConnectionClosed => {
-                    tracing::warn!("Conexão P2P de compartilhamento encerrada");
+                    tracing::warn!(
+                        screen_share_session,
+                        "Conexão P2P de compartilhamento encerrada"
+                    );
                     self.screen_share_status =
                         Some("A conexão P2P de tela foi encerrada ou perdida.".to_owned());
                     stop_session = true;
@@ -1800,6 +1896,9 @@ impl ClientUi {
                         egui::TextureOptions::LINEAR,
                     ));
                 }
+                if let Some(session) = self.screen_share_session.as_ref() {
+                    session.record_ui_texture_update();
+                }
                 if self.remote_screen_sequence == 0 {
                     self.screen_share_status =
                         Some("Primeiro quadro da tela recebido e decodificado.".to_owned());
@@ -1829,6 +1928,22 @@ impl ClientUi {
             }
         }
         if let Some(session) = self.screen_share_session.take() {
+            let metrics = session.metrics();
+            tracing::info!(
+                screen_share_session = metrics.session_id,
+                track_ssrc = metrics.track_ssrc.unwrap_or_default(),
+                role = match &self.screen_share_role {
+                    ScreenShareRole::Sending { .. } => "sender",
+                    ScreenShareRole::Receiving { .. } => "receiver",
+                    ScreenShareRole::Requesting { .. } => "requesting",
+                    ScreenShareRole::Idle => "idle",
+                },
+                selected_ice_pair = %metrics.selected_ice_pair,
+                rtc_outbound = %metrics.rtc_outbound_summary,
+                rtc_inbound = %metrics.rtc_inbound_summary,
+                h264 = %metrics.h264_diagnostics,
+                "Resumo final do compartilhamento antes de liberar a sessão"
+            );
             session.stop();
         }
         self.last_screen_metrics_log_at = None;
@@ -3181,9 +3296,20 @@ impl ClientUi {
                 .collect(),
             screen_share_state: share_state.to_owned(),
             screen_metrics: format!(
-                "P2P={}, rota={:?}, codec local/remoto={}/{}, fallback local/remoto={}/{}, ICE local/remoto={}/{}, srflx local/remoto={}/{}, relay local/remoto={}/{}, entradas/quadros H.264/enviados/decodificados={}/{}/{}/{}, IDR/P enviados={}/{}, descartados antes do IDR={}, quadros P montados/decodificados={}/{}, pacotes recebidos={}, erros de decodificação={}, diagnóstico H.264={} ",
+                "sessão={}, SSRC={}, P2P={}, rota={:?}; par ICE: {}; RTP enviado: {}; RTP recebido: {}; RTP total enviado={} pacotes/{} bytes, recebido={} pacotes/{} bytes, perda={}, jitter={:.1} ms; codec local/remoto={}/{}, fallback local/remoto={}/{}, ICE local/remoto={}/{}, srflx local/remoto={}/{}, relay local/remoto={}/{}, entradas/quadros H.264/enviados/decodificados={}/{}/{}/{}, IDR/P enviados={}/{}, descartados antes do IDR={}, P montados/decodificados={}/{}, pacotes RTP observados={}, decoder entradas/sem saída/fila cheia={}/{}/{}, quadros publicados/atualizações da prévia={}/{}, PLI fila cheia={}, erros de decodificação={}, diagnóstico H.264={}",
+                metrics.session_id,
+                metrics.track_ssrc.unwrap_or_default(),
                 metrics.p2p_connected,
                 metrics.route,
+                metrics.selected_ice_pair,
+                metrics.rtc_outbound_summary,
+                metrics.rtc_inbound_summary,
+                metrics.outbound_rtp_packets,
+                metrics.outbound_rtp_bytes,
+                metrics.inbound_rtp_packets,
+                metrics.inbound_rtp_bytes,
+                metrics.inbound_rtp_lost,
+                metrics.inbound_rtp_jitter_ms,
                 metrics.encoder_backend,
                 metrics.decoder_backend,
                 metrics.encoder_fallback_reason.as_deref().unwrap_or(""),
@@ -3204,6 +3330,12 @@ impl ClientUi {
                 metrics.received_delta_frames,
                 metrics.decoded_delta_frames,
                 metrics.received_packets,
+                metrics.decoder_input_frames,
+                metrics.decoder_no_output_frames,
+                metrics.decoder_queue_drops,
+                metrics.published_frames,
+                metrics.ui_texture_updates,
+                metrics.pli_queue_overflow,
                 metrics.decode_errors,
                 metrics.h264_diagnostics
             ),
