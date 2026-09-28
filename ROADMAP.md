@@ -77,11 +77,13 @@ Usar o servidor da sala apenas para trocar pedido, oferta, resposta, candidatos 
 
 **Implementado:** captura de até 1280×720, codificação H.264 com OpenH264 incluído, envio WebRTC de até 30 fps, decodificação da tela remota, negociação por oferta/resposta e ICE, controle para pedir/aceitar/recusar/encerrar compartilhamento, desempate pela ordem de entrada quando há pedidos simultâneos, parada ao encerrar a captura ou perder a conexão. Salas com mais de duas pessoas não podem iniciar o compartilhamento.
 
-**Aceleração de vídeo:** no Windows, o aplicativo tenta usar codificadores H.264 de hardware enumerados pelo Media Foundation e decodificadores DXVA/Direct3D 11. A entrada continua sendo convertida para NV12 na CPU e o quadro decodificado é copiado de volta para a memória do aplicativo; captura, prévia e interface não foram migradas para a GPU. Se o codec ou a inicialização do dispositivo não estiver disponível, o app usa OpenH264 na CPU. A interface e os logs exibem o codec ativo e a razão do fallback. O formato solicitado continua H.264 Baseline, até 1280×720 e 30 fps.
+**Aceleração de vídeo:** no Windows, o aplicativo tenta usar codificadores H.264 de hardware do Media Foundation e decodificadores DXVA/Direct3D 11. Na captura de monitores por DXGI, o app tenta redimensionar e converter BGRA para NV12 na GPU e entregar a superfície D3D11 diretamente ao encoder. A prévia lê de volta apenas o quadro reduzido; se essa etapa ou a conversão GPU falhar, usa a cópia BGRA e o caminho atual por CPU. Captura de janela continua usando Windows Graphics Capture e pode exibir a borda amarela de privacidade. Se o encoder não aceitar a superfície, o app tenta a entrada NV12 pela CPU e depois OpenH264. O decoder DXVA também pode cair para OpenH264 se não publicar quadros. Interface e logs exibem os backends e os motivos de fallback. O formato continua H.264 Baseline, até 1280×720 e teto de 30 fps.
+
+**Pacing e diagnóstico:** o limitador aceita quadros com tolerância a pequenas variações nos callbacks, sem ultrapassar 30 FPS; quadros excedentes são descartados e uma imagem parada pode ser repetida a 1 FPS. Durante a sessão, a interface e os logs resumem a cada cinco segundos callbacks, quadros aceitos/descartados, leitura e preparação da prévia, conversão GPU, encoder, envio, recepção, decodificação e publicação.
 
 **Validação automatizada local:** o NVIDIA H.264 Encoder MFT deste PC gerou SPS/PPS/IDR Baseline e o quadro foi decodificado pelo OpenH264, cobrindo a compatibilidade com receptores antigos. O Microsoft H264 Video Decoder MFT inicializou DXVA, mas não produziu quadros neste PC; o teste de loopback confirmou a troca para OpenH264 e a chegada da imagem.
 
-**Ainda falta validar manualmente:** conferir no Gerenciador de Tarefas o uso dos mecanismos de vídeo, testar com outros drivers/GPU que o DXVA entregue quadros, e transmitir entre dois computadores físicos. A aceleração do decoder pode ficar em CPU neste PC; o motivo aparece na interface e nos logs.
+**Ainda falta validar manualmente:** confirmar a captura DXGI sem borda em monitor principal/secundário, mudanças de resolução e fallback WGC; confirmar que o encoder Media Foundation deste PC aceita superfícies D3D11 e que a conversão DXGI→NV12 mantém o caminho GPU ativo; conferir no Gerenciador de Tarefas os mecanismos de vídeo e transmitir conteúdo em movimento entre dois computadores físicos por 30 segundos. O decoder pode ficar em CPU neste PC; o motivo aparece na interface e nos logs. Não considerar 30 FPS garantidos em hardware sem suporte.
 
 **Validação manual:** transmissão do PC principal para o notebook confirmada, com 104 quadros decodificados e zero erros H.264; cancelamento do seletor confirmado. A transmissão inversa não foi validada porque o notebook tem hardware limitado.
 
@@ -125,7 +127,7 @@ Tratar encerramento do compartilhamento, desconexões, acesso às salas e estado
 
 **Instalador e preferências:** o setup por usuário instala em `%LOCALAPPDATA%\Programs\P2P-Voz-e-tela`, sem exigir administrador. O aplicativo salva preferências em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json`; atualizações preservam o arquivo e a desinstalação o remove. Códigos de sala e credenciais temporárias não são persistidos. O script `scripts/build-installer.ps1` compila o `.exe` e o instalador Inno Setup localmente.
 
-**Versão:** a publicação inicial foi 1.0.0; a próxima compilação planejada passa a ser 1.0.6.
+**Versão:** a publicação inicial foi 1.0.0; a próxima compilação planejada é 1.0.9.
 
 **Falta validar:** instalar o setup, conferir a persistência das preferências e a remoção na desinstalação. Publicar os dois assets (`p2p-client.exe` e `P2P-Voz-e-tela-Setup.exe`) em um GitHub Release e validar uma atualização futura e a recuperação após falha. Também falta validar manualmente os cenários de rede da Etapa 7 entre duas casas, incluindo a rota TURN.
 

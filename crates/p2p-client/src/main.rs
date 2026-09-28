@@ -18,7 +18,7 @@ use audio_capture::MicrophoneTest;
 use control_mesh::{ControlEvent, ControlMesh, QueueEntry};
 use eframe::egui;
 use logging::{DiagnosticSnapshot, LoggingState, safe_signaling_endpoint, safe_stun_endpoint};
-use screen_capture::{PendingScreenCapture, ScreenCapture};
+use screen_capture::{MonitorOption, PendingScreenCapture, ScreenCapture};
 use screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
 use settings::AppSettings;
 use signaling_client::{SignalingClient, SignalingEvent};
@@ -114,8 +114,13 @@ struct ClientUi {
     microphone_clipping_warning: bool,
     screen_capture: Option<ScreenCapture>,
     screen_picker: Option<PendingScreenCapture>,
+    available_monitors: Vec<MonitorOption>,
+    monitors_loaded: bool,
+    selected_monitor: usize,
+    dxgi_capture_error: Option<String>,
     screen_texture: Option<egui::TextureHandle>,
     screen_status: Option<String>,
+    screen_pipeline_summary: String,
     screen_share_session: Option<ScreenShareSession>,
     screen_share_role: ScreenShareRole,
     screen_share_status: Option<String>,
@@ -162,6 +167,26 @@ struct HostAddress {
 }
 
 impl ClientUi {
+    fn refresh_monitors(&mut self) {
+        if self.monitors_loaded || self.screen_capture.is_some() {
+            return;
+        }
+        self.monitors_loaded = true;
+        match ScreenCapture::monitors() {
+            Ok(monitors) => {
+                tracing::info!(
+                    count = monitors.len(),
+                    "Monitores ativos enumerados para DXGI"
+                );
+                self.available_monitors = monitors;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "NÃ£o foi possÃ­vel enumerar monitores DXGI");
+                self.dxgi_capture_error = Some(error);
+            }
+        }
+    }
+
     fn refresh_updates(&mut self, context: &egui::Context) {
         if self.room_code.is_some() {
             if let UpdateStatus::Downloading { manifest, .. } = &self.update_status {
@@ -300,6 +325,7 @@ impl ClientUi {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         self.refresh_microphone();
+        self.refresh_monitors();
         self.refresh_screen(ui.ctx());
         self.refresh_signaling(ui.ctx());
         self.refresh_turn_state();
@@ -720,7 +746,15 @@ impl ClientUi {
             }
 
             if self.screen_capture.is_some() {
-                ui.label("Captura de tela ativa.");
+                let backend = self.screen_capture.as_ref().map(ScreenCapture::backend_name).unwrap_or("desconhecido");
+                ui.label(format!("Captura de tela ativa — {backend}."));
+                if let Some(reason) = self
+                    .screen_capture
+                    .as_ref()
+                    .and_then(ScreenCapture::fallback_reason)
+                {
+                    ui.small(format!("Fallback da captura/prévia: {reason}"));
+                }
                 if ui.button("Parar captura da tela").clicked() {
                     self.stop_screen_capture();
                 }
@@ -731,10 +765,58 @@ impl ClientUi {
                 }
             } else if self.screen_picker.is_some() {
                 ui.label("Aguardando o seletor do Windows...");
-            } else if ui.button("Selecionar tela ou janela").clicked() {
-                self.select_screen(ui.ctx());
+            } else {
+                if !self.available_monitors.is_empty() {
+                    let selected = self.selected_monitor.min(self.available_monitors.len() - 1);
+                    self.selected_monitor = selected;
+                    egui::ComboBox::from_label("Monitor para captura DXGI")
+                        .selected_text(format!(
+                            "{} ({}×{})",
+                            self.available_monitors[selected].name,
+                            self.available_monitors[selected].width,
+                            self.available_monitors[selected].height
+                        ))
+                        .show_ui(ui, |ui| {
+                            for (index, monitor) in self.available_monitors.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.selected_monitor,
+                                    index,
+                                    format!("{} ({}×{})", monitor.name, monitor.width, monitor.height),
+                                );
+                            }
+                        });
+                    if ui.button("Capturar monitor por DXGI (sem borda amarela)").clicked() {
+                        self.dxgi_capture_error = None;
+                        match ScreenCapture::start_monitor(self.selected_monitor, ui.ctx().clone()) {
+                            Ok(capture) => {
+                                self.screen_capture = Some(capture);
+                                self.screen_status = Some("Captura DXGI ativa. A captura de monitor nÃ£o usa a borda de privacidade do Windows Graphics Capture.".to_owned());
+                            }
+                            Err(error) => {
+                                tracing::error!(error = %error, monitor_index = self.selected_monitor + 1, "Falha ao iniciar captura DXGI; Windows Graphics Capture estÃ¡ disponÃ­vel como alternativa");
+                                self.dxgi_capture_error = Some(error.clone());
+                                self.screen_status = Some(format!("NÃ£o foi possÃ­vel capturar este monitor por DXGI: {error}"));
+                            }
+                        }
+                    }
+                } else {
+                    ui.label("Nenhum monitor DXGI disponÃ­vel.");
+                }
+                ui.small("A captura de janela usa Windows Graphics Capture e exibe a borda amarela de privacidade do Windows.");
+                if ui.button("Selecionar janela ou monitor pelo Windows (borda amarela)").clicked() {
+                    self.select_screen(ui.ctx());
+                }
+                if self.dxgi_capture_error.is_some() {
+                    ui.small("Como alternativa, selecione o monitor no seletor do Windows; ele mostrarÃ¡ a borda amarela.");
+                    if ui.button("Tentar Windows Graphics Capture (borda amarela)").clicked() {
+                        self.select_screen(ui.ctx());
+                    }
+                }
             }
 
+            if !self.screen_pipeline_summary.is_empty() {
+                ui.small(&self.screen_pipeline_summary);
+            }
             if let Some(status) = &self.screen_status {
                 ui.label(status);
             }
@@ -1365,13 +1447,19 @@ impl ClientUi {
             return;
         }
 
+        let was_dxgi = capture.backend_name() == "DXGI Desktop Duplication";
         if let Some(result) = capture.poll_finished() {
             self.stop_screen_share(true);
             self.screen_capture = None;
             self.screen_texture = None;
             self.screen_status = Some(match result {
                 Ok(()) => "A captura da tela foi encerrada pelo Windows.".to_owned(),
-                Err(error) => format!("A captura da tela falhou: {error}"),
+                Err(error) => {
+                    if was_dxgi {
+                        self.dxgi_capture_error = Some(error.clone());
+                    }
+                    format!("A captura da tela falhou: {error}")
+                }
             });
         }
     }
@@ -1732,6 +1820,18 @@ impl ClientUi {
                     } else {
                         Default::default()
                     };
+                let capture_fps = capture_performance.processed_frames as f64 / interval_seconds;
+                let encoder_fps = performance.encoded_frames as f64 / interval_seconds;
+                let send_fps = performance.sent_frames as f64 / interval_seconds;
+                let receive_fps = performance.assembled_access_units as f64 / interval_seconds;
+                let receive_packet_rate = performance.received_packets as f64 / interval_seconds;
+                let decode_fps = performance.decoded_frames as f64 / interval_seconds;
+                let publish_fps = performance.published_frames as f64 / interval_seconds;
+                let backend = self
+                    .screen_capture
+                    .as_ref()
+                    .map(ScreenCapture::backend_name)
+                    .unwrap_or("sem captura local");
                 let average_ms = |nanos: u64, samples: u64| {
                     if samples == 0 {
                         0.0
@@ -1739,6 +1839,22 @@ impl ClientUi {
                         nanos as f64 / samples as f64 / 1_000_000.0
                     }
                 };
+                let capture_readback_ms = average_ms(
+                    capture_performance.readback_nanos,
+                    capture_performance.processed_frames,
+                );
+                let capture_resize_ms = average_ms(
+                    capture_performance.resize_nanos,
+                    capture_performance.processed_frames,
+                );
+                let capture_gpu_ms = average_ms(
+                    capture_performance.gpu_convert_nanos,
+                    capture_performance.processed_frames,
+                );
+                self.screen_pipeline_summary = format!(
+                    "5 s: captura {capture_fps:.1} FPS ({backend}; {} callbacks, {} descartados, leitura {capture_readback_ms:.1} ms, prévia {capture_resize_ms:.1} ms, GPU {capture_gpu_ms:.1} ms); encoder {encoder_fps:.1} FPS, envio {send_fps:.1} FPS; recepção {receive_fps:.1} quadros/s ({receive_packet_rate:.0} pacotes/s), decoder {decode_fps:.1} FPS, prévia publicada {publish_fps:.1} FPS.",
+                    capture_performance.received_frames, capture_performance.skipped_frames,
+                );
                 tracing::info!(
                     screen_share_session = metrics.session_id,
                     role = match &self.screen_share_role {
@@ -1804,10 +1920,12 @@ impl ClientUi {
                     last_decode_error = metrics.last_decode_error.as_deref().unwrap_or(""),
                     interval_seconds,
                     capture_fps = capture_performance.processed_frames as f64 / interval_seconds,
+                    capture_callbacks = capture_performance.received_frames,
                     capture_processed = capture_performance.processed_frames,
                     capture_skipped = capture_performance.skipped_frames,
                     capture_readback_avg_ms = average_ms(capture_performance.readback_nanos, capture_performance.processed_frames),
                     capture_resize_avg_ms = average_ms(capture_performance.resize_nanos, capture_performance.processed_frames),
+                    capture_gpu_convert_avg_ms = average_ms(capture_performance.gpu_convert_nanos, capture_performance.processed_frames),
                     encoder_new_capture_frames = performance.new_capture_frames,
                     encoder_repeated_capture_frames = performance.repeated_capture_frames,
                     encoder_input_frames = performance.encoder_input_frames,

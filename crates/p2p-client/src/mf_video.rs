@@ -1,8 +1,8 @@
 //! Hardware H.264 transforms backed by Windows Media Foundation.
 //!
-//! The input and output remain system-memory buffers in this first version.
 //! Media Foundation performs H.264 encode/decode on a hardware MFT when one is
-//! available; the capture and UI paths are deliberately unchanged.
+//! available. DXGI monitor capture can pass scaled NV12 D3D11 surfaces directly
+//! to a D3D-aware encoder; other sources keep the system-memory path.
 
 #[cfg(windows)]
 mod windows_backend {
@@ -15,13 +15,24 @@ mod windows_backend {
     use std::time::{Duration, Instant};
 
     use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
+    use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ,
-        D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
-        ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
+        D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+        D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+        D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT,
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+        D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+        D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice,
+        ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D, ID3D11VideoContext,
+        ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
     };
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    };
     use windows::Win32::Media::MediaFoundation::*;
     use windows::Win32::System::Com::{
         COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -223,6 +234,11 @@ mod windows_backend {
         }
 
         fn send_input(&self, bytes: &[u8], time_hns: i64) -> Result<(), String> {
+            let sample = make_sample(bytes, time_hns)?;
+            self.send_sample(&sample, time_hns)
+        }
+
+        fn send_sample(&self, sample: &IMFSample, time_hns: i64) -> Result<(), String> {
             if self.async_transform
                 && !self.wait_for_event(METransformNeedInput.0 as u32, MF_EVENT_WAIT)?
             {
@@ -230,7 +246,6 @@ mod windows_backend {
                     "O codec de hardware não solicitou um quadro de entrada no prazo.".to_owned(),
                 );
             }
-            let sample = make_sample(bytes, time_hns)?;
             unsafe {
                 sample
                     .SetSampleTime(time_hns)
@@ -239,7 +254,7 @@ mod windows_backend {
                     .SetSampleDuration(HNS_PER_SECOND / i64::from(FRAME_RATE))
                     .map_err(|e| format!("Não foi possível marcar a duração do quadro: {e}"))?;
             }
-            let mut result = unsafe { self.transform.ProcessInput(0, &sample, 0) };
+            let mut result = unsafe { self.transform.ProcessInput(0, sample, 0) };
             for _ in 0..8 {
                 match result {
                     Ok(()) => return Ok(()),
@@ -253,7 +268,7 @@ mod windows_backend {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push_back(output);
                         }
-                        result = unsafe { self.transform.ProcessInput(0, &sample, 0) };
+                        result = unsafe { self.transform.ProcessInput(0, sample, 0) };
                     }
                     Err(error) => {
                         return Err(format!("O codec de hardware recusou o quadro: {error}"));
@@ -330,12 +345,15 @@ mod windows_backend {
 
     pub struct HardwareEncoder {
         _apartment: ComApartment,
+        _device: Option<ID3D11Device>,
+        _device_manager: Option<IMFDXGIDeviceManager>,
         transform: Transform,
         width: u32,
         height: u32,
         next_time_hns: i64,
         name: String,
         force_keyframe_available: Option<bool>,
+        gpu_surface_input_enabled: bool,
     }
 
     impl HardwareEncoder {
@@ -352,12 +370,41 @@ mod windows_backend {
             )?;
             Ok(Self {
                 _apartment: apartment,
+                _device: None,
+                _device_manager: None,
                 transform,
                 width,
                 height,
                 next_time_hns: 0,
                 name,
                 force_keyframe_available: None,
+                gpu_surface_input_enabled: false,
+            })
+        }
+
+        pub fn new_gpu(width: u32, height: u32, device: &ID3D11Device) -> Result<Self, String> {
+            let apartment = ComApartment::enter()?;
+            ensure_media_foundation()?;
+            let device_manager = create_device_manager(device)?;
+            let (transform, name) = activate_hardware_transform(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFVideoFormat_NV12,
+                MFVideoFormat_H264,
+                width,
+                height,
+                Some(&device_manager),
+            )?;
+            Ok(Self {
+                _apartment: apartment,
+                _device: Some(device.clone()),
+                _device_manager: Some(device_manager),
+                transform,
+                width,
+                height,
+                next_time_hns: 0,
+                name,
+                force_keyframe_available: None,
+                gpu_surface_input_enabled: true,
             })
         }
 
@@ -427,6 +474,82 @@ mod windows_backend {
             self.transform.send_input(&nv12, self.next_time_hns)?;
             self.next_time_hns += HNS_PER_SECOND / i64::from(FRAME_RATE);
 
+            self.drain_output()
+        }
+
+        pub fn encode_gpu(&mut self, frame: &GpuNv12Surface) -> Result<Vec<u8>, String> {
+            if frame.width != self.width || frame.height != self.height {
+                return Err(
+                    "A superfÃ­cie NV12 da GPU nÃ£o corresponde Ã s dimensÃµes do codificador."
+                        .to_owned(),
+                );
+            }
+            if self._device.is_none() {
+                return Err(
+                    "O codificador Media Foundation nÃ£o foi configurado para superfÃ­cies D3D11."
+                        .to_owned(),
+                );
+            }
+            let buffer = unsafe {
+                MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &frame.texture, 0, false)
+            }
+            .map_err(|error| {
+                format!("O Media Foundation nÃ£o aceitou a superfÃ­cie D3D11 NV12: {error}")
+            })?;
+            let sample = unsafe { MFCreateSample() }
+                .map_err(|error| format!("NÃ£o foi possÃ­vel criar amostra da GPU: {error}"))?;
+            unsafe {
+                sample.AddBuffer(&buffer).map_err(|error| {
+                    format!("NÃ£o foi possÃ­vel anexar a superfÃ­cie D3D11: {error}")
+                })?;
+            }
+            self.transform.send_sample(&sample, self.next_time_hns)?;
+            self.next_time_hns += HNS_PER_SECOND / i64::from(FRAME_RATE);
+            self.drain_output()
+        }
+
+        pub fn encode_gpu_or_rgba(
+            &mut self,
+            frame: Option<&GpuNv12Surface>,
+            rgba: &[u8],
+        ) -> Result<(Vec<u8>, bool, Option<String>), String> {
+            if !self.gpu_surface_input_enabled {
+                return self.encode_rgba(rgba).map(|bytes| (bytes, false, None));
+            }
+            let Some(frame) = frame else {
+                if self.gpu_surface_input_enabled {
+                    self.gpu_surface_input_enabled = false;
+                    return self.encode_rgba(rgba).map(|bytes| {
+                        (
+                            bytes,
+                            false,
+                            Some("A captura não forneceu uma superfície NV12 D3D11; usando entrada pela CPU.".to_owned()),
+                        )
+                    });
+                }
+                return self.encode_rgba(rgba).map(|bytes| (bytes, false, None));
+            };
+            match self.encode_gpu(frame) {
+                Ok(bytes) => Ok((bytes, true, None)),
+                Err(gpu_error) => {
+                    self.gpu_surface_input_enabled = false;
+                    match self.encode_rgba(rgba) {
+                        Ok(bytes) => Ok((
+                            bytes,
+                            false,
+                            Some(format!(
+                                "O encoder não aceitou a superfície D3D11; usando entrada pela CPU: {gpu_error}"
+                            )),
+                        )),
+                        Err(cpu_error) => Err(format!(
+                            "A entrada D3D11 falhou ({gpu_error}) e a nova tentativa pela CPU também falhou: {cpu_error}"
+                        )),
+                    }
+                }
+            }
+        }
+
+        fn drain_output(&mut self) -> Result<Vec<u8>, String> {
             let mut output = Vec::new();
             let deadline = Instant::now() + Duration::from_millis(250);
             loop {
@@ -458,6 +581,267 @@ mod windows_backend {
                 return Ok(Vec::new());
             }
             Ok(normalize_annex_b(output))
+        }
+    }
+
+    pub struct GpuNv12Surface {
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        texture: ID3D11Texture2D,
+        width: u32,
+        height: u32,
+    }
+
+    impl GpuNv12Surface {
+        pub fn device(&self) -> &ID3D11Device {
+            &self.device
+        }
+
+        pub fn readback_nv12(&self) -> Result<(Vec<u8>, usize), String> {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { self.texture.GetDesc(&mut desc) };
+            let mut staging_desc = desc;
+            staging_desc.Usage = D3D11_USAGE_STAGING;
+            staging_desc.BindFlags = 0;
+            staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            staging_desc.MiscFlags = 0;
+            let mut staging = None;
+            unsafe {
+                self.device
+                    .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+                    .map_err(|error| {
+                        format!("Não foi possível criar a cópia NV12 para a prévia: {error}")
+                    })?;
+            }
+            let staging =
+                staging.ok_or_else(|| "D3D11 não criou a cópia NV12 para a prévia.".to_owned())?;
+            let source: ID3D11Resource = self
+                .texture
+                .cast()
+                .map_err(|error| format!("Não foi possível acessar a superfície NV12: {error}"))?;
+            let destination: ID3D11Resource = staging
+                .cast()
+                .map_err(|error| format!("Não foi possível acessar a cópia NV12: {error}"))?;
+            unsafe { self.context.CopyResource(&destination, &source) };
+
+            let mut mapped = Default::default();
+            unsafe {
+                self.context
+                    .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .map_err(|error| {
+                        format!("Não foi possível ler a superfície NV12 reduzida: {error}")
+                    })?;
+                let stride = mapped.RowPitch as usize;
+                let length = stride
+                    .checked_mul(self.height as usize + self.height as usize / 2)
+                    .ok_or_else(|| "O tamanho da prévia NV12 excedeu o limite.".to_owned())?;
+                let bytes = slice::from_raw_parts(mapped.pData.cast::<u8>(), length).to_vec();
+                self.context.Unmap(&staging, 0);
+                Ok((bytes, stride))
+            }
+        }
+
+        pub fn to_rgba(&self, nv12: &[u8], stride: usize) -> Result<Vec<u8>, String> {
+            nv12_to_rgba(nv12, self.width as usize, self.height as usize, stride)
+        }
+    }
+
+    pub struct GpuNv12Processor {
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        video_device: ID3D11VideoDevice,
+        video_context: ID3D11VideoContext,
+        enumerator: ID3D11VideoProcessorEnumerator,
+        processor: ID3D11VideoProcessor,
+        input_width: u32,
+        input_height: u32,
+        output_width: u32,
+        output_height: u32,
+    }
+
+    impl GpuNv12Processor {
+        pub fn new(
+            device: &ID3D11Device,
+            context: &ID3D11DeviceContext,
+            input_width: u32,
+            input_height: u32,
+            output_width: u32,
+            output_height: u32,
+        ) -> Result<Self, String> {
+            let video_device: ID3D11VideoDevice = device.cast().map_err(|error| {
+                format!("O dispositivo DXGI nÃ£o oferece conversÃ£o D3D11 de vÃ­deo: {error}")
+            })?;
+            let video_context: ID3D11VideoContext = context.cast().map_err(|error| {
+                format!("O contexto DXGI nÃ£o oferece ID3D11VideoContext: {error}")
+            })?;
+            let description = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+                InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                InputFrameRate: DXGI_RATIONAL {
+                    Numerator: FRAME_RATE,
+                    Denominator: 1,
+                },
+                InputWidth: input_width,
+                InputHeight: input_height,
+                OutputFrameRate: DXGI_RATIONAL {
+                    Numerator: FRAME_RATE,
+                    Denominator: 1,
+                },
+                OutputWidth: output_width,
+                OutputHeight: output_height,
+                Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+            };
+            let enumerator =
+                unsafe { video_device.CreateVideoProcessorEnumerator(&description) }
+                    .map_err(|error| format!("NÃ£o foi possÃ­vel criar conversor D3D11: {error}"))?;
+            let input_support =
+                unsafe { enumerator.CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM) }
+                    .map_err(|error| {
+                        format!("NÃ£o foi possÃ­vel consultar formato BGRA do monitor: {error}")
+                    })?;
+            if input_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 as u32 == 0 {
+                return Err("A GPU nÃ£o aceita BGRA como entrada do conversor de vÃ­deo.".to_owned());
+            }
+            let output_support = unsafe { enumerator.CheckVideoProcessorFormat(DXGI_FORMAT_NV12) }
+                .map_err(|error| {
+                    format!("NÃ£o foi possÃ­vel consultar saÃ­da NV12 da GPU: {error}")
+                })?;
+            if output_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 == 0 {
+                return Err("A GPU nÃ£o aceita NV12 como saÃ­da do conversor de vÃ­deo.".to_owned());
+            }
+            let processor =
+                unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }.map_err(|error| {
+                    format!("NÃ£o foi possÃ­vel iniciar o conversor de vÃ­deo D3D11: {error}")
+                })?;
+            Ok(Self {
+                device: device.clone(),
+                context: context.clone(),
+                video_device,
+                video_context,
+                enumerator,
+                processor,
+                input_width,
+                input_height,
+                output_width,
+                output_height,
+            })
+        }
+
+        pub fn process(&mut self, input: &ID3D11Texture2D) -> Result<GpuNv12Surface, String> {
+            let texture_desc = D3D11_TEXTURE2D_DESC {
+                Width: self.output_width,
+                Height: self.output_height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_NV12,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut texture = None;
+            unsafe {
+                self.device
+                    .CreateTexture2D(&texture_desc, None, Some(&mut texture))
+                    .map_err(|error| {
+                        format!("NÃ£o foi possÃ­vel criar textura NV12 para o encoder: {error}")
+                    })?;
+            }
+            let texture =
+                texture.ok_or_else(|| "D3D11 nÃ£o retornou a textura NV12.".to_owned())?;
+            let input_description = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                FourCC: 0,
+                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPIV {
+                        MipSlice: 0,
+                        ArraySlice: 0,
+                    },
+                },
+            };
+            let output_description = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                },
+            };
+            let mut input_view = None;
+            let mut output_view = None;
+            unsafe {
+                self.video_device
+                    .CreateVideoProcessorInputView(
+                        input,
+                        &self.enumerator,
+                        &input_description,
+                        Some(&mut input_view),
+                    )
+                    .map_err(|error| {
+                        format!("D3D11 nÃ£o criou a visualizaÃ§Ã£o do quadro DXGI: {error}")
+                    })?;
+                self.video_device
+                    .CreateVideoProcessorOutputView(
+                        &texture,
+                        &self.enumerator,
+                        &output_description,
+                        Some(&mut output_view),
+                    )
+                    .map_err(|error| {
+                        format!("D3D11 nÃ£o criou a superfÃ­cie de saÃ­da NV12: {error}")
+                    })?;
+                let source_rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: self.input_width as i32,
+                    bottom: self.input_height as i32,
+                };
+                let destination_rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: self.output_width as i32,
+                    bottom: self.output_height as i32,
+                };
+                self.video_context.VideoProcessorSetStreamSourceRect(
+                    &self.processor,
+                    0,
+                    true,
+                    Some(&source_rect),
+                );
+                self.video_context.VideoProcessorSetStreamDestRect(
+                    &self.processor,
+                    0,
+                    true,
+                    Some(&destination_rect),
+                );
+                let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+                    Enable: true.into(),
+                    OutputIndex: 0,
+                    InputFrameOrField: 0,
+                    PastFrames: 0,
+                    FutureFrames: 0,
+                    pInputSurface: std::mem::ManuallyDrop::new(input_view),
+                    ..Default::default()
+                };
+                self.video_context
+                    .VideoProcessorBlt(
+                        &self.processor,
+                        output_view.as_ref().ok_or_else(|| {
+                            "D3D11 nÃ£o retornou visualizaÃ§Ã£o de saÃ­da.".to_owned()
+                        })?,
+                        0,
+                        &[stream],
+                    )
+                    .map_err(|error| format!("A GPU nÃ£o converteu BGRA para NV12: {error}"))?;
+            }
+            Ok(GpuNv12Surface {
+                device: self.device.clone(),
+                context: self.context.clone(),
+                texture,
+                width: self.output_width,
+                height: self.output_height,
+            })
         }
     }
 
@@ -526,9 +910,9 @@ mod windows_backend {
             let mut decoded = None;
             for output_index in 0..8 {
                 let wait = if output_index == 0 {
-                    Duration::from_millis(100)
+                    Duration::from_millis(8)
                 } else {
-                    Duration::from_millis(5)
+                    Duration::from_millis(2)
                 };
                 let Some(sample) = self
                     .transform
@@ -748,6 +1132,27 @@ mod windows_backend {
                 .map_err(|e| format!("Não foi possível ativar DXVA no dispositivo D3D11: {e}"))?;
         }
         Ok((device, context, manager))
+    }
+
+    fn create_device_manager(device: &ID3D11Device) -> Result<IMFDXGIDeviceManager, String> {
+        let mut token = 0u32;
+        let mut manager = None;
+        unsafe {
+            MFCreateDXGIDeviceManager(&mut token, &mut manager).map_err(|error| {
+                format!("Could not create the Media Foundation D3D manager: {error}")
+            })?;
+        }
+        let manager =
+            manager.ok_or_else(|| "Media Foundation returned no D3D manager.".to_owned())?;
+        let unknown: IUnknown = device.cast().map_err(|error| {
+            format!("Could not expose the D3D11 device to Media Foundation: {error}")
+        })?;
+        unsafe {
+            manager.ResetDevice(&unknown, token).map_err(|error| {
+                format!("Could not register the D3D11 device with Media Foundation: {error}")
+            })?;
+        }
+        Ok(manager)
     }
 
     fn read_dxgi_nv12(
@@ -1087,7 +1492,9 @@ mod windows_backend {
 }
 
 #[cfg(windows)]
-pub(crate) use windows_backend::{HardwareDecoder, HardwareEncoder, sps_dimensions};
+pub(crate) use windows_backend::{
+    GpuNv12Processor, GpuNv12Surface, HardwareDecoder, HardwareEncoder, sps_dimensions,
+};
 
 #[cfg(not(windows))]
 pub struct HardwareEncoder;
@@ -1099,6 +1506,10 @@ pub struct DecodedFrame {
     pub height: u32,
     pub rgba: Vec<u8>,
 }
+#[cfg(not(windows))]
+pub(crate) struct GpuNv12Processor;
+#[cfg(not(windows))]
+pub(crate) struct GpuNv12Surface;
 #[cfg(not(windows))]
 impl HardwareEncoder {
     pub fn new(_: u32, _: u32) -> Result<Self, String> {

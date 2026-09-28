@@ -1534,6 +1534,8 @@ fn decode_h264_access_unit(
                     width,
                     height,
                     rgba,
+                    #[cfg(windows)]
+                    gpu_nv12: None,
                 }));
             metrics.published_frames.fetch_add(1, Ordering::Relaxed);
             metrics
@@ -2372,6 +2374,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                     let mut cached_pps = None;
                     let mut cached_idr = None;
                     let mut last_hardware_input_at: Option<Instant> = None;
+                    let mut hardware_decoder_disabled = false;
                     loop {
                         let watchdog_wait = if matches!(
                             decoder.as_ref(),
@@ -2404,6 +2407,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                 tracing::warn!(fallback_reason = %reason, cached_idr = cached_idr.is_some(), "Watchdog do primeiro quadro DXVA acionado");
                                 match Decoder::new() {
                                     Ok(cpu) => {
+                                        hardware_decoder_disabled = true;
                                         worker_metrics.set_decoder_backend(
                                             "CPU — OpenH264".to_owned(),
                                             Some(reason),
@@ -2490,8 +2494,8 @@ impl PeerConnectionEventHandler for PeerEvents {
                         };
 
                         #[cfg(windows)]
-                        let should_try_hardware = decoder.is_none()
-                            || (using_cpu_pending_sps && has_sps_and_idr);
+                        let should_try_hardware = !hardware_decoder_disabled
+                            && (decoder.is_none() || (using_cpu_pending_sps && has_sps_and_idr));
                         #[cfg(not(windows))]
                         let should_try_hardware = false;
 
@@ -2499,8 +2503,10 @@ impl PeerConnectionEventHandler for PeerEvents {
                             #[cfg(windows)]
                             {
                                 if let Some((width, height)) = mf_video::sps_dimensions(&access_unit) {
+                                    hardware_decoder_disabled = true;
                                     match mf_video::HardwareDecoder::new(width, height) {
                                         Ok(hardware) => {
+                                            hardware_decoder_disabled = false;
                                             let name = hardware.name().to_owned();
                                             worker_metrics.set_decoder_backend(
                                                 format!("GPU — DXVA / {name}"),
@@ -2617,6 +2623,7 @@ impl PeerConnectionEventHandler for PeerEvents {
                                 failure.hardware_decoder
                                     && is_hardware_device_failure(&failure.detail)
                             }) {
+                                hardware_decoder_disabled = true;
                                 let reason = hardware_error
                                     .as_ref()
                                     .map(|failure| failure.detail.clone())
@@ -2647,8 +2654,9 @@ impl PeerConnectionEventHandler for PeerEvents {
                             {
                                 last_hardware_input_at = Some(Instant::now());
                                 hardware_frames_without_output = hardware_frames_without_output.saturating_add(1);
-                                if hardware_frames_without_output >= 5 {
-                                    let reason = "DXVA recebeu 5 quadros H.264 sem produzir imagem; usando OpenH264 na CPU.".to_owned();
+                                if hardware_frames_without_output >= 15 {
+                                    hardware_decoder_disabled = true;
+                                    let reason = "DXVA recebeu 15 quadros H.264 sem produzir imagem; usando OpenH264 na CPU.".to_owned();
                                     tracing::warn!(fallback_reason = %reason, "Decodificador DXVA sem saída; mudando para OpenH264 na CPU");
                                     match Decoder::new() {
                                         Ok(cpu) => {
@@ -3788,13 +3796,44 @@ fn encode_latest_frames(
         if encoder.is_none() {
             #[cfg(windows)]
             {
-                match mf_video::HardwareEncoder::new(frame.width, frame.height) {
-                    Ok(hardware) => {
+                let hardware_result = if let Some(surface) = frame.gpu_nv12.as_ref() {
+                    match mf_video::HardwareEncoder::new_gpu(
+                        frame.width,
+                        frame.height,
+                        surface.device(),
+                    ) {
+                        Ok(hardware) => Ok((hardware, true, None)),
+                        Err(gpu_error) => mf_video::HardwareEncoder::new(frame.width, frame.height)
+                            .map(|hardware| {
+                                (
+                                    hardware,
+                                    false,
+                                    Some(format!("Entrada por superfície D3D11 indisponível: {gpu_error}")),
+                                )
+                            })
+                            .map_err(|cpu_error| {
+                                format!(
+                                    "Superfície D3D11: {gpu_error}; entrada do Media Foundation pela CPU: {cpu_error}"
+                                )
+                            }),
+                    }
+                } else {
+                    mf_video::HardwareEncoder::new(frame.width, frame.height)
+                        .map(|hardware| (hardware, false, None))
+                };
+                match hardware_result {
+                    Ok((hardware, gpu_input, fallback_reason)) => {
                         let name = hardware.name().to_owned();
                         tracing::info!(codec = %name, width = frame.width, height = frame.height, "Codificador H.264 de hardware ativado");
                         metrics
                             .set_encoder_backend(format!("GPU — Media Foundation / {name}"), None);
                         encoder = Some(ActiveH264Encoder::MediaFoundation(hardware));
+                        let active_backend = if gpu_input {
+                            format!("GPU / D3D11 surface -> Media Foundation / {name}")
+                        } else {
+                            format!("GPU / Media Foundation / {name} (entrada em CPU)")
+                        };
+                        metrics.set_encoder_backend(active_backend, fallback_reason);
                     }
                     Err(error) => {
                         let reason =
@@ -3855,7 +3894,17 @@ fn encode_latest_frames(
                     hardware_warmup_frames = hardware_warmup_frames.saturating_add(1);
                 }
                 let encode_started_at = Instant::now();
-                let encode_result = hardware.encode_rgba(&frame.rgba);
+                let encode_result = hardware
+                    .encode_gpu_or_rgba(frame.gpu_nv12.as_deref(), &frame.rgba)
+                    .map(|(bytes, used_gpu, fallback_reason)| {
+                        if !used_gpu && fallback_reason.is_some() {
+                            metrics.set_encoder_backend(
+                                "GPU / Media Foundation (entrada em CPU)".to_owned(),
+                                fallback_reason,
+                            );
+                        }
+                        bytes
+                    });
                 metrics.record_encode_duration(encode_started_at.elapsed());
                 match encode_result {
                     Ok(encoded) => {
@@ -4113,6 +4162,8 @@ mod tests {
             rgba: (0..320 * 240 * 4)
                 .map(|index| ((index * 17) % 251) as u8)
                 .collect(),
+            #[cfg(windows)]
+            gpu_nv12: None,
         };
         let encoded = encode_frame(&mut encoder, &source).unwrap();
         let mut cached_sps = None;
@@ -4496,6 +4547,8 @@ mod tests {
             width: 320,
             height: 240,
             rgba: vec![96; 320 * 240 * 4],
+            #[cfg(windows)]
+            gpu_nv12: None,
         };
         let encoded = encode_frame(&mut encoder, &frame).unwrap();
         assert!(!encoded.is_empty());
@@ -4515,6 +4568,8 @@ mod tests {
             width: 1282,
             height: 720,
             rgba: Vec::new(),
+            #[cfg(windows)]
+            gpu_nv12: None,
         };
         assert!(encode_frame(&mut encoder, &frame).is_err());
     }
@@ -4651,6 +4706,8 @@ mod tests {
             width: 320,
             height: 240,
             rgba: vec![128; 320 * 240 * 4],
+            #[cfg(windows)]
+            gpu_nv12: None,
         }))));
         sender.start_sending(Arc::clone(&source)).unwrap();
 
@@ -4717,6 +4774,8 @@ mod tests {
                         width: 320,
                         height: 240,
                         rgba: vec![(sequence % 255) as u8; 320 * 240 * 4],
+                        #[cfg(windows)]
+                        gpu_nv12: None,
                     }));
                 next_frame += FRAME_DURATION;
             }

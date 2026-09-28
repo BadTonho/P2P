@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
+use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
 use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::InternalCaptureControl;
 use windows_capture::graphics_capture_picker::{Error as PickerError, GraphicsCapturePicker};
@@ -21,6 +22,14 @@ use windows_capture::settings::{
 const MAX_FRAME_WIDTH: u32 = 1280;
 const MAX_FRAME_HEIGHT: u32 = 720;
 const MIN_CAPTURE_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
+const CAPTURE_PACING_JITTER_TOLERANCE: Duration = Duration::from_micros(250);
+
+#[derive(Clone, Debug)]
+pub struct MonitorOption {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+}
 
 #[derive(Clone)]
 pub struct PreviewFrame {
@@ -28,33 +37,41 @@ pub struct PreviewFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    #[cfg(windows)]
+    pub gpu_nv12: Option<Arc<crate::mf_video::GpuNv12Surface>>,
 }
 
 pub type LatestFrame = Arc<Mutex<Option<Arc<PreviewFrame>>>>;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CapturePerformanceSnapshot {
+    pub received_frames: u64,
     pub processed_frames: u64,
     pub skipped_frames: u64,
     pub readback_nanos: u64,
     pub resize_nanos: u64,
+    pub gpu_convert_nanos: u64,
 }
 
 #[derive(Default)]
 struct CapturePerformanceCounters {
+    received_frames: AtomicU64,
     processed_frames: AtomicU64,
     skipped_frames: AtomicU64,
     readback_nanos: AtomicU64,
     resize_nanos: AtomicU64,
+    gpu_convert_nanos: AtomicU64,
 }
 
 impl CapturePerformanceCounters {
     fn take_snapshot(&self) -> CapturePerformanceSnapshot {
         CapturePerformanceSnapshot {
+            received_frames: self.received_frames.swap(0, Ordering::Relaxed),
             processed_frames: self.processed_frames.swap(0, Ordering::Relaxed),
             skipped_frames: self.skipped_frames.swap(0, Ordering::Relaxed),
             readback_nanos: self.readback_nanos.swap(0, Ordering::Relaxed),
             resize_nanos: self.resize_nanos.swap(0, Ordering::Relaxed),
+            gpu_convert_nanos: self.gpu_convert_nanos.swap(0, Ordering::Relaxed),
         }
     }
 }
@@ -64,11 +81,19 @@ type Control = CaptureControl<ScreenFrameHandler, HandlerError>;
 type PickResult = Result<Option<(windows_capture::GraphicsCaptureItem, (i32, i32))>, String>;
 
 pub struct ScreenCapture {
+    backend_name: &'static str,
     control: Option<Control>,
+    dxgi_worker: Option<DxgiCaptureWorker>,
     latest_frame: LatestFrame,
     performance: Arc<CapturePerformanceCounters>,
+    fallback_reason: Arc<Mutex<Option<String>>>,
     source_closed: Arc<AtomicBool>,
     picker_owner: Option<PickerThreadOwner>,
+}
+
+struct DxgiCaptureWorker {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<Result<(), String>>>,
 }
 
 pub struct PendingScreenCapture {
@@ -199,6 +224,73 @@ impl PickerThreadOwner {
 }
 
 impl ScreenCapture {
+    pub fn monitors() -> Result<Vec<MonitorOption>, String> {
+        Monitor::enumerate()
+            .map_err(|error| {
+                format!("NÃ£o foi possÃ­vel enumerar monitores para captura DXGI: {error}")
+            })?
+            .into_iter()
+            .enumerate()
+            .map(|(index, monitor)| {
+                Ok(MonitorOption {
+                    name: monitor.device_string().unwrap_or_else(|_| {
+                        monitor
+                            .device_name()
+                            .unwrap_or_else(|_| format!("Monitor {}", index + 1))
+                    }),
+                    width: monitor.width().map_err(|error| error.to_string())?,
+                    height: monitor.height().map_err(|error| error.to_string())?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn start_monitor(index: usize, context: egui::Context) -> Result<Self, String> {
+        let monitor = Monitor::from_index(index + 1).map_err(|error| {
+            format!("NÃ£o foi possÃ­vel localizar o monitor selecionado: {error}")
+        })?;
+        let latest_frame = Arc::new(Mutex::new(None));
+        let performance = Arc::new(CapturePerformanceCounters::default());
+        let fallback_reason = Arc::new(Mutex::new(None));
+        let source_closed = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_frame = Arc::clone(&latest_frame);
+        let worker_performance = Arc::clone(&performance);
+        let worker_fallback_reason = Arc::clone(&fallback_reason);
+        let thread = thread::Builder::new()
+            .name("dxgi-monitor-capture".to_owned())
+            .spawn(move || {
+                capture_dxgi_monitor(
+                    monitor,
+                    context,
+                    worker_frame,
+                    worker_performance,
+                    worker_fallback_reason,
+                    worker_stop,
+                )
+            })
+            .map_err(|error| format!("NÃ£o foi possÃ­vel iniciar a thread DXGI: {error}"))?;
+
+        tracing::info!(
+            monitor_index = index + 1,
+            "Captura DXGI do monitor iniciada"
+        );
+        Ok(Self {
+            backend_name: "DXGI Desktop Duplication",
+            control: None,
+            dxgi_worker: Some(DxgiCaptureWorker {
+                stop,
+                thread: Some(thread),
+            }),
+            latest_frame,
+            performance,
+            fallback_reason,
+            source_closed,
+            picker_owner: None,
+        })
+    }
+
     fn start_selected(selected: PickerSelection, context: egui::Context) -> Result<Self, String> {
         let size = selected.size;
         if size.0 <= 0 || size.1 <= 0 {
@@ -211,6 +303,7 @@ impl ScreenCapture {
         }
         let latest_frame = Arc::new(Mutex::new(None));
         let performance = Arc::new(CapturePerformanceCounters::default());
+        let fallback_reason = Arc::new(Mutex::new(None));
         let source_closed = Arc::new(AtomicBool::new(false));
         let settings = Settings::new(
             PickerItemForThread(selected.item.clone()),
@@ -239,9 +332,12 @@ impl ScreenCapture {
         );
 
         Ok(Self {
+            backend_name: "Windows Graphics Capture",
             control: Some(control),
+            dxgi_worker: None,
             latest_frame,
             performance,
+            fallback_reason,
             source_closed,
             picker_owner: Some(selected.owner),
         })
@@ -254,6 +350,10 @@ impl ScreenCapture {
             .clone()
     }
 
+    pub fn backend_name(&self) -> &'static str {
+        self.backend_name
+    }
+
     pub fn frame_source(&self) -> LatestFrame {
         Arc::clone(&self.latest_frame)
     }
@@ -262,11 +362,26 @@ impl ScreenCapture {
         self.performance.take_snapshot()
     }
 
+    pub fn fallback_reason(&self) -> Option<String> {
+        self.fallback_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub fn source_closed(&self) -> bool {
         self.source_closed.load(Ordering::Relaxed)
     }
 
     pub fn poll_finished(&mut self) -> Option<Result<(), String>> {
+        if let Some(worker) = self.dxgi_worker.as_mut() {
+            let thread = worker.thread.as_ref()?;
+            if !thread.is_finished() {
+                return None;
+            }
+            let mut worker = self.dxgi_worker.take().expect("DXGI capture worker exists");
+            return Some(join_dxgi_worker(&mut worker));
+        }
         let control = self.control.as_ref()?;
         if !control.is_finished() {
             return None;
@@ -281,13 +396,19 @@ impl ScreenCapture {
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
+        let worker_result = if let Some(mut worker) = self.dxgi_worker.take() {
+            worker.stop.store(true, Ordering::Relaxed);
+            join_dxgi_worker(&mut worker)
+        } else {
+            Ok(())
+        };
         let result = if let Some(control) = self.control.take() {
             control.stop().map_err(|error| format!("{error}"))
         } else {
             Ok(())
         };
         self.stop_picker_owner();
-        result
+        result.and(worker_result)
     }
 
     fn stop_picker_owner(&mut self) {
@@ -295,6 +416,16 @@ impl ScreenCapture {
             owner.stop();
         }
     }
+}
+
+fn join_dxgi_worker(worker: &mut DxgiCaptureWorker) -> Result<(), String> {
+    worker.stop.store(true, Ordering::Relaxed);
+    let Some(thread) = worker.thread.take() else {
+        return Ok(());
+    };
+    thread
+        .join()
+        .map_err(|_| "A thread de captura DXGI foi encerrada inesperadamente.".to_owned())?
 }
 
 impl Drop for ScreenCapture {
@@ -312,9 +443,7 @@ struct HandlerFlags {
 }
 
 // windows-capture's picker wrapper owns an HWND guard and is therefore not Send.
-// Keep it on its dedicated thread, and send only the agile WinRT capture item to the worker.
-// The Monitor tag makes the library skip window-title-bar cropping; capture still uses this exact
-// item returned by the system picker.
+// Keep it on its dedicated thread and send only the WinRT capture item to the worker.
 struct PickerItemForThread(windows_capture::GraphicsCaptureItem);
 
 impl TryInto<GraphicsCaptureItemType> for PickerItemForThread {
@@ -340,19 +469,256 @@ struct ScreenFrameHandler {
 
 #[derive(Default)]
 struct FrameRateLimiter {
-    last_processed_at: Option<Instant>,
+    next_deadline: Option<Instant>,
 }
 
 impl FrameRateLimiter {
     fn should_process(&mut self, now: Instant) -> bool {
-        if self
-            .last_processed_at
-            .is_some_and(|last| now.saturating_duration_since(last) < MIN_CAPTURE_FRAME_INTERVAL)
-        {
-            return false;
+        if let Some(deadline) = self.next_deadline {
+            if now + CAPTURE_PACING_JITTER_TOLERANCE < deadline {
+                return false;
+            }
+            // Keep the target cadence anchored to the original timeline. A small early
+            // tolerance absorbs callback jitter; late callbacks skip missed slots instead
+            // of moving the cadence and causing alternating frame drops.
+            let mut next_deadline = deadline + MIN_CAPTURE_FRAME_INTERVAL;
+            while next_deadline <= now {
+                next_deadline += MIN_CAPTURE_FRAME_INTERVAL;
+            }
+            self.next_deadline = Some(next_deadline);
+        } else {
+            self.next_deadline = Some(now + MIN_CAPTURE_FRAME_INTERVAL);
         }
-        self.last_processed_at = Some(now);
         true
+    }
+}
+
+fn capture_dxgi_monitor(
+    monitor: Monitor,
+    context: egui::Context,
+    latest_frame: LatestFrame,
+    performance: Arc<CapturePerformanceCounters>,
+    fallback_reason: Arc<Mutex<Option<String>>>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut duplication = DxgiDuplicationApi::new_options(monitor, &[DxgiDuplicationFormat::Bgra8])
+        .map_err(|error| format!("DXGI Desktop Duplication nÃ£o iniciou: {error}"))?;
+    let mut sequence = 0u64;
+    let mut limiter = FrameRateLimiter::default();
+    let mut scratch = Vec::new();
+    let mut gpu_processor: Option<(crate::mf_video::GpuNv12Processor, (u32, u32, u32, u32))> = None;
+    let mut gpu_processor_attempted: Option<(u32, u32, u32, u32)> = None;
+    let mut gpu_fallback_logged = false;
+    let mut gpu_preview_fallback_logged = false;
+
+    while !stop.load(Ordering::Relaxed) {
+        let mut frame = match duplication.acquire_next_frame(100) {
+            Ok(frame) => frame,
+            Err(windows_capture::dxgi_duplication_api::Error::Timeout) => continue,
+            Err(windows_capture::dxgi_duplication_api::Error::AccessLost) => {
+                tracing::warn!("DXGI perdeu acesso ao monitor; recriando a duplicaÃ§Ã£o");
+                gpu_processor = None;
+                gpu_processor_attempted = None;
+                *fallback_reason
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                duplication = duplication
+                    .recreate_options(&[DxgiDuplicationFormat::Bgra8])
+                    .map_err(|error| {
+                        format!("DXGI nÃ£o recriou a captura apÃ³s mudanÃ§a de tela: {error}")
+                    })?;
+                limiter = FrameRateLimiter::default();
+                continue;
+            }
+            Err(error) => return Err(format!("Falha ao capturar monitor via DXGI: {error}")),
+        };
+        performance.received_frames.fetch_add(1, Ordering::Relaxed);
+        if !limiter.should_process(Instant::now()) {
+            performance.skipped_frames.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let width = frame.width();
+        let height = frame.height();
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let (out_width, out_height) = scaled_dimensions(width, height);
+        let dimensions = (width, height, out_width, out_height);
+        if gpu_processor_attempted != Some(dimensions) {
+            gpu_processor_attempted = Some(dimensions);
+            match crate::mf_video::GpuNv12Processor::new(
+                frame.device(),
+                frame.device_context(),
+                width,
+                height,
+                out_width,
+                out_height,
+            ) {
+                Ok(processor) => {
+                    tracing::info!(
+                        width,
+                        height,
+                        output_width = out_width,
+                        output_height = out_height,
+                        "Conversor DXGI GPU para NV12 ativado"
+                    );
+                    gpu_processor = Some((processor, dimensions));
+                    gpu_fallback_logged = false;
+                    *fallback_reason
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "ConversÃ£o DXGI para NV12 na GPU indisponÃ­vel; encoder usarÃ¡ o caminho atual por CPU");
+                    gpu_processor = None;
+                    gpu_fallback_logged = true;
+                    *fallback_reason
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                }
+            }
+        }
+        let gpu_convert_started_at = Instant::now();
+        let gpu_result = gpu_processor
+            .as_mut()
+            .map(|(processor, _)| processor.process(frame.texture()));
+        performance.gpu_convert_nanos.fetch_add(
+            gpu_convert_started_at.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        let gpu_surface = match gpu_result {
+            Some(Ok(surface)) => Some(Arc::new(surface)),
+            Some(Err(error)) => {
+                if !gpu_fallback_logged {
+                    tracing::warn!(error = %error, "Falha no processamento GPU do quadro DXGI; voltando ao caminho de CPU");
+                    gpu_fallback_logged = true;
+                }
+                gpu_processor = None;
+                *fallback_reason
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                None
+            }
+            None => None,
+        };
+        sequence = sequence.wrapping_add(1);
+        let mut readback_nanos = 0;
+        let mut resize_nanos = 0;
+        let preview_rgba = if let Some(surface) = gpu_surface.as_ref() {
+            let started_at = Instant::now();
+            match surface.readback_nv12() {
+                Ok((nv12, stride)) => {
+                    readback_nanos += started_at.elapsed().as_nanos() as u64;
+                    let started_at = Instant::now();
+                    match surface.to_rgba(&nv12, stride) {
+                        Ok(rgba) => {
+                            resize_nanos += started_at.elapsed().as_nanos() as u64;
+                            gpu_preview_fallback_logged = false;
+                            let mut reason = fallback_reason
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if reason
+                                .as_deref()
+                                .is_some_and(|value| value.starts_with("Prévia GPU:"))
+                            {
+                                *reason = None;
+                            }
+                            Some(rgba)
+                        }
+                        Err(error) => {
+                            resize_nanos += started_at.elapsed().as_nanos() as u64;
+                            if !gpu_preview_fallback_logged {
+                                tracing::warn!(error = %error, "Falha ao converter a prévia NV12; usando cópia BGRA do DXGI");
+                                gpu_preview_fallback_logged = true;
+                            }
+                            *fallback_reason
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(format!(
+                                    "Prévia GPU: falha na conversão para a imagem local: {error}"
+                                ));
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    readback_nanos += started_at.elapsed().as_nanos() as u64;
+                    if !gpu_preview_fallback_logged {
+                        tracing::warn!(error = %error, "Falha ao ler a superfície NV12 reduzida; usando cópia BGRA do DXGI");
+                        gpu_preview_fallback_logged = true;
+                    }
+                    *fallback_reason
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format!(
+                        "Prévia GPU: falha na leitura da imagem reduzida: {error}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let rgba = match preview_rgba {
+            Some(rgba) => rgba,
+            None => {
+                let started_at = Instant::now();
+                let buffer = frame.buffer().map_err(|error| {
+                    format!("DXGI nÃ£o conseguiu ler o quadro do monitor: {error}")
+                })?;
+                let bytes = buffer.as_nopadding_buffer(&mut scratch);
+                readback_nanos += started_at.elapsed().as_nanos() as u64;
+                let started_at = Instant::now();
+                let rgba = downsample_bgra(bytes, width, height, sequence).rgba;
+                resize_nanos += started_at.elapsed().as_nanos() as u64;
+                rgba
+            }
+        };
+        let mut preview = PreviewFrame {
+            sequence,
+            width: out_width,
+            height: out_height,
+            rgba,
+            #[cfg(windows)]
+            gpu_nv12: None,
+        };
+        preview.gpu_nv12 = gpu_surface;
+        performance
+            .readback_nanos
+            .fetch_add(readback_nanos, Ordering::Relaxed);
+        performance
+            .resize_nanos
+            .fetch_add(resize_nanos, Ordering::Relaxed);
+        *latest_frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(preview));
+        performance.processed_frames.fetch_add(1, Ordering::Relaxed);
+        context.request_repaint();
+    }
+    Ok(())
+}
+
+fn downsample_bgra(bytes: &[u8], width: u32, height: u32, sequence: u64) -> PreviewFrame {
+    let (out_width, out_height) = scaled_dimensions(width, height);
+    let mut rgba = Vec::with_capacity((out_width * out_height * 4) as usize);
+    for y in 0..out_height {
+        let source_y = (y * height / out_height).min(height - 1);
+        for x in 0..out_width {
+            let source_x = (x * width / out_width).min(width - 1);
+            let offset = ((source_y * width + source_x) * 4) as usize;
+            if let Some(pixel) = bytes.get(offset..offset + 4) {
+                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+            } else {
+                rgba.extend_from_slice(&[0, 0, 0, 255]);
+            }
+        }
+    }
+    PreviewFrame {
+        sequence,
+        width: out_width,
+        height: out_height,
+        rgba,
+        #[cfg(windows)]
+        gpu_nv12: None,
     }
 }
 
@@ -377,6 +743,9 @@ impl GraphicsCaptureApiHandler for ScreenFrameHandler {
         frame: &mut Frame,
         _capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        self.performance
+            .received_frames
+            .fetch_add(1, Ordering::Relaxed);
         if !self.frame_rate_limiter.should_process(Instant::now()) {
             self.performance
                 .skipped_frames
@@ -444,6 +813,8 @@ fn downsample_rgba(bytes: &[u8], width: u32, height: u32, sequence: u64) -> Prev
         width: out_width,
         height: out_height,
         rgba,
+        #[cfg(windows)]
+        gpu_nv12: None,
     }
 }
 
@@ -475,6 +846,51 @@ mod tests {
         assert!(limiter.should_process(start));
         assert!(!limiter.should_process(start + Duration::from_millis(16)));
         assert!(limiter.should_process(start + MIN_CAPTURE_FRAME_INTERVAL));
+    }
+
+    #[test]
+    fn capture_limiter_does_not_alternate_at_30_fps_with_small_jitter() {
+        let start = Instant::now();
+        let mut limiter = FrameRateLimiter::default();
+        let mut accepted = 0;
+        for frame in 0..90u64 {
+            let jitter_ns = match frame % 3 {
+                0 => 0,
+                1 => 180_000,
+                _ => -90_000i64,
+            };
+            let base = start + Duration::from_nanos(frame * 33_333_333);
+            let time = if jitter_ns < 0 {
+                base - Duration::from_nanos(jitter_ns.unsigned_abs())
+            } else {
+                base + Duration::from_nanos(jitter_ns as u64)
+            };
+            accepted += usize::from(limiter.should_process(time));
+        }
+        assert!(accepted >= 88, "accepted {accepted} of 90 30-FPS callbacks");
+    }
+
+    #[test]
+    fn capture_limiter_caps_60_fps_without_bursts_and_keeps_15_fps() {
+        let start = Instant::now();
+        let mut limiter_60 = FrameRateLimiter::default();
+        let accepted_60 = (0..180u64)
+            .filter(|frame| {
+                limiter_60.should_process(start + Duration::from_nanos(frame * 16_666_667))
+            })
+            .count();
+        assert!(
+            (89..=91).contains(&accepted_60),
+            "accepted {accepted_60} frames at 60 FPS"
+        );
+
+        let mut limiter_15 = FrameRateLimiter::default();
+        let accepted_15 = (0..45u64)
+            .filter(|frame| {
+                limiter_15.should_process(start + Duration::from_nanos(frame * 66_666_667))
+            })
+            .count();
+        assert_eq!(accepted_15, 45);
     }
 
     #[test]
