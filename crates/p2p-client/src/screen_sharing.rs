@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -56,6 +56,7 @@ use crate::turn_relay::TurnCredentials;
 const VIDEO_PAYLOAD_TYPE: PayloadType = 102;
 const VIDEO_CLOCK_RATE: u32 = 90_000;
 const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 30);
+const ENCODER_PACING_JITTER_TOLERANCE: Duration = Duration::from_micros(1_000);
 const STATIC_FRAME_REPEAT_INTERVAL: Duration = Duration::from_secs(1);
 const DXVA_FIRST_OUTPUT_WATCHDOG: Duration = Duration::from_millis(750);
 const RTP_REORDER_DELAY: Duration = Duration::from_millis(40);
@@ -222,6 +223,8 @@ pub struct ScreenShareMetrics {
 pub struct ScreenSharePerformanceSnapshot {
     pub new_capture_frames: u64,
     pub repeated_capture_frames: u64,
+    pub encoder_worker_late_frames: u64,
+    pub skipped_capture_sequences: u64,
     pub encoder_input_frames: u64,
     pub encoded_frames: u64,
     pub encoded_idr_frames: u64,
@@ -350,6 +353,8 @@ struct SharedMetrics {
     interval_encoder_input_frames: AtomicU64,
     interval_new_capture_frames: AtomicU64,
     interval_repeated_capture_frames: AtomicU64,
+    interval_encoder_worker_late_frames: AtomicU64,
+    interval_skipped_capture_sequences: AtomicU64,
     interval_encoded_frames: AtomicU64,
     interval_encoded_idr_frames: AtomicU64,
     interval_encoded_delta_frames: AtomicU64,
@@ -736,6 +741,15 @@ impl SharedMetrics {
         self.record_encoder_input_frame();
     }
 
+    fn record_encoder_worker_delay(&self, late: bool, skipped_sequences: u64) {
+        if late {
+            self.interval_encoder_worker_late_frames
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.interval_skipped_capture_sequences
+            .fetch_add(skipped_sequences, Ordering::Relaxed);
+    }
+
     fn record_drop_before_initial_idr(&self) {
         self.dropped_before_initial_idr
             .fetch_add(1, Ordering::Relaxed);
@@ -1006,6 +1020,12 @@ impl SharedMetrics {
             new_capture_frames: self.interval_new_capture_frames.swap(0, Ordering::Relaxed),
             repeated_capture_frames: self
                 .interval_repeated_capture_frames
+                .swap(0, Ordering::Relaxed),
+            encoder_worker_late_frames: self
+                .interval_encoder_worker_late_frames
+                .swap(0, Ordering::Relaxed),
+            skipped_capture_sequences: self
+                .interval_skipped_capture_sequences
                 .swap(0, Ordering::Relaxed),
             encoder_input_frames: self
                 .interval_encoder_input_frames
@@ -1536,6 +1556,8 @@ fn decode_h264_access_unit(
                     rgba,
                     #[cfg(windows)]
                     gpu_nv12: None,
+                    #[cfg(windows)]
+                    cpu_nv12: None,
                 }));
             metrics.published_frames.fetch_add(1, Ordering::Relaxed);
             metrics
@@ -1591,6 +1613,7 @@ fn is_hardware_device_failure(error: &str) -> bool {
         "d3d11",
         "dispositivo de vídeo",
         "superfície d3d",
+        "mf_e_transform_stream_change",
         "0x887a",
         "0xc00d36b5",
     ]
@@ -1644,6 +1667,7 @@ fn annex_b_nal_types(data: &[u8]) -> Vec<u8> {
 struct LatestFramePacer {
     last_sequence: Option<u64>,
     last_encoded_at: Option<Instant>,
+    next_frame_due_at: Option<Instant>,
 }
 
 impl LatestFramePacer {
@@ -1655,7 +1679,12 @@ impl LatestFramePacer {
         };
         let elapsed = now.saturating_duration_since(last_encoded_at);
         if self.last_sequence != Some(sequence) {
-            if elapsed < FRAME_DURATION {
+            let next_due = self.next_frame_due_at.unwrap_or(last_encoded_at);
+            if now
+                .checked_add(ENCODER_PACING_JITTER_TOLERANCE)
+                .unwrap_or(now)
+                < next_due
+            {
                 return None;
             }
             Some(true)
@@ -1667,8 +1696,44 @@ impl LatestFramePacer {
     }
 
     fn record_encoded(&mut self, sequence: u64, now: Instant) {
+        let is_repeat = self.last_sequence == Some(sequence);
         self.last_sequence = Some(sequence);
         self.last_encoded_at = Some(now);
+        if is_repeat {
+            self.next_frame_due_at = now.checked_add(FRAME_DURATION);
+            return;
+        }
+        let mut next_due = self
+            .next_frame_due_at
+            .unwrap_or(now)
+            .checked_add(FRAME_DURATION)
+            .unwrap_or(now);
+        while next_due <= now {
+            let Some(advanced) = next_due.checked_add(FRAME_DURATION) else {
+                break;
+            };
+            next_due = advanced;
+        }
+        self.next_frame_due_at = Some(next_due);
+    }
+
+    fn wait_duration(&self, sequence: Option<u64>, now: Instant) -> Duration {
+        let Some(last_encoded_at) = self.last_encoded_at else {
+            return Duration::ZERO;
+        };
+        if sequence.is_some() && sequence == self.last_sequence {
+            return last_encoded_at
+                .checked_add(STATIC_FRAME_REPEAT_INTERVAL)
+                .map(|deadline| deadline.saturating_duration_since(now))
+                .unwrap_or_default();
+        }
+        let next_due = self
+            .next_frame_due_at
+            .unwrap_or_else(|| last_encoded_at + FRAME_DURATION);
+        let tolerance_due = next_due
+            .checked_sub(ENCODER_PACING_JITTER_TOLERANCE)
+            .unwrap_or(next_due);
+        tolerance_due.saturating_duration_since(now)
     }
 }
 
@@ -1924,6 +1989,7 @@ pub struct ScreenShareSession {
 impl ScreenShareSession {
     pub fn new(
         context: egui::Context,
+        bind_ipv4: Ipv4Addr,
         stun_server: Option<String>,
         turn_credentials: Option<TurnCredentials>,
     ) -> Result<Self, String> {
@@ -1935,7 +2001,7 @@ impl ScreenShareSession {
         }
         Self::with_udp_address(
             context,
-            format!("0.0.0.0:{MEDIA_UDP_PORT}"),
+            format!("{bind_ipv4}:{MEDIA_UDP_PORT}"),
             stun_server,
             turn_credentials,
         )
@@ -2100,6 +2166,7 @@ struct PeerSession {
     no_video_notice_sent: bool,
     metrics: Arc<SharedMetrics>,
     encoder_stop: Option<Arc<AtomicBool>>,
+    encoder_source: Option<LatestFrame>,
     encoder_task: Option<TokioJoinHandle<Result<(), String>>>,
     sample_writer_task: Option<TokioJoinHandle<()>>,
     rtcp_feedback_task: Option<TokioJoinHandle<()>>,
@@ -3523,6 +3590,7 @@ async fn create_sender(
     let (sample_tx, sample_rx) = mpsc::channel::<EncodedFrame>(1);
     let encoder_stop = Arc::new(AtomicBool::new(false));
     let encoder_stop_worker = Arc::clone(&encoder_stop);
+    let encoder_source = source.clone();
     let force_keyframe = Arc::new(AtomicBool::new(false));
     let encoder_force_keyframe = Arc::clone(&force_keyframe);
     let encoder_events = events.clone();
@@ -3648,6 +3716,7 @@ async fn create_sender(
         no_video_notice_sent: false,
         metrics,
         encoder_stop: Some(encoder_stop),
+        encoder_source: Some(encoder_source),
         encoder_task: Some(encoder_task),
         sample_writer_task: Some(sample_writer_task),
         rtcp_feedback_task: Some(rtcp_feedback_task),
@@ -3718,6 +3787,7 @@ async fn create_receiver(
         no_video_notice_sent: false,
         metrics,
         encoder_stop: None,
+        encoder_source: None,
         encoder_task: None,
         sample_writer_task: None,
         rtcp_feedback_task: None,
@@ -3740,6 +3810,9 @@ async fn apply_pending_ice(peer: &mut PeerSession, events: &std_mpsc::Sender<Scr
 async fn close_peer(mut peer: PeerSession) {
     if let Some(stop) = peer.encoder_stop.take() {
         stop.store(true, Ordering::Relaxed);
+    }
+    if let Some(source) = peer.encoder_source.take() {
+        source.wake_waiters();
     }
     if let Some(writer) = peer.sample_writer_task.take() {
         writer.abort();
@@ -3764,35 +3837,51 @@ fn encode_latest_frames(
     let mut hardware_warmup_frames = 0u32;
     let mut forwarding_gate = H264ForwardingGate::default();
     let mut pacer = LatestFramePacer::default();
-    let mut next_frame = Instant::now();
+    let mut observed_generation = source.generation();
 
     while !stop.load(Ordering::Relaxed) {
-        let wait = next_frame.saturating_duration_since(Instant::now());
-        if !wait.is_zero() {
-            thread::sleep(wait);
-        }
-        next_frame += FRAME_DURATION;
-
         // Do not consume the encoder's first IDR/SPS/PPS while ICE/DTLS is still
         // negotiating. RTP packets written before the peer is connected can be
         // discarded; starting with a P-frame then leaves the receiver without
         // the parameter sets needed to decode the stream.
         if !metrics.p2p_connected.load(Ordering::Relaxed) {
+            let (generation, _, _) =
+                source.wait_for_change(observed_generation, Duration::from_millis(250), &stop);
+            observed_generation = generation;
             continue;
         }
 
-        let frame = source
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let frame = source.latest();
         let Some(frame) = frame else {
+            let (generation, _, _) =
+                source.wait_for_change(observed_generation, Duration::from_millis(250), &stop);
+            observed_generation = generation;
             continue;
         };
-        let Some(is_new_capture_frame) = pacer.should_encode(frame.sequence, Instant::now()) else {
+        let now = Instant::now();
+        let Some(is_new_capture_frame) = pacer.should_encode(frame.sequence, now) else {
+            let wait = pacer.wait_duration(Some(frame.sequence), now);
+            let (generation, _, _) = source.wait_for_change(
+                observed_generation,
+                wait.max(Duration::from_millis(1)),
+                &stop,
+            );
+            observed_generation = generation;
             continue;
         };
         validate_encoder_frame(&frame)?;
-        metrics.record_capture_frame_for_encoder(is_new_capture_frame);
+        let skipped_sequences = if is_new_capture_frame {
+            pacer.last_sequence.map_or(0, |previous| {
+                frame.sequence.wrapping_sub(previous).saturating_sub(1)
+            })
+        } else {
+            0
+        };
+        let worker_was_late = pacer.last_encoded_at.is_some_and(|previous| {
+            now.saturating_duration_since(previous) > FRAME_DURATION + Duration::from_millis(3)
+        });
+        metrics.record_capture_frame_for_encoder(!is_new_capture_frame);
+        metrics.record_encoder_worker_delay(worker_was_late, skipped_sequences);
         if encoder.is_none() {
             #[cfg(windows)]
             {
@@ -3895,7 +3984,11 @@ fn encode_latest_frames(
                 }
                 let encode_started_at = Instant::now();
                 let encode_result = hardware
-                    .encode_gpu_or_rgba(frame.gpu_nv12.as_deref(), &frame.rgba)
+                    .encode_gpu_or_nv12_or_rgba(
+                        frame.gpu_nv12.as_deref(),
+                        frame.cpu_nv12.as_deref(),
+                        &frame.rgba,
+                    )
                     .map(|(bytes, used_gpu, fallback_reason)| {
                         if !used_gpu && fallback_reason.is_some() {
                             metrics.set_encoder_backend(
@@ -3943,9 +4036,6 @@ fn encode_latest_frames(
             let encoded = encoded_result?;
             forward_encoded_access_unit(&encoded, &samples, &metrics, &mut forwarding_gate)?;
             encoder = Some(ActiveH264Encoder::OpenH264(cpu));
-        }
-        if next_frame < Instant::now() {
-            next_frame = Instant::now() + FRAME_DURATION;
         }
     }
     Ok(())
@@ -4077,11 +4167,11 @@ mod tests {
     use openh264::formats::YUVSource;
 
     use super::{
-        ActiveH264Decoder, DXVA_FIRST_OUTPUT_WATCHDOG, Encoder, FRAME_DURATION,
-        H264ForwardDecision, H264ForwardingGate, H264FrameKind, KeyframeRequestLimiter,
-        LatestFrame, LatestFramePacer, MediaRoute, PreviewFrame, RtpPacket, RtpSequenceTracker,
-        ScreenShareEvent, ScreenShareSession, annex_b_nal_types, assemble_h264_access_unit,
-        classify_h264_access_unit, dxva_watchdog_expired, encode_frame,
+        ActiveH264Decoder, DXVA_FIRST_OUTPUT_WATCHDOG, ENCODER_PACING_JITTER_TOLERANCE, Encoder,
+        FRAME_DURATION, H264ForwardDecision, H264ForwardingGate, H264FrameKind,
+        KeyframeRequestLimiter, LatestFrame, LatestFramePacer, MediaRoute, PreviewFrame, RtpPacket,
+        RtpSequenceTracker, ScreenShareEvent, ScreenShareSession, annex_b_nal_types,
+        assemble_h264_access_unit, classify_h264_access_unit, dxva_watchdog_expired, encode_frame,
         media_route_from_candidate_types, media_route_label, peer_stats_snapshot,
         rtp_jitter_ticks_to_ms, should_decode_access_unit, should_log_aggregate_error,
         update_cached_idr, validate_stun_uri,
@@ -4097,12 +4187,15 @@ mod tests {
         assert_eq!(pacer.should_encode(1, start), Some(true));
         pacer.record_encoded(1, start);
         assert_eq!(
-            pacer.should_encode(2, start + FRAME_DURATION - Duration::from_nanos(1)),
+            pacer.should_encode(
+                2,
+                start + FRAME_DURATION - ENCODER_PACING_JITTER_TOLERANCE - Duration::from_nanos(1),
+            ),
             None,
             "não pode exceder 30 FPS"
         );
         assert_eq!(
-            pacer.should_encode(2, start + FRAME_DURATION),
+            pacer.should_encode(2, start + FRAME_DURATION - ENCODER_PACING_JITTER_TOLERANCE,),
             Some(true),
             "o quadro novo deve ser enviado assim que o intervalo permitir"
         );
@@ -4116,6 +4209,79 @@ mod tests {
             Some(false),
             "imagem estática deve ser repetida a cada segundo"
         );
+    }
+
+    #[test]
+    fn frame_pacer_accepts_30_fps_coalesces_60_fps_and_keeps_15_fps() {
+        let start = Instant::now();
+        let mut at_30 = LatestFramePacer::default();
+        at_30.record_encoded(0, start);
+        let mut accepted_30 = 0;
+        for index in 1..=30 {
+            let now = start + FRAME_DURATION * index;
+            if at_30.should_encode(index as u64, now).is_some() {
+                accepted_30 += 1;
+                at_30.record_encoded(index as u64, now);
+            }
+        }
+        assert_eq!(accepted_30, 30);
+
+        let mut at_60 = LatestFramePacer::default();
+        assert_eq!(at_60.should_encode(0, start), Some(true));
+        at_60.record_encoded(0, start);
+        let half_frame = Duration::from_nanos(FRAME_DURATION.as_nanos() as u64 / 2 + 1);
+        let mut accepted_60 = 0;
+        for index in 1..=60 {
+            let now = start + half_frame * index;
+            if at_60.should_encode(index as u64, now).is_some() {
+                accepted_60 += 1;
+                at_60.record_encoded(index as u64, now);
+            }
+        }
+        assert!(
+            (29..=30).contains(&accepted_60),
+            "aceitos em 60 callbacks: {accepted_60}"
+        );
+
+        let mut at_15 = LatestFramePacer::default();
+        at_15.record_encoded(0, start);
+        for index in 1..=15 {
+            let now = start + FRAME_DURATION * (index * 2);
+            assert_eq!(at_15.should_encode(index as u64, now), Some(true));
+            at_15.record_encoded(index as u64, now);
+        }
+
+        let mut jittered = LatestFramePacer::default();
+        jittered.record_encoded(0, start);
+        let mut elapsed = Duration::ZERO;
+        let mut accepted_jittered = 0;
+        for index in 1..=90u64 {
+            elapsed += if index % 2 == 0 {
+                Duration::from_micros(33_800)
+            } else {
+                Duration::from_micros(32_800)
+            };
+            let now = start + elapsed;
+            if jittered.should_encode(index, now).is_some() {
+                accepted_jittered += 1;
+                jittered.record_encoded(index, now);
+            }
+        }
+        assert!(
+            accepted_jittered >= 89,
+            "pequena variação não deve descartar quadros alternados: {accepted_jittered}/90"
+        );
+    }
+
+    #[test]
+    fn capture_metrics_distinguish_new_frames_from_static_repeats() {
+        let metrics = super::SharedMetrics::default();
+        metrics.record_capture_frame_for_encoder(false);
+        metrics.record_capture_frame_for_encoder(true);
+        let snapshot = metrics.take_performance_snapshot();
+        assert_eq!(snapshot.new_capture_frames, 1);
+        assert_eq!(snapshot.repeated_capture_frames, 1);
+        assert_eq!(snapshot.encoder_input_frames, 2);
     }
 
     #[test]
@@ -4164,6 +4330,8 @@ mod tests {
                 .collect(),
             #[cfg(windows)]
             gpu_nv12: None,
+            #[cfg(windows)]
+            cpu_nv12: None,
         };
         let encoded = encode_frame(&mut encoder, &source).unwrap();
         let mut cached_sps = None;
@@ -4549,6 +4717,8 @@ mod tests {
             rgba: vec![96; 320 * 240 * 4],
             #[cfg(windows)]
             gpu_nv12: None,
+            #[cfg(windows)]
+            cpu_nv12: None,
         };
         let encoded = encode_frame(&mut encoder, &frame).unwrap();
         assert!(!encoded.is_empty());
@@ -4570,6 +4740,8 @@ mod tests {
             rgba: Vec::new(),
             #[cfg(windows)]
             gpu_nv12: None,
+            #[cfg(windows)]
+            cpu_nv12: None,
         };
         assert!(encode_frame(&mut encoder, &frame).is_err());
     }
@@ -4701,17 +4873,20 @@ mod tests {
         let context = egui::Context::default();
         let sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
         let receiver = ScreenShareSession::new_loopback(context).unwrap();
-        let source: LatestFrame = Arc::new(Mutex::new(Some(Arc::new(PreviewFrame {
+        let source = LatestFrame::default();
+        source.publish(PreviewFrame {
             sequence: 1,
             width: 320,
             height: 240,
             rgba: vec![128; 320 * 240 * 4],
             #[cfg(windows)]
             gpu_nv12: None,
-        }))));
-        sender.start_sending(Arc::clone(&source)).unwrap();
+            #[cfg(windows)]
+            cpu_nv12: None,
+        });
+        sender.start_sending(source.clone()).unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut sequence = 1;
         let mut next_frame = Instant::now() + FRAME_DURATION;
         let mut received_frame = None;
@@ -4766,17 +4941,16 @@ mod tests {
             }
             if Instant::now() >= next_frame {
                 sequence += 1;
-                *source
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(Arc::new(PreviewFrame {
-                        sequence,
-                        width: 320,
-                        height: 240,
-                        rgba: vec![(sequence % 255) as u8; 320 * 240 * 4],
-                        #[cfg(windows)]
-                        gpu_nv12: None,
-                    }));
+                source.publish(PreviewFrame {
+                    sequence,
+                    width: 320,
+                    height: 240,
+                    rgba: vec![(sequence % 255) as u8; 320 * 240 * 4],
+                    #[cfg(windows)]
+                    gpu_nv12: None,
+                    #[cfg(windows)]
+                    cpu_nv12: None,
+                });
                 next_frame += FRAME_DURATION;
             }
             thread::sleep(Duration::from_millis(5));

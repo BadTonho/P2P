@@ -483,7 +483,7 @@ impl ClientUi {
             ui.group(|ui| {
                 ui.heading("Rede de controle da sala");
                 ui.label("Todos os participantes mantêm uma conexão direta de controle pela porta TCP 9001.");
-                ui.small("Permita TCP 9001 no firewall e escolha o adaptador pelo qual os outros participantes alcançam este PC. Esta escolha vale para criar e entrar: use Radmin VPN se entrar pelo endereço Radmin; use Ethernet/Wi-Fi se entrar pela rede local.");
+                ui.small("Permita TCP 9001 e UDP 9002 no firewall e escolha o adaptador pelo qual os outros participantes alcançam este PC. A mesma escolha vale para a malha de controle e para a mídia: use Radmin VPN se entrar pelo endereço Radmin; use Ethernet/Wi-Fi se entrar pela rede local.");
                 self.show_control_address_picker(ui);
                 ui.checkbox(&mut self.may_host, "Permitir que este computador seja escolhido para hospedar futuramente");
                 ui.small("Opcional: isso não impede entrar na sala nem compartilhar a tela. Só permite que este PC assuma a hospedagem se o anfitrião sair.");
@@ -706,6 +706,12 @@ impl ClientUi {
         ui.group(|ui| {
             ui.heading("Prévia local da tela");
             ui.label("A prévia fica na memória. Ao iniciar o compartilhamento, a tela tenta P2P direto; se o anfitrião habilitou TURN e o caminho direto falhar, poderá ser retransmitida pelo PC anfitrião.");
+            if let Some(address) = self.host_addresses.get(self.selected_host_address) {
+                ui.small(format!(
+                    "A mídia UDP 9002 usará {} ({}) neste PC.",
+                    address.ipv4, address.adapter
+                ));
+            }
             if self.room_mode == RoomMode::InternetTest {
                 ui.small("O vídeo direto usa UDP 9002. TURN usa UDP 3478 e UDP 50000–50100 no PC anfitrião; o roteador e o firewall precisam permitir essas portas.");
                 ui.small("Teste controlado: a sinalização usa ws:// sem criptografia nem autenticação. Credenciais TURN temporárias passam por esse canal. Somente duas pessoas; o anfitrião precisa permanecer online.");
@@ -1152,6 +1158,10 @@ impl ClientUi {
 
     fn show_connection_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Conexão");
+        ui.label("Adaptador local usado pelas conexões diretas:");
+        self.show_control_address_picker(ui);
+        ui.small("O IPv4 selecionado será usado tanto pela malha TCP 9001 quanto pelo vídeo WebRTC em UDP 9002. Se a interface escolhida ficar indisponível, selecione outra e tente novamente.");
+        ui.separator();
         ui.label("Endereço IPv4 ou nome DDNS do anfitrião (a porta é sempre 9000):");
         ui.add(
             egui::TextEdit::singleline(&mut self.server_url)
@@ -1595,8 +1605,21 @@ impl ClientUi {
                     }
                 }
 
+                let bind_ipv4 = match self.selected_media_ipv4() {
+                    Ok(address) => address,
+                    Err(error) => {
+                        let _ = self.send_screen_share_signal(
+                            SignalKind::ScreenShareBusy,
+                            request.request_id,
+                        );
+                        self.screen_share_status = Some(error);
+                        return;
+                    }
+                };
+
                 match ScreenShareSession::new(
                     context.clone(),
+                    bind_ipv4,
                     self.stun_server_for_room(),
                     self.turn_credentials_for_room(),
                 ) {
@@ -1652,8 +1675,17 @@ impl ClientUi {
                     );
                     return;
                 };
+                let bind_ipv4 = match self.selected_media_ipv4() {
+                    Ok(address) => address,
+                    Err(error) => {
+                        self.screen_share_role = ScreenShareRole::Idle;
+                        self.screen_share_status = Some(error);
+                        return;
+                    }
+                };
                 match ScreenShareSession::new(
                     context.clone(),
+                    bind_ipv4,
                     self.stun_server_for_room(),
                     self.turn_credentials_for_room(),
                 ) {
@@ -1821,6 +1853,9 @@ impl ClientUi {
                         Default::default()
                     };
                 let capture_fps = capture_performance.processed_frames as f64 / interval_seconds;
+                let capture_examined_frames = capture_performance
+                    .processed_frames
+                    .saturating_add(capture_performance.unchanged_frames);
                 let encoder_fps = performance.encoded_frames as f64 / interval_seconds;
                 let send_fps = performance.sent_frames as f64 / interval_seconds;
                 let receive_fps = performance.assembled_access_units as f64 / interval_seconds;
@@ -1839,21 +1874,23 @@ impl ClientUi {
                         nanos as f64 / samples as f64 / 1_000_000.0
                     }
                 };
-                let capture_readback_ms = average_ms(
-                    capture_performance.readback_nanos,
-                    capture_performance.processed_frames,
-                );
-                let capture_resize_ms = average_ms(
-                    capture_performance.resize_nanos,
-                    capture_performance.processed_frames,
-                );
+                let capture_readback_ms =
+                    average_ms(capture_performance.readback_nanos, capture_examined_frames);
+                let capture_resize_ms =
+                    average_ms(capture_performance.resize_nanos, capture_examined_frames);
                 let capture_gpu_ms = average_ms(
                     capture_performance.gpu_convert_nanos,
-                    capture_performance.processed_frames,
+                    capture_examined_frames,
                 );
                 self.screen_pipeline_summary = format!(
-                    "5 s: captura {capture_fps:.1} FPS ({backend}; {} callbacks, {} descartados, leitura {capture_readback_ms:.1} ms, prévia {capture_resize_ms:.1} ms, GPU {capture_gpu_ms:.1} ms); encoder {encoder_fps:.1} FPS, envio {send_fps:.1} FPS; recepção {receive_fps:.1} quadros/s ({receive_packet_rate:.0} pacotes/s), decoder {decode_fps:.1} FPS, prévia publicada {publish_fps:.1} FPS.",
-                    capture_performance.received_frames, capture_performance.skipped_frames,
+                    "5 s: captura {capture_fps:.1} FPS únicos ({backend}; {} callbacks, {} imagens iguais, {} descartados); encoder {encoder_fps:.1} FPS (novos {}, repetidos {}, worker atrasado {}, sequências puladas {}); envio {send_fps:.1} FPS; recepção {receive_fps:.1} quadros/s ({receive_packet_rate:.0} pacotes/s), decoder {decode_fps:.1} FPS, prévia publicada {publish_fps:.1} FPS. Captura: leitura {capture_readback_ms:.1} ms, prévia {capture_resize_ms:.1} ms, GPU {capture_gpu_ms:.1} ms.",
+                    capture_performance.received_frames,
+                    capture_performance.unchanged_frames,
+                    capture_performance.skipped_frames,
+                    performance.new_capture_frames,
+                    performance.repeated_capture_frames,
+                    performance.encoder_worker_late_frames,
+                    performance.skipped_capture_sequences,
                 );
                 tracing::info!(
                     screen_share_session = metrics.session_id,
@@ -1922,12 +1959,15 @@ impl ClientUi {
                     capture_fps = capture_performance.processed_frames as f64 / interval_seconds,
                     capture_callbacks = capture_performance.received_frames,
                     capture_processed = capture_performance.processed_frames,
+                    capture_unchanged = capture_performance.unchanged_frames,
                     capture_skipped = capture_performance.skipped_frames,
-                    capture_readback_avg_ms = average_ms(capture_performance.readback_nanos, capture_performance.processed_frames),
-                    capture_resize_avg_ms = average_ms(capture_performance.resize_nanos, capture_performance.processed_frames),
-                    capture_gpu_convert_avg_ms = average_ms(capture_performance.gpu_convert_nanos, capture_performance.processed_frames),
+                    capture_readback_avg_ms = average_ms(capture_performance.readback_nanos, capture_examined_frames),
+                    capture_resize_avg_ms = average_ms(capture_performance.resize_nanos, capture_examined_frames),
+                    capture_gpu_convert_avg_ms = average_ms(capture_performance.gpu_convert_nanos, capture_examined_frames),
                     encoder_new_capture_frames = performance.new_capture_frames,
                     encoder_repeated_capture_frames = performance.repeated_capture_frames,
+                    encoder_worker_late_frames = performance.encoder_worker_late_frames,
+                    skipped_capture_sequences = performance.skipped_capture_sequences,
                     encoder_input_frames = performance.encoder_input_frames,
                     encode_fps = performance.encoded_frames as f64 / interval_seconds,
                     encoded_frames = performance.encoded_frames,
@@ -2542,6 +2582,7 @@ impl ClientUi {
                 "ws://{}:9001",
                 self.host_addresses[self.selected_host_address].ipv4
             ));
+            ui.small("Este IPv4 também será usado para vincular o vídeo WebRTC na porta UDP 9002.");
         } else if let Some(error) = &self.host_addresses_error {
             ui.colored_label(egui::Color32::from_rgb(190, 55, 55), error);
         } else {
@@ -2599,6 +2640,15 @@ impl ClientUi {
         self.host_addresses
             .get(self.selected_host_address)
             .map(|address| format!("ws://{}:9000", address.ipv4))
+    }
+
+    fn selected_media_ipv4(&self) -> Result<Ipv4Addr, String> {
+        self.host_addresses
+            .get(self.selected_host_address)
+            .map(|address| address.ipv4)
+            .ok_or_else(|| {
+                "Nenhum adaptador IPv4 está selecionado. Atualize os adaptadores em Configurações > Conexão antes de compartilhar a tela.".to_owned()
+            })
     }
 
     fn refresh_signaling(&mut self, context: &egui::Context) {

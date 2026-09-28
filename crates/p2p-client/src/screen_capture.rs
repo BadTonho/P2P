@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, Receiver, SyncSender, TryRecvError},
 };
@@ -39,14 +39,104 @@ pub struct PreviewFrame {
     pub rgba: Vec<u8>,
     #[cfg(windows)]
     pub gpu_nv12: Option<Arc<crate::mf_video::GpuNv12Surface>>,
+    #[cfg(windows)]
+    pub cpu_nv12: Option<Arc<CpuNv12Frame>>,
 }
 
-pub type LatestFrame = Arc<Mutex<Option<Arc<PreviewFrame>>>>;
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct CpuNv12Frame {
+    pub bytes: Arc<Vec<u8>>,
+    pub stride: usize,
+}
+
+#[derive(Clone, Default)]
+pub struct LatestFrame {
+    shared: Arc<LatestFrameShared>,
+}
+
+#[derive(Default)]
+struct LatestFrameShared {
+    slot: Mutex<LatestFrameSlot>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct LatestFrameSlot {
+    generation: u64,
+    frame: Option<Arc<PreviewFrame>>,
+}
+
+impl LatestFrame {
+    pub fn latest(&self) -> Option<Arc<PreviewFrame>> {
+        self.shared
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .frame
+            .clone()
+    }
+
+    pub fn publish(&self, frame: PreviewFrame) {
+        let mut slot = self
+            .shared
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.frame = Some(Arc::new(frame));
+        slot.generation = slot.generation.wrapping_add(1);
+        self.shared.changed.notify_one();
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.shared
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+    }
+
+    pub fn wait_for_change(
+        &self,
+        observed_generation: u64,
+        timeout: Duration,
+        stop: &AtomicBool,
+    ) -> (u64, Option<Arc<PreviewFrame>>, bool) {
+        let deadline = Instant::now() + timeout;
+        let mut slot = self
+            .shared
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while slot.generation == observed_generation && !stop.load(Ordering::Relaxed) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next_slot, result) = self
+                .shared
+                .changed
+                .wait_timeout(slot, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot = next_slot;
+            if result.timed_out() {
+                break;
+            }
+        }
+        let timed_out = slot.generation == observed_generation && !stop.load(Ordering::Relaxed);
+        (slot.generation, slot.frame.clone(), timed_out)
+    }
+
+    pub fn wake_waiters(&self) {
+        self.shared.changed.notify_all();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CapturePerformanceSnapshot {
     pub received_frames: u64,
     pub processed_frames: u64,
+    pub unchanged_frames: u64,
     pub skipped_frames: u64,
     pub readback_nanos: u64,
     pub resize_nanos: u64,
@@ -57,6 +147,7 @@ pub(crate) struct CapturePerformanceSnapshot {
 struct CapturePerformanceCounters {
     received_frames: AtomicU64,
     processed_frames: AtomicU64,
+    unchanged_frames: AtomicU64,
     skipped_frames: AtomicU64,
     readback_nanos: AtomicU64,
     resize_nanos: AtomicU64,
@@ -68,6 +159,7 @@ impl CapturePerformanceCounters {
         CapturePerformanceSnapshot {
             received_frames: self.received_frames.swap(0, Ordering::Relaxed),
             processed_frames: self.processed_frames.swap(0, Ordering::Relaxed),
+            unchanged_frames: self.unchanged_frames.swap(0, Ordering::Relaxed),
             skipped_frames: self.skipped_frames.swap(0, Ordering::Relaxed),
             readback_nanos: self.readback_nanos.swap(0, Ordering::Relaxed),
             resize_nanos: self.resize_nanos.swap(0, Ordering::Relaxed),
@@ -249,13 +341,13 @@ impl ScreenCapture {
         let monitor = Monitor::from_index(index + 1).map_err(|error| {
             format!("NÃ£o foi possÃ­vel localizar o monitor selecionado: {error}")
         })?;
-        let latest_frame = Arc::new(Mutex::new(None));
+        let latest_frame = LatestFrame::default();
         let performance = Arc::new(CapturePerformanceCounters::default());
         let fallback_reason = Arc::new(Mutex::new(None));
         let source_closed = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
-        let worker_frame = Arc::clone(&latest_frame);
+        let worker_frame = latest_frame.clone();
         let worker_performance = Arc::clone(&performance);
         let worker_fallback_reason = Arc::clone(&fallback_reason);
         let thread = thread::Builder::new()
@@ -301,7 +393,7 @@ impl ScreenCapture {
             );
             return Err("A tela ou janela selecionada tem tamanho inválido.".to_owned());
         }
-        let latest_frame = Arc::new(Mutex::new(None));
+        let latest_frame = LatestFrame::default();
         let performance = Arc::new(CapturePerformanceCounters::default());
         let fallback_reason = Arc::new(Mutex::new(None));
         let source_closed = Arc::new(AtomicBool::new(false));
@@ -316,7 +408,7 @@ impl ScreenCapture {
             HandlerFlags {
                 _size: size,
                 context,
-                latest_frame: Arc::clone(&latest_frame),
+                latest_frame: latest_frame.clone(),
                 performance: Arc::clone(&performance),
                 source_closed: Arc::clone(&source_closed),
             },
@@ -344,10 +436,7 @@ impl ScreenCapture {
     }
 
     pub fn latest_frame(&self) -> Option<Arc<PreviewFrame>> {
-        self.latest_frame
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.latest_frame.latest()
     }
 
     pub fn backend_name(&self) -> &'static str {
@@ -355,7 +444,7 @@ impl ScreenCapture {
     }
 
     pub fn frame_source(&self) -> LatestFrame {
-        Arc::clone(&self.latest_frame)
+        self.latest_frame.clone()
     }
 
     pub(crate) fn take_performance_snapshot(&self) -> CapturePerformanceSnapshot {
@@ -601,10 +690,10 @@ fn capture_dxgi_monitor(
             }
             None => None,
         };
-        sequence = sequence.wrapping_add(1);
+        let next_sequence = sequence.wrapping_add(1);
         let mut readback_nanos = 0;
         let mut resize_nanos = 0;
-        let preview_rgba = if let Some(surface) = gpu_surface.as_ref() {
+        let (preview_rgba, cpu_nv12) = if let Some(surface) = gpu_surface.as_ref() {
             let started_at = Instant::now();
             match surface.readback_nv12() {
                 Ok((nv12, stride)) => {
@@ -623,7 +712,13 @@ fn capture_dxgi_monitor(
                             {
                                 *reason = None;
                             }
-                            Some(rgba)
+                            (
+                                Some(rgba),
+                                Some(Arc::new(CpuNv12Frame {
+                                    bytes: Arc::new(nv12),
+                                    stride,
+                                })),
+                            )
                         }
                         Err(error) => {
                             resize_nanos += started_at.elapsed().as_nanos() as u64;
@@ -637,7 +732,13 @@ fn capture_dxgi_monitor(
                                 Some(format!(
                                     "Prévia GPU: falha na conversão para a imagem local: {error}"
                                 ));
-                            None
+                            (
+                                None,
+                                Some(Arc::new(CpuNv12Frame {
+                                    bytes: Arc::new(nv12),
+                                    stride,
+                                })),
+                            )
                         }
                     }
                 }
@@ -652,11 +753,11 @@ fn capture_dxgi_monitor(
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format!(
                         "Prévia GPU: falha na leitura da imagem reduzida: {error}"
                     ));
-                    None
+                    (None, None)
                 }
             }
         } else {
-            None
+            (None, None)
         };
         let rgba = match preview_rgba {
             Some(rgba) => rgba,
@@ -668,29 +769,37 @@ fn capture_dxgi_monitor(
                 let bytes = buffer.as_nopadding_buffer(&mut scratch);
                 readback_nanos += started_at.elapsed().as_nanos() as u64;
                 let started_at = Instant::now();
-                let rgba = downsample_bgra(bytes, width, height, sequence).rgba;
+                let preview = downsample_bgra(bytes, width, height, next_sequence);
                 resize_nanos += started_at.elapsed().as_nanos() as u64;
-                rgba
+                preview.rgba
             }
         };
         let mut preview = PreviewFrame {
-            sequence,
+            sequence: next_sequence,
             width: out_width,
             height: out_height,
             rgba,
             #[cfg(windows)]
             gpu_nv12: None,
+            #[cfg(windows)]
+            cpu_nv12,
         };
         preview.gpu_nv12 = gpu_surface;
+        // DXGI surfaces are copied to NV12 CPU memory already to make the local
+        // preview. Keep that readback alongside the latest frame so MF can use
+        // it if a D3D11 surface input is rejected, without converting RGBA again.
         performance
             .readback_nanos
             .fetch_add(readback_nanos, Ordering::Relaxed);
         performance
             .resize_nanos
             .fetch_add(resize_nanos, Ordering::Relaxed);
-        *latest_frame
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(preview));
+        if same_preview_pixels(latest_frame.latest().as_deref(), &preview) {
+            performance.unchanged_frames.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        sequence = next_sequence;
+        latest_frame.publish(preview);
         performance.processed_frames.fetch_add(1, Ordering::Relaxed);
         context.request_repaint();
     }
@@ -719,6 +828,8 @@ fn downsample_bgra(bytes: &[u8], width: u32, height: u32, sequence: u64) -> Prev
         rgba,
         #[cfg(windows)]
         gpu_nv12: None,
+        #[cfg(windows)]
+        cpu_nv12: None,
     }
 }
 
@@ -766,17 +877,21 @@ impl GraphicsCaptureApiHandler for ScreenFrameHandler {
             readback_started_at.elapsed().as_nanos() as u64,
             Ordering::Relaxed,
         );
-        self.sequence = self.sequence.wrapping_add(1);
+        let next_sequence = self.sequence.wrapping_add(1);
         let resize_started_at = Instant::now();
-        let preview = downsample_rgba(rgba, width, height, self.sequence);
+        let preview = downsample_rgba(rgba, width, height, next_sequence);
         self.performance.resize_nanos.fetch_add(
             resize_started_at.elapsed().as_nanos() as u64,
             Ordering::Relaxed,
         );
-        *self
-            .latest_frame
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(preview));
+        if same_preview_pixels(self.latest_frame.latest().as_deref(), &preview) {
+            self.performance
+                .unchanged_frames
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.sequence = next_sequence;
+        self.latest_frame.publish(preview);
         self.performance
             .processed_frames
             .fetch_add(1, Ordering::Relaxed);
@@ -815,7 +930,17 @@ fn downsample_rgba(bytes: &[u8], width: u32, height: u32, sequence: u64) -> Prev
         rgba,
         #[cfg(windows)]
         gpu_nv12: None,
+        #[cfg(windows)]
+        cpu_nv12: None,
     }
+}
+
+fn same_preview_pixels(previous: Option<&PreviewFrame>, candidate: &PreviewFrame) -> bool {
+    previous.is_some_and(|previous| {
+        previous.width == candidate.width
+            && previous.height == candidate.height
+            && previous.rgba == candidate.rgba
+    })
 }
 
 fn scaled_dimensions(width: u32, height: u32) -> (u32, u32) {
@@ -836,7 +961,10 @@ fn even_dimension(value: u32) -> u32 {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{FrameRateLimiter, MIN_CAPTURE_FRAME_INTERVAL, scaled_dimensions};
+    use super::{
+        FrameRateLimiter, MIN_CAPTURE_FRAME_INTERVAL, PreviewFrame, same_preview_pixels,
+        scaled_dimensions,
+    };
 
     #[test]
     fn capture_limiter_accepts_first_frame_and_caps_at_30_fps() {
@@ -906,5 +1034,31 @@ mod tests {
         assert_eq!(height % 2, 0);
         assert!(width <= 1280);
         assert!(height <= 720);
+    }
+
+    #[test]
+    fn identical_preview_pixels_are_detected_without_comparing_sequence() {
+        let first = PreviewFrame {
+            sequence: 1,
+            width: 2,
+            height: 2,
+            rgba: [1, 2, 3, 255].repeat(4),
+            #[cfg(windows)]
+            gpu_nv12: None,
+            #[cfg(windows)]
+            cpu_nv12: None,
+        };
+        let identical = PreviewFrame {
+            sequence: 2,
+            ..first.clone()
+        };
+        let changed = PreviewFrame {
+            rgba: [9, 2, 3, 255].repeat(4),
+            ..identical.clone()
+        };
+
+        assert!(same_preview_pixels(Some(&first), &identical));
+        assert!(!same_preview_pixels(Some(&first), &changed));
+        assert!(!same_preview_pixels(None, &first));
     }
 }

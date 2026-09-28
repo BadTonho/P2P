@@ -14,6 +14,7 @@ mod windows_backend {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use crate::screen_capture::CpuNv12Frame;
     use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
@@ -83,6 +84,9 @@ mod windows_backend {
         pending_output_samples: Mutex<VecDeque<IMFSample>>,
         transform_provides_sample: bool,
         output_capacity: u32,
+        output_subtype: windows::core::GUID,
+        width: u32,
+        height: u32,
     }
 
     impl Transform {
@@ -97,6 +101,14 @@ mod windows_backend {
             let transform: IMFTransform = unsafe { activate.ActivateObject() }
                 .map_err(|e| format!("Ativação do transform falhou: {e}"))?;
 
+            let attributes = unsafe { transform.GetAttributes() }
+                .map_err(|e| format!("Não foi possível consultar atributos do codec: {e}"))?;
+            if decoder_device_manager.is_some()
+                && unsafe { attributes.GetUINT32(&MF_SA_D3D11_AWARE) }.unwrap_or_default() == 0
+            {
+                return Err("O MFT de hardware não anuncia suporte a superfícies D3D11 (MF_SA_D3D11_AWARE).".to_owned());
+            }
+
             if let Some(manager) = decoder_device_manager {
                 unsafe {
                     transform
@@ -108,8 +120,6 @@ mod windows_backend {
                 }
             }
 
-            let attributes = unsafe { transform.GetAttributes() }
-                .map_err(|e| format!("Não foi possível consultar atributos do codec: {e}"))?;
             let async_transform =
                 unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or_default() != 0;
             let events = if async_transform {
@@ -182,6 +192,9 @@ mod windows_backend {
                 pending_output_samples: Mutex::new(VecDeque::new()),
                 transform_provides_sample,
                 output_capacity,
+                output_subtype,
+                width,
+                height,
             })
         }
 
@@ -233,12 +246,12 @@ mod windows_backend {
             Ok(false)
         }
 
-        fn send_input(&self, bytes: &[u8], time_hns: i64) -> Result<(), String> {
+        fn send_input(&mut self, bytes: &[u8], time_hns: i64) -> Result<(), String> {
             let sample = make_sample(bytes, time_hns)?;
             self.send_sample(&sample, time_hns)
         }
 
-        fn send_sample(&self, sample: &IMFSample, time_hns: i64) -> Result<(), String> {
+        fn send_sample(&mut self, sample: &IMFSample, time_hns: i64) -> Result<(), String> {
             if self.async_transform
                 && !self.wait_for_event(METransformNeedInput.0 as u32, MF_EVENT_WAIT)?
             {
@@ -282,7 +295,7 @@ mod windows_backend {
         }
 
         fn receive_output_sample(
-            &self,
+            &mut self,
             wait: Duration,
             transform_provides_sample: bool,
         ) -> Result<Option<IMFSample>, String> {
@@ -298,9 +311,18 @@ mod windows_backend {
         }
 
         fn process_output_sample(
-            &self,
+            &mut self,
             wait: Duration,
             transform_provides_sample: bool,
+        ) -> Result<Option<IMFSample>, String> {
+            self.process_output_sample_inner(wait, transform_provides_sample, true)
+        }
+
+        fn process_output_sample_inner(
+            &mut self,
+            wait: Duration,
+            transform_provides_sample: bool,
+            allow_stream_change: bool,
         ) -> Result<Option<IMFSample>, String> {
             if self.async_transform && !self.wait_for_event(METransformHaveOutput.0 as u32, wait)? {
                 return Ok(None);
@@ -336,10 +358,70 @@ mod windows_backend {
                     .map(Some)
                     .ok_or_else(|| "O codec terminou sem amostra de saída.".to_owned()),
                 Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
+                Err(error)
+                    if error.code() == MF_E_TRANSFORM_STREAM_CHANGE && allow_stream_change =>
+                {
+                    self.renegotiate_output_type().map_err(|reason| {
+                        format!("MF_E_TRANSFORM_STREAM_CHANGE: não foi possível manter a saída NV12: {reason}")
+                    })?;
+                    self.process_output_sample_inner(
+                        wait,
+                        self.transform_provides_sample,
+                        false,
+                    )
+                }
+                Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => Err(
+                    "O Media Foundation continuou solicitando mudança de formato após renegociar NV12.".to_owned(),
+                ),
                 Err(error) => Err(format!(
                     "O codec de hardware falhou ao produzir um quadro: {error}"
                 )),
             }
+        }
+
+        fn renegotiate_output_type(&mut self) -> Result<(), String> {
+            if self.output_subtype != MFVideoFormat_NV12 {
+                return Err("O codec pediu uma mudança inesperada do formato de saída.".to_owned());
+            }
+            let mut accepted = false;
+            for index in 0..64 {
+                let available = match unsafe { self.transform.GetOutputAvailableType(0, index) } {
+                    Ok(available) => available,
+                    Err(error) if error.code() == MF_E_NO_MORE_TYPES => break,
+                    Err(error) => {
+                        return Err(format!(
+                            "Não foi possível enumerar saídas após a mudança do fluxo: {error}"
+                        ));
+                    }
+                };
+                let subtype = unsafe { available.GetGUID(&MF_MT_SUBTYPE) };
+                if subtype
+                    .as_ref()
+                    .is_ok_and(|subtype| *subtype == MFVideoFormat_NV12)
+                    && unsafe { self.transform.SetOutputType(0, &available, 0) }.is_ok()
+                {
+                    accepted = true;
+                    break;
+                }
+            }
+            if !accepted {
+                let fallback = make_video_type(MFVideoFormat_NV12, self.width, self.height)?;
+                unsafe { self.transform.SetOutputType(0, &fallback, 0) }.map_err(|error| {
+                    format!("O decodificador não aceitou NV12 ao renegociar o fluxo: {error}")
+                })?;
+            }
+            let info = unsafe { self.transform.GetOutputStreamInfo(0) }.map_err(|error| {
+                format!("Não foi possível consultar o buffer após renegociar NV12: {error}")
+            })?;
+            self.output_capacity = info.cbSize.max(MF_OUTPUT_CAPACITY);
+            self.transform_provides_sample =
+                info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
+            tracing::warn!(
+                width = self.width,
+                height = self.height,
+                "Decoder Media Foundation renegociou saída NV12 após MF_E_TRANSFORM_STREAM_CHANGE"
+            );
+            Ok(())
         }
     }
 
@@ -471,9 +553,50 @@ mod windows_backend {
                 nv12.push(u);
                 nv12.push(v);
             }
-            self.transform.send_input(&nv12, self.next_time_hns)?;
-            self.next_time_hns += HNS_PER_SECOND / i64::from(FRAME_RATE);
+            self.encode_packed_nv12(&nv12)
+        }
 
+        pub fn encode_nv12(&mut self, frame: &CpuNv12Frame) -> Result<Vec<u8>, String> {
+            let width = self.width as usize;
+            let height = self.height as usize;
+            if self.width % 2 != 0 || self.height % 2 != 0 || frame.stride < width {
+                return Err(
+                    "O quadro NV12 da captura tem dimensões ou stride inválidos.".to_owned(),
+                );
+            }
+            let required = frame
+                .stride
+                .checked_mul(height + height / 2)
+                .ok_or_else(|| "O tamanho do quadro NV12 excedeu o limite permitido.".to_owned())?;
+            if frame.bytes.len() < required {
+                return Err(format!(
+                    "A captura NV12 forneceu {} bytes, mas eram necessários pelo menos {required}.",
+                    frame.bytes.len()
+                ));
+            }
+            let mut packed = Vec::with_capacity(width * height * 3 / 2);
+            for row in 0..height {
+                let start = row * frame.stride;
+                packed.extend_from_slice(&frame.bytes[start..start + width]);
+            }
+            let uv_start = frame.stride * height;
+            for row in 0..height / 2 {
+                let start = uv_start + row * frame.stride;
+                packed.extend_from_slice(&frame.bytes[start..start + width]);
+            }
+            self.encode_packed_nv12(&packed)
+        }
+
+        fn encode_packed_nv12(&mut self, nv12: &[u8]) -> Result<Vec<u8>, String> {
+            let expected = self.width as usize * self.height as usize * 3 / 2;
+            if nv12.len() != expected {
+                return Err(format!(
+                    "O quadro NV12 tem {} bytes; eram esperados {expected}.",
+                    nv12.len()
+                ));
+            }
+            self.transform.send_input(nv12, self.next_time_hns)?;
+            self.next_time_hns += HNS_PER_SECOND / i64::from(FRAME_RATE);
             self.drain_output()
         }
 
@@ -508,18 +631,23 @@ mod windows_backend {
             self.drain_output()
         }
 
-        pub fn encode_gpu_or_rgba(
+        pub fn encode_gpu_or_nv12_or_rgba(
             &mut self,
             frame: Option<&GpuNv12Surface>,
+            cpu_nv12: Option<&CpuNv12Frame>,
             rgba: &[u8],
         ) -> Result<(Vec<u8>, bool, Option<String>), String> {
             if !self.gpu_surface_input_enabled {
-                return self.encode_rgba(rgba).map(|bytes| (bytes, false, None));
+                let result = match cpu_nv12 {
+                    Some(frame) => self.encode_nv12(frame),
+                    None => self.encode_rgba(rgba),
+                }?;
+                return Ok((result, false, None));
             }
             let Some(frame) = frame else {
                 if self.gpu_surface_input_enabled {
                     self.gpu_surface_input_enabled = false;
-                    return self.encode_rgba(rgba).map(|bytes| {
+                    return self.encode_cpu_input(cpu_nv12, rgba).map(|bytes| {
                         (
                             bytes,
                             false,
@@ -527,13 +655,15 @@ mod windows_backend {
                         )
                     });
                 }
-                return self.encode_rgba(rgba).map(|bytes| (bytes, false, None));
+                return self
+                    .encode_cpu_input(cpu_nv12, rgba)
+                    .map(|bytes| (bytes, false, None));
             };
             match self.encode_gpu(frame) {
                 Ok(bytes) => Ok((bytes, true, None)),
                 Err(gpu_error) => {
                     self.gpu_surface_input_enabled = false;
-                    match self.encode_rgba(rgba) {
+                    match self.encode_cpu_input(cpu_nv12, rgba) {
                         Ok(bytes) => Ok((
                             bytes,
                             false,
@@ -546,6 +676,17 @@ mod windows_backend {
                         )),
                     }
                 }
+            }
+        }
+
+        fn encode_cpu_input(
+            &mut self,
+            cpu_nv12: Option<&CpuNv12Frame>,
+            rgba: &[u8],
+        ) -> Result<Vec<u8>, String> {
+            match cpu_nv12 {
+                Some(frame) => self.encode_nv12(frame),
+                None => self.encode_rgba(rgba),
             }
         }
 
@@ -1226,6 +1367,14 @@ mod windows_backend {
                 .map_err(|e| format!("Não foi possível copiar quadro DXVA para a CPU: {e}"))?;
             let stride = mapped.RowPitch as usize;
             let height = desc.Height as usize;
+            let width = desc.Width as usize;
+            if mapped.pData.is_null() || stride < width || height == 0 {
+                context.Unmap(&staging, 0);
+                return Err(format!(
+                    "O DXVA retornou uma superfície sem leitura válida: stride {stride}, dimensões {width}×{height}, dados nulos={}.",
+                    mapped.pData.is_null()
+                ));
+            }
             let length = stride
                 .checked_mul(height + height / 2)
                 .ok_or_else(|| "O tamanho do quadro DXVA excedeu o limite.".to_owned())?;

@@ -38,6 +38,7 @@ struct PendingTransfer {
 enum OutboundMessage {
     Protocol(ServerMessage),
     Control(WebSocketMessage),
+    CloseAcknowledgement(WebSocketMessage),
 }
 
 #[derive(Default)]
@@ -295,6 +296,9 @@ impl RoomRegistry {
             let _ = sender.send(match &message {
                 OutboundMessage::Protocol(message) => OutboundMessage::Protocol(message.clone()),
                 OutboundMessage::Control(message) => OutboundMessage::Control(message.clone()),
+                OutboundMessage::CloseAcknowledgement(message) => {
+                    OutboundMessage::CloseAcknowledgement(message.clone())
+                }
             });
         }
     }
@@ -709,8 +713,10 @@ async fn serve_websocket(
             WebSocketMessage::Ping(payload) => {
                 let _ = outgoing.send(OutboundMessage::Control(WebSocketMessage::Pong(payload)));
             }
-            WebSocketMessage::Close(_) => {
-                let _ = outgoing.send(OutboundMessage::Control(WebSocketMessage::Close(None)));
+            WebSocketMessage::Close(close_frame) => {
+                let _ = outgoing.send(OutboundMessage::CloseAcknowledgement(
+                    WebSocketMessage::Close(close_frame),
+                ));
                 break;
             }
             WebSocketMessage::Binary(_) => {
@@ -736,12 +742,13 @@ async fn write_outgoing_messages<S>(
     S: futures_util::Sink<WebSocketMessage> + Unpin,
     S::Error: std::fmt::Display,
 {
-    let mut close_sent = false;
     while let Some(outgoing) = outgoing_messages.recv().await {
         let is_close = matches!(
             &outgoing,
             OutboundMessage::Control(WebSocketMessage::Close(_))
+                | OutboundMessage::CloseAcknowledgement(WebSocketMessage::Close(_))
         );
+        let is_acknowledgement = matches!(&outgoing, OutboundMessage::CloseAcknowledgement(_));
         let message = match outgoing {
             OutboundMessage::Protocol(message) => match serde_json::to_string(&message) {
                 Ok(json) => WebSocketMessage::Text(json.into()),
@@ -751,19 +758,31 @@ async fn write_outgoing_messages<S>(
                 }
             },
             OutboundMessage::Control(message) => message,
+            OutboundMessage::CloseAcknowledgement(message) => message,
         };
         if let Err(error) = websocket_sender.send(message).await {
             tracing::warn!(connection_id, error = %error, "Falha ao enviar resposta pelo WebSocket");
             break;
         }
         if is_close {
-            close_sent = true;
+            if !is_acknowledgement {
+                // The read half queues a CloseAcknowledgement when the peer
+                // answers. Its frame is already on the socket, so do not echo
+                // a second close frame.
+                while let Some(response) = outgoing_messages.recv().await {
+                    if matches!(response, OutboundMessage::CloseAcknowledgement(_)) {
+                        break;
+                    }
+                    tracing::debug!(
+                        connection_id,
+                        "Ignoring queued WebSocket message after close started"
+                    );
+                }
+            }
             break;
         }
     }
-    if !close_sent {
-        let _ = websocket_sender.close().await;
-    }
+    let _ = websocket_sender.close().await;
 }
 
 async fn handle_client_message(
@@ -827,6 +846,7 @@ async fn handle_client_message(
         ClientMessage::LeaveRoom => {
             rooms.lock().await.leave_room(connection_id);
             send_message(outgoing, ServerMessage::RoomLeft);
+            let _ = outgoing.send(OutboundMessage::Control(WebSocketMessage::Close(None)));
             Ok(())
         }
         ClientMessage::RequestHostTransfer => {
@@ -955,13 +975,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_writer_stops_after_close_and_drops_queued_messages() {
+    async fn websocket_writer_sends_room_left_before_close_and_drops_later_messages() {
         let (outgoing, receiver) = mpsc::unbounded_channel();
+        outgoing
+            .send(OutboundMessage::Protocol(ServerMessage::RoomLeft))
+            .unwrap();
         outgoing
             .send(OutboundMessage::Control(WebSocketMessage::Close(None)))
             .unwrap();
         outgoing
-            .send(OutboundMessage::Protocol(ServerMessage::RoomLeft))
+            .send(OutboundMessage::Protocol(ServerMessage::PeerLeft))
             .unwrap();
         drop(outgoing);
 
@@ -973,16 +996,24 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             sent.len(),
-            1,
+            2,
             "nenhuma mensagem pode ser enviada após Close"
         );
-        assert!(matches!(sent.first(), Some(WebSocketMessage::Close(_))));
+        assert!(matches!(
+            sent.first(),
+            Some(WebSocketMessage::Text(text))
+                if serde_json::from_str::<ServerMessage>(text.as_str())
+                    .is_ok_and(|message| matches!(message, ServerMessage::RoomLeft))
+        ));
+        assert!(matches!(sent.get(1), Some(WebSocketMessage::Close(_))));
     }
 
     fn server_message(receiver: &mut mpsc::UnboundedReceiver<OutboundMessage>) -> ServerMessage {
         match receiver.try_recv().expect("expected a server message") {
             OutboundMessage::Protocol(message) => message,
-            OutboundMessage::Control(_) => panic!("expected a protocol message"),
+            OutboundMessage::Control(_) | OutboundMessage::CloseAcknowledgement(_) => {
+                panic!("expected a protocol message")
+            }
         }
     }
 

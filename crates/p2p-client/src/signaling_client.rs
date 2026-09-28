@@ -408,7 +408,11 @@ async fn run_client(
                                 tracing::info!(participants = participants.len(), room_mode = ?room_mode, "Servidor atualizou lista de participantes");
                                 let _ = events.send(SignalingEvent::RoomRoster { participants, leader_id, room_mode });
                             }
-                            Ok(ServerMessage::RoomLeft) => break,
+                            Ok(ServerMessage::RoomLeft) => {
+                                let _ = writer.send(WebSocketMessage::Close(None)).await;
+                                let _ = writer.close().await;
+                                break;
+                            }
                             Ok(ServerMessage::Error { message }) => {
                                 tracing::warn!(reason = %message, "Servidor recusou operação de sinalização");
                                 let _ = events.send(SignalingEvent::ServerError(message));
@@ -430,6 +434,8 @@ async fn run_client(
                     }
                     Some(Ok(WebSocketMessage::Close(_))) => {
                         tracing::warn!("Servidor encerrou a conexão WebSocket");
+                        let _ = writer.send(WebSocketMessage::Close(None)).await;
+                        let _ = writer.close().await;
                         break;
                     }
                     None => {
@@ -513,6 +519,38 @@ async fn run_client(
                     Some(ClientCommand::Leave) | None => {
                         tracing::info!("Enviando saída da sala e fechando conexão WebSocket");
                         let _ = send_client_message(&mut writer, ClientMessage::LeaveRoom).await;
+                        let close_handshake = timeout(Duration::from_secs(3), async {
+                            while let Some(message) = reader.next().await {
+                                match message {
+                                    Ok(WebSocketMessage::Text(text)) => {
+                                        if matches!(
+                                            serde_json::from_str::<ServerMessage>(text.as_str()),
+                                            Ok(ServerMessage::RoomLeft)
+                                        ) {
+                                            tracing::debug!("Servidor confirmou a saída antes do fechamento WebSocket");
+                                        }
+                                    }
+                                    Ok(WebSocketMessage::Close(_)) => {
+                                        let _ = writer.send(WebSocketMessage::Close(None)).await;
+                                        break;
+                                    }
+                                    Ok(WebSocketMessage::Ping(payload)) => {
+                                        if writer.send(WebSocketMessage::Pong(payload)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::debug!(error = %error, "Fluxo terminou durante o fechamento WebSocket");
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        })
+                        .await;
+                        if close_handshake.is_err() {
+                            tracing::warn!("O fechamento WebSocket excedeu o prazo; encerrando a conexão localmente");
+                        }
                         let _ = writer.close().await;
                         break;
                     }
