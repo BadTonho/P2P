@@ -867,6 +867,42 @@ mod tests {
     }
 
     #[test]
+    fn interval_snapshots_are_isolated_between_screen_share_sessions() {
+        let mut sender = super::SharedMetrics::default();
+        sender.session_id = 101;
+        sender.interval_encoded_frames.store(7, Ordering::Relaxed);
+        sender
+            .interval_outbound_rtp_packets
+            .store(31, Ordering::Relaxed);
+
+        let mut receiver = super::SharedMetrics::default();
+        receiver.session_id = 202;
+        receiver
+            .interval_received_packets
+            .store(43, Ordering::Relaxed);
+        receiver
+            .interval_assembled_access_units
+            .store(5, Ordering::Relaxed);
+
+        let sender_metrics = sender.snapshot();
+        let receiver_metrics = receiver.snapshot();
+        let sender_interval = sender.take_performance_snapshot();
+        let receiver_interval = receiver.take_performance_snapshot();
+
+        assert_eq!(sender_metrics.session_id, 101);
+        assert_eq!(receiver_metrics.session_id, 202);
+        assert_eq!(sender_interval.encoded_frames, 7);
+        assert_eq!(sender_interval.outbound_rtp_packets, 31);
+        assert_eq!(sender_interval.received_packets, 0);
+        assert_eq!(receiver_interval.received_packets, 43);
+        assert_eq!(receiver_interval.assembled_access_units, 5);
+        assert_eq!(receiver_interval.encoded_frames, 0);
+
+        assert_eq!(sender.take_performance_snapshot().encoded_frames, 0);
+        assert_eq!(receiver.take_performance_snapshot().received_packets, 0);
+    }
+
+    #[test]
     fn repeated_media_errors_are_logged_at_doubling_counts() {
         assert!([1, 2, 4, 8, 16].into_iter().all(should_log_aggregate_error));
         assert!(

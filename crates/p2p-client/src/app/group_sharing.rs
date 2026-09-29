@@ -18,6 +18,92 @@ fn next_group_media_port(used_ports: &HashSet<u16>) -> Option<u16> {
     (9002..=9009).find(|port| !used_ports.contains(port))
 }
 
+fn log_group_session_diagnostics(
+    session: &ScreenShareSession,
+    role: &'static str,
+    interval_seconds: Option<f64>,
+) {
+    let metrics = session.metrics();
+    let performance = session.take_performance_snapshot();
+    let route = match metrics.route {
+        Some(crate::screen_sharing::MediaRoute::Direct) => "direct",
+        Some(crate::screen_sharing::MediaRoute::Turn) => "turn",
+        None => "unknown",
+    };
+    let track_ssrc = metrics
+        .track_ssrc
+        .map(|ssrc| ssrc.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let selected_ice_pair = if metrics.selected_ice_pair.is_empty() {
+        "unknown"
+    } else {
+        metrics.selected_ice_pair.as_str()
+    };
+
+    tracing::info!(
+        screen_share_session = metrics.session_id,
+        track_ssrc = %track_ssrc,
+        role,
+        interval_seconds = ?interval_seconds,
+        p2p_connected = metrics.p2p_connected,
+        route,
+        selected_ice_pair = %selected_ice_pair,
+        encoder_backend = %metrics.encoder_backend,
+        encoder_fallback = metrics.encoder_fallback_reason.as_deref().unwrap_or(""),
+        decoder_backend = %metrics.decoder_backend,
+        decoder_preference = %metrics.decoder_preference,
+        decoder_fallback = metrics.decoder_fallback_reason.as_deref().unwrap_or(""),
+        encoder_input_total = metrics.encoder_input_frames,
+        encoded_total = metrics.encoded_frames,
+        sent_total = metrics.sent_frames,
+        received_packets_total = metrics.received_packets,
+        assembled_delta_total = metrics.received_delta_frames,
+        decoded_total = metrics.decoded_frames,
+        published_total = metrics.published_frames,
+        rtp_out_total = %metrics.rtc_outbound_summary,
+        rtp_in_total = %metrics.rtc_inbound_summary,
+        encoder_inputs_interval = performance.encoder_input_frames,
+        capture_new_interval = performance.new_capture_frames,
+        capture_repeated_interval = performance.repeated_capture_frames,
+        encoded_interval = performance.encoded_frames,
+        encoded_idr_interval = performance.encoded_idr_frames,
+        encoded_p_interval = performance.encoded_delta_frames,
+        sent_interval = performance.sent_frames,
+        sent_idr_interval = performance.sent_idr_frames,
+        sent_p_interval = performance.sent_delta_frames,
+        rtp_out_packets_interval = performance.outbound_rtp_packets,
+        rtp_out_bytes_interval = performance.outbound_rtp_bytes,
+        rtp_in_packets_interval = performance.inbound_rtp_packets,
+        rtp_in_bytes_interval = performance.inbound_rtp_bytes,
+        rtp_in_lost_interval = performance.inbound_rtp_lost_delta,
+        rtp_in_jitter_ms = metrics.inbound_rtp_jitter_ms,
+        packets_accepted_interval = performance.received_packets,
+        sequence_gaps_observed_interval = performance.observed_sequence_gaps,
+        reordered_packets_recovered_interval = performance.recovered_reordered_packets,
+        out_of_order_packets_interval = performance.unmatched_out_of_order_packets,
+        duplicate_packets_interval = performance.duplicate_packets,
+        packets_lost_confirmed_interval = performance.confirmed_missing_packets,
+        late_packets_interval = performance.late_after_confirmed_packets,
+        sequence_resyncs_interval = performance.sequence_gap_resyncs,
+        access_units_assembled_interval = performance.assembled_access_units,
+        assembly_errors_interval = performance.assembly_errors,
+        decoder_inputs_interval = performance.decoder_input_frames,
+        decoder_no_output_interval = performance.decoder_no_output_frames,
+        decoder_queue_drops_interval = performance.decoder_queue_drops,
+        decoded_interval = performance.decoded_frames,
+        decode_errors_interval = performance.decode_errors,
+        published_interval = performance.published_frames,
+        texture_updates_interval = performance.ui_texture_updates,
+        pli_sent_interval = performance.pli_requests_sent,
+        pli_received_interval = performance.pli_requests_received,
+        pli_sent_total = metrics.pli_requests_sent,
+        pli_received_total = metrics.pli_requests_received,
+        h264 = %metrics.h264_diagnostics,
+        last_decode_error = metrics.last_decode_error.as_deref().unwrap_or(""),
+        "Diagnóstico individual da sessão de compartilhamento em grupo"
+    );
+}
+
 impl ClientUi {
     pub(super) fn group_sharing_compatible(&self) -> bool {
         group_screen_share_compatible(self.room_mode, &self.participants)
@@ -429,6 +515,16 @@ impl ClientUi {
             .last_group_metrics_log_at
             .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
         {
+            let interval_seconds = self
+                .last_group_metrics_log_at
+                .map(|last| last.elapsed().as_secs_f64());
+            for session in self.group_outbound_sessions.values() {
+                log_group_session_diagnostics(session, "sender", interval_seconds);
+            }
+            for session in self.group_inbound_sessions.values() {
+                log_group_session_diagnostics(session, "receiver", interval_seconds);
+            }
+
             let outbound = self
                 .group_outbound_sessions
                 .values()
