@@ -458,32 +458,25 @@ impl ClientUi {
             }
 
             if !self.available_monitors.is_empty() {
-                let selected = self
+                let monitor_choices = self
                     .available_monitors
                     .iter()
-                    .position(|monitor| {
-                        self.selected_monitor_id.as_deref() == Some(monitor.device_id.as_str())
+                    .enumerate()
+                    .map(|(index, monitor)| {
+                        (
+                            monitor.device_id.clone(),
+                            format!("Capturar {}", monitor.label(index + 1)),
+                        )
                     })
-                    .unwrap_or(0);
-                let selected_monitor = &self.available_monitors[selected];
-                egui::ComboBox::from_id_salt("room-monitor-source")
-                    .selected_text(selected_monitor.label(selected + 1))
-                    .show_ui(ui, |ui| {
-                        for (index, monitor) in self.available_monitors.iter().enumerate() {
-                            ui.selectable_value(
-                                &mut self.selected_monitor_id,
-                                Some(monitor.device_id.clone()),
-                                monitor.label(index + 1),
-                            );
-                        }
-                    });
-                if ui.button("Capturar monitor por DXGI").clicked() {
+                    .collect::<Vec<_>>();
+                let mut selected_device_id = None;
+                for (device_id, label) in monitor_choices {
+                    if ui.button(label).clicked() {
+                        selected_device_id = Some(device_id);
+                    }
+                }
+                if let Some(selected_device_id) = selected_device_id {
                     self.dxgi_capture_error = None;
-                    let selected_device_id = self
-                        .selected_monitor_id
-                        .as_deref()
-                        .unwrap_or(&selected_monitor.device_id)
-                        .to_owned();
                     match ScreenCapture::start_monitor(
                         &selected_device_id,
                         ui.ctx().clone(),

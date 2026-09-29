@@ -130,7 +130,6 @@ struct ClientUi {
     screen_picker: Option<PendingScreenCapture>,
     available_monitors: Vec<MonitorOption>,
     monitors_loaded: bool,
-    selected_monitor_id: Option<String>,
     monitor_menu_open: bool,
     dxgi_capture_error: Option<String>,
     screen_texture: Option<egui::TextureHandle>,
@@ -208,7 +207,6 @@ impl ClientUi {
             return;
         }
         self.monitors_loaded = true;
-        let previous_selection = self.selected_monitor_id.clone();
         match ScreenCapture::monitors() {
             Ok(monitors) => {
                 tracing::info!(
@@ -216,21 +214,9 @@ impl ClientUi {
                     "Monitores ativos enumerados para DXGI"
                 );
                 self.available_monitors = monitors;
-                self.selected_monitor_id = previous_selection
-                    .filter(|device_id| {
-                        self.available_monitors
-                            .iter()
-                            .any(|monitor| &monitor.device_id == device_id)
-                    })
-                    .or_else(|| {
-                        self.available_monitors
-                            .first()
-                            .map(|monitor| monitor.device_id.clone())
-                    });
             }
             Err(error) => {
                 self.available_monitors.clear();
-                self.selected_monitor_id = None;
                 tracing::warn!(error = %error, "NÃ£o foi possÃ­vel enumerar monitores DXGI");
                 self.dxgi_capture_error = Some(error);
             }
