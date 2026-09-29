@@ -54,6 +54,8 @@ Os nomes e limites finais dos módulos devem seguir as dependências reais entre
 
 Reavaliar `control_mesh.rs` (cerca de 1.800 linhas), `mf_video.rs` (cerca de 1.700 linhas), `screen_capture.rs` (cerca de 1.100 linhas) e `update.rs` (cerca de 1.000 linhas). Eles já têm responsabilidades mais específicas; dividir somente se a revisão mostrar partes independentes que ficam mais fáceis de manter em módulos separados.
 
+Na extração, manter `control_mesh.rs` como uma máquina de estados coesa. Separar em `screen_capture/` os backends DXGI e Windows Graphics Capture; em `mf_video/windows_backend/`, encoder, decoder, processamento NV12/GPU e utilitários H.264; e em `update/`, consulta ao GitHub, download/validação e aplicação/rollback. As fachadas preservam os pontos de entrada existentes.
+
 **Concluída quando:** cada módulo tiver um propósito claro, sem fragmentação excessiva e sem mudança funcional.
 
 ## Ordem e acompanhamento
@@ -63,4 +65,4 @@ Fazer as etapas na ordem acima. A primeira prioridade é `main.rs`; a segunda é
 - Etapa 1: concluída — interface extraída para módulos; `cargo fmt --all -- --check`, testes offline e build offline passaram.
 - Etapa 2: concluída — ciclo de vida da sala, participantes/sucessão e compartilhamento em grupo extraídos para módulos; formatação, testes offline e build offline passaram.
 - Etapa 3: extração implementada em `screen_sharing/{session,sender,receiver,metrics,h264}.rs`; `cargo fmt --all -- --check`, `cargo test --workspace --offline` e `cargo build --workspace --offline` passaram. Validação manual entre dois PCs ainda pendente.
-- Etapa 4: pendente
+- Etapa 4: concluída — backends de captura, componentes Media Foundation e etapas do atualizador separados em módulos; `control_mesh.rs` mantido coeso. `cargo fmt --all -- --check`, `cargo test --workspace --offline` (97 testes) e `cargo build --workspace --offline` passaram.
