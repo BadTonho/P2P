@@ -7,6 +7,9 @@ impl ClientUi {
             self.refresh_host_addresses();
         }
 
+        self.show_profile_card(ui);
+        ui.add_space(8.0);
+
         ui.horizontal(|ui| {
             ui.heading("Modo da sala");
             ui.selectable_value(
@@ -88,6 +91,59 @@ impl ClientUi {
         ui.collapsing("Como entrar", |ui| {
             ui.label("Escolha um anfitrião salvo na tela inicial; use Gerenciar anfitriões para adicionar ou editar endereços.");
         });
+    }
+
+    fn show_profile_card(&mut self, ui: &mut egui::Ui) {
+        let mut choose_avatar = false;
+        let mut remove_avatar = false;
+        ui.group(|ui| {
+            ui.heading("Seu perfil");
+            ui.horizontal(|ui| {
+                if let Some(texture) = self.local_profile_avatar_texture(ui.ctx()) {
+                    ui.add(
+                        egui::Image::new((texture.id(), egui::vec2(64.0, 64.0)))
+                            .fit_to_exact_size(egui::vec2(64.0, 64.0)),
+                    );
+                }
+                ui.vertical(|ui| {
+                    ui.label("Nome na sala (opcional)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.profile_display_name)
+                            .hint_text("Se ficar vazio, aparecerá Participante N")
+                            .char_limit(32)
+                            .desired_width(ui.available_width().min(360.0)),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(if self.profile_avatar_jpeg.is_some() {
+                                "Alterar foto"
+                            } else {
+                                "Escolher foto"
+                            })
+                            .clicked()
+                        {
+                            choose_avatar = true;
+                        }
+                        if self.profile_avatar_jpeg.is_some()
+                            && ui.button("Remover foto").clicked()
+                        {
+                            remove_avatar = true;
+                        }
+                    });
+                });
+            });
+            ui.small("O nome aparece em qualquer sala. A foto é compartilhada apenas em salas Rede local / Radmin.");
+        });
+
+        if choose_avatar {
+            self.choose_profile_avatar();
+        }
+        if remove_avatar {
+            self.remove_profile_avatar();
+        }
+        if let Some(error) = self.profile_avatar_error.clone() {
+            ClientUi::show_notice(ui, "Foto do perfil:", &error);
+        }
     }
 
     fn show_create_room_card(&mut self, ui: &mut egui::Ui) {

@@ -43,3 +43,5 @@ Filename: "{app}\p2p-client.exe"; Description: "Abrir P2P - Voz e tela"; Flags: 
 [UninstallDelete]
 Type: files; Name: "{localappdata}\P2P-Voz-e-tela\settings.json"
 Type: files; Name: "{localappdata}\P2P-Voz-e-tela\settings.json.tmp"
+Type: files; Name: "{localappdata}\P2P-Voz-e-tela\profile-avatar.jpg"
+Type: files; Name: "{localappdata}\P2P-Voz-e-tela\profile-avatar.jpg.tmp"

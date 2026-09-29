@@ -214,9 +214,21 @@ impl ClientUi {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         for participant in &participants {
+                            let avatar = self.participant_avatar_texture(ui.ctx(), participant);
                             egui::Frame::group(ui.style()).show(ui, |ui| {
                                 ui.set_min_width(150.0);
-                                ui.label(&participant.display_name);
+                                ui.horizontal(|ui| {
+                                    if let Some(texture) = avatar {
+                                        ui.add(
+                                            egui::Image::new((
+                                                texture.id(),
+                                                egui::vec2(40.0, 40.0),
+                                            ))
+                                            .fit_to_exact_size(egui::vec2(40.0, 40.0)),
+                                        );
+                                    }
+                                    ui.label(&participant.display_name);
+                                });
                             });
                         }
                     });

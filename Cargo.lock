@@ -2338,6 +2338,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3397,6 +3399,7 @@ name = "p2p-client"
 version = "1.0.17"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "cpal",
  "eframe",
@@ -4709,6 +4712,7 @@ dependencies = [
 name = "signaling-server"
 version = "1.0.17"
 dependencies = [
+ "base64 0.22.1",
  "futures-util",
  "rand 0.9.5",
  "serde_json",

@@ -59,6 +59,8 @@ pub struct AppSettings {
     pub control_ipv4: Option<Ipv4Addr>,
     pub video_decoder_preference: VideoDecoderPreference,
     pub show_local_preview: bool,
+    #[serde(default)]
+    pub profile_display_name: String,
 }
 
 impl Default for AppSettings {
@@ -77,6 +79,7 @@ impl Default for AppSettings {
             control_ipv4: None,
             video_decoder_preference: VideoDecoderPreference::Automatic,
             show_local_preview: true,
+            profile_display_name: String::new(),
         }
     }
 }
@@ -99,11 +102,15 @@ pub fn save(settings: &AppSettings) -> Result<(), String> {
     })
 }
 
-fn settings_path() -> Result<PathBuf, String> {
+pub(crate) fn data_directory() -> Result<PathBuf, String> {
     let local_app_data = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or_else(|| "A variável LOCALAPPDATA não está definida.".to_owned())?;
-    Ok(local_app_data.join(SETTINGS_DIRECTORY).join(SETTINGS_FILE))
+    Ok(local_app_data.join(SETTINGS_DIRECTORY))
+}
+
+fn settings_path() -> Result<PathBuf, String> {
+    Ok(data_directory()?.join(SETTINGS_FILE))
 }
 
 fn load_from(path: &Path) -> (AppSettings, Option<String>) {
@@ -220,7 +227,7 @@ fn save_to(path: &Path, settings: &AppSettings) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
@@ -256,7 +263,7 @@ fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
 }
 
@@ -342,6 +349,20 @@ mod tests {
         let loaded: AppSettings =
             serde_json::from_value(stored).expect("older settings files should remain compatible");
         assert!(loaded.show_local_preview);
+    }
+
+    #[test]
+    fn older_settings_default_profile_name_to_empty() {
+        let mut stored =
+            serde_json::to_value(AppSettings::default()).expect("settings should serialize");
+        stored
+            .as_object_mut()
+            .expect("settings should serialize as an object")
+            .remove("profile_display_name");
+
+        let loaded: AppSettings =
+            serde_json::from_value(stored).expect("older settings files should remain compatible");
+        assert!(loaded.profile_display_name.is_empty());
     }
 
     #[test]

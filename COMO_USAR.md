@@ -9,7 +9,11 @@ Este guia cobre a versão Windows 1.0.0. O aplicativo compartilha tela; chamada 
 3. O app lembra endereço do anfitrião, STUN, ganho de áudio, modo de criação, opção TURN, autorização para hospedagem e adaptador de controle. As preferências ficam neste computador e sobrevivem às atualizações. O código da sala e credenciais temporárias não são salvos.
 4. Se preferir, o release também oferece `p2p-client.exe` para executar sem o instalador.
 
-Ao desinstalar pelo Windows, as preferências são removidas. Os logs de diagnóstico permanecem em `%LOCALAPPDATA%\P2P-Voz-e-tela\logs`.
+Ao desinstalar pelo Windows, as preferências e a foto do perfil são removidas. Os logs de diagnóstico permanecem em `%LOCALAPPDATA%\P2P-Voz-e-tela\logs`.
+
+## Perfil de participante
+
+Na tela inicial, **Seu perfil** permite informar um nome e escolher uma foto; ambos são opcionais. O nome aparece para os participantes em salas locais/Radmin e no modo Internet. Se ficar vazio, o aplicativo mostra **Participante N**. A foto é reduzida a uma miniatura JPEG de até 96×96 e 16 KiB, salva neste computador e enviada somente em salas locais/Radmin. No modo Internet, a foto não é enviada. O nome e a foto ficam salvos entre aberturas e atualizações. O perfil passa a valer quando você entrar na próxima sala.
 
 ## Antes de começar
 

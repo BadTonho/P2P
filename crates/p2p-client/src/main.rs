@@ -5,6 +5,7 @@ mod audio_capture;
 mod control_mesh;
 mod logging;
 mod mf_video;
+mod profile;
 mod screen_capture;
 mod screen_sharing;
 mod settings;

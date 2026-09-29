@@ -7,10 +7,11 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 cpal = "0.18.2"
 bytes = "1"
 eframe = "0.36.2"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rand = "0.9"

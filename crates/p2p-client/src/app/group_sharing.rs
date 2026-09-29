@@ -467,6 +467,7 @@ mod tests {
             order: id as u8,
             may_host: false,
             control_address: String::new(),
+            avatar_jpeg_base64: None,
             supports_group_screen_share,
         }
     }

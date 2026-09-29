@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage};
 use tokio::net::{TcpListener, TcpStream};
@@ -13,6 +14,9 @@ use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::{WebSocketStream, accept_async};
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_AVATAR_BYTES: usize = 16 * 1024;
+const MAX_AVATAR_BASE64_BYTES: usize = MAX_AVATAR_BYTES.div_ceil(3) * 4;
+const MAX_DISPLAY_NAME_CHARS: usize = 32;
 const HOST_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ROOM_PARTICIPANTS: usize = 8;
 
@@ -247,10 +251,13 @@ impl RoomRegistry {
         } else {
             participant.order
         };
-        participant.display_name = format!("Participante {}", participant.order);
+        participant.display_name =
+            sanitize_display_name(&participant.display_name, participant.order);
+        participant.avatar_jpeg_base64 = sanitize_avatar(participant.avatar_jpeg_base64);
         if internet_test {
             participant.may_host = false;
             participant.control_address.clear();
+            participant.avatar_jpeg_base64 = None;
         }
         self.participant_info.insert(connection_id, participant);
         if let Some(room) = self.rooms.get_mut(&code) {
@@ -649,6 +656,79 @@ impl RoomRegistry {
     }
 }
 
+fn sanitize_display_name(name: &str, order: u8) -> String {
+    let cleaned = name
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_DISPLAY_NAME_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    if cleaned.is_empty() {
+        format!("Participante {order}")
+    } else {
+        cleaned
+    }
+}
+
+fn sanitize_avatar(encoded: Option<String>) -> Option<String> {
+    let encoded = encoded?;
+    if encoded.len() > MAX_AVATAR_BASE64_BYTES {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_AVATAR_BYTES || !is_small_baseline_jpeg(&bytes) {
+        return None;
+    }
+    Some(encoded)
+}
+
+fn is_small_baseline_jpeg(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return false;
+    }
+
+    let mut offset = 2;
+    while offset < bytes.len() {
+        if bytes[offset] != 0xff {
+            return false;
+        }
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        let Some(&marker) = bytes.get(offset) else {
+            return false;
+        };
+        offset += 1;
+        if marker == 0xd9 || marker == 0xda {
+            return false;
+        }
+        if marker == 0xd8 || marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let Some(length_bytes) = bytes.get(offset..offset + 2) else {
+            return false;
+        };
+        let segment_length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+        if segment_length < 2 || offset + segment_length > bytes.len() {
+            return false;
+        }
+        if marker == 0xc0 {
+            if segment_length < 8 {
+                return false;
+            }
+            let height = u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]);
+            let width = u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]);
+            return width > 0 && height > 0 && width <= 96 && height <= 96;
+        }
+        offset += segment_length;
+    }
+    false
+}
+
 fn default_participant(connection_id: ConnectionId, order: u8) -> ParticipantInfo {
     ParticipantInfo {
         id: format!("participant-{connection_id}"),
@@ -656,6 +736,7 @@ fn default_participant(connection_id: ConnectionId, order: u8) -> ParticipantInf
         order,
         may_host: false,
         control_address: String::new(),
+        avatar_jpeg_base64: None,
         supports_group_screen_share: false,
     }
 }
@@ -970,6 +1051,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    use base64::Engine as _;
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio::sync::{Mutex, mpsc, oneshot};
@@ -978,10 +1060,20 @@ mod tests {
     use tokio_tungstenite::{WebSocketStream, connect_async};
 
     use super::{
-        OutboundMessage, RoomRegistry, TransferReservation, handle_connection, serve,
+        OutboundMessage, RoomRegistry, TransferReservation, handle_connection,
+        is_small_baseline_jpeg, sanitize_avatar, sanitize_display_name, serve,
         write_outgoing_messages,
     };
     use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage, SignalKind};
+
+    fn small_jpeg_base64() -> String {
+        // Minimal SOF0 header used to exercise the server's bounded metadata parser.
+        let bytes = [
+            0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x60, 0x00, 0x60, 0x03, 0x01, 0x11,
+            0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00, 0xff, 0xd9,
+        ];
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
 
     struct RecordingSink(Arc<std::sync::Mutex<Vec<WebSocketMessage>>>);
 
@@ -1109,10 +1201,11 @@ mod tests {
                 1,
                 ParticipantInfo {
                     id: "host-id".to_owned(),
-                    display_name: "ignored".to_owned(),
+                    display_name: "Anfitrião da sala".to_owned(),
                     order: 0,
                     may_host: true,
                     control_address: "192.168.1.2:9001".to_owned(),
+                    avatar_jpeg_base64: Some(small_jpeg_base64()),
                     supports_group_screen_share: false,
                 },
             )
@@ -1126,6 +1219,8 @@ mod tests {
             panic!("expected internet room roster")
         };
         assert_eq!(room_mode, RoomMode::InternetTest);
+        assert_eq!(participants[0].display_name, "Anfitrião da sala");
+        assert!(participants[0].avatar_jpeg_base64.is_none());
         assert!(!participants[0].may_host);
         assert!(participants[0].control_address.is_empty());
 
@@ -1136,10 +1231,11 @@ mod tests {
                 guest_tx,
                 ParticipantInfo {
                     id: "guest-id".to_owned(),
-                    display_name: "ignored".to_owned(),
+                    display_name: "Convidado".to_owned(),
                     order: 0,
                     may_host: true,
                     control_address: "192.168.1.3:9001".to_owned(),
+                    avatar_jpeg_base64: Some(small_jpeg_base64()),
                     supports_group_screen_share: false,
                 },
             )
@@ -1160,6 +1256,13 @@ mod tests {
             assert!(participants.iter().all(|participant| {
                 !participant.may_host && participant.control_address.is_empty()
             }));
+            assert!(
+                participants
+                    .iter()
+                    .all(|participant| participant.avatar_jpeg_base64.is_none())
+            );
+            assert_eq!(participants[0].display_name, "Anfitrião da sala");
+            assert_eq!(participants[1].display_name, "Convidado");
         }
 
         let (third_tx, _third_rx) = mpsc::unbounded_channel();
@@ -1185,10 +1288,11 @@ mod tests {
                 1,
                 ParticipantInfo {
                     id: "host-id".to_owned(),
-                    display_name: "ignored".to_owned(),
+                    display_name: "Anfitrião".to_owned(),
                     order: 0,
                     may_host: true,
                     control_address: "192.168.1.2:9001".to_owned(),
+                    avatar_jpeg_base64: Some(small_jpeg_base64()),
                     supports_group_screen_share: false,
                 },
             )
@@ -1204,6 +1308,11 @@ mod tests {
         assert_eq!(leader_id, "host-id");
         assert_eq!(participants[0].order, 1);
         assert!(participants[0].may_host);
+        assert_eq!(participants[0].display_name, "Anfitrião");
+        assert_eq!(
+            participants[0].avatar_jpeg_base64,
+            Some(small_jpeg_base64())
+        );
 
         registry.join_room(2, &code, guest_tx).unwrap();
         let _ = server_message(&mut guest_rx);
@@ -1213,10 +1322,11 @@ mod tests {
                 2,
                 ParticipantInfo {
                     id: "guest-id".to_owned(),
-                    display_name: "ignored".to_owned(),
+                    display_name: "Amiga".to_owned(),
                     order: 0,
                     may_host: false,
                     control_address: "192.168.1.3:9001".to_owned(),
+                    avatar_jpeg_base64: Some(small_jpeg_base64()),
                     supports_group_screen_share: false,
                 },
             )
@@ -1230,6 +1340,12 @@ mod tests {
             panic!("expected updated roster")
         };
         assert_eq!(leader_id, "host-id");
+        assert_eq!(participants[0].display_name, "Anfitrião");
+        assert_eq!(participants[1].display_name, "Amiga");
+        assert_eq!(
+            participants[1].avatar_jpeg_base64,
+            Some(small_jpeg_base64())
+        );
         assert_eq!(
             participants
                 .iter()
@@ -1248,6 +1364,20 @@ mod tests {
     }
 
     #[test]
+    fn participant_profile_fields_are_bounded_and_sanitized() {
+        let long_name = "x".repeat(64);
+        assert_eq!(sanitize_display_name(&long_name, 4), "x".repeat(32));
+        assert_eq!(sanitize_display_name("  \n\t  ", 4), "Participante 4");
+        assert_eq!(sanitize_display_name("  Ana\n  ", 4), "Ana");
+
+        let valid = small_jpeg_base64();
+        assert_eq!(sanitize_avatar(Some(valid.clone())), Some(valid));
+        assert!(sanitize_avatar(Some("not base64".to_owned())).is_none());
+        assert!(sanitize_avatar(Some("A".repeat(30_000))).is_none());
+        assert!(!is_small_baseline_jpeg(&[0xff, 0xd8, 0xff, 0xc2]));
+    }
+
+    #[test]
     fn election_adoption_preserves_roster_and_allows_existing_members_to_rejoin() {
         let original_members = vec![
             ParticipantInfo {
@@ -1256,6 +1386,7 @@ mod tests {
                 order: 1,
                 may_host: true,
                 control_address: "192.168.1.2:9001".to_owned(),
+                avatar_jpeg_base64: None,
                 supports_group_screen_share: false,
             },
             ParticipantInfo {
@@ -1264,6 +1395,7 @@ mod tests {
                 order: 2,
                 may_host: true,
                 control_address: "192.168.1.3:9001".to_owned(),
+                avatar_jpeg_base64: None,
                 supports_group_screen_share: false,
             },
             ParticipantInfo {
@@ -1272,6 +1404,7 @@ mod tests {
                 order: 3,
                 may_host: false,
                 control_address: "192.168.1.4:9001".to_owned(),
+                avatar_jpeg_base64: None,
                 supports_group_screen_share: false,
             },
         ];
@@ -1302,6 +1435,7 @@ mod tests {
                     order: 2,
                     may_host: true,
                     control_address: "192.168.1.3:9001".to_owned(),
+                    avatar_jpeg_base64: None,
                     supports_group_screen_share: false,
                 },
             )
@@ -1335,6 +1469,7 @@ mod tests {
                     order: 1,
                     may_host: true,
                     control_address: "192.168.1.2:9001".to_owned(),
+                    avatar_jpeg_base64: None,
                     supports_group_screen_share: false,
                 },
             )

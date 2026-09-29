@@ -1,4 +1,5 @@
 use super::*;
+use base64::Engine as _;
 
 impl ClientUi {
     pub(super) fn local_participant_info(&mut self) -> ParticipantInfo {
@@ -24,10 +25,17 @@ impl ClientUi {
             .map_or(0, |participant| participant.order);
         ParticipantInfo {
             id: self.participant_id.clone(),
-            display_name: "Participante".to_owned(),
+            display_name: self.profile_display_name.clone(),
             order,
             may_host: self.room_mode == RoomMode::Local && self.may_host,
             control_address,
+            avatar_jpeg_base64: if self.room_mode == RoomMode::Local {
+                self.profile_avatar_jpeg
+                    .as_deref()
+                    .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+            } else {
+                None
+            },
             supports_group_screen_share: self.room_mode == RoomMode::Local,
         }
     }
@@ -40,12 +48,14 @@ impl ClientUi {
     ) {
         self.room_mode = room_mode;
         self.participants = participants;
-        self.current_leader_id = leader_id.clone();
         let member_ids = self
             .participants
             .iter()
             .map(|participant| participant.id.clone())
             .collect::<HashSet<_>>();
+        self.participant_avatar_textures
+            .retain(|id, _| member_ids.contains(id));
+        self.current_leader_id = leader_id.clone();
         self.group_available_shares
             .retain(|id| member_ids.contains(id));
         self.group_watched_shares

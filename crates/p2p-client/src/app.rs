@@ -11,6 +11,7 @@ use crate::control_mesh::{ControlEvent, ControlMesh, QueueEntry};
 use crate::logging::{
     DiagnosticSnapshot, LoggingState, safe_signaling_endpoint, safe_stun_endpoint,
 };
+use crate::profile;
 use crate::screen_capture::{MonitorOption, PendingScreenCapture, ScreenCapture};
 use crate::screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
 use crate::settings::{AppSettings, MAX_SAVED_HOSTS, SavedHostProfile, VideoDecoderPreference};
@@ -126,6 +127,11 @@ struct ClientUi {
     microphone_monitor_error: Option<String>,
     microphone_audio_warning: bool,
     microphone_clipping_warning: bool,
+    profile_display_name: String,
+    profile_avatar_jpeg: Option<Vec<u8>>,
+    profile_avatar_texture: Option<egui::TextureHandle>,
+    profile_avatar_error: Option<String>,
+    participant_avatar_textures: HashMap<String, (Option<String>, Option<egui::TextureHandle>)>,
     screen_capture: Option<ScreenCapture>,
     screen_picker: Option<PendingScreenCapture>,
     available_monitors: Vec<MonitorOption>,
@@ -341,6 +347,7 @@ impl ClientUi {
         settings.monitor_gain_db = self.monitor_gain_db;
         settings.video_decoder_preference = self.video_decoder_preference;
         settings.show_local_preview = self.show_local_preview;
+        settings.profile_display_name = self.profile_display_name.clone();
         settings.create_room_mode = self.create_room_mode;
         settings.use_turn_on_create = self.use_turn_on_create;
         settings.may_host = self.may_host;
@@ -359,12 +366,99 @@ impl ClientUi {
         self.monitor_gain_db = preferences.monitor_gain_db;
         self.video_decoder_preference = preferences.video_decoder_preference;
         self.show_local_preview = preferences.show_local_preview;
+        self.profile_display_name = preferences.profile_display_name;
         self.capture_preview_enabled
             .store(self.show_local_preview, Ordering::Relaxed);
         self.create_room_mode = preferences.create_room_mode;
         self.use_turn_on_create = preferences.use_turn_on_create;
         self.may_host = preferences.may_host;
         self.preferred_control_ipv4 = preferences.control_ipv4;
+    }
+
+    pub(super) fn choose_profile_avatar(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Imagens PNG ou JPEG", &["png", "jpg", "jpeg"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let result = profile::normalize_avatar_file(&path);
+        match result {
+            Ok(avatar) => match profile::store_avatar(&avatar) {
+                Ok(()) => {
+                    self.profile_avatar_jpeg = Some(avatar);
+                    self.profile_avatar_texture = None;
+                    self.profile_avatar_error = None;
+                }
+                Err(error) => self.profile_avatar_error = Some(error),
+            },
+            Err(error) => self.profile_avatar_error = Some(error),
+        }
+    }
+
+    pub(super) fn remove_profile_avatar(&mut self) {
+        match profile::remove_avatar() {
+            Ok(()) => {
+                self.profile_avatar_jpeg = None;
+                self.profile_avatar_texture = None;
+                self.profile_avatar_error = None;
+            }
+            Err(error) => self.profile_avatar_error = Some(error),
+        }
+    }
+
+    pub(super) fn local_profile_avatar_texture(
+        &mut self,
+        context: &egui::Context,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(texture) = &self.profile_avatar_texture {
+            return Some(texture.clone());
+        }
+        let bytes = self.profile_avatar_jpeg.as_deref()?;
+        match profile::avatar_color_image(bytes) {
+            Ok(image) => {
+                let texture = context.load_texture(
+                    "local-profile-avatar",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.profile_avatar_texture = Some(texture.clone());
+                Some(texture)
+            }
+            Err(error) => {
+                self.profile_avatar_error = Some(error);
+                None
+            }
+        }
+    }
+
+    pub(super) fn participant_avatar_texture(
+        &mut self,
+        context: &egui::Context,
+        participant: &ParticipantInfo,
+    ) -> Option<egui::TextureHandle> {
+        let encoded = participant.avatar_jpeg_base64.clone();
+        if let Some((cached, texture)) = self.participant_avatar_textures.get(&participant.id) {
+            if *cached == encoded {
+                return texture.clone();
+            }
+        }
+
+        let texture = encoded
+            .as_deref()
+            .and_then(|encoded| profile::decode_avatar_payload(encoded).ok())
+            .and_then(|bytes| profile::avatar_color_image(&bytes).ok())
+            .map(|image| {
+                context.load_texture(
+                    format!("participant-avatar-{}", participant.id),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+        self.participant_avatar_textures
+            .insert(participant.id.clone(), (encoded, texture.clone()));
+        texture
     }
 
     fn save_preferences(&mut self) {
@@ -2022,6 +2116,10 @@ pub(super) fn run() -> eframe::Result {
     let (preferences, settings_warning) = settings::load();
     app.apply_preferences(preferences);
     app.settings_error = settings_warning;
+    match profile::load_avatar() {
+        Ok(avatar) => app.profile_avatar_jpeg = avatar,
+        Err(error) => app.profile_avatar_error = Some(error),
+    }
     if let Some(error) = &app.settings_error {
         tracing::warn!(error = %error, "Preferências não puderam ser carregadas; usando valores padrão");
     }

@@ -114,6 +114,8 @@ pub struct ParticipantInfo {
     pub order: u8,
     pub may_host: bool,
     pub control_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_jpeg_base64: Option<String>,
     #[serde(default)]
     pub supports_group_screen_share: bool,
 }
@@ -189,7 +191,7 @@ pub enum SignalKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientMessage, ServerMessage, SignalKind};
+    use super::{ClientMessage, ParticipantInfo, ServerMessage, SignalKind};
 
     #[test]
     fn messages_use_stable_tagged_json_names() {
@@ -222,6 +224,22 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&stopped).unwrap(),
             r#"{"type":"signal","kind":"screen_share_stopped","payload":"share-request-1"}"#
+        );
+    }
+
+    #[test]
+    fn participant_messages_without_avatar_remain_compatible() {
+        let participant: ParticipantInfo = serde_json::from_str(
+            r#"{"id":"peer-1","display_name":"Participante 1","order":1,"may_host":false,"control_address":"","supports_group_screen_share":true}"#,
+        )
+        .expect("older participant message should deserialize");
+
+        assert_eq!(participant.avatar_jpeg_base64, None);
+        assert!(participant.supports_group_screen_share);
+        assert!(
+            !serde_json::to_string(&participant)
+                .expect("participant should serialize")
+                .contains("avatar_jpeg_base64")
         );
     }
 }
