@@ -1,13 +1,20 @@
 use super::{BUILD_VERSION_MARKER_PREFIX, UpdateManifest};
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn test_directory() -> std::path::PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("p2p-updater-test-{nonce}"));
+    let id = NEXT_TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "p2p-updater-test-{}-{nonce}-{id}",
+        std::process::id()
+    ));
     fs::create_dir_all(&path).unwrap();
     path
 }
