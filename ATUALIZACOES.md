@@ -16,7 +16,7 @@ O app encontra atualizações pelo asset `p2p-client.exe`; o instalador é um as
 
 O instalador é por usuário, não exige administrador e instala em `%LOCALAPPDATA%\Programs\P2P-Voz-e-tela`. Ele cria um atalho no menu Iniciar. O atualizador integrado substitui o executável nessa pasta; as preferências ficam separadas em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json` e sobrevivem às atualizações.
 
-Ao desinstalar, o instalador remove o arquivo de preferências. O aplicativo não grava códigos de sala nem credenciais temporárias nesse arquivo. Os logs ficam na pasta `logs` e não são apagados junto com as preferências.
+Ao desinstalar, o instalador remove o arquivo de preferências e a foto opcional do perfil (`profile-avatar.jpg`). O aplicativo não grava códigos de sala nem credenciais temporárias nesse arquivo. Os logs ficam na pasta `logs` e não são apagados junto com as preferências.
 
 ## Validação e segurança
 
