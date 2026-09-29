@@ -62,5 +62,5 @@ Fazer as etapas na ordem acima. A primeira prioridade é `main.rs`; a segunda é
 
 - Etapa 1: concluída — interface extraída para módulos; `cargo fmt --all -- --check`, testes offline e build offline passaram.
 - Etapa 2: concluída — ciclo de vida da sala, participantes/sucessão e compartilhamento em grupo extraídos para módulos; formatação, testes offline e build offline passaram.
-- Etapa 3: pendente
+- Etapa 3: extração implementada em `screen_sharing/{session,sender,receiver,metrics,h264}.rs`; `cargo fmt --all -- --check`, `cargo test --workspace --offline` e `cargo build --workspace --offline` passaram. Validação manual entre dois PCs ainda pendente.
 - Etapa 4: pendente
