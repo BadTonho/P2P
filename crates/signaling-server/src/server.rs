@@ -546,6 +546,8 @@ impl RoomRegistry {
         connection_id: ConnectionId,
         kind: signaling_protocol::SignalKind,
         payload: String,
+        target_participant_id: Option<String>,
+        stream_id: Option<String>,
     ) -> Result<(), String> {
         let Some(code) = self.connection_rooms.get(&connection_id) else {
             return Err("Entre em uma sala antes de enviar um sinal.".to_owned());
@@ -554,16 +556,55 @@ impl RoomRegistry {
             self.connection_rooms.remove(&connection_id);
             return Err("A sala foi encerrada.".to_owned());
         };
-        let peers = room
-            .participants
-            .iter()
-            .filter(|(peer_id, _)| *peer_id != connection_id)
-            .map(|(_, sender)| sender.clone())
-            .collect::<Vec<_>>();
-        if peers.is_empty() {
+        let from_participant_id = self
+            .participant_info
+            .get(&connection_id)
+            .map(|participant| participant.id.clone())
+            .ok_or_else(|| "A identidade do participante ainda nao foi registrada.".to_owned())?;
+        if stream_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || id.len() > 128)
+        {
+            return Err("O identificador da transmissão é inválido.".to_owned());
+        }
+        let peers = if let Some(target_id) = target_participant_id {
+            let target = room
+                .participants
+                .iter()
+                .find(|(peer_id, _)| {
+                    *peer_id != connection_id
+                        && self
+                            .participant_info
+                            .get(peer_id)
+                            .is_some_and(|participant| participant.id == target_id)
+                })
+                .map(|(_, sender)| sender.clone())
+                .ok_or_else(|| {
+                    "O destinatario do sinal nao esta conectado nesta sala.".to_owned()
+                })?;
+            vec![target]
+        } else {
+            room.participants
+                .iter()
+                .filter(|(peer_id, _)| *peer_id != connection_id)
+                .map(|(_, sender)| sender.clone())
+                .collect::<Vec<_>>()
+        };
+        if peers.is_empty()
+            && !matches!(
+                kind,
+                signaling_protocol::SignalKind::ScreenShareAvailable
+                    | signaling_protocol::SignalKind::ScreenShareUnavailable
+            )
+        {
             return Err("Aguardando o outro participante entrar na sala.".to_owned());
         }
-        let message = ServerMessage::Signal { kind, payload };
+        let message = ServerMessage::Signal {
+            kind,
+            payload,
+            from_participant_id: Some(from_participant_id),
+            stream_id,
+        };
         for peer in peers {
             let _ = peer.send(OutboundMessage::Protocol(message.clone()));
         }
@@ -615,6 +656,7 @@ fn default_participant(connection_id: ConnectionId, order: u8) -> ParticipantInf
         order,
         may_host: false,
         control_address: String::new(),
+        supports_group_screen_share: false,
     }
 }
 
@@ -805,7 +847,7 @@ async fn handle_client_message(
         ClientMessage::RejectHostTransfer { .. } => "reject_host_transfer",
         ClientMessage::CancelHostTransfer { .. } => "cancel_host_transfer",
     };
-    if let ClientMessage::Signal { kind, payload } = &message {
+    if let ClientMessage::Signal { kind, payload, .. } = &message {
         tracing::debug!(connection_id, signal_kind = ?kind, payload_bytes = payload.len(), "Encaminhando sinal sem registrar conteúdo");
     }
     let result = match message {
@@ -833,12 +875,18 @@ async fn handle_client_message(
             .lock()
             .await
             .join_room_identified(connection_id, &code, outgoing.clone(), participant),
-        ClientMessage::Signal { kind, payload } => {
-            rooms
-                .lock()
-                .await
-                .forward_signal(connection_id, kind, payload)
-        }
+        ClientMessage::Signal {
+            kind,
+            payload,
+            target_participant_id,
+            stream_id,
+        } => rooms.lock().await.forward_signal(
+            connection_id,
+            kind,
+            payload,
+            target_participant_id,
+            stream_id,
+        ),
         ClientMessage::IdentifyParticipant { participant } => rooms
             .lock()
             .await
@@ -1065,6 +1113,7 @@ mod tests {
                     order: 0,
                     may_host: true,
                     control_address: "192.168.1.2:9001".to_owned(),
+                    supports_group_screen_share: false,
                 },
             )
             .unwrap();
@@ -1091,6 +1140,7 @@ mod tests {
                     order: 0,
                     may_host: true,
                     control_address: "192.168.1.3:9001".to_owned(),
+                    supports_group_screen_share: false,
                 },
             )
             .unwrap();
@@ -1139,6 +1189,7 @@ mod tests {
                     order: 0,
                     may_host: true,
                     control_address: "192.168.1.2:9001".to_owned(),
+                    supports_group_screen_share: false,
                 },
             )
             .unwrap();
@@ -1166,6 +1217,7 @@ mod tests {
                     order: 0,
                     may_host: false,
                     control_address: "192.168.1.3:9001".to_owned(),
+                    supports_group_screen_share: false,
                 },
             )
             .unwrap();
@@ -1204,6 +1256,7 @@ mod tests {
                 order: 1,
                 may_host: true,
                 control_address: "192.168.1.2:9001".to_owned(),
+                supports_group_screen_share: false,
             },
             ParticipantInfo {
                 id: "candidate-id".to_owned(),
@@ -1211,6 +1264,7 @@ mod tests {
                 order: 2,
                 may_host: true,
                 control_address: "192.168.1.3:9001".to_owned(),
+                supports_group_screen_share: false,
             },
             ParticipantInfo {
                 id: "guest-id".to_owned(),
@@ -1218,6 +1272,7 @@ mod tests {
                 order: 3,
                 may_host: false,
                 control_address: "192.168.1.4:9001".to_owned(),
+                supports_group_screen_share: false,
             },
         ];
         let mut registry = RoomRegistry {
@@ -1247,6 +1302,7 @@ mod tests {
                     order: 2,
                     may_host: true,
                     control_address: "192.168.1.3:9001".to_owned(),
+                    supports_group_screen_share: false,
                 },
             )
             .unwrap();
@@ -1279,6 +1335,7 @@ mod tests {
                     order: 1,
                     may_host: true,
                     control_address: "192.168.1.2:9001".to_owned(),
+                    supports_group_screen_share: false,
                 },
             )
             .unwrap();
@@ -1326,13 +1383,15 @@ mod tests {
         let _ = server_message(&mut second_rx);
 
         registry
-            .forward_signal(1, SignalKind::Diagnostic, "ping".to_owned())
+            .forward_signal(1, SignalKind::Diagnostic, "ping".to_owned(), None, None)
             .unwrap();
         assert_eq!(
             server_message(&mut second_rx),
             ServerMessage::Signal {
                 kind: SignalKind::Diagnostic,
                 payload: "ping".to_owned(),
+                from_participant_id: Some("participant-1".to_owned()),
+                stream_id: None,
             }
         );
         assert!(first_rx.try_recv().is_err());
@@ -1342,6 +1401,57 @@ mod tests {
         assert!(registry.rooms.contains_key(&code));
         assert!(registry.leave_room(2));
         assert!(!registry.rooms.contains_key(&code));
+    }
+
+    #[test]
+    fn targeted_media_signaling_reaches_only_the_named_room_member() {
+        let mut registry = RoomRegistry::default();
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let (third_tx, mut third_rx) = mpsc::unbounded_channel();
+        let code = registry.create_room(1, first_tx).unwrap();
+        registry.join_room(2, &code, second_tx).unwrap();
+        registry.join_room(3, &code, third_tx).unwrap();
+
+        // Consume the room-created/joined notifications; this test concerns only
+        // delivery of a directed WebRTC message.
+        while first_rx.try_recv().is_ok() {}
+        while second_rx.try_recv().is_ok() {}
+        while third_rx.try_recv().is_ok() {}
+
+        registry
+            .forward_signal(
+                1,
+                SignalKind::Offer,
+                "offer-sdp".to_owned(),
+                Some("participant-2".to_owned()),
+                Some("participant-1".to_owned()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            server_message(&mut second_rx),
+            ServerMessage::Signal {
+                kind: SignalKind::Offer,
+                payload: "offer-sdp".to_owned(),
+                from_participant_id: Some("participant-1".to_owned()),
+                stream_id: Some("participant-1".to_owned()),
+            }
+        );
+        assert!(first_rx.try_recv().is_err());
+        assert!(third_rx.try_recv().is_err());
+
+        assert!(
+            registry
+                .forward_signal(
+                    1,
+                    SignalKind::IceCandidate,
+                    "candidate".to_owned(),
+                    Some("not-in-this-room".to_owned()),
+                    Some("participant-1".to_owned()),
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -1628,6 +1738,8 @@ mod tests {
             ClientMessage::Signal {
                 kind: SignalKind::Diagnostic,
                 payload: "diagnostic-ping-v1".to_owned(),
+                target_participant_id: None,
+                stream_id: None,
             },
         )
         .await;
@@ -1636,6 +1748,8 @@ mod tests {
             ServerMessage::Signal {
                 kind: SignalKind::Diagnostic,
                 payload: "diagnostic-ping-v1".to_owned(),
+                from_participant_id: Some("participant-1".to_owned()),
+                stream_id: None,
             }
         );
         assert_eq!(
@@ -1643,6 +1757,8 @@ mod tests {
             ServerMessage::Signal {
                 kind: SignalKind::Diagnostic,
                 payload: "diagnostic-ping-v1".to_owned(),
+                from_participant_id: Some("participant-1".to_owned()),
+                stream_id: None,
             }
         );
         send_client_message(
@@ -1650,6 +1766,8 @@ mod tests {
             ClientMessage::Signal {
                 kind: SignalKind::Diagnostic,
                 payload: "diagnostic-pong-v1".to_owned(),
+                target_participant_id: None,
+                stream_id: None,
             },
         )
         .await;
@@ -1658,6 +1776,8 @@ mod tests {
             ServerMessage::Signal {
                 kind: SignalKind::Diagnostic,
                 payload: "diagnostic-pong-v1".to_owned(),
+                from_participant_id: Some("participant-2".to_owned()),
+                stream_id: None,
             }
         );
         assert_eq!(
@@ -1665,6 +1785,8 @@ mod tests {
             ServerMessage::Signal {
                 kind: SignalKind::Diagnostic,
                 payload: "diagnostic-pong-v1".to_owned(),
+                from_participant_id: Some("participant-2".to_owned()),
+                stream_id: None,
             }
         );
 

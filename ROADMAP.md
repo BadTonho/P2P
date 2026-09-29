@@ -91,6 +91,12 @@ Usar o servidor da sala apenas para trocar pedido, oferta, resposta, candidatos 
 
 **Ainda falta validar:** fechar a janela capturada, testar o encerramento da sessão e confirmar que o servidor nunca recebe quadros de vídeo. Também falta validar com firewall e adaptadores que as pessoas realmente usarão. O teste inverso pode ser feito depois com outro computador mais potente.
 
+### Extensão da Etapa 5 — Compartilhamento em grupo (1.0.13)
+
+O cliente agora anuncia compatibilidade de grupo, permite que cada pessoa publique uma tela e escolha quais participantes assistir, encaminha oferta/resposta/ICE somente ao destinatário e mostra as telas assistidas em grade com foco. O modo fica disponível em salas LAN/Radmin com 2 a 8 participantes somente quando todos anunciam suporte; participantes antigos mantêm o fluxo legado de duas pessoas. A meta de envio por transmissor é limitada a 8 Mbps no total e 4 Mbps por espectador.
+
+**Limitações antes de considerar esta extensão concluída:** a implementação atual cria sessões WebRTC separadas para envio e recepção e codifica novamente para cada espectador. Portanto, ainda não cumpre a meta de uma conexão bidirecional por par nem de codificar uma única vez e distribuir o mesmo fluxo; a faixa UDP 9002–9009 também pode ser insuficiente quando alguém envia e assiste a várias telas ao mesmo tempo. Essa revisão de arquitetura e o teste manual com pelo menos três PCs (incluindo carga próxima de oito participantes) continuam pendentes. Não anunciar a versão 1.0.13 como validada para oito transmissões simultâneas até resolver e medir esses limites.
+
 ### Etapa 6 — Conectar participantes em casas diferentes (teste controlado)
 
 Adicionar um modo de sala **Internet (teste)** separado de **Rede local / Radmin**. O modo local mantém até oito participantes e a sucessão atual. O modo Internet admite somente duas pessoas, não inicia a malha TCP 9001 e encerra a sala quando o anfitrião sai ou perde a conexão.
@@ -127,7 +133,7 @@ Tratar encerramento do compartilhamento, desconexões, acesso às salas e estado
 
 **Instalador e preferências:** o setup por usuário instala em `%LOCALAPPDATA%\Programs\P2P-Voz-e-tela`, sem exigir administrador. O aplicativo salva preferências em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json`; atualizações preservam o arquivo e a desinstalação o remove. Códigos de sala e credenciais temporárias não são persistidos. O script `scripts/build-installer.ps1` compila o `.exe` e o instalador Inno Setup localmente.
 
-**Versão:** a publicação inicial foi 1.0.0; a próxima compilação planejada é 1.0.9.
+**Versão:** a publicação inicial foi 1.0.0; o workspace está na versão 1.0.13 em desenvolvimento. A publicação desta versão ainda depende da validação do compartilhamento em grupo descrita na extensão da Etapa 5.
 
 **Falta validar:** instalar o setup, conferir a persistência das preferências e a remoção na desinstalação. Publicar os dois assets (`p2p-client.exe` e `P2P-Voz-e-tela-Setup.exe`) em um GitHub Release e validar uma atualização futura e a recuperação após falha. Também falta validar manualmente os cenários de rede da Etapa 7 entre duas casas, incluindo a rota TURN.
 

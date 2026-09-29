@@ -35,6 +35,12 @@ pub enum ClientMessage {
     Signal {
         kind: SignalKind,
         payload: String,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_participant_id: Option<String>,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stream_id: Option<String>,
     },
     IdentifyParticipant {
         participant: ParticipantInfo,
@@ -73,6 +79,12 @@ pub enum ServerMessage {
     Signal {
         kind: SignalKind,
         payload: String,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from_participant_id: Option<String>,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stream_id: Option<String>,
     },
     Error {
         message: String,
@@ -102,6 +114,8 @@ pub struct ParticipantInfo {
     pub order: u8,
     pub may_host: bool,
     pub control_address: String,
+    #[serde(default)]
+    pub supports_group_screen_share: bool,
 }
 
 /// Mensagens da conexão direta entre os clientes. Não transporta mídia.
@@ -167,6 +181,10 @@ pub enum SignalKind {
     ScreenShareAccept,
     ScreenShareBusy,
     ScreenShareStopped,
+    ScreenShareAvailable,
+    ScreenShareUnavailable,
+    ScreenShareWatch,
+    ScreenShareUnwatch,
 }
 
 #[cfg(test)]
@@ -186,6 +204,8 @@ mod tests {
         let response = ServerMessage::Signal {
             kind: SignalKind::IceCandidate,
             payload: "candidate-payload".to_owned(),
+            from_participant_id: None,
+            stream_id: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(
@@ -196,6 +216,8 @@ mod tests {
         let stopped = ClientMessage::Signal {
             kind: SignalKind::ScreenShareStopped,
             payload: "share-request-1".to_owned(),
+            target_participant_id: None,
+            stream_id: None,
         };
         assert_eq!(
             serde_json::to_string(&stopped).unwrap(),

@@ -23,15 +23,17 @@ Ao desinstalar pelo Windows, as preferências são removidas. Os logs de diagnó
 1. As duas pessoas entram na mesma rede local ou na mesma rede Radmin VPN.
 2. O anfitrião seleciona **Rede local / Radmin** e clica em **Criar sala**. Escolhe o adaptador cujo IPv4 o amigo pode alcançar e compartilha o endereço `ws://IP:9000` e o código da sala.
 3. O convidado seleciona **Rede local / Radmin** para escolher seu adaptador de controle, abre **Configurações > Conexão**, informa o endereço do anfitrião e volta à tela inicial. Digita o código e clica em **Entrar**.
-4. Os dois escolhem uma tela ou janela. Quem quiser transmitir clica em **Compartilhar tela com meu amigo**; o outro participante aceita. Para encerrar, clique em **Parar compartilhamento**.
+4. Os participantes escolhem uma tela ou janela. Em uma sala compatível com grupo, cada pessoa pode clicar em **Compartilhar minha tela**; quem quiser assistir escolhe **Assistir** na transmissão correspondente. As telas assistidas aparecem na grade. Em uma sala com cliente antigo, o compartilhamento continua no fluxo de duas pessoas, com pedido e aceite.
 
 Portas para permitir no firewall:
 
 - TCP 9000 no PC anfitrião, para a sinalização da sala.
 - TCP 9001 em cada PC, para controle e sucessão do anfitrião.
-- UDP 9002 nos dois PCs, para o vídeo direto.
+- UDP 9002–9009 nos PCs, para as sessões de vídeo em grupo.
 
 No Radmin, escolham o adaptador e o endereço IPv4 da VPN. Todos precisam estar conectados à mesma rede virtual. A sucessão só funciona se os participantes elegíveis permitirem hospedagem e a malha de controle conseguir se conectar.
+
+O compartilhamento em grupo requer que todos estejam usando uma versão compatível. A sala aceita até oito participantes, mas cada PC tem oito portas UDP de mídia disponíveis (9002–9009); sessões simultâneas de envio e recepção podem atingir esse limite antes de a sala chegar a oito pessoas. Se isso ocorrer, pare de assistir a uma tela que não seja necessária e tente novamente.
 
 ## Internet entre duas casas — teste controlado
 

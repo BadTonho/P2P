@@ -28,6 +28,7 @@ fn default_participant() -> ParticipantInfo {
         order: 0,
         may_host: false,
         control_address: String::new(),
+        supports_group_screen_share: false,
     }
 }
 
@@ -55,6 +56,8 @@ pub enum SignalingEvent {
     HostTransferCanceled(String),
     ServerError(String),
     Signal {
+        from_participant_id: Option<String>,
+        stream_id: Option<String>,
         kind: SignalKind,
         payload: String,
     },
@@ -65,11 +68,23 @@ pub enum SignalingEvent {
 enum ClientCommand {
     SendDiagnostic,
     AcknowledgeDiagnostic,
-    SendSignal { kind: SignalKind, payload: String },
+    SendSignal {
+        target_participant_id: Option<String>,
+        stream_id: Option<String>,
+        kind: SignalKind,
+        payload: String,
+    },
     RequestHostTransfer,
-    CancelHostTransfer { token: String },
-    ConfirmHostTransfer { code: String, token: String },
-    RejectHostTransfer { token: String },
+    CancelHostTransfer {
+        token: String,
+    },
+    ConfirmHostTransfer {
+        code: String,
+        token: String,
+    },
+    RejectHostTransfer {
+        token: String,
+    },
     Leave,
 }
 
@@ -226,7 +241,45 @@ impl SignalingClient {
 
     pub fn send_signal(&self, kind: SignalKind, payload: String) -> Result<(), String> {
         self.commands
-            .send(ClientCommand::SendSignal { kind, payload })
+            .send(ClientCommand::SendSignal {
+                target_participant_id: None,
+                stream_id: None,
+                kind,
+                payload,
+            })
+            .map_err(|_| "A conexao com o servidor foi encerrada.".to_owned())
+    }
+
+    pub fn send_signal_to(
+        &self,
+        target_participant_id: String,
+        kind: SignalKind,
+        payload: String,
+    ) -> Result<(), String> {
+        self.commands
+            .send(ClientCommand::SendSignal {
+                target_participant_id: Some(target_participant_id),
+                stream_id: None,
+                kind,
+                payload,
+            })
+            .map_err(|_| "A conexao com o servidor foi encerrada.".to_owned())
+    }
+
+    pub fn send_signal_to_stream(
+        &self,
+        target_participant_id: String,
+        stream_id: String,
+        kind: SignalKind,
+        payload: String,
+    ) -> Result<(), String> {
+        self.commands
+            .send(ClientCommand::SendSignal {
+                target_participant_id: Some(target_participant_id),
+                stream_id: Some(stream_id),
+                kind,
+                payload,
+            })
             .map_err(|_| "A conexao com o servidor foi encerrada.".to_owned())
     }
 
@@ -400,9 +453,9 @@ async fn run_client(
                                 tracing::warn!(reason = %message, "Servidor cancelou a transferência de hospedagem");
                                 let _ = events.send(SignalingEvent::HostTransferCanceled(message));
                             }
-                            Ok(ServerMessage::Signal { kind, payload }) => {
+                            Ok(ServerMessage::Signal { kind, payload, from_participant_id, stream_id }) => {
                                 tracing::debug!(signal_kind = ?kind, payload_bytes = payload.len(), "Sinal recebido; payload omitido");
-                                let _ = events.send(SignalingEvent::Signal { kind, payload });
+                                let _ = events.send(SignalingEvent::Signal { from_participant_id, stream_id, kind, payload });
                             }
                             Ok(ServerMessage::RoomRoster { participants, leader_id, room_mode }) => {
                                 tracing::info!(participants = participants.len(), room_mode = ?room_mode, "Servidor atualizou lista de participantes");
@@ -461,22 +514,22 @@ async fn run_client(
                 match command {
                     Some(ClientCommand::SendDiagnostic) => {
                         tracing::debug!("Enviando sinal de diagnóstico sem dados pessoais");
-                        if let Err(error) = send_signal(&mut writer, SignalKind::Diagnostic, DIAGNOSTIC_PAYLOAD).await {
+                        if let Err(error) = send_signal(&mut writer, SignalKind::Diagnostic, DIAGNOSTIC_PAYLOAD, None, None).await {
                             let _ = events.send(SignalingEvent::Error(error));
                             failed = true;
                             break;
                         }
                     }
                     Some(ClientCommand::AcknowledgeDiagnostic) => {
-                        if let Err(error) = send_signal(&mut writer, SignalKind::Diagnostic, DIAGNOSTIC_ACK_PAYLOAD).await {
+                        if let Err(error) = send_signal(&mut writer, SignalKind::Diagnostic, DIAGNOSTIC_ACK_PAYLOAD, None, None).await {
                             let _ = events.send(SignalingEvent::Error(error));
                             failed = true;
                             break;
                         }
                     }
-                    Some(ClientCommand::SendSignal { kind, payload }) => {
-                        tracing::debug!(signal_kind = ?kind, payload_bytes = payload.len(), "Enviando sinal; conteúdo omitido");
-                        if let Err(error) = send_signal(&mut writer, kind, &payload).await {
+                    Some(ClientCommand::SendSignal { target_participant_id, stream_id, kind, payload }) => {
+                        tracing::debug!(signal_kind = ?kind, payload_bytes = payload.len(), targeted = target_participant_id.is_some(), "Enviando sinal; conteúdo omitido");
+                        if let Err(error) = send_signal(&mut writer, kind, &payload, target_participant_id, stream_id).await {
                             let _ = events.send(SignalingEvent::Error(error));
                             failed = true;
                             break;
@@ -584,7 +637,13 @@ where
         .map_err(|error| format!("Falha ao enviar a mensagem: {error}"))
 }
 
-async fn send_signal<W>(writer: &mut W, kind: SignalKind, payload: &str) -> Result<(), String>
+async fn send_signal<W>(
+    writer: &mut W,
+    kind: SignalKind,
+    payload: &str,
+    target_participant_id: Option<String>,
+    stream_id: Option<String>,
+) -> Result<(), String>
 where
     W: futures_util::Sink<WebSocketMessage> + Unpin,
     W::Error: std::fmt::Display,
@@ -594,6 +653,8 @@ where
         ClientMessage::Signal {
             kind,
             payload: payload.to_owned(),
+            target_participant_id,
+            stream_id,
         },
     )
     .await

@@ -11,6 +11,7 @@ mod signaling_client;
 mod turn_relay;
 mod update;
 
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::{
     Arc,
@@ -31,6 +32,26 @@ use turn_relay::{TurnCredentials, TurnRelayServer, TurnRoomConfig};
 use update::{UpdateEvent, UpdateManager, UpdateManifest};
 
 const TURN_CONFIG_SIGNAL_PREFIX: &str = "p2p-turn-room-config-v1:";
+const GROUP_SCREEN_MAX_AGGREGATE_BITRATE: u32 = 8_000_000;
+const GROUP_SCREEN_MAX_PEER_BITRATE: u32 = 4_000_000;
+
+fn group_share_bitrate(viewer_count: usize) -> u32 {
+    (GROUP_SCREEN_MAX_AGGREGATE_BITRATE / viewer_count.max(1) as u32)
+        .min(GROUP_SCREEN_MAX_PEER_BITRATE)
+        .max(250_000)
+}
+
+fn group_screen_share_compatible(room_mode: RoomMode, participants: &[ParticipantInfo]) -> bool {
+    room_mode == RoomMode::Local
+        && (2..=8).contains(&participants.len())
+        && participants
+            .iter()
+            .all(|participant| participant.supports_group_screen_share)
+}
+
+fn next_group_media_port(used_ports: &HashSet<u16>) -> Option<u16> {
+    (9002..=9009).find(|port| !used_ports.contains(port))
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsCategory {
@@ -134,6 +155,18 @@ struct ClientUi {
     screen_share_status: Option<String>,
     remote_screen_texture: Option<egui::TextureHandle>,
     remote_screen_sequence: u64,
+    group_local_sharing: bool,
+    group_available_shares: HashSet<String>,
+    group_watched_shares: HashSet<String>,
+    group_outbound_sessions: HashMap<String, ScreenShareSession>,
+    group_inbound_sessions: HashMap<String, ScreenShareSession>,
+    group_outbound_ports: HashMap<String, u16>,
+    group_inbound_ports: HashMap<String, u16>,
+    group_remote_textures: HashMap<String, egui::TextureHandle>,
+    group_remote_sequences: HashMap<String, u64>,
+    group_peer_status: HashMap<String, String>,
+    focused_group_screen: Option<String>,
+    last_group_metrics_log_at: Option<Instant>,
     screen_share_metrics: ScreenShareMetrics,
     logging: LoggingState,
     last_screen_metrics_log_at: Option<Instant>,
@@ -354,9 +387,12 @@ impl ClientUi {
         if self.microphone.is_some()
             || (self.screen_capture.is_some()
                 && self.show_local_preview
-                && matches!(&self.screen_share_role, ScreenShareRole::Sending { .. }))
+                && (self.group_local_sharing
+                    || matches!(&self.screen_share_role, ScreenShareRole::Sending { .. })))
             || self.screen_picker.is_some()
             || self.screen_share_session.is_some()
+            || !self.group_inbound_sessions.is_empty()
+            || !self.group_outbound_sessions.is_empty()
             || self.connecting
             || self.signaling.is_some()
             || self.control_mesh.is_some()
@@ -545,7 +581,7 @@ impl ClientUi {
                 );
                 ui.collapsing("Requisitos de rede", |ui| {
                     ui.label("A interface selecionada será usada para controle e vídeo.");
-                    ui.label("Libere TCP 9001 e UDP 9002 no firewall do Windows.");
+                    ui.label("Libere TCP 9001 e UDP 9002–9009 no firewall do Windows.");
                     ui.label("Use Radmin VPN quando o amigo entrar pelo endereço Radmin; use Ethernet/Wi-Fi na rede local.");
                     ui.label("A permissão para hospedar só permite assumir a sala se o anfitrião sair.");
                 });
@@ -672,7 +708,7 @@ impl ClientUi {
         ui.heading("Transmissão de tela");
         if let Some(address) = self.host_addresses.get(self.selected_host_address) {
             ui.label(format!(
-                "Adaptador de mídia UDP 9002: {} ({})",
+                "Adaptador de mídia UDP: {} ({})",
                 address.ipv4, address.adapter
             ));
         }
@@ -703,7 +739,7 @@ impl ClientUi {
             ui.label("Teste controlado: ws:// não criptografa a sinalização ou as credenciais temporárias do TURN.");
         } else {
             ui.label(
-                "Rede local/Radmin: libere TCP 9001 e UDP 9002 no firewall dos participantes.",
+                "Rede local/Radmin: libere TCP 9001 e UDP 9002–9009 no firewall dos participantes.",
             );
         }
 
@@ -1060,85 +1096,93 @@ impl ClientUi {
                 });
         }
 
+        self.show_group_watch_controls(ui, &participants);
+
         ui.add_space(8.0);
         let stage_width = ui.available_width();
         let stage_height = ui.available_height().clamp(280.0, 680.0);
         egui::Frame::group(ui.style()).show(ui, |stage| {
             stage.set_min_size(egui::vec2(stage_width, stage_height));
-            match &self.screen_share_role {
-                ScreenShareRole::Receiving { .. } => {
-                    if let Some(texture) = &self.remote_screen_texture {
-                        let available = stage.available_size();
-                        let source = texture.size_vec2();
-                        let scale = (available.x / source.x)
-                            .min(available.y / source.y)
-                            .min(1.0);
-                        let image_size = source * scale.max(0.01);
-                        stage.vertical_centered(|ui| {
-                            ui.add_space(((stage_height - image_size.y) * 0.5).max(0.0));
-                            ui.add(
-                                egui::Image::new((texture.id(), source))
-                                    .fit_to_exact_size(image_size),
-                            );
-                        });
-                    } else {
-                        stage.vertical_centered(|ui| {
-                            ui.add_space(stage_height * 0.4);
-                            ui.heading("Conectando à tela do participante…");
-                            ui.label("A imagem aparecerá aqui quando o primeiro quadro chegar.");
-                        });
+            if self.group_sharing_compatible() {
+                self.show_group_screen_stage(stage, stage_height);
+            } else {
+                match &self.screen_share_role {
+                    ScreenShareRole::Receiving { .. } => {
+                        if let Some(texture) = &self.remote_screen_texture {
+                            let available = stage.available_size();
+                            let source = texture.size_vec2();
+                            let scale = (available.x / source.x)
+                                .min(available.y / source.y)
+                                .min(1.0);
+                            let image_size = source * scale.max(0.01);
+                            stage.vertical_centered(|ui| {
+                                ui.add_space(((stage_height - image_size.y) * 0.5).max(0.0));
+                                ui.add(
+                                    egui::Image::new((texture.id(), source))
+                                        .fit_to_exact_size(image_size),
+                                );
+                            });
+                        } else {
+                            stage.vertical_centered(|ui| {
+                                ui.add_space(stage_height * 0.4);
+                                ui.heading("Conectando à tela do participante…");
+                                ui.label(
+                                    "A imagem aparecerá aqui quando o primeiro quadro chegar.",
+                                );
+                            });
+                        }
                     }
-                }
-                ScreenShareRole::Sending { .. } if self.show_local_preview => {
-                    if let Some(texture) = &self.screen_texture {
-                        let available = stage.available_size();
-                        let source = texture.size_vec2();
-                        let scale = (available.x / source.x)
-                            .min(available.y / source.y)
-                            .min(1.0);
-                        let image_size = source * scale.max(0.01);
-                        stage.vertical_centered(|ui| {
-                            ui.add_space(((stage_height - image_size.y) * 0.5).max(0.0));
-                            ui.add(
-                                egui::Image::new((texture.id(), source))
-                                    .fit_to_exact_size(image_size),
-                            );
-                        });
-                    } else {
+                    ScreenShareRole::Sending { .. } if self.show_local_preview => {
+                        if let Some(texture) = &self.screen_texture {
+                            let available = stage.available_size();
+                            let source = texture.size_vec2();
+                            let scale = (available.x / source.x)
+                                .min(available.y / source.y)
+                                .min(1.0);
+                            let image_size = source * scale.max(0.01);
+                            stage.vertical_centered(|ui| {
+                                ui.add_space(((stage_height - image_size.y) * 0.5).max(0.0));
+                                ui.add(
+                                    egui::Image::new((texture.id(), source))
+                                        .fit_to_exact_size(image_size),
+                                );
+                            });
+                        } else {
+                            stage.vertical_centered(|ui| {
+                                ui.add_space(stage_height * 0.4);
+                                ui.heading("Você está compartilhando");
+                                ui.label("Preparando sua prévia local…");
+                            });
+                        }
+                    }
+                    ScreenShareRole::Sending { .. } => {
                         stage.vertical_centered(|ui| {
                             ui.add_space(stage_height * 0.4);
                             ui.heading("Você está compartilhando");
-                            ui.label("Preparando sua prévia local…");
+                            ui.label("Prévia local desativada para economizar recursos.");
                         });
                     }
-                }
-                ScreenShareRole::Sending { .. } => {
-                    stage.vertical_centered(|ui| {
-                        ui.add_space(stage_height * 0.4);
-                        ui.heading("Você está compartilhando");
-                        ui.label("Prévia local desativada para economizar recursos.");
-                    });
-                }
-                ScreenShareRole::Requesting { .. } => {
-                    stage.vertical_centered(|ui| {
-                        ui.add_space(stage_height * 0.4);
-                        ui.heading("Solicitação enviada");
-                        ui.label("Aguardando resposta do outro participante…");
-                    });
-                }
-                ScreenShareRole::Idle if self.peer_connected => {
-                    stage.vertical_centered(|ui| {
-                        ui.add_space(stage_height * 0.4);
-                        ui.heading("Sala pronta");
-                        ui.label("Compartilhe sua tela para começar.");
-                    });
-                }
-                ScreenShareRole::Idle => {
-                    stage.vertical_centered(|ui| {
-                        ui.add_space(stage_height * 0.4);
-                        ui.heading("Aguardando seu amigo");
-                        ui.label("A tela compartilhada aparecerá aqui.");
-                    });
+                    ScreenShareRole::Requesting { .. } => {
+                        stage.vertical_centered(|ui| {
+                            ui.add_space(stage_height * 0.4);
+                            ui.heading("Solicitação enviada");
+                            ui.label("Aguardando resposta do outro participante…");
+                        });
+                    }
+                    ScreenShareRole::Idle if self.peer_connected => {
+                        stage.vertical_centered(|ui| {
+                            ui.add_space(stage_height * 0.4);
+                            ui.heading("Sala pronta");
+                            ui.label("Compartilhe sua tela para começar.");
+                        });
+                    }
+                    ScreenShareRole::Idle => {
+                        stage.vertical_centered(|ui| {
+                            ui.add_space(stage_height * 0.4);
+                            ui.heading("Aguardando seu amigo");
+                            ui.label("A tela compartilhada aparecerá aqui.");
+                        });
+                    }
                 }
             }
         });
@@ -1155,32 +1199,55 @@ impl ClientUi {
     fn show_room_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             self.show_screen_source_menu(ui);
-
-            let share_role = self.screen_share_role.clone();
-            match share_role {
-                ScreenShareRole::Idle => {
-                    let allowed = self.participants.len() == 2
-                        && self.peer_connected
-                        && self.turn_configuration_ready()
-                        && self.screen_capture.is_some()
-                        && self.screen_share_session.is_none();
-                    if ui
-                        .add_enabled(allowed, egui::Button::new("Compartilhar tela"))
-                        .clicked()
-                    {
-                        self.request_screen_share(ui.ctx());
-                    }
-                }
-                ScreenShareRole::Requesting { .. } => {
-                    if ui.button("Cancelar pedido").clicked() {
-                        self.stop_screen_share(true);
-                        self.screen_share_status =
-                            Some("Pedido de compartilhamento cancelado.".to_owned());
-                    }
-                }
-                ScreenShareRole::Sending { .. } | ScreenShareRole::Receiving { .. } => {
+            if self.group_sharing_compatible() {
+                let can_share = self.peer_connected
+                    && self.screen_capture.is_some()
+                    && self.screen_picker.is_none();
+                if self.group_local_sharing {
                     if ui.button("Parar compartilhamento").clicked() {
-                        self.stop_screen_share(true);
+                        self.set_group_share(false);
+                    }
+                } else if ui
+                    .add_enabled(can_share, egui::Button::new("Compartilhar minha tela"))
+                    .clicked()
+                {
+                    self.request_screen_share(ui.ctx());
+                }
+                let preview_changed = ui
+                    .checkbox(&mut self.show_local_preview, "Mostrar minha prévia")
+                    .changed();
+                if preview_changed {
+                    self.capture_preview_enabled
+                        .store(self.show_local_preview, Ordering::Relaxed);
+                    self.save_preferences();
+                }
+            } else {
+                let share_role = self.screen_share_role.clone();
+                match share_role {
+                    ScreenShareRole::Idle => {
+                        let allowed = self.participants.len() == 2
+                            && self.peer_connected
+                            && self.turn_configuration_ready()
+                            && self.screen_capture.is_some()
+                            && self.screen_share_session.is_none();
+                        if ui
+                            .add_enabled(allowed, egui::Button::new("Compartilhar tela"))
+                            .clicked()
+                        {
+                            self.request_screen_share(ui.ctx());
+                        }
+                    }
+                    ScreenShareRole::Requesting { .. } => {
+                        if ui.button("Cancelar pedido").clicked() {
+                            self.stop_screen_share(true);
+                            self.screen_share_status =
+                                Some("Pedido de compartilhamento cancelado.".to_owned());
+                        }
+                    }
+                    ScreenShareRole::Sending { .. } | ScreenShareRole::Receiving { .. } => {
+                        if ui.button("Parar compartilhamento").clicked() {
+                            self.stop_screen_share(true);
+                        }
                     }
                 }
             }
@@ -1477,7 +1544,7 @@ impl ClientUi {
         ui.group(|ui| {
             ui.label("Adaptador para controle e mídia");
             self.show_control_address_picker(ui);
-            ui.small("O endereço escolhido vale para TCP 9001 e UDP 9002.");
+            ui.small("O endereço escolhido vale para TCP 9001 e UDP 9002–9009.");
         });
 
         ui.add_space(8.0);
@@ -1753,7 +1820,8 @@ impl ClientUi {
     }
     fn refresh_screen(&mut self, context: &egui::Context) {
         let preview_active = self.show_local_preview
-            && matches!(&self.screen_share_role, ScreenShareRole::Sending { .. });
+            && (self.group_local_sharing
+                || matches!(&self.screen_share_role, ScreenShareRole::Sending { .. }));
         self.capture_preview_enabled
             .store(preview_active, Ordering::Relaxed);
         if !preview_active {
@@ -1853,6 +1921,11 @@ impl ClientUi {
     }
 
     fn request_screen_share(&mut self, context: &egui::Context) {
+        if self.group_sharing_compatible() {
+            self.set_group_share(true);
+            context.request_repaint();
+            return;
+        }
         if self.participants.len() != 2
             || !self.peer_connected
             || self.screen_capture.is_none()
@@ -1902,11 +1975,49 @@ impl ClientUi {
 
     fn handle_screen_share_signal(
         &mut self,
+        from_participant_id: Option<String>,
+        stream_id: Option<String>,
         kind: SignalKind,
         payload: String,
         context: &egui::Context,
     ) {
         match kind {
+            SignalKind::ScreenShareAvailable => {
+                if let Some(peer_id) = from_participant_id.filter(|id| id != &self.participant_id) {
+                    if self.group_sharing_compatible() {
+                        self.group_available_shares.insert(peer_id);
+                    }
+                }
+            }
+            SignalKind::ScreenShareUnavailable => {
+                if let Some(peer_id) = from_participant_id {
+                    self.group_available_shares.remove(&peer_id);
+                    self.group_watched_shares.remove(&peer_id);
+                    self.group_inbound_sessions.remove(&peer_id);
+                    self.group_inbound_ports.remove(&peer_id);
+                    self.group_remote_textures.remove(&peer_id);
+                    self.group_remote_sequences.remove(&peer_id);
+                }
+            }
+            SignalKind::ScreenShareWatch => {
+                let Some(viewer_id) = from_participant_id else {
+                    return;
+                };
+                if !self.group_local_sharing || !self.group_sharing_compatible() {
+                    return;
+                }
+                if self.group_outbound_sessions.contains_key(&viewer_id) {
+                    return;
+                }
+                self.rebalance_group_outbound(context, Some(viewer_id));
+            }
+            SignalKind::ScreenShareUnwatch => {
+                if let Some(viewer_id) = from_participant_id {
+                    self.group_outbound_sessions.remove(&viewer_id);
+                    self.group_outbound_ports.remove(&viewer_id);
+                    self.rebalance_group_outbound(context, None);
+                }
+            }
             SignalKind::ScreenShareRequest => {
                 let request: ScreenShareRequest = match serde_json::from_str(&payload) {
                     Ok(request) => request,
@@ -2095,6 +2206,21 @@ impl ClientUi {
                 }
             }
             SignalKind::ScreenShareStopped => {
+                if let Some(peer_id) = from_participant_id.as_deref().filter(|id| {
+                    self.group_sharing_compatible()
+                        && self.group_watched_shares.contains(*id)
+                        && stream_id.as_deref() == Some(*id)
+                }) {
+                    self.group_inbound_sessions.remove(peer_id);
+                    self.group_inbound_ports.remove(peer_id);
+                    self.group_remote_textures.remove(peer_id);
+                    self.group_remote_sequences.remove(peer_id);
+                    self.group_peer_status.insert(
+                        peer_id.to_owned(),
+                        "A transmissão está sendo reconfigurada…".to_owned(),
+                    );
+                    return;
+                }
                 let request_id = payload;
                 let active_request = match &self.screen_share_role {
                     ScreenShareRole::Requesting { request_id }
@@ -2109,7 +2235,15 @@ impl ClientUi {
                 }
             }
             SignalKind::Offer | SignalKind::Answer | SignalKind::IceCandidate => {
-                if let Some(session) = &self.screen_share_session {
+                if self.group_sharing_compatible() {
+                    self.handle_group_peer_signal(
+                        from_participant_id,
+                        stream_id,
+                        kind,
+                        payload,
+                        context,
+                    );
+                } else if let Some(session) = &self.screen_share_session {
                     if let Err(error) = session.handle_signal(kind, payload) {
                         self.stop_screen_share(true);
                         self.screen_share_status = Some(error);
@@ -2130,6 +2264,31 @@ impl ClientUi {
             .as_ref()
             .ok_or_else(|| "A conexão de sinalização não está disponível.".to_owned())?
             .send_signal(kind, payload)
+    }
+
+    fn send_screen_share_signal_to(
+        &self,
+        participant_id: &str,
+        kind: SignalKind,
+        payload: String,
+    ) -> Result<(), String> {
+        self.signaling
+            .as_ref()
+            .ok_or_else(|| "A conexão de sinalização não está disponível.".to_owned())?
+            .send_signal_to(participant_id.to_owned(), kind, payload)
+    }
+
+    fn send_screen_share_signal_to_stream(
+        &self,
+        participant_id: &str,
+        stream_id: String,
+        kind: SignalKind,
+        payload: String,
+    ) -> Result<(), String> {
+        self.signaling
+            .as_ref()
+            .ok_or_else(|| "A conexão de sinalização não está disponível.".to_owned())?
+            .send_signal_to_stream(participant_id.to_owned(), stream_id, kind, payload)
     }
 
     fn send_turn_room_config(&self) {
@@ -2193,6 +2352,7 @@ impl ClientUi {
     }
 
     fn refresh_screen_share(&mut self, context: &egui::Context) {
+        self.refresh_group_screen_shares(context);
         if let Some(session) = self.screen_share_session.as_ref() {
             self.screen_share_metrics = session.metrics();
             let should_log_metrics = self
@@ -2435,6 +2595,13 @@ impl ClientUi {
     }
 
     fn stop_screen_share(&mut self, announce: bool) {
+        if self.group_local_sharing
+            || !self.group_watched_shares.is_empty()
+            || !self.group_inbound_sessions.is_empty()
+            || !self.group_outbound_sessions.is_empty()
+        {
+            self.stop_group_media(announce);
+        }
         let was_sending = matches!(&self.screen_share_role, ScreenShareRole::Sending { .. });
         let request_id = match &self.screen_share_role {
             ScreenShareRole::Requesting { request_id }
@@ -2660,6 +2827,590 @@ impl ClientUi {
             order,
             may_host: self.room_mode == RoomMode::Local && self.may_host,
             control_address,
+            supports_group_screen_share: self.room_mode == RoomMode::Local,
+        }
+    }
+
+    fn group_sharing_compatible(&self) -> bool {
+        group_screen_share_compatible(self.room_mode, &self.participants)
+    }
+
+    fn allocate_group_media_port(&self) -> Result<u16, String> {
+        let used = self
+            .group_outbound_ports
+            .values()
+            .chain(self.group_inbound_ports.values())
+            .copied()
+            .collect::<HashSet<_>>();
+        next_group_media_port(&used)
+            .ok_or_else(|| "Todas as portas de mídia UDP 9002–9009 estão ocupadas.".to_owned())
+    }
+
+    fn set_group_share(&mut self, enabled: bool) {
+        if enabled && !self.group_sharing_compatible() {
+            self.screen_share_status = Some(if self.participants.len() > 2 {
+                "O compartilhamento em grupo exige que todos atualizem para uma versão compatível."
+                    .to_owned()
+            } else {
+                "O compartilhamento em grupo não está disponível nesta sala.".to_owned()
+            });
+            return;
+        }
+        let kind = if enabled {
+            SignalKind::ScreenShareAvailable
+        } else {
+            SignalKind::ScreenShareUnavailable
+        };
+        match self.send_screen_share_signal(kind, String::new()) {
+            Ok(()) => {
+                self.group_local_sharing = enabled;
+                if !enabled {
+                    self.group_outbound_sessions.clear();
+                    self.group_outbound_ports.clear();
+                }
+                self.screen_share_status = Some(if enabled {
+                    "Sua tela está disponível. Cada participante escolhe se quer assistir."
+                        .to_owned()
+                } else {
+                    "Você parou de compartilhar sua tela.".to_owned()
+                });
+                tracing::info!(enabled, "Estado de compartilhamento em grupo alterado");
+            }
+            Err(error) => self.screen_share_status = Some(error),
+        }
+    }
+
+    fn toggle_group_watch(&mut self, peer_id: &str) {
+        if self.group_watched_shares.remove(peer_id) {
+            if let Err(error) = self.send_screen_share_signal_to(
+                peer_id,
+                SignalKind::ScreenShareUnwatch,
+                String::new(),
+            ) {
+                self.screen_share_status = Some(error);
+            }
+            self.group_inbound_sessions.remove(peer_id);
+            self.group_inbound_ports.remove(peer_id);
+            self.group_remote_textures.remove(peer_id);
+            self.group_remote_sequences.remove(peer_id);
+            self.group_peer_status.remove(peer_id);
+        } else if self.group_available_shares.contains(peer_id) {
+            match self.send_screen_share_signal_to(
+                peer_id,
+                SignalKind::ScreenShareWatch,
+                String::new(),
+            ) {
+                Ok(()) => {
+                    self.group_watched_shares.insert(peer_id.to_owned());
+                    self.group_peer_status.insert(
+                        peer_id.to_owned(),
+                        "Pedido para assistir enviado…".to_owned(),
+                    );
+                }
+                Err(error) => self.screen_share_status = Some(error),
+            }
+        }
+    }
+
+    fn start_group_outbound(&mut self, viewer_id: String, context: &egui::Context, bitrate: u32) {
+        let Some(source) = self
+            .screen_capture
+            .as_ref()
+            .map(ScreenCapture::frame_source)
+        else {
+            self.screen_share_status = Some("Selecione uma tela antes de compartilhar.".to_owned());
+            return;
+        };
+        let (address, port) = match (self.selected_media_ipv4(), self.allocate_group_media_port()) {
+            (Ok(address), Ok(port)) => (address, port),
+            (Err(error), _) | (_, Err(error)) => {
+                self.screen_share_status = Some(error);
+                return;
+            }
+        };
+        match ScreenShareSession::new_with_port(
+            context.clone(),
+            address,
+            port,
+            None,
+            None,
+            self.video_decoder_preference,
+        ) {
+            Ok(session) => {
+                if let Err(error) = session.start_sending_with_bitrate(source, bitrate) {
+                    self.screen_share_status = Some(error);
+                } else {
+                    self.group_outbound_ports.insert(viewer_id.clone(), port);
+                    self.group_outbound_sessions.insert(viewer_id, session);
+                }
+            }
+            Err(error) => self.screen_share_status = Some(error),
+        }
+    }
+
+    fn rebalance_group_outbound(
+        &mut self,
+        context: &egui::Context,
+        additional_viewer: Option<String>,
+    ) {
+        let mut viewers = self
+            .group_outbound_sessions
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(viewer) = additional_viewer {
+            if !viewers.contains(&viewer) {
+                viewers.push(viewer);
+            }
+        }
+        viewers.sort();
+        if viewers.is_empty() {
+            return;
+        }
+        for viewer in self.group_outbound_sessions.keys() {
+            let _ = self.send_screen_share_signal_to_stream(
+                viewer,
+                self.participant_id.clone(),
+                SignalKind::ScreenShareStopped,
+                String::new(),
+            );
+        }
+        self.group_outbound_sessions.clear();
+        self.group_outbound_ports.clear();
+        let bitrate = group_share_bitrate(viewers.len());
+        for viewer in viewers {
+            self.start_group_outbound(viewer, context, bitrate);
+        }
+        tracing::info!(
+            viewers = self.group_outbound_sessions.len(),
+            target_bitrate_bps = bitrate,
+            "Encoder de grupo reequilibrado dentro do limite de banda"
+        );
+    }
+
+    fn stop_group_media(&mut self, announce: bool) {
+        if announce && self.group_local_sharing {
+            let _ =
+                self.send_screen_share_signal(SignalKind::ScreenShareUnavailable, String::new());
+        }
+        if announce {
+            let watched = self.group_watched_shares.drain().collect::<Vec<_>>();
+            for peer_id in watched {
+                let _ = self.send_screen_share_signal_to(
+                    &peer_id,
+                    SignalKind::ScreenShareUnwatch,
+                    String::new(),
+                );
+            }
+        } else {
+            self.group_watched_shares.clear();
+        }
+        self.group_available_shares.clear();
+        self.group_outbound_sessions.clear();
+        self.group_inbound_sessions.clear();
+        self.group_outbound_ports.clear();
+        self.group_inbound_ports.clear();
+        self.group_remote_textures.clear();
+        self.group_remote_sequences.clear();
+        self.group_peer_status.clear();
+        self.group_local_sharing = false;
+        self.focused_group_screen = None;
+    }
+
+    fn show_group_watch_controls(&mut self, ui: &mut egui::Ui, participants: &[ParticipantInfo]) {
+        if !self.group_sharing_compatible() {
+            if self.room_mode == RoomMode::Local && participants.len() > 2 {
+                Self::show_notice(
+                    ui,
+                    "Compartilhamento em grupo indisponível:",
+                    "Todos precisam usar uma versão que ofereça suporte ao compartilhamento em grupo.",
+                );
+            }
+            return;
+        }
+        let mut peers = self
+            .group_available_shares
+            .iter()
+            .filter_map(|id| participants.iter().find(|p| &p.id == id))
+            .cloned()
+            .collect::<Vec<_>>();
+        peers.sort_by_key(|participant| participant.order);
+        if peers.is_empty() && !self.group_local_sharing {
+            return;
+        }
+        ui.group(|ui| {
+            ui.heading("Telas compartilhadas");
+            ui.horizontal_wrapped(|ui| {
+                for peer in peers {
+                    let watching = self.group_watched_shares.contains(&peer.id);
+                    let label = if watching {
+                        format!("Parar de assistir {}", peer.display_name)
+                    } else {
+                        format!("Assistir {}", peer.display_name)
+                    };
+                    if ui.button(label).clicked() {
+                        self.toggle_group_watch(&peer.id);
+                    }
+                }
+                if self.group_local_sharing {
+                    ui.label("Sua tela está disponível");
+                }
+            });
+        });
+    }
+
+    fn show_group_screen_stage(&mut self, ui: &mut egui::Ui, stage_height: f32) {
+        let focused = self.focused_group_screen.clone();
+        if let Some(id) = focused.as_deref() {
+            if let Some(texture) = self.group_remote_textures.get(id) {
+                let source = texture.size_vec2();
+                let available = ui.available_size();
+                let scale = (available.x / source.x)
+                    .min(available.y / source.y)
+                    .min(1.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(((stage_height - source.y * scale.max(0.01)) * 0.5).max(0.0));
+                    ui.add(
+                        egui::Image::new((texture.id(), source))
+                            .fit_to_exact_size(source * scale.max(0.01)),
+                    );
+                    if ui.button("Voltar à grade").clicked() {
+                        self.focused_group_screen = None;
+                    }
+                });
+                return;
+            }
+            if id == "__local" {
+                if let Some(texture) = self
+                    .screen_texture
+                    .as_ref()
+                    .filter(|_| self.show_local_preview)
+                {
+                    let source = texture.size_vec2();
+                    let available = ui.available_size();
+                    let scale = (available.x / source.x)
+                        .min(available.y / source.y)
+                        .min(1.0);
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(((stage_height - source.y * scale.max(0.01)) * 0.5).max(0.0));
+                        ui.add(
+                            egui::Image::new((texture.id(), source))
+                                .fit_to_exact_size(source * scale.max(0.01)),
+                        );
+                        if ui.button("Voltar à grade").clicked() {
+                            self.focused_group_screen = None;
+                        }
+                    });
+                    return;
+                }
+            }
+            self.focused_group_screen = None;
+        }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if self.group_local_sharing && self.show_local_preview {
+                    egui::Frame::group(ui.style()).show(ui, |tile| {
+                        tile.set_min_size(egui::vec2(300.0, 195.0));
+                        tile.label("Você (prévia local)");
+                        if let Some(texture) = &self.screen_texture {
+                            tile.add(
+                                egui::Image::new((texture.id(), texture.size_vec2()))
+                                    .fit_to_exact_size(egui::vec2(280.0, 158.0)),
+                            );
+                        } else {
+                            tile.label("Preparando prévia…");
+                        }
+                        if tile.button("Ampliar").clicked() {
+                            self.focused_group_screen = Some("__local".to_owned());
+                        }
+                    });
+                }
+                let watched = self
+                    .group_watched_shares
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for peer_id in watched {
+                    let name = self
+                        .participants
+                        .iter()
+                        .find(|p| p.id == peer_id)
+                        .map(|p| p.display_name.clone())
+                        .unwrap_or_else(|| "Participante".to_owned());
+                    egui::Frame::group(ui.style()).show(ui, |tile| {
+                        tile.set_min_size(egui::vec2(300.0, 195.0));
+                        tile.label(name);
+                        if let Some(texture) = self.group_remote_textures.get(&peer_id) {
+                            tile.add(
+                                egui::Image::new((texture.id(), texture.size_vec2()))
+                                    .fit_to_exact_size(egui::vec2(280.0, 158.0)),
+                            );
+                            if tile.button("Ampliar").clicked() {
+                                self.focused_group_screen = Some(peer_id.clone());
+                            }
+                        } else {
+                            tile.label(
+                                self.group_peer_status
+                                    .get(&peer_id)
+                                    .map(String::as_str)
+                                    .unwrap_or("Aguardando a tela…"),
+                            );
+                        }
+                    });
+                }
+                if !self.group_local_sharing && self.group_watched_shares.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(stage_height * 0.35);
+                        ui.heading("Sala pronta");
+                        ui.label("Escolha uma transmissão e pressione Assistir.");
+                    });
+                }
+            });
+        });
+    }
+
+    fn handle_group_peer_signal(
+        &mut self,
+        from_participant_id: Option<String>,
+        stream_id: Option<String>,
+        kind: SignalKind,
+        payload: String,
+        context: &egui::Context,
+    ) {
+        let Some(peer_id) = from_participant_id else {
+            self.screen_share_status = Some(
+                "O servidor não identificou o participante que enviou a negociação WebRTC."
+                    .to_owned(),
+            );
+            return;
+        };
+        if !self.group_sharing_compatible() || peer_id == self.participant_id {
+            return;
+        }
+        let Some(stream_id) = stream_id else {
+            self.group_peer_status.insert(
+                peer_id,
+                "A negociação WebRTC veio sem identificação da transmissão.".to_owned(),
+            );
+            return;
+        };
+        if kind == SignalKind::Offer && stream_id != peer_id {
+            tracing::warn!(signal_kind = ?kind, "Oferta de grupo não corresponde à identidade do transmissor");
+            return;
+        }
+        if kind == SignalKind::Offer && !self.group_inbound_sessions.contains_key(&peer_id) {
+            let (address, port) =
+                match (self.selected_media_ipv4(), self.allocate_group_media_port()) {
+                    (Ok(address), Ok(port)) => (address, port),
+                    (Err(error), _) | (_, Err(error)) => {
+                        self.screen_share_status = Some(error);
+                        return;
+                    }
+                };
+            match ScreenShareSession::new_with_port(
+                context.clone(),
+                address,
+                port,
+                None,
+                None,
+                self.video_decoder_preference,
+            ) {
+                Ok(session) => {
+                    self.group_inbound_ports.insert(peer_id.clone(), port);
+                    self.group_inbound_sessions.insert(peer_id.clone(), session);
+                    self.group_peer_status
+                        .insert(peer_id.clone(), "Negociando a tela recebida…".to_owned());
+                }
+                Err(error) => {
+                    self.screen_share_status = Some(error);
+                    return;
+                }
+            }
+        }
+        let session = match kind {
+            SignalKind::Answer if stream_id == self.participant_id => {
+                self.group_outbound_sessions.get(&peer_id)
+            }
+            SignalKind::Offer => self.group_inbound_sessions.get(&peer_id),
+            SignalKind::IceCandidate if stream_id == self.participant_id => {
+                self.group_outbound_sessions.get(&peer_id)
+            }
+            SignalKind::IceCandidate if stream_id == peer_id => {
+                self.group_inbound_sessions.get(&peer_id)
+            }
+            _ => None,
+        };
+        if let Some(session) = session {
+            if let Err(error) = session.handle_signal(kind, payload) {
+                self.group_peer_status.insert(peer_id, error.clone());
+                self.screen_share_status = Some(error);
+            }
+        } else {
+            tracing::debug!(signal_kind = ?kind, "Ignorando sinal WebRTC sem sessão de grupo correspondente");
+        }
+    }
+
+    fn refresh_group_screen_shares(&mut self, context: &egui::Context) {
+        let mut peer_ids = self
+            .group_inbound_sessions
+            .keys()
+            .chain(self.group_outbound_sessions.keys())
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        peer_ids.sort();
+        let mut outbound_membership_changed = false;
+        for peer_id in peer_ids {
+            let mut signal_events = Vec::new();
+            let mut failures = Vec::new();
+            let mut states = Vec::new();
+            let mut inbound_failed = false;
+            let mut outbound_failed = false;
+            if let Some(session) = self.group_inbound_sessions.get(&peer_id) {
+                while let Some(event) = session.try_recv() {
+                    match event {
+                        ScreenShareEvent::Signal { kind, payload } => {
+                            signal_events.push((true, kind, payload))
+                        }
+                        ScreenShareEvent::State(state) => states.push(state),
+                        ScreenShareEvent::Error(error) => {
+                            inbound_failed = true;
+                            failures.push(error);
+                        }
+                        ScreenShareEvent::ConnectionClosed => {
+                            inbound_failed = true;
+                            failures.push("A conexão P2P foi encerrada.".to_owned());
+                        }
+                    }
+                }
+                if let Some(frame) = session.latest_remote_frame() {
+                    let sequence = self
+                        .group_remote_sequences
+                        .get(&peer_id)
+                        .copied()
+                        .unwrap_or(0);
+                    if sequence != frame.sequence {
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [frame.width as usize, frame.height as usize],
+                            &frame.rgba,
+                        );
+                        if let Some(texture) = self.group_remote_textures.get_mut(&peer_id) {
+                            texture.set(image, egui::TextureOptions::LINEAR);
+                        } else {
+                            self.group_remote_textures.insert(
+                                peer_id.clone(),
+                                context.load_texture(
+                                    format!("group-screen-{peer_id}"),
+                                    image,
+                                    egui::TextureOptions::LINEAR,
+                                ),
+                            );
+                        }
+                        self.group_remote_sequences
+                            .insert(peer_id.clone(), frame.sequence);
+                    }
+                }
+            }
+            if let Some(session) = self.group_outbound_sessions.get(&peer_id) {
+                while let Some(event) = session.try_recv() {
+                    match event {
+                        ScreenShareEvent::Signal { kind, payload } => {
+                            signal_events.push((false, kind, payload))
+                        }
+                        ScreenShareEvent::State(state) => states.push(state),
+                        ScreenShareEvent::Error(error) => {
+                            outbound_failed = true;
+                            failures.push(error);
+                        }
+                        ScreenShareEvent::ConnectionClosed => {
+                            outbound_failed = true;
+                            failures.push("A conexão P2P foi encerrada.".to_owned());
+                        }
+                    }
+                }
+            }
+            for (is_inbound, kind, payload) in signal_events {
+                let stream_id = if is_inbound {
+                    peer_id.clone()
+                } else {
+                    self.participant_id.clone()
+                };
+                if let Err(error) =
+                    self.send_screen_share_signal_to_stream(&peer_id, stream_id, kind, payload)
+                {
+                    if is_inbound {
+                        inbound_failed = true;
+                    } else {
+                        outbound_failed = true;
+                    }
+                    failures.push(error);
+                }
+            }
+            if let Some(state) = states.last() {
+                self.group_peer_status
+                    .insert(peer_id.clone(), state.clone());
+            }
+            if let Some(error) = failures.last() {
+                tracing::error!(error = %error, "Falha isolada em sessão de tela de participante");
+                self.group_peer_status
+                    .insert(peer_id.clone(), error.clone());
+            }
+            if inbound_failed {
+                self.group_inbound_sessions.remove(&peer_id);
+                self.group_inbound_ports.remove(&peer_id);
+                self.group_remote_textures.remove(&peer_id);
+                self.group_remote_sequences.remove(&peer_id);
+                self.group_watched_shares.remove(&peer_id);
+                let _ = self.send_screen_share_signal_to(
+                    &peer_id,
+                    SignalKind::ScreenShareUnwatch,
+                    String::new(),
+                );
+            }
+            if outbound_failed {
+                self.group_outbound_sessions.remove(&peer_id);
+                self.group_outbound_ports.remove(&peer_id);
+                let _ = self.send_screen_share_signal_to_stream(
+                    &peer_id,
+                    self.participant_id.clone(),
+                    SignalKind::ScreenShareStopped,
+                    String::new(),
+                );
+                outbound_membership_changed = true;
+            }
+        }
+        if outbound_membership_changed {
+            self.rebalance_group_outbound(context, None);
+        }
+
+        if self
+            .last_group_metrics_log_at
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+        {
+            let outbound = self
+                .group_outbound_sessions
+                .values()
+                .map(ScreenShareSession::metrics)
+                .collect::<Vec<_>>();
+            let inbound = self
+                .group_inbound_sessions
+                .values()
+                .map(ScreenShareSession::metrics)
+                .collect::<Vec<_>>();
+            tracing::info!(
+                outbound_peers = outbound.len(),
+                inbound_peers = inbound.len(),
+                encoded_frames = outbound.iter().map(|m| m.encoded_frames).sum::<u64>(),
+                sent_frames = outbound.iter().map(|m| m.sent_frames).sum::<u64>(),
+                received_packets = inbound.iter().map(|m| m.received_packets).sum::<u64>(),
+                decoded_frames = inbound.iter().map(|m| m.decoded_frames).sum::<u64>(),
+                decode_errors = inbound.iter().map(|m| m.decode_errors).sum::<u64>(),
+                watching = self.group_watched_shares.len(),
+                sharing = self.group_local_sharing,
+                "Resumo agregado de compartilhamento em grupo"
+            );
+            self.last_group_metrics_log_at = Some(Instant::now());
         }
     }
 
@@ -2672,6 +3423,49 @@ impl ClientUi {
         self.room_mode = room_mode;
         self.participants = participants;
         self.current_leader_id = leader_id.clone();
+        let member_ids = self
+            .participants
+            .iter()
+            .map(|participant| participant.id.clone())
+            .collect::<HashSet<_>>();
+        self.group_available_shares
+            .retain(|id| member_ids.contains(id));
+        self.group_watched_shares
+            .retain(|id| member_ids.contains(id));
+        self.group_outbound_sessions
+            .retain(|id, _| member_ids.contains(id));
+        self.group_inbound_sessions
+            .retain(|id, _| member_ids.contains(id));
+        self.group_outbound_ports
+            .retain(|id, _| member_ids.contains(id));
+        self.group_inbound_ports
+            .retain(|id, _| member_ids.contains(id));
+        self.group_remote_textures
+            .retain(|id, _| member_ids.contains(id));
+        self.group_remote_sequences
+            .retain(|id, _| member_ids.contains(id));
+        self.group_peer_status
+            .retain(|id, _| member_ids.contains(id));
+        if self.room_mode != RoomMode::Local
+            && (self.group_local_sharing
+                || !self.group_watched_shares.is_empty()
+                || !self.group_inbound_sessions.is_empty()
+                || !self.group_outbound_sessions.is_empty())
+        {
+            self.stop_group_media(false);
+        } else if self.room_mode == RoomMode::Local
+            && !self.group_sharing_compatible()
+            && (self.group_local_sharing
+                || !self.group_watched_shares.is_empty()
+                || !self.group_inbound_sessions.is_empty()
+                || !self.group_outbound_sessions.is_empty())
+        {
+            self.stop_group_media(true);
+            self.screen_share_status = Some(
+                "O compartilhamento em grupo foi encerrado: todos os participantes precisam de uma versão compatível."
+                    .to_owned(),
+            );
+        }
         if self.participants.len() != 2 && !matches!(&self.screen_share_role, ScreenShareRole::Idle)
         {
             self.stop_screen_share(true);
@@ -2717,6 +3511,9 @@ impl ClientUi {
                 }
                 Err(error) => self.control_status = Some(error),
             }
+        }
+        if self.group_local_sharing && self.group_sharing_compatible() {
+            let _ = self.send_screen_share_signal(SignalKind::ScreenShareAvailable, String::new());
         }
     }
 
@@ -2953,7 +3750,7 @@ impl ClientUi {
                 "ws://{}:9001",
                 self.host_addresses[self.selected_host_address].ipv4
             ));
-            ui.small("Este IPv4 também será usado para vincular o vídeo WebRTC na porta UDP 9002.");
+            ui.small("Este IPv4 também será usado para vincular o vídeo WebRTC nas portas UDP 9002–9009.");
         } else if let Some(error) = &self.host_addresses_error {
             Self::show_notice(ui, "Erro de adaptador:", error);
         } else {
@@ -3292,6 +4089,8 @@ impl ClientUi {
                     }
                 }
                 SignalingEvent::Signal {
+                    from_participant_id: _,
+                    stream_id: _,
                     kind: SignalKind::Diagnostic,
                     payload,
                 } => {
@@ -3341,7 +4140,12 @@ impl ClientUi {
                         }
                     }
                 }
-                SignalingEvent::Signal { kind, payload } => {
+                SignalingEvent::Signal {
+                    from_participant_id,
+                    stream_id,
+                    kind,
+                    payload,
+                } => {
                     tracing::debug!(signal_kind = ?kind, payload_bytes = payload.len(), "Sinal de negociação recebido; payload omitido");
                     if matches!(
                         kind,
@@ -3352,8 +4156,29 @@ impl ClientUi {
                             | SignalKind::ScreenShareAccept
                             | SignalKind::ScreenShareBusy
                             | SignalKind::ScreenShareStopped
+                            | SignalKind::ScreenShareAvailable
+                            | SignalKind::ScreenShareUnavailable
+                            | SignalKind::ScreenShareWatch
+                            | SignalKind::ScreenShareUnwatch
                     ) {
-                        self.handle_screen_share_signal(kind, payload, context);
+                        self.handle_screen_share_signal(
+                            from_participant_id.clone(),
+                            stream_id.clone(),
+                            kind,
+                            payload.clone(),
+                            context,
+                        );
+                    } else if matches!(
+                        kind,
+                        SignalKind::Offer | SignalKind::Answer | SignalKind::IceCandidate
+                    ) {
+                        self.handle_group_peer_signal(
+                            from_participant_id,
+                            stream_id,
+                            kind,
+                            payload,
+                            context,
+                        );
                     } else {
                         self.connection_status = Some("Sinal de conexão recebido.".to_owned());
                     }
@@ -4095,8 +4920,24 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_public_ipv4_candidate, signaling_ws_url};
+    use super::{
+        group_screen_share_compatible, is_public_ipv4_candidate, next_group_media_port,
+        signaling_ws_url,
+    };
+    use signaling_protocol::{ParticipantInfo, RoomMode};
+    use std::collections::HashSet;
     use std::net::Ipv4Addr;
+
+    fn participant(id: usize, supports_group_screen_share: bool) -> ParticipantInfo {
+        ParticipantInfo {
+            id: format!("participant-{id}"),
+            display_name: format!("Participante {id}"),
+            order: id as u8,
+            may_host: false,
+            control_address: String::new(),
+            supports_group_screen_share,
+        }
+    }
 
     #[test]
     fn signaling_address_accepts_ipv4_or_ddns_with_fixed_port() {
@@ -4116,6 +4957,48 @@ mod tests {
         assert!(signaling_ws_url("2001:db8::1").is_err());
         assert!(signaling_ws_url("192.0.2.10:9001").is_err());
         assert!(signaling_ws_url("192.0.2.10/room").is_err());
+    }
+
+    #[test]
+    fn group_sender_bitrate_stays_within_aggregate_limit() {
+        for viewers in [1, 2, 7] {
+            let per_peer = super::group_share_bitrate(viewers);
+            assert!(per_peer <= 4_000_000);
+            assert!(u64::from(per_peer) * viewers as u64 <= 8_000_000);
+        }
+        assert_eq!(super::group_share_bitrate(1), 4_000_000);
+        assert_eq!(super::group_share_bitrate(2), 4_000_000);
+        assert_eq!(super::group_share_bitrate(7), 1_142_857);
+    }
+
+    #[test]
+    fn group_sharing_requires_two_to_eight_compatible_local_participants() {
+        let eight = (1..=8).map(|id| participant(id, true)).collect::<Vec<_>>();
+        assert!(group_screen_share_compatible(RoomMode::Local, &eight));
+
+        let mut old_client = eight[..2].to_vec();
+        old_client[1].supports_group_screen_share = false;
+        assert!(!group_screen_share_compatible(RoomMode::Local, &old_client));
+        assert!(!group_screen_share_compatible(
+            RoomMode::InternetTest,
+            &eight[..2]
+        ));
+        assert!(!group_screen_share_compatible(RoomMode::Local, &eight[..1]));
+        assert!(!group_screen_share_compatible(
+            RoomMode::Local,
+            &(1..=9).map(|id| participant(id, true)).collect::<Vec<_>>()
+        ));
+    }
+
+    #[test]
+    fn group_media_ports_are_unique_and_limited_to_the_documented_range() {
+        let mut used = HashSet::new();
+        for expected in 9002..=9009 {
+            let port = next_group_media_port(&used).unwrap();
+            assert_eq!(port, expected);
+            assert!(used.insert(port));
+        }
+        assert_eq!(next_group_media_port(&used), None);
     }
 
     #[test]

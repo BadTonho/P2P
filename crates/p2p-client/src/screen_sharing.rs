@@ -71,6 +71,7 @@ const RTP_REORDER_DELAY: Duration = Duration::from_millis(40);
 const MAX_RTP_FRAME_AGE: Duration = Duration::from_millis(200);
 const MAX_PENDING_RTP_FRAMES: usize = 8;
 const MEDIA_UDP_PORT: u16 = 9002;
+const MAX_PEER_MEDIA_BITRATE: u32 = 4_000_000;
 const PEER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const INTERNET_PEER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const FIRST_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2097,7 +2098,10 @@ pub enum ScreenShareEvent {
 }
 
 enum Command {
-    StartSending(LatestFrame),
+    StartSending {
+        source: LatestFrame,
+        bitrate_bps: u32,
+    },
     Signal {
         kind: SignalKind,
         payload: String,
@@ -2125,6 +2129,24 @@ impl ScreenShareSession {
         turn_credentials: Option<TurnCredentials>,
         decoder_preference: VideoDecoderPreference,
     ) -> Result<Self, String> {
+        Self::new_with_port(
+            context,
+            bind_ipv4,
+            MEDIA_UDP_PORT,
+            stun_server,
+            turn_credentials,
+            decoder_preference,
+        )
+    }
+
+    pub fn new_with_port(
+        context: egui::Context,
+        bind_ipv4: Ipv4Addr,
+        udp_port: u16,
+        stun_server: Option<String>,
+        turn_credentials: Option<TurnCredentials>,
+        decoder_preference: VideoDecoderPreference,
+    ) -> Result<Self, String> {
         if let Some(server) = stun_server.as_deref() {
             if let Err(error) = validate_stun_uri(server) {
                 tracing::error!(reason = %error, "URI STUN recusada antes de iniciar WebRTC");
@@ -2133,7 +2155,7 @@ impl ScreenShareSession {
         }
         Self::with_udp_address(
             context,
-            format!("{bind_ipv4}:{MEDIA_UDP_PORT}"),
+            format!("{bind_ipv4}:{udp_port}"),
             stun_server,
             turn_credentials,
             decoder_preference,
@@ -2241,8 +2263,19 @@ impl ScreenShareSession {
     }
 
     pub fn start_sending(&self, source: LatestFrame) -> Result<(), String> {
+        self.start_sending_with_bitrate(source, MAX_PEER_MEDIA_BITRATE)
+    }
+
+    pub fn start_sending_with_bitrate(
+        &self,
+        source: LatestFrame,
+        bitrate_bps: u32,
+    ) -> Result<(), String> {
         self.commands
-            .send(Command::StartSending(source))
+            .send(Command::StartSending {
+                source,
+                bitrate_bps: bitrate_bps.clamp(250_000, MAX_PEER_MEDIA_BITRATE),
+            })
             .map_err(|_| "A sessão WebRTC foi encerrada.".to_owned())
     }
 
@@ -3381,7 +3414,7 @@ async fn run_session(
             command = commands.recv() => {
                 let Some(command) = command else { break };
         match command {
-            Command::StartSending(source) => {
+            Command::StartSending { source, bitrate_bps } => {
                 if active_peer.is_some() {
                     let _ = events.send(ScreenShareEvent::Error(
                         "Já existe uma sessão de compartilhamento ativa.".to_owned(),
@@ -3400,6 +3433,7 @@ async fn run_session(
                     stun_server.as_deref(),
                     turn_credentials.as_ref(),
                     decoder_preference,
+                    bitrate_bps,
                 )
                 .await
                 {
@@ -3839,7 +3873,10 @@ async fn create_peer(
         .build()
         .await
         .map_err(|error| {
-            if udp_address.ends_with(&format!(":{MEDIA_UDP_PORT}")) {
+            let port = udp_address
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok());
+            if port.is_some_and(|port| (9002..=9009).contains(&port)) {
                 format!(
                     "Não foi possível abrir UDP {MEDIA_UDP_PORT} para o compartilhamento. Verifique se a porta está livre e permita o aplicativo ou UDP {MEDIA_UDP_PORT} no firewall do Windows: {error}"
                 )
@@ -3862,6 +3899,7 @@ async fn create_sender(
     stun_server: Option<&str>,
     turn_credentials: Option<&TurnCredentials>,
     decoder_preference: VideoDecoderPreference,
+    bitrate_bps: u32,
 ) -> Result<PeerSession, String> {
     let connection = create_peer(
         events,
@@ -3952,6 +3990,7 @@ async fn create_sender(
             encoder_stop_worker,
             encoder_metrics,
             encoder_force_keyframe,
+            bitrate_bps,
         ) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -4184,6 +4223,7 @@ fn encode_latest_frames(
     stop: Arc<AtomicBool>,
     metrics: Arc<SharedMetrics>,
     force_keyframe: Arc<AtomicBool>,
+    bitrate_bps: u32,
 ) -> Result<(), String> {
     let mut encoder: Option<ActiveH264Encoder> = None;
     let mut hardware_warmup_frames = 0u32;
@@ -4238,13 +4278,14 @@ fn encode_latest_frames(
             #[cfg(windows)]
             {
                 let hardware_result = if let Some(surface) = frame.gpu_nv12.as_ref() {
-                    match mf_video::HardwareEncoder::new_gpu(
+                    match mf_video::HardwareEncoder::new_gpu_with_bitrate(
                         frame.width,
                         frame.height,
                         surface.device(),
+                        bitrate_bps,
                     ) {
                         Ok(hardware) => Ok((hardware, true, None)),
-                        Err(gpu_error) => mf_video::HardwareEncoder::new(frame.width, frame.height)
+                        Err(gpu_error) => mf_video::HardwareEncoder::new_with_bitrate(frame.width, frame.height, bitrate_bps)
                             .map(|hardware| {
                                 (
                                     hardware,
@@ -4259,8 +4300,12 @@ fn encode_latest_frames(
                             }),
                     }
                 } else {
-                    mf_video::HardwareEncoder::new(frame.width, frame.height)
-                        .map(|hardware| (hardware, false, None))
+                    mf_video::HardwareEncoder::new_with_bitrate(
+                        frame.width,
+                        frame.height,
+                        bitrate_bps,
+                    )
+                    .map(|hardware| (hardware, false, None))
                 };
                 match hardware_result {
                     Ok((hardware, gpu_input, fallback_reason)) => {
@@ -4281,7 +4326,7 @@ fn encode_latest_frames(
                             format!("Media Foundation H.264 de hardware indisponível: {error}");
                         tracing::warn!(fallback_reason = %reason, "Usando codificador H.264 OpenH264 na CPU");
                         metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
-                        encoder = Some(ActiveH264Encoder::OpenH264(openh264_encoder()?));
+                        encoder = Some(ActiveH264Encoder::OpenH264(openh264_encoder(bitrate_bps)?));
                     }
                 }
             }
@@ -4289,7 +4334,7 @@ fn encode_latest_frames(
             {
                 let reason = "Media Foundation está disponível apenas no Windows.".to_owned();
                 metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
-                encoder = Some(ActiveH264Encoder::OpenH264(openh264_encoder()?));
+                encoder = Some(ActiveH264Encoder::OpenH264(openh264_encoder(bitrate_bps)?));
             }
         }
 
@@ -4380,7 +4425,7 @@ fn encode_latest_frames(
             metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
             forwarding_gate.reset();
             hardware_warmup_frames = 0;
-            let mut cpu = openh264_encoder()?;
+            let mut cpu = openh264_encoder(bitrate_bps)?;
             metrics.record_encoder_input_frame();
             let encode_started_at = Instant::now();
             let encoded_result = encode_frame(&mut cpu, &frame);
@@ -4399,9 +4444,9 @@ enum ActiveH264Encoder {
     MediaFoundation(mf_video::HardwareEncoder),
 }
 
-fn openh264_encoder() -> Result<Encoder, String> {
+fn openh264_encoder(bitrate_bps: u32) -> Result<Encoder, String> {
     let encoder_config = EncoderConfig::new()
-        .bitrate(BitRate::from_bps(4_000_000))
+        .bitrate(BitRate::from_bps(bitrate_bps))
         .max_frame_rate(FrameRate::from_hz(30.0))
         .usage_type(UsageType::ScreenContentRealTime)
         .adaptive_quantization(false)
@@ -4825,7 +4870,7 @@ mod tests {
 
     #[test]
     fn cpu_fallback_can_publish_the_cached_initial_idr_without_new_network_frames() {
-        let mut encoder = super::openh264_encoder().unwrap();
+        let mut encoder = super::openh264_encoder(4_000_000).unwrap();
         let source = PreviewFrame {
             sequence: 1,
             width: 320,

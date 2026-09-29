@@ -97,6 +97,7 @@ mod windows_backend {
             width: u32,
             height: u32,
             decoder_device_manager: Option<&IMFDXGIDeviceManager>,
+            bitrate: u32,
         ) -> Result<Self, String> {
             let transform: IMFTransform = unsafe { activate.ActivateObject() }
                 .map_err(|e| format!("Ativação do transform falhou: {e}"))?;
@@ -137,7 +138,7 @@ mod windows_backend {
             if output_subtype == MFVideoFormat_H264 {
                 unsafe {
                     output_type
-                        .SetUINT32(&MF_MT_AVG_BITRATE, BITRATE)
+                        .SetUINT32(&MF_MT_AVG_BITRATE, bitrate)
                         .map_err(|e| format!("Não foi possível definir o bitrate H.264: {e}"))?;
                     output_type
                         .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)
@@ -440,6 +441,10 @@ mod windows_backend {
 
     impl HardwareEncoder {
         pub fn new(width: u32, height: u32) -> Result<Self, String> {
+            Self::new_with_bitrate(width, height, BITRATE)
+        }
+
+        pub fn new_with_bitrate(width: u32, height: u32, bitrate: u32) -> Result<Self, String> {
             let apartment = ComApartment::enter()?;
             ensure_media_foundation()?;
             let (transform, name) = activate_hardware_transform(
@@ -449,6 +454,7 @@ mod windows_backend {
                 width,
                 height,
                 None,
+                bitrate,
             )?;
             Ok(Self {
                 _apartment: apartment,
@@ -465,6 +471,15 @@ mod windows_backend {
         }
 
         pub fn new_gpu(width: u32, height: u32, device: &ID3D11Device) -> Result<Self, String> {
+            Self::new_gpu_with_bitrate(width, height, device, BITRATE)
+        }
+
+        pub fn new_gpu_with_bitrate(
+            width: u32,
+            height: u32,
+            device: &ID3D11Device,
+            bitrate: u32,
+        ) -> Result<Self, String> {
             let apartment = ComApartment::enter()?;
             ensure_media_foundation()?;
             let device_manager = create_device_manager(device)?;
@@ -475,6 +490,7 @@ mod windows_backend {
                 width,
                 height,
                 Some(&device_manager),
+                bitrate,
             )?;
             Ok(Self {
                 _apartment: apartment,
@@ -1027,6 +1043,7 @@ mod windows_backend {
                 width,
                 height,
                 Some(&device_manager),
+                BITRATE,
             )?;
             Ok(Self {
                 _apartment: apartment,
@@ -1080,6 +1097,7 @@ mod windows_backend {
         width: u32,
         height: u32,
         device_manager: Option<&IMFDXGIDeviceManager>,
+        bitrate: u32,
     ) -> Result<(Transform, String), String> {
         let input_info = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
@@ -1136,6 +1154,7 @@ mod windows_backend {
                 width,
                 height,
                 device_manager,
+                bitrate,
             ) {
                 Ok(transform) => return Ok((transform, name)),
                 Err(error) => failures.push(format!("{name}: {error}")),

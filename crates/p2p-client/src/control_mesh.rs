@@ -1429,6 +1429,7 @@ mod tests {
             order,
             may_host,
             control_address: format!("192.168.1.{order}:9001"),
+            supports_group_screen_share: false,
         }
     }
 
@@ -1536,6 +1537,7 @@ mod tests {
                 order,
                 may_host: true,
                 control_address: "127.0.0.1:9001".to_owned(),
+                supports_group_screen_share: false,
             },
             loss_percent: loss,
             jitter_ms: jitter,
