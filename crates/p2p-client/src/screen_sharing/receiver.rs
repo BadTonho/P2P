@@ -10,6 +10,140 @@ struct RtpSequenceTracker {
     confirmed_order: VecDeque<u16>,
 }
 
+const MAX_BUFFERED_RTP_PACKETS: usize = 512;
+
+#[derive(Default)]
+struct RtpReorderBuffer {
+    next_sequence: Option<u16>,
+    pending: HashMap<u16, BufferedRtpPacket>,
+    gap_since: Option<Instant>,
+}
+
+struct BufferedRtpPacket {
+    received_at: Instant,
+    packet: RtpPacket,
+}
+
+#[derive(Default)]
+struct RtpReorderUpdate {
+    ordered_packets: Vec<RtpPacket>,
+    confirmed_missing_packets: u64,
+    resume_timestamp: Option<u32>,
+    overflowed: bool,
+}
+
+impl RtpReorderUpdate {
+    fn append(&mut self, mut other: Self) {
+        self.ordered_packets.append(&mut other.ordered_packets);
+        self.confirmed_missing_packets = self
+            .confirmed_missing_packets
+            .saturating_add(other.confirmed_missing_packets);
+        if self.resume_timestamp.is_none() {
+            self.resume_timestamp = other.resume_timestamp;
+        }
+        self.overflowed |= other.overflowed;
+    }
+}
+
+impl RtpReorderBuffer {
+    fn push(&mut self, packet: RtpPacket, now: Instant) -> RtpReorderUpdate {
+        let sequence = packet.header.sequence_number;
+        let mut update = RtpReorderUpdate::default();
+        let next_sequence = *self.next_sequence.get_or_insert(sequence);
+        let distance = sequence.wrapping_sub(next_sequence);
+
+        // A packet behind the released sequence was either duplicated or arrived too late.
+        // RtpSequenceTracker owns the diagnostic classification; never feed it to H.264 again.
+        if distance >= 0x8000 {
+            return update;
+        }
+        if self.pending.contains_key(&sequence) {
+            return update;
+        }
+        if distance != 0 && self.pending.len() >= MAX_BUFFERED_RTP_PACKETS {
+            update.overflowed = true;
+            self.refresh_gap_since();
+            return update;
+        }
+
+        self.pending.insert(
+            sequence,
+            BufferedRtpPacket {
+                received_at: now,
+                packet,
+            },
+        );
+        self.drain_contiguous(&mut update.ordered_packets);
+        self.refresh_gap_since();
+        update
+    }
+
+    fn expire(&mut self, now: Instant) -> RtpReorderUpdate {
+        let mut update = RtpReorderUpdate::default();
+        let gap_expired = self
+            .gap_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= RTP_REORDER_DELAY);
+        if !gap_expired {
+            return update;
+        }
+
+        let Some(expected) = self.next_sequence else {
+            self.gap_since = None;
+            return update;
+        };
+        let Some(next_available) = self
+            .pending
+            .keys()
+            .copied()
+            .min_by_key(|sequence| sequence.wrapping_sub(expected))
+        else {
+            self.gap_since = None;
+            return update;
+        };
+        let skipped = next_available.wrapping_sub(expected);
+        if skipped == 0 || skipped >= 0x8000 {
+            self.refresh_gap_since();
+            return update;
+        }
+
+        update.confirmed_missing_packets = u64::from(skipped);
+        update.resume_timestamp = self
+            .pending
+            .get(&next_available)
+            .map(|buffered| buffered.packet.header.timestamp);
+        self.next_sequence = Some(next_available);
+        self.drain_contiguous(&mut update.ordered_packets);
+        self.refresh_gap_since();
+        update
+    }
+
+    fn drain_contiguous(&mut self, ordered: &mut Vec<RtpPacket>) {
+        while let Some(sequence) = self.next_sequence {
+            let Some(buffered) = self.pending.remove(&sequence) else {
+                break;
+            };
+            ordered.push(buffered.packet);
+            self.next_sequence = Some(sequence.wrapping_add(1));
+        }
+    }
+
+    fn refresh_gap_since(&mut self) {
+        let Some(expected) = self.next_sequence else {
+            self.gap_since = None;
+            return;
+        };
+        self.gap_since = self
+            .pending
+            .iter()
+            .filter(|(sequence, _)| {
+                let distance = sequence.wrapping_sub(expected);
+                distance > 0 && distance < 0x8000
+            })
+            .min_by_key(|(sequence, _)| sequence.wrapping_sub(expected))
+            .map(|(_, packet)| packet.received_at);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct RtpSequenceUpdate {
     pub(super) observed_gap_packets: u64,
@@ -110,6 +244,7 @@ pub(super) enum PliReason {
 #[derive(Default)]
 struct H264AccessUnitAssembler {
     frames: HashMap<u32, PendingRtpFrame>,
+    discard_timestamp: Option<u32>,
 }
 
 struct PendingRtpFrame {
@@ -197,6 +332,15 @@ pub(super) fn begin_stream_resync(
 impl H264AccessUnitAssembler {
     fn push(&mut self, packet: RtpPacket) -> Option<String> {
         let timestamp = packet.header.timestamp;
+        if let Some(discard_timestamp) = self.discard_timestamp {
+            if discard_timestamp == timestamp {
+                if packet.header.marker {
+                    self.discard_timestamp = None;
+                }
+                return None;
+            }
+            self.discard_timestamp = None;
+        }
         let now = Instant::now();
         let mut evicted = None;
         if !self.frames.contains_key(&timestamp) && self.frames.len() >= MAX_PENDING_RTP_FRAMES {
@@ -222,6 +366,11 @@ impl H264AccessUnitAssembler {
         frame.marker_seen |= packet.header.marker;
         frame.packets.push(packet);
         evicted
+    }
+
+    fn discard_incomplete_after_loss(&mut self, resume_timestamp: Option<u32>) {
+        self.frames.clear();
+        self.discard_timestamp = resume_timestamp;
     }
 
     fn take_ready(&mut self, now: Instant) -> Vec<Result<Vec<u8>, String>> {
@@ -1262,17 +1411,26 @@ impl PeerEvents {
             }
             let mut assembler = H264AccessUnitAssembler::default();
             let mut sequence_tracker = RtpSequenceTracker::default();
+            let mut reorder_buffer = RtpReorderBuffer::default();
             let mut keyframe_request_limiter = KeyframeRequestLimiter::default();
+            let mut awaiting_sequence_recovery = false;
+            let mut reorder_overflow_count = 0_u64;
             let mut flush_pending = tokio::time::interval(Duration::from_millis(10));
             flush_pending.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
+                let mut reorder_update = RtpReorderUpdate::default();
+                let mut confirmed_sequence_loss = false;
                 tokio::select! {
                     _ = flush_pending.tick() => {
-                        let expired = sequence_tracker.expire(Instant::now());
+                        let now = Instant::now();
+                        let expired = sequence_tracker.expire(now);
                         if expired.confirmed_missing_packets > 0 {
                             metrics.record_sequence_update(expired);
+                            confirmed_sequence_loss = true;
                         }
+                        reorder_update = reorder_buffer.expire(now);
+                        confirmed_sequence_loss |= reorder_update.confirmed_missing_packets > 0;
                     }
                     request = keyframe_request_rx.recv() => {
                         if let Some(reason) = request {
@@ -1292,32 +1450,21 @@ impl PeerEvents {
                                 metrics
                                     .interval_received_packets
                                     .fetch_add(1, Ordering::Relaxed);
+                                let now = Instant::now();
                                 let sequence_update = sequence_tracker.observe(
                                     packet.header.sequence_number,
-                                    Instant::now(),
+                                    now,
                                 );
                                 metrics.record_sequence_update(sequence_update);
                                 metrics.record_received_packet(&packet);
-                                if sequence_update.observed_gap_packets > 0 {
-                                    metrics.record_sequence_gap_resync();
-                                    assembler.frames.clear();
-                                    begin_stream_resync(
-                                        &decoder_generation,
-                                        &metrics,
-                                        &keyframe_request_tx,
-                                        PliReason::SequenceGap,
-                                    );
-                                    context.request_repaint();
+                                if sequence_update.confirmed_missing_packets > 0 {
+                                    reorder_update.append(reorder_buffer.expire(now));
+                                    confirmed_sequence_loss = true;
                                 }
-                                if let Some(error) = assembler.push(packet) {
-                                    metrics.record_assembly_error(error);
-                                    begin_stream_resync(
-                                        &decoder_generation,
-                                        &metrics,
-                                        &keyframe_request_tx,
-                                        PliReason::AssemblyError,
-                                    );
-                                    context.request_repaint();
+                                if sequence_update.duplicate_packets == 0
+                                    && sequence_update.late_after_confirmed_packets == 0
+                                {
+                                    reorder_update.append(reorder_buffer.push(packet, now));
                                 }
                             }
                             TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnEnding => break,
@@ -1326,23 +1473,83 @@ impl PeerEvents {
                     }
                 }
 
+                if confirmed_sequence_loss || reorder_update.confirmed_missing_packets > 0 {
+                    metrics.record_sequence_gap_resync();
+                    assembler.discard_incomplete_after_loss(reorder_update.resume_timestamp);
+                    if !awaiting_sequence_recovery {
+                        begin_stream_resync(
+                            &decoder_generation,
+                            &metrics,
+                            &keyframe_request_tx,
+                            PliReason::SequenceGap,
+                        );
+                        awaiting_sequence_recovery = true;
+                    }
+                    context.request_repaint();
+                }
+                if reorder_update.overflowed {
+                    reorder_overflow_count = reorder_overflow_count.saturating_add(1);
+                    if should_log_aggregate_error(reorder_overflow_count) {
+                        tracing::warn!(
+                            screen_share_session = metrics.session_id,
+                            track_ssrc = metrics.track_ssrc.load(Ordering::Relaxed),
+                            overflow_count = reorder_overflow_count,
+                            capacity_packets = MAX_BUFFERED_RTP_PACKETS,
+                            "Buffer de reordenaÃ§Ã£o RTP cheio; pacote futuro descartado"
+                        );
+                    }
+                }
+                for packet in reorder_update.ordered_packets {
+                    if let Some(error) = assembler.push(packet) {
+                        metrics.record_assembly_error(error);
+                        if !awaiting_sequence_recovery {
+                            begin_stream_resync(
+                                &decoder_generation,
+                                &metrics,
+                                &keyframe_request_tx,
+                                PliReason::AssemblyError,
+                            );
+                            awaiting_sequence_recovery = true;
+                        }
+                        context.request_repaint();
+                    }
+                }
+
                 for result in assembler.take_ready(Instant::now()) {
                     match result {
                         Ok(access_unit) => {
                             metrics.record_assembled_access_unit(&access_unit);
+                            let nal_types = annex_b_nal_types(&access_unit);
+                            let is_valid_recovery_idr = nal_types.contains(&5)
+                                && nal_types.contains(&7)
+                                && nal_types.contains(&8);
+                            // After a confirmed gap, P frames still depend on the damaged
+                            // reference chain. Keep them out of the decoder until a complete
+                            // IDR with parameter sets is accepted by its bounded queue.
+                            if awaiting_sequence_recovery && !is_valid_recovery_idr {
+                                metrics.record_drop_waiting_for_idr();
+                                continue;
+                            }
                             match decoder_tx.try_send(QueuedAccessUnit {
                                 generation: decoder_generation.load(Ordering::Relaxed),
                                 bytes: access_unit,
                             }) {
-                                Ok(()) => {}
+                                Ok(()) => {
+                                    if is_valid_recovery_idr {
+                                        awaiting_sequence_recovery = false;
+                                    }
+                                }
                                 Err(std_mpsc::TrySendError::Full(_)) => {
                                     metrics.record_decoder_queue_drop();
-                                    begin_stream_resync(
-                                        &decoder_generation,
-                                        &metrics,
-                                        &keyframe_request_tx,
-                                        PliReason::DecoderQueueFull,
-                                    );
+                                    if !awaiting_sequence_recovery {
+                                        begin_stream_resync(
+                                            &decoder_generation,
+                                            &metrics,
+                                            &keyframe_request_tx,
+                                            PliReason::DecoderQueueFull,
+                                        );
+                                        awaiting_sequence_recovery = true;
+                                    }
                                     context.request_repaint();
                                 }
                                 Err(std_mpsc::TrySendError::Disconnected(_)) => {
@@ -1355,12 +1562,15 @@ impl PeerEvents {
                         }
                         Err(error) => {
                             metrics.record_assembly_error(error);
-                            begin_stream_resync(
-                                &decoder_generation,
-                                &metrics,
-                                &keyframe_request_tx,
-                                PliReason::AssemblyError,
-                            );
+                            if !awaiting_sequence_recovery {
+                                begin_stream_resync(
+                                    &decoder_generation,
+                                    &metrics,
+                                    &keyframe_request_tx,
+                                    PliReason::AssemblyError,
+                                );
+                                awaiting_sequence_recovery = true;
+                            }
                             context.request_repaint();
                         }
                     }
@@ -1687,6 +1897,201 @@ mod tests {
                 late_after_confirmed_packets: 1,
                 ..Default::default()
             }
+        );
+    }
+
+    #[test]
+    fn rtp_reorder_buffer_restores_packets_arriving_within_the_40ms_window() {
+        let start = Instant::now();
+        let mut buffer = RtpReorderBuffer::default();
+
+        let first = buffer.push(rtp_packet(10, 100, false, &[0x41, 1]), start);
+        assert_eq!(
+            first
+                .ordered_packets
+                .iter()
+                .map(|packet| packet.header.sequence_number)
+                .collect::<Vec<_>>(),
+            [10]
+        );
+        assert!(
+            buffer
+                .push(
+                    rtp_packet(12, 100, true, &[0x41, 3]),
+                    start + Duration::from_millis(1)
+                )
+                .ordered_packets
+                .is_empty()
+        );
+        assert_eq!(
+            buffer
+                .expire(start + RTP_REORDER_DELAY - Duration::from_nanos(1))
+                .confirmed_missing_packets,
+            0
+        );
+
+        let reordered = buffer.push(
+            rtp_packet(11, 100, false, &[0x41, 2]),
+            start + Duration::from_millis(20),
+        );
+        assert_eq!(
+            reordered
+                .ordered_packets
+                .iter()
+                .map(|packet| packet.header.sequence_number)
+                .collect::<Vec<_>>(),
+            [11, 12]
+        );
+        assert_eq!(
+            buffer
+                .expire(start + Duration::from_millis(60))
+                .confirmed_missing_packets,
+            0
+        );
+    }
+
+    #[test]
+    fn rtp_reorder_buffer_confirms_loss_discards_late_packet_and_handles_wrap() {
+        let start = Instant::now();
+        let mut buffer = RtpReorderBuffer::default();
+        buffer.push(rtp_packet(10, 100, false, &[0x41, 1]), start);
+        buffer.push(
+            rtp_packet(12, 200, true, &[0x41, 2]),
+            start + Duration::from_millis(1),
+        );
+
+        let lost = buffer.expire(start + RTP_REORDER_DELAY + Duration::from_millis(1));
+        assert_eq!(lost.confirmed_missing_packets, 1);
+        assert_eq!(lost.resume_timestamp, Some(200));
+        assert_eq!(
+            lost.ordered_packets
+                .iter()
+                .map(|packet| packet.header.sequence_number)
+                .collect::<Vec<_>>(),
+            [12]
+        );
+        assert!(
+            buffer
+                .push(
+                    rtp_packet(11, 100, true, &[0x41, 3]),
+                    start + Duration::from_millis(50)
+                )
+                .ordered_packets
+                .is_empty()
+        );
+
+        let mut wrapping = RtpReorderBuffer::default();
+        wrapping.push(rtp_packet(u16::MAX - 1, 300, false, &[0x41, 1]), start);
+        let wrapped_future = wrapping.push(rtp_packet(0, 300, true, &[0x41, 3]), start);
+        assert!(wrapped_future.ordered_packets.is_empty());
+        let wrapped = wrapping.push(rtp_packet(u16::MAX, 300, false, &[0x41, 2]), start);
+        assert_eq!(
+            wrapped
+                .ordered_packets
+                .iter()
+                .map(|packet| packet.header.sequence_number)
+                .collect::<Vec<_>>(),
+            [u16::MAX, 0]
+        );
+    }
+
+    #[test]
+    fn rtp_reorder_buffer_is_bounded_and_reorders_fu_a_before_assembly() {
+        let start = Instant::now();
+        let mut buffer = RtpReorderBuffer::default();
+        buffer.push(rtp_packet(9, 99, true, &[0x41, 1]), start);
+        let mut assembler = H264AccessUnitAssembler::default();
+
+        let end = buffer.push(
+            rtp_packet(11, 100, true, &[28, 0x45, 0x99, 0x22]),
+            start + Duration::from_millis(1),
+        );
+        assert!(end.ordered_packets.is_empty());
+        let start_fragment = buffer.push(
+            rtp_packet(10, 100, false, &[28, 0x85, 0x88, 0x84]),
+            start + Duration::from_millis(2),
+        );
+        assert_eq!(
+            start_fragment
+                .ordered_packets
+                .iter()
+                .map(|packet| packet.header.sequence_number)
+                .collect::<Vec<_>>(),
+            [10, 11]
+        );
+        for packet in start_fragment.ordered_packets {
+            assert!(assembler.push(packet).is_none());
+        }
+        let ready = assembler.take_ready(start + Duration::from_millis(50));
+        let frame = ready
+            .into_iter()
+            .find_map(Result::ok)
+            .expect("FU-A reordenado deve formar um access unit válido");
+        assert_eq!(annex_b_nal_types(&frame), [5]);
+
+        let mut bounded = RtpReorderBuffer::default();
+        bounded.push(rtp_packet(100, 400, false, &[0x41, 1]), start);
+        for sequence in 102..(102 + MAX_BUFFERED_RTP_PACKETS as u16) {
+            let update = bounded.push(rtp_packet(sequence, 400, false, &[0x41, 2]), start);
+            assert!(!update.overflowed);
+        }
+        assert_eq!(bounded.pending.len(), MAX_BUFFERED_RTP_PACKETS);
+        assert!(
+            bounded
+                .push(
+                    rtp_packet(
+                        102 + MAX_BUFFERED_RTP_PACKETS as u16,
+                        400,
+                        false,
+                        &[0x41, 3]
+                    ),
+                    start
+                )
+                .overflowed
+        );
+    }
+
+    #[test]
+    fn confirmed_loss_discards_damaged_fu_a_timestamp_and_accepts_next_idr() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::default();
+        let mut assembler = H264AccessUnitAssembler::default();
+        buffer.push(rtp_packet(9, 99, true, &[0x41, 1]), now);
+        let first_fragment = buffer.push(rtp_packet(10, 100, false, &[28, 0x85, 0x88, 0x84]), now);
+        for packet in first_fragment.ordered_packets {
+            assembler.push(packet);
+        }
+        buffer.push(
+            rtp_packet(12, 100, true, &[28, 0x45, 0x99, 0x22]),
+            now + Duration::from_millis(1),
+        );
+
+        let loss = buffer.expire(now + RTP_REORDER_DELAY + Duration::from_millis(1));
+        assert_eq!(loss.confirmed_missing_packets, 1);
+        assembler.discard_incomplete_after_loss(loss.resume_timestamp);
+        for packet in loss.ordered_packets {
+            assembler.push(packet);
+        }
+        assert!(
+            assembler
+                .take_ready(now + Duration::from_millis(100))
+                .is_empty()
+        );
+
+        let recovered = buffer.push(
+            rtp_packet(13, 101, true, &[0x65, 0x88, 0x84, 0x21]),
+            now + Duration::from_millis(50),
+        );
+        for packet in recovered.ordered_packets {
+            assembler.push(packet);
+        }
+        assert!(
+            assembler
+                .take_ready(now + Duration::from_millis(100))
+                .iter()
+                .any(|unit| unit
+                    .as_ref()
+                    .is_ok_and(|bytes| annex_b_nal_types(bytes).contains(&5)))
         );
     }
 

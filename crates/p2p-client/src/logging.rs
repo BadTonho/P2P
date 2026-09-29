@@ -1,7 +1,8 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use time::{Date, Duration, OffsetDateTime};
 use tracing_subscriber::EnvFilter;
@@ -11,6 +12,107 @@ use tracing_subscriber::fmt::time::UtcTime;
 const LOG_FOLDER_NAME: &str = "P2P-Voz-e-tela";
 const LOG_FILE_PREFIX: &str = "p2p-";
 const RETENTION_DAYS: i64 = 14;
+const MAX_TRACK_SSRCS: usize = 64;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SrtpTrackContext {
+    route: Option<String>,
+    selected_ice_pair: Option<String>,
+}
+
+#[derive(Default)]
+struct SrtpContextRegistry {
+    sessions_by_ssrc: HashMap<u32, HashMap<u64, SrtpTrackContext>>,
+    ssrc_order: VecDeque<u32>,
+}
+
+static SRTP_CONTEXTS: OnceLock<Mutex<SrtpContextRegistry>> = OnceLock::new();
+
+fn srtp_context_registry() -> &'static Mutex<SrtpContextRegistry> {
+    SRTP_CONTEXTS.get_or_init(|| Mutex::new(SrtpContextRegistry::default()))
+}
+
+pub(super) fn register_srtp_track_context(
+    ssrc: u32,
+    session_id: u64,
+    route: Option<&str>,
+    selected_ice_pair: Option<&str>,
+) {
+    let mut registry = srtp_context_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !registry.sessions_by_ssrc.contains_key(&ssrc) {
+        registry.ssrc_order.push_back(ssrc);
+        if registry.ssrc_order.len() > MAX_TRACK_SSRCS {
+            if let Some(oldest) = registry.ssrc_order.pop_front() {
+                registry.sessions_by_ssrc.remove(&oldest);
+            }
+        }
+    }
+    registry.sessions_by_ssrc.entry(ssrc).or_default().insert(
+        session_id,
+        SrtpTrackContext {
+            route: route.map(str::to_owned),
+            selected_ice_pair: selected_ice_pair.map(str::to_owned),
+        },
+    );
+}
+
+pub(super) fn remove_srtp_contexts_for_session(session_id: u64) {
+    let mut registry = srtp_context_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry.sessions_by_ssrc.retain(|_, sessions| {
+        sessions.remove(&session_id);
+        !sessions.is_empty()
+    });
+    let active_ssrcs = registry
+        .sessions_by_ssrc
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    registry
+        .ssrc_order
+        .retain(|ssrc| active_ssrcs.contains(ssrc));
+}
+
+fn describe_srtp_context(registry: &SrtpContextRegistry, ssrc: Option<u32>) -> String {
+    let Some(ssrc) = ssrc else {
+        return "sessão desconhecida, SSRC desconhecido, rota desconhecida, par ICE desconhecido"
+            .to_owned();
+    };
+    let Some(sessions) = registry.sessions_by_ssrc.get(&ssrc) else {
+        return format!(
+            "sessão desconhecida, SSRC {ssrc}, rota desconhecida, par ICE desconhecido"
+        );
+    };
+    if sessions.len() != 1 {
+        return format!(
+            "sessão desconhecida (SSRC associado a {} sessões), SSRC {ssrc}, rota desconhecida, par ICE desconhecido",
+            sessions.len()
+        );
+    }
+    let Some((session_id, context)) = sessions.iter().next() else {
+        return format!(
+            "sessão desconhecida, SSRC {ssrc}, rota desconhecida, par ICE desconhecido"
+        );
+    };
+    format!(
+        "sessão {session_id}, SSRC {ssrc}, rota {}, par ICE {}",
+        context.route.as_deref().unwrap_or("desconhecida"),
+        context
+            .selected_ice_pair
+            .as_deref()
+            .unwrap_or("desconhecido")
+    )
+}
+
+fn current_srtp_context(ssrc: Option<u32>) -> String {
+    let registry = srtp_context_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    describe_srtp_context(&registry, ssrc)
+}
 
 #[derive(Default)]
 pub struct LoggingState {
@@ -65,7 +167,8 @@ struct SharedLogWriter {
 struct RollingSink {
     path: PathBuf,
     file: Option<File>,
-    duplicate_packet_warnings: u64,
+    duplicate_packet_warnings: HashMap<Option<u32>, u64>,
+    duplicate_packet_warning_order: VecDeque<Option<u32>>,
 }
 
 fn default_log_filter() -> EnvFilter {
@@ -75,6 +178,33 @@ fn default_log_filter() -> EnvFilter {
 fn is_duplicate_packet_warning(line: &str) -> bool {
     let line = line.to_ascii_lowercase();
     (line.contains("warn") || line.contains("warning")) && line.contains("duplicat")
+}
+
+fn duplicate_packet_ssrc(line: &str) -> Option<u32> {
+    let value = line.split_once("srtp ssrc=")?.1;
+    let digits = value
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn increment_duplicate_warning_count(
+    counts: &mut HashMap<Option<u32>, u64>,
+    order: &mut VecDeque<Option<u32>>,
+    ssrc: Option<u32>,
+) -> u64 {
+    if !counts.contains_key(&ssrc) {
+        order.push_back(ssrc);
+        if order.len() > 64 {
+            if let Some(oldest) = order.pop_front() {
+                counts.remove(&oldest);
+            }
+        }
+    }
+    let count = counts.entry(ssrc).or_default();
+    *count = count.saturating_add(1);
+    *count
 }
 
 fn install_subscriber<S>(subscriber: S) -> Result<(), String>
@@ -405,28 +535,35 @@ impl RollingSink {
         Ok(Self {
             path,
             file: Some(file),
-            duplicate_packet_warnings: 0,
+            duplicate_packet_warnings: HashMap::new(),
+            duplicate_packet_warning_order: VecDeque::new(),
         })
     }
 
     fn write_line(&mut self, bytes: &[u8]) -> io::Result<()> {
         let line = String::from_utf8_lossy(bytes);
         if is_duplicate_packet_warning(&line) {
-            self.duplicate_packet_warnings = self.duplicate_packet_warnings.saturating_add(1);
-            let count = self.duplicate_packet_warnings;
+            let ssrc = duplicate_packet_ssrc(&line);
+            let count = increment_duplicate_warning_count(
+                &mut self.duplicate_packet_warnings,
+                &mut self.duplicate_packet_warning_order,
+                ssrc,
+            );
             if count != 1 && !count.is_power_of_two() {
                 return Ok(());
             }
 
             let mut aggregated = bytes.to_vec();
-            if count > 1 {
-                let newline = aggregated.pop().filter(|byte| *byte == b'\n');
-                aggregated.extend_from_slice(
-                    format!(" [avisos duplicados agregados: {count} ocorrencias]").as_bytes(),
-                );
-                if let Some(newline) = newline {
-                    aggregated.push(newline);
-                }
+            let newline = aggregated.pop().filter(|byte| *byte == b'\n');
+            aggregated.extend_from_slice(
+                format!(
+                    " [avisos SRTP duplicados agregados: {count} ocorrencias; {}]",
+                    current_srtp_context(ssrc)
+                )
+                .as_bytes(),
+            );
+            if let Some(newline) = newline {
+                aggregated.push(newline);
             }
             return self.write_raw_line(&aggregated);
         }
@@ -447,7 +584,12 @@ impl RollingSink {
 
 #[cfg(test)]
 mod filter_tests {
-    use super::{default_log_filter, is_duplicate_packet_warning};
+    use super::{
+        SrtpContextRegistry, SrtpTrackContext, default_log_filter, describe_srtp_context,
+        duplicate_packet_ssrc, increment_duplicate_warning_count, is_duplicate_packet_warning,
+        register_srtp_track_context, remove_srtp_contexts_for_session, srtp_context_registry,
+    };
+    use std::collections::{HashMap, VecDeque};
 
     #[test]
     fn app_debug_is_retained_while_dependencies_use_info_default() {
@@ -464,6 +606,108 @@ mod filter_tests {
         ));
         assert!(!is_duplicate_packet_warning("DEBUG packet duplicated"));
         assert!(!is_duplicate_packet_warning("WARN ICE candidate failed"));
+    }
+
+    #[test]
+    fn duplicate_srtp_warning_extracts_ssrc_for_session_correlation() {
+        assert_eq!(
+            duplicate_packet_ssrc(
+                "WARN rtc::peer_connection::handler: SrtpHandler.handle_read got error: srtp ssrc=177936076 index=39252: duplicated"
+            ),
+            Some(177_936_076)
+        );
+        assert_eq!(duplicate_packet_ssrc("WARN packet duplicated"), None);
+    }
+
+    #[test]
+    fn duplicate_warning_counts_are_isolated_by_ssrc() {
+        let mut counts = HashMap::new();
+        let mut order = VecDeque::new();
+        assert_eq!(
+            increment_duplicate_warning_count(&mut counts, &mut order, Some(10)),
+            1
+        );
+        assert_eq!(
+            increment_duplicate_warning_count(&mut counts, &mut order, Some(20)),
+            1
+        );
+        assert_eq!(
+            increment_duplicate_warning_count(&mut counts, &mut order, Some(10)),
+            2
+        );
+    }
+
+    #[test]
+    fn duplicate_warning_context_reports_session_route_and_selected_pair_only_when_known() {
+        let mut registry = SrtpContextRegistry::default();
+        registry.sessions_by_ssrc.insert(
+            77,
+            HashMap::from([(
+                1234,
+                SrtpTrackContext {
+                    route: Some("Direto (P2P)".to_owned()),
+                    selected_ice_pair: Some("local 192.168.1.2 -> remoto 192.168.1.3".to_owned()),
+                },
+            )]),
+        );
+        let known = describe_srtp_context(&registry, Some(77));
+        assert!(known.contains("sessão 1234"));
+        assert!(known.contains("rota Direto (P2P)"));
+        assert!(known.contains("par ICE local 192.168.1.2 -> remoto 192.168.1.3"));
+
+        let unknown = describe_srtp_context(&registry, Some(88));
+        assert!(unknown.contains("rota desconhecida"));
+        assert!(unknown.contains("par ICE desconhecido"));
+        let ambiguous = describe_srtp_context(
+            &SrtpContextRegistry {
+                sessions_by_ssrc: HashMap::from([(
+                    77,
+                    HashMap::from([
+                        (1, SrtpTrackContext::default()),
+                        (2, SrtpTrackContext::default()),
+                    ]),
+                )]),
+                ..SrtpContextRegistry::default()
+            },
+            Some(77),
+        );
+        assert!(ambiguous.contains("sessão desconhecida"));
+        assert!(ambiguous.contains("par ICE desconhecido"));
+    }
+
+    #[test]
+    fn srtp_context_registration_updates_and_removes_session_correlation() {
+        let ssrc = u32::MAX - 101;
+        let session_id = u64::MAX - 201;
+        register_srtp_track_context(ssrc, session_id, None, None);
+        let registered = srtp_context_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            describe_srtp_context(&registered, Some(ssrc))
+                .contains(&format!("sessão {session_id}"))
+        );
+        drop(registered);
+
+        register_srtp_track_context(
+            ssrc,
+            session_id,
+            Some("Retransmitido (TURN)"),
+            Some("ICE TURN local -> remoto"),
+        );
+        let updated = srtp_context_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let summary = describe_srtp_context(&updated, Some(ssrc));
+        assert!(summary.contains("rota Retransmitido (TURN)"));
+        assert!(summary.contains("par ICE ICE TURN local -> remoto"));
+        drop(updated);
+
+        remove_srtp_contexts_for_session(session_id);
+        let removed = srtp_context_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(describe_srtp_context(&removed, Some(ssrc)).contains("sessão desconhecida"));
     }
 }
 

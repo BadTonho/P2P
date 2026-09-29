@@ -291,6 +291,7 @@ impl SharedMetrics {
 
     pub(super) fn set_track_ssrc(&self, ssrc: u32) {
         self.track_ssrc.store(u64::from(ssrc), Ordering::Relaxed);
+        crate::logging::register_srtp_track_context(ssrc, self.session_id, None, None);
     }
 
     pub(super) fn update_transport_diagnostics(
@@ -312,6 +313,22 @@ impl SharedMetrics {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             snapshot.selected_pair_summary.clone();
+        let ssrc = self.track_ssrc.load(Ordering::Relaxed) as u32;
+        if ssrc != 0 {
+            let route = snapshot.route.map(|route| match route {
+                MediaRoute::Direct => "Direto (P2P)",
+                MediaRoute::Turn => "Retransmitido (TURN)",
+            });
+            let selected_pair = (!snapshot.selected_pair_key.is_empty()
+                && !snapshot.selected_pair_summary.contains("desconhecido"))
+            .then_some(snapshot.selected_pair_summary.as_str());
+            crate::logging::register_srtp_track_context(
+                ssrc,
+                self.session_id,
+                route,
+                selected_pair,
+            );
+        }
         *self
             .rtc_outbound_summary
             .lock()
@@ -777,6 +794,12 @@ impl SharedMetrics {
         self.interval_encode_nanos
             .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
         self.interval_encode_samples.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for SharedMetrics {
+    fn drop(&mut self) {
+        crate::logging::remove_srtp_contexts_for_session(self.session_id);
     }
 }
 

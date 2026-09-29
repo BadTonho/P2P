@@ -126,12 +126,20 @@ impl ScreenShareSession {
 
     #[cfg(test)]
     fn new_loopback(context: egui::Context) -> Result<Self, String> {
+        Self::new_loopback_with_decoder_preference(context, VideoDecoderPreference::Automatic)
+    }
+
+    #[cfg(test)]
+    fn new_loopback_with_decoder_preference(
+        context: egui::Context,
+        decoder_preference: VideoDecoderPreference,
+    ) -> Result<Self, String> {
         Self::with_udp_address(
             context,
             "127.0.0.1:0".to_owned(),
             None,
             None,
-            VideoDecoderPreference::Automatic,
+            decoder_preference,
         )
     }
 
@@ -1495,7 +1503,11 @@ mod tests {
     fn loopback_webrtc_requests_pli_and_recovers_with_another_decodable_idr() {
         let context = egui::Context::default();
         let sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
-        let receiver = ScreenShareSession::new_loopback(context).unwrap();
+        let receiver = ScreenShareSession::new_loopback_with_decoder_preference(
+            context,
+            VideoDecoderPreference::Cpu,
+        )
+        .unwrap();
         let source = LatestFrame::default();
         source.publish(PreviewFrame {
             sequence: 1,
