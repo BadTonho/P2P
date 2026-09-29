@@ -130,7 +130,8 @@ struct ClientUi {
     screen_picker: Option<PendingScreenCapture>,
     available_monitors: Vec<MonitorOption>,
     monitors_loaded: bool,
-    selected_monitor: usize,
+    selected_monitor_id: Option<String>,
+    monitor_menu_open: bool,
     dxgi_capture_error: Option<String>,
     screen_texture: Option<egui::TextureHandle>,
     show_local_preview: bool,
@@ -202,11 +203,12 @@ impl ClientUi {
             .unwrap_or(&self.server_url)
     }
 
-    fn refresh_monitors(&mut self) {
-        if self.monitors_loaded || self.screen_capture.is_some() {
+    fn refresh_monitors(&mut self, force: bool) {
+        if self.screen_capture.is_some() || (self.monitors_loaded && !force) {
             return;
         }
         self.monitors_loaded = true;
+        let previous_selection = self.selected_monitor_id.clone();
         match ScreenCapture::monitors() {
             Ok(monitors) => {
                 tracing::info!(
@@ -214,8 +216,21 @@ impl ClientUi {
                     "Monitores ativos enumerados para DXGI"
                 );
                 self.available_monitors = monitors;
+                self.selected_monitor_id = previous_selection
+                    .filter(|device_id| {
+                        self.available_monitors
+                            .iter()
+                            .any(|monitor| &monitor.device_id == device_id)
+                    })
+                    .or_else(|| {
+                        self.available_monitors
+                            .first()
+                            .map(|monitor| monitor.device_id.clone())
+                    });
             }
             Err(error) => {
+                self.available_monitors.clear();
+                self.selected_monitor_id = None;
                 tracing::warn!(error = %error, "NÃ£o foi possÃ­vel enumerar monitores DXGI");
                 self.dxgi_capture_error = Some(error);
             }
@@ -410,7 +425,7 @@ impl ClientUi {
             context.request_repaint_after(Duration::from_millis(100));
         }
         self.refresh_microphone();
-        self.refresh_monitors();
+        self.refresh_monitors(false);
         self.refresh_screen(&context);
         self.refresh_signaling(&context);
         self.refresh_turn_state();

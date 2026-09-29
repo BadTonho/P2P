@@ -425,7 +425,7 @@ impl ClientUi {
         } else {
             "Capturar tela".to_owned()
         };
-        ui.menu_button(label, |ui| {
+        let menu_response = ui.menu_button(label, |ui| {
             if self.screen_capture.is_some() {
                 if ui.button("Parar captura da tela").clicked() {
                     self.stop_screen_capture();
@@ -438,32 +438,54 @@ impl ClientUi {
                 return;
             }
 
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!(
+                    "Monitores encontrados: {}",
+                    self.available_monitors.len()
+                ));
+                if ui.button("Atualizar lista de monitores").clicked() {
+                    self.refresh_monitors(true);
+                }
+            });
+            if self.available_monitors.len() == 1 {
+                ui.small(
+                    "O Windows disponibilizou apenas um monitor. Se esperava dois, confirme que as telas estão em modo Estender nas configurações de vídeo.",
+                );
+            } else if self.available_monitors.is_empty() {
+                ui.small(
+                    "Confira se há monitores ativos e se o Windows está configurado para Estender as telas.",
+                );
+            }
+
             if !self.available_monitors.is_empty() {
-                let selected = self.selected_monitor.min(self.available_monitors.len() - 1);
-                self.selected_monitor = selected;
+                let selected = self
+                    .available_monitors
+                    .iter()
+                    .position(|monitor| {
+                        self.selected_monitor_id.as_deref() == Some(monitor.device_id.as_str())
+                    })
+                    .unwrap_or(0);
+                let selected_monitor = &self.available_monitors[selected];
                 egui::ComboBox::from_id_salt("room-monitor-source")
-                    .selected_text(format!(
-                        "{} ({}×{})",
-                        self.available_monitors[selected].name,
-                        self.available_monitors[selected].width,
-                        self.available_monitors[selected].height
-                    ))
+                    .selected_text(selected_monitor.label(selected + 1))
                     .show_ui(ui, |ui| {
                         for (index, monitor) in self.available_monitors.iter().enumerate() {
                             ui.selectable_value(
-                                &mut self.selected_monitor,
-                                index,
-                                format!(
-                                    "{} ({}×{})",
-                                    monitor.name, monitor.width, monitor.height
-                                ),
+                                &mut self.selected_monitor_id,
+                                Some(monitor.device_id.clone()),
+                                monitor.label(index + 1),
                             );
                         }
                     });
                 if ui.button("Capturar monitor por DXGI").clicked() {
                     self.dxgi_capture_error = None;
+                    let selected_device_id = self
+                        .selected_monitor_id
+                        .as_deref()
+                        .unwrap_or(&selected_monitor.device_id)
+                        .to_owned();
                     match ScreenCapture::start_monitor(
-                        self.selected_monitor,
+                        &selected_device_id,
                         ui.ctx().clone(),
                         Arc::clone(&self.capture_preview_enabled),
                     ) {
@@ -473,11 +495,11 @@ impl ClientUi {
                                 "Captura DXGI ativa; o app não adiciona a borda de captura do Windows."
                                     .to_owned(),
                             );
-                            tracing::info!(monitor_index = self.selected_monitor + 1, "Captura DXGI iniciada pela barra da sala");
+                            tracing::info!(monitor_device_id = %selected_device_id, "Captura DXGI iniciada pela barra da sala");
                             ui.close();
                         }
                         Err(error) => {
-                            tracing::error!(error = %error, monitor_index = self.selected_monitor + 1, "Falha ao iniciar captura DXGI; Windows Graphics Capture está disponível como alternativa");
+                            tracing::error!(error = %error, monitor_device_id = %selected_device_id, "Falha ao iniciar captura DXGI; Windows Graphics Capture está disponível como alternativa");
                             self.dxgi_capture_error = Some(error.clone());
                             self.screen_status = Some(format!(
                                 "Não foi possível capturar este monitor por DXGI: {error}"
@@ -497,6 +519,12 @@ impl ClientUi {
                 ui.small("O seletor do Windows pode ser usado como alternativa.");
             }
         });
+        let menu_is_open = menu_response.inner.is_some();
+        if menu_is_open && !self.monitor_menu_open {
+            self.refresh_monitors(true);
+            ui.ctx().request_repaint();
+        }
+        self.monitor_menu_open = menu_is_open;
     }
 
     fn show_group_watch_controls(&mut self, ui: &mut egui::Ui, participants: &[ParticipantInfo]) {

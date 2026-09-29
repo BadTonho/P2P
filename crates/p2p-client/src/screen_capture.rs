@@ -29,9 +29,30 @@ const CAPTURE_PACING_JITTER_TOLERANCE: Duration = Duration::from_micros(250);
 
 #[derive(Clone, Debug)]
 pub struct MonitorOption {
+    pub device_id: String,
     pub name: String,
     pub width: u32,
     pub height: u32,
+    pub is_primary: bool,
+}
+
+impl MonitorOption {
+    pub fn label(&self, ordinal: usize) -> String {
+        let device_label = self
+            .device_id
+            .rsplit('\\')
+            .next()
+            .unwrap_or(&self.device_id);
+        let primary_label = if self.is_primary {
+            " — principal"
+        } else {
+            ""
+        };
+        format!(
+            "Monitor {ordinal} — {} ({device_label}) — {}×{}{primary_label}",
+            self.name, self.width, self.height
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -326,34 +347,50 @@ impl PickerThreadOwner {
 
 impl ScreenCapture {
     pub fn monitors() -> Result<Vec<MonitorOption>, String> {
-        Monitor::enumerate()
-            .map_err(|error| {
-                format!("NÃ£o foi possÃ­vel enumerar monitores para captura DXGI: {error}")
-            })?
+        let monitors = Monitor::enumerate().map_err(|error| {
+            format!("NÃ£o foi possÃ­vel enumerar monitores para captura DXGI: {error}")
+        })?;
+        let primary = Monitor::primary().ok();
+        monitors
             .into_iter()
             .enumerate()
             .map(|(index, monitor)| {
+                let device_id = monitor
+                    .device_name()
+                    .map_err(|_| format!("Não foi possível identificar o monitor {}", index + 1))?;
                 Ok(MonitorOption {
-                    name: monitor.device_string().unwrap_or_else(|_| {
-                        monitor
-                            .device_name()
-                            .unwrap_or_else(|_| format!("Monitor {}", index + 1))
-                    }),
+                    name: monitor
+                        .name()
+                        .unwrap_or_else(|_| format!("Monitor {}", index + 1)),
+                    device_id,
                     width: monitor.width().map_err(|error| error.to_string())?,
                     height: monitor.height().map_err(|error| error.to_string())?,
+                    is_primary: primary == Some(monitor),
                 })
             })
             .collect()
     }
 
     pub fn start_monitor(
-        index: usize,
+        device_id: &str,
         context: egui::Context,
         preview_enabled: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        let monitor = Monitor::from_index(index + 1).map_err(|error| {
-            format!("NÃ£o foi possÃ­vel localizar o monitor selecionado: {error}")
-        })?;
+        let monitor = Monitor::enumerate()
+            .map_err(|error| {
+                format!("Não foi possível atualizar a lista de monitores DXGI: {error}")
+            })?
+            .into_iter()
+            .find(|monitor| {
+                monitor
+                    .device_name()
+                    .is_ok_and(|current_id| current_id == device_id)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "O monitor {device_id} não está mais disponível. Atualize a lista e escolha outro monitor."
+                )
+            })?;
         let latest_frame = LatestFrame::default();
         let performance = Arc::new(CapturePerformanceCounters::default());
         let fallback_reason = Arc::new(Mutex::new(None));
@@ -379,10 +416,7 @@ impl ScreenCapture {
             })
             .map_err(|error| format!("NÃ£o foi possÃ­vel iniciar a thread DXGI: {error}"))?;
 
-        tracing::info!(
-            monitor_index = index + 1,
-            "Captura DXGI do monitor iniciada"
-        );
+        tracing::info!(monitor_device_id = %device_id, "Captura DXGI do monitor iniciada");
         Ok(Self {
             backend_name: "DXGI Desktop Duplication",
             control: None,
@@ -660,9 +694,33 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        FrameRateLimiter, MIN_CAPTURE_FRAME_INTERVAL, PreviewFrame, same_preview_pixels,
-        scaled_dimensions,
+        FrameRateLimiter, MIN_CAPTURE_FRAME_INTERVAL, MonitorOption, PreviewFrame,
+        same_preview_pixels, scaled_dimensions,
     };
+
+    #[test]
+    fn monitor_labels_distinguish_same_name_and_resolution_by_device_id() {
+        let primary = MonitorOption {
+            device_id: r"\\.\DISPLAY1".to_owned(),
+            name: "Monitor genérico PnP".to_owned(),
+            width: 1920,
+            height: 1080,
+            is_primary: true,
+        };
+        let secondary = MonitorOption {
+            device_id: r"\\.\DISPLAY2".to_owned(),
+            is_primary: false,
+            ..primary.clone()
+        };
+
+        let primary_label = primary.label(1);
+        let secondary_label = secondary.label(2);
+        assert_ne!(primary_label, secondary_label);
+        assert!(primary_label.contains("DISPLAY1"));
+        assert!(primary_label.contains("principal"));
+        assert!(secondary_label.contains("DISPLAY2"));
+        assert!(!secondary_label.contains("principal"));
+    }
 
     #[test]
     fn capture_limiter_accepts_first_frame_and_caps_at_30_fps() {
