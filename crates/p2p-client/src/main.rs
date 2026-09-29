@@ -25,7 +25,7 @@ use eframe::egui;
 use logging::{DiagnosticSnapshot, LoggingState, safe_signaling_endpoint, safe_stun_endpoint};
 use screen_capture::{MonitorOption, PendingScreenCapture, ScreenCapture};
 use screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
-use settings::{AppSettings, VideoDecoderPreference};
+use settings::{AppSettings, MAX_SAVED_HOSTS, SavedHostProfile, VideoDecoderPreference};
 use signaling_client::{SignalingClient, SignalingEvent};
 use signaling_protocol::{ParticipantInfo, RoomMode, SignalKind};
 use turn_relay::{TurnCredentials, TurnRelayServer, TurnRoomConfig};
@@ -90,6 +90,12 @@ struct ClientUi {
     settings_open: bool,
     settings_category: SettingsCategory,
     server_url: String,
+    public_server_url: String,
+    saved_hosts: Vec<SavedHostProfile>,
+    selected_host_index: Option<usize>,
+    new_host_name: String,
+    new_host_address: String,
+    saved_host_error: Option<String>,
     stun_server_url: String,
     create_room_mode: RoomMode,
     use_turn_on_create: bool,
@@ -208,6 +214,13 @@ struct HostAddress {
 }
 
 impl ClientUi {
+    fn join_address(&self) -> &str {
+        self.selected_host_index
+            .and_then(|index| self.saved_hosts.get(index))
+            .map(|profile| profile.address.as_str())
+            .unwrap_or(&self.server_url)
+    }
+
     fn refresh_monitors(&mut self) {
         if self.monitors_loaded || self.screen_capture.is_some() {
             return;
@@ -339,6 +352,9 @@ impl ClientUi {
     fn preferences_snapshot(&self) -> AppSettings {
         let mut settings = AppSettings::default();
         settings.server_url = self.server_url.clone();
+        settings.public_server_url = Some(self.public_server_url.clone());
+        settings.saved_hosts = self.saved_hosts.clone();
+        settings.selected_host_index = self.selected_host_index;
         settings.stun_server_url = self.stun_server_url.clone();
         settings.monitor_gain_db = self.monitor_gain_db;
         settings.video_decoder_preference = self.video_decoder_preference;
@@ -352,6 +368,11 @@ impl ClientUi {
 
     fn apply_preferences(&mut self, preferences: AppSettings) {
         self.server_url = preferences.server_url;
+        self.public_server_url = preferences.public_server_url.unwrap_or_default();
+        self.saved_hosts = preferences.saved_hosts;
+        self.selected_host_index = preferences
+            .selected_host_index
+            .filter(|index| *index < self.saved_hosts.len());
         self.stun_server_url = preferences.stun_server_url;
         self.monitor_gain_db = preferences.monitor_gain_db;
         self.video_decoder_preference = preferences.video_decoder_preference;
@@ -634,7 +655,7 @@ impl ClientUi {
             Self::show_notice(ui, "Erro de conexão:", error);
         }
         ui.collapsing("Como entrar", |ui| {
-            ui.label("Em Configurações > Conexão, informe o IPv4 ou nome DDNS compartilhado pelo anfitrião.");
+            ui.label("Escolha um anfitrião salvo na tela inicial; use Gerenciar anfitriões para adicionar ou editar endereços.");
         });
     }
 
@@ -655,8 +676,43 @@ impl ClientUi {
     }
 
     fn show_join_room_card(&mut self, ui: &mut egui::Ui) {
+        let mut manage_hosts = false;
         ui.group(|ui| {
             ui.heading("Entrar em uma sala");
+            let selected_label = self
+                .selected_host_index
+                .and_then(|index| self.saved_hosts.get(index))
+                .map(|profile| profile.name.as_str())
+                .unwrap_or("Endereço manual");
+            egui::ComboBox::from_id_salt("join-host-profile")
+                .selected_text(selected_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.selected_host_index, None, "Endereço manual");
+                    for (index, profile) in self.saved_hosts.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut self.selected_host_index,
+                            Some(index),
+                            &profile.name,
+                        );
+                    }
+                });
+            if let Some(index) = self.selected_host_index {
+                if let Some(profile) = self.saved_hosts.get(index) {
+                    ui.small(format!("Endereço: {}", profile.address));
+                    if let Err(error) = signaling_ws_url(&profile.address) {
+                        Self::show_notice(ui, "Perfil inválido:", &error);
+                    }
+                }
+            } else {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.server_url)
+                        .hint_text("IP ou nome DDNS do anfitrião")
+                        .desired_width(ui.available_width().min(420.0)),
+                );
+            }
+            if ui.small_button("Gerenciar anfitriões").clicked() {
+                manage_hosts = true;
+            }
             ui.label("Digite o código da sala:");
             ui.horizontal(|ui| {
                 let field_width = (ui.available_width() - 72.0).max(100.0);
@@ -666,7 +722,10 @@ impl ClientUi {
                         .desired_width(field_width),
                 );
 
+                let address = self.join_address();
+                let valid_address = signaling_ws_url(address).is_ok();
                 let has_code = !self.join_code.trim().is_empty()
+                    && valid_address
                     && !self.connecting
                     && !self.update_blocks_room_actions();
                 if ui
@@ -678,6 +737,9 @@ impl ClientUi {
                 }
             });
         });
+        if manage_hosts {
+            self.open_connection_settings();
+        }
     }
 
     fn show_diagnostics(&self, ui: &mut egui::Ui, open_logs_directory: &mut bool) {
@@ -974,7 +1036,7 @@ impl ClientUi {
                 ui.separator();
                 ui.heading("Convite");
                 if self.hosting_locally && self.room_mode == RoomMode::InternetTest {
-                    match signaling_ws_url(&self.server_url) {
+                    match signaling_ws_url(&self.public_server_url) {
                         Ok(url) => {
                             ui.horizontal_wrapped(|ui| {
                                 ui.monospace(&url);
@@ -1549,13 +1611,142 @@ impl ClientUi {
 
         ui.add_space(8.0);
         ui.group(|ui| {
-            ui.label("Endereço do anfitrião · porta 9000");
+            ui.heading("Anfitriões salvos");
+            ui.label("Salve os endereços das pessoas com quem você costuma entrar em salas.");
+            let mut remove_index = None;
+            let mut select_index = None;
+            for (index, profile) in self.saved_hosts.iter_mut().enumerate() {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{}.", index + 1));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut profile.name)
+                            .hint_text("Apelido")
+                            .desired_width(150.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut profile.address)
+                            .hint_text("IPv4 ou nome DDNS")
+                            .desired_width(250.0),
+                    );
+                });
+                let validation = validate_saved_host_profile(profile);
+                ui.horizontal_wrapped(|ui| {
+                    let is_selected = self.selected_host_index == Some(index);
+                    if ui
+                        .add_enabled(
+                            validation.is_ok(),
+                            egui::Button::new(if is_selected {
+                                "Selecionado"
+                            } else {
+                                "Usar ao entrar"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        select_index = Some(index);
+                    }
+                    if ui.small_button("Remover").clicked() {
+                        remove_index = Some(index);
+                    }
+                    if let Err(error) = &validation {
+                        ui.small(egui::RichText::new(error).strong());
+                    }
+                });
+            }
+            if let Some(index) = remove_index {
+                self.saved_hosts.remove(index);
+                self.selected_host_index = match self.selected_host_index {
+                    Some(selected) if selected == index => None,
+                    Some(selected) if selected > index => Some(selected - 1),
+                    selected => selected,
+                };
+                self.saved_host_error = None;
+            }
+            if let Some(index) = select_index {
+                self.selected_host_index = Some(index);
+            }
+
+            ui.separator();
+            ui.label(format!(
+                "Adicionar anfitrião ({}/{MAX_SAVED_HOSTS})",
+                self.saved_hosts.len()
+            ));
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_host_name)
+                        .hint_text("Apelido, por exemplo: Ana")
+                        .desired_width(180.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_host_address)
+                        .hint_text("IPv4 ou nome DDNS")
+                        .desired_width(260.0),
+                );
+                if ui
+                    .add_enabled(
+                        self.saved_hosts.len() < MAX_SAVED_HOSTS,
+                        egui::Button::new("Adicionar"),
+                    )
+                    .clicked()
+                {
+                    match validate_new_host_profile(
+                        &self.new_host_name,
+                        &self.new_host_address,
+                        self.saved_hosts.len(),
+                    ) {
+                        Ok(()) => {
+                            self.saved_hosts.push(SavedHostProfile {
+                                name: self.new_host_name.trim().to_owned(),
+                                address: self.new_host_address.trim().to_owned(),
+                            });
+                            self.selected_host_index = Some(self.saved_hosts.len() - 1);
+                            self.new_host_name.clear();
+                            self.new_host_address.clear();
+                            self.saved_host_error = None;
+                        }
+                        Err(error) => self.saved_host_error = Some(error),
+                    }
+                }
+            });
+            if self.saved_hosts.len() >= MAX_SAVED_HOSTS {
+                ui.small("Limite de 50 anfitriões atingido.");
+            }
+            if let Some(error) = &self.saved_host_error {
+                Self::show_notice(ui, "Não foi possível adicionar:", error);
+            }
+            ui.small("Endereços inválidos continuam visíveis para você corrigir, mas não podem ser selecionados.");
+        });
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.label("Endereço manual para entrar · porta 9000");
             ui.add(
                 egui::TextEdit::singleline(&mut self.server_url)
-                    .hint_text("IP público ou minha-sala.ddns.net")
+                    .hint_text("IP ou nome DDNS do anfitrião")
                     .desired_width(ui.available_width().min(420.0)),
             );
             match signaling_ws_url(&self.server_url) {
+                Ok(url) => {
+                    ui.monospace(url);
+                }
+                Err(error) if !self.server_url.trim().is_empty() => {
+                    Self::show_notice(ui, "Endereço manual inválido:", &error);
+                }
+                Err(_) => {}
+            }
+            ui.small("Usado quando “Endereço manual” estiver selecionado na tela inicial.");
+        });
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.label("Meu endereço público para convites · porta 9000");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.public_server_url)
+                    .hint_text("Meu IPv4 público ou minha-sala.ddns.net")
+                    .desired_width(ui.available_width().min(420.0)),
+            );
+            match signaling_ws_url(&self.public_server_url) {
                 Ok(url) => {
                     ui.horizontal_wrapped(|ui| {
                         ui.monospace(&url);
@@ -1564,11 +1755,12 @@ impl ClientUi {
                         }
                     });
                 }
-                Err(error) if !self.server_url.trim().is_empty() => {
-                    Self::show_notice(ui, "Endereço inválido:", &error);
+                Err(error) if !self.public_server_url.trim().is_empty() => {
+                    Self::show_notice(ui, "Endereço de convite inválido:", &error);
                 }
                 Err(_) => {}
             }
+            ui.small("Usado somente nos convites das suas salas pela Internet. Escolher outro anfitrião para entrar não altera este endereço.");
         });
 
         ui.add_space(8.0);
@@ -1586,12 +1778,13 @@ impl ClientUi {
         });
 
         ui.collapsing("Ajuda de conexão", |ui| {
-            ui.label("Na rede local/Radmin, informe o endereço compartilhado pelo anfitrião.");
-            ui.label("Na Internet, informe o IPv4 público ou DDNS do anfitrião; o app não detecta o IP público.");
+            ui.label("Salve um perfil por pessoa em Anfitriões salvos e escolha-o na tela inicial ao entrar.");
+            ui.label("Sem perfil selecionado, o campo Endereço manual da tela inicial será usado.");
+            ui.label("O endereço de convite é o IPv4 público ou DDNS deste computador; o app não detecta o IP público.");
             ui.label("Para hospedar na Internet, encaminhe TCP 9000 e libere a porta no firewall. TURN também requer UDP 3478 e UDP 50000–50100; CGNAT pode impedir conexões de entrada.");
             ui.label("TURN é configurado pelo anfitrião. Não é necessário manter um notebook separado ligado.");
             ui.label("ws:// não criptografa a sinalização nem autentica os participantes. Use apenas testes controlados com pessoas conhecidas.");
-            ui.label("O endereço fica salvo nas preferências locais deste aplicativo.");
+            ui.label("Perfis, endereço manual e endereço de convite ficam salvos nas preferências locais deste aplicativo.");
         });
     }
 
@@ -1696,6 +1889,17 @@ impl ClientUi {
             self.stop_screen_capture();
         }
         self.settings_category = SettingsCategory::Audio;
+        self.settings_open = true;
+    }
+
+    fn open_connection_settings(&mut self) {
+        if self.room_code.is_some() && self.screen_capture.is_some() {
+            self.stop_screen_capture();
+        }
+        if self.settings_category == SettingsCategory::Audio {
+            self.stop_microphone();
+        }
+        self.settings_category = SettingsCategory::Connection;
         self.settings_open = true;
     }
 
@@ -2677,7 +2881,7 @@ impl ClientUi {
         self.turn_config_received = false;
         self.turn_config_wait_started_at = None;
         if self.create_room_mode == RoomMode::InternetTest {
-            if let Err(error) = signaling_ws_url(&self.server_url) {
+            if let Err(error) = signaling_ws_url(&self.public_server_url) {
                 tracing::error!(reason = %error, "Configuração do endereço Internet inválida para criar sala");
                 self.connection_error = Some(format!(
                     "Configure um IPv4 público ou nome DDNS válido em Configurações > Conexão: {error}"
@@ -2690,12 +2894,12 @@ impl ClientUi {
                 return;
             }
             tracing::info!(
-                signaling_endpoint = %safe_signaling_endpoint(&self.server_url),
+                signaling_endpoint = %safe_signaling_endpoint(&self.public_server_url),
                 stun_endpoint = %safe_stun_endpoint(&self.stun_server_url),
                 "Configuração de rede do teste Internet validada"
             );
             if self.use_turn_on_create {
-                let external_ipv4 = match resolve_public_ipv4(&self.server_url) {
+                let external_ipv4 = match resolve_public_ipv4(&self.public_server_url) {
                     Ok(address) => address,
                     Err(error) => {
                         self.connection_error = Some(format!(
@@ -2763,12 +2967,12 @@ impl ClientUi {
         if self.signaling.is_some() || self.connecting || self.update_blocks_room_actions() {
             return;
         }
-        let server_url = match signaling_ws_url(&self.server_url) {
+        let server_url = match signaling_ws_url(self.join_address()) {
             Ok(url) => url,
             Err(error) => {
                 tracing::error!(reason = %error, "Endereço do anfitrião inválido ao entrar em sala");
                 self.connection_error = Some(format!(
-                    "Informe o IPv4 ou nome DDNS do anfitrião em Configurações > Conexão: {error}"
+                    "Escolha um anfitrião salvo ou informe o endereço manual na tela inicial: {error}"
                 ));
                 return;
             }
@@ -4647,7 +4851,13 @@ impl ClientUi {
             .to_owned(),
             connected_to_signaling: self.signaling.is_some() && !self.connecting,
             participant_count: self.participants.len(),
-            signaling_address: safe_signaling_endpoint(&self.server_url),
+            signaling_address: safe_signaling_endpoint(
+                if self.hosting_locally && self.room_mode == RoomMode::InternetTest {
+                    &self.public_server_url
+                } else {
+                    self.join_address()
+                },
+            ),
             stun_server: safe_stun_endpoint(&self.stun_server_url),
             microphone_active: self.microphone.is_some(),
             microphone_level_dbfs: self.microphone_level_dbfs,
@@ -4799,6 +5009,43 @@ fn signaling_ws_url(input: &str) -> Result<String, String> {
     Ok(format!("ws://{host}:9000"))
 }
 
+fn validate_saved_host_profile(profile: &SavedHostProfile) -> Result<(), String> {
+    validate_host_name(&profile.name)?;
+    let address = profile.address.trim();
+    if address.len() > 512 {
+        return Err("O endereço excede 512 caracteres.".to_owned());
+    }
+    signaling_ws_url(address).map(|_| ())
+}
+
+fn validate_new_host_profile(
+    name: &str,
+    address: &str,
+    current_count: usize,
+) -> Result<(), String> {
+    if current_count >= MAX_SAVED_HOSTS {
+        return Err(format!(
+            "A lista já atingiu o limite de {MAX_SAVED_HOSTS} anfitriões."
+        ));
+    }
+    validate_host_name(name)?;
+    validate_saved_host_profile(&SavedHostProfile {
+        name: name.trim().to_owned(),
+        address: address.trim().to_owned(),
+    })
+}
+
+fn validate_host_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Informe um apelido para este anfitrião.".to_owned());
+    }
+    if name.chars().count() > 64 {
+        return Err("O apelido pode ter no máximo 64 caracteres.".to_owned());
+    }
+    Ok(())
+}
+
 fn resolve_public_ipv4(input: &str) -> Result<Ipv4Addr, String> {
     let endpoint = signaling_ws_url(input)?;
     let authority = endpoint
@@ -4922,8 +5169,9 @@ fn format_bytes(bytes: u64) -> String {
 mod tests {
     use super::{
         group_screen_share_compatible, is_public_ipv4_candidate, next_group_media_port,
-        signaling_ws_url,
+        signaling_ws_url, validate_new_host_profile, validate_saved_host_profile,
     };
+    use crate::settings::{MAX_SAVED_HOSTS, SavedHostProfile};
     use signaling_protocol::{ParticipantInfo, RoomMode};
     use std::collections::HashSet;
     use std::net::Ipv4Addr;
@@ -4957,6 +5205,39 @@ mod tests {
         assert!(signaling_ws_url("2001:db8::1").is_err());
         assert!(signaling_ws_url("192.0.2.10:9001").is_err());
         assert!(signaling_ws_url("192.0.2.10/room").is_err());
+    }
+
+    #[test]
+    fn saved_host_profiles_validate_name_address_and_limit() {
+        assert!(validate_new_host_profile("Friend", "192.168.1.20", 0).is_ok());
+        assert!(validate_new_host_profile("  ", "192.168.1.20", 0).is_err());
+        assert!(validate_new_host_profile("Friend", "not an address", 0).is_err());
+        assert!(validate_new_host_profile("Friend", "192.168.1.20", MAX_SAVED_HOSTS).is_err());
+        assert!(validate_new_host_profile("Friend", "192.168.1.20", MAX_SAVED_HOSTS - 1).is_ok());
+        assert!(
+            validate_saved_host_profile(&SavedHostProfile {
+                name: "Friend".to_owned(),
+                address: "ws://friend.example.net:9000".to_owned(),
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn selected_saved_host_is_used_for_join_without_changing_own_invite_address() {
+        let mut ui = super::ClientUi::default();
+        ui.server_url = "manual.example.net".to_owned();
+        ui.public_server_url = "my-room.example.net".to_owned();
+        ui.saved_hosts = vec![SavedHostProfile {
+            name: "Friend".to_owned(),
+            address: "friend.example.net".to_owned(),
+        }];
+        ui.selected_host_index = Some(0);
+
+        assert_eq!(ui.join_address(), "friend.example.net");
+        assert_eq!(ui.public_server_url, "my-room.example.net");
+        ui.selected_host_index = None;
+        assert_eq!(ui.join_address(), "manual.example.net");
     }
 
     #[test]

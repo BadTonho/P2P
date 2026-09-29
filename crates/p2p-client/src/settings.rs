@@ -10,6 +10,17 @@ const SETTINGS_DIRECTORY: &str = "P2P-Voz-e-tela";
 const SETTINGS_FILE: &str = "settings.json";
 const SETTINGS_SCHEMA_VERSION: u32 = 1;
 const MAX_SETTINGS_BYTES: u64 = 128 * 1024;
+pub const MAX_SAVED_HOSTS: usize = 50;
+
+fn legacy_public_server_url() -> Option<String> {
+    None
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedHostProfile {
+    pub name: String,
+    pub address: String,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,7 +45,12 @@ impl VideoDecoderPreference {
 #[serde(default)]
 pub struct AppSettings {
     pub(crate) schema_version: u32,
+    // Kept as the manual join address for compatibility with the existing UI and settings.
     pub server_url: String,
+    #[serde(default = "legacy_public_server_url")]
+    pub public_server_url: Option<String>,
+    pub saved_hosts: Vec<SavedHostProfile>,
+    pub selected_host_index: Option<usize>,
     pub stun_server_url: String,
     pub monitor_gain_db: f32,
     pub create_room_mode: RoomMode,
@@ -50,6 +66,9 @@ impl Default for AppSettings {
         Self {
             schema_version: SETTINGS_SCHEMA_VERSION,
             server_url: String::new(),
+            public_server_url: Some(String::new()),
+            saved_hosts: Vec::new(),
+            selected_host_index: None,
             stun_server_url: "stun:stun.l.google.com:19302".to_owned(),
             monitor_gain_db: 6.0,
             create_room_mode: RoomMode::Local,
@@ -130,16 +149,48 @@ fn load_from(path: &Path) -> (AppSettings, Option<String>) {
         );
     }
 
+    let mut migration_warnings = Vec::new();
+    if settings.public_server_url.is_none() {
+        settings.public_server_url = Some(settings.server_url.clone());
+        migration_warnings.push("O endereço antigo foi copiado para o endereço de convite.");
+    }
+    if settings.saved_hosts.is_empty() && !settings.server_url.trim().is_empty() {
+        settings.saved_hosts.push(SavedHostProfile {
+            name: "Endereço anterior".to_owned(),
+            address: settings.server_url.clone(),
+        });
+        settings.selected_host_index = Some(0);
+        migration_warnings.push("O endereço antigo foi criado como primeiro anfitrião salvo.");
+    }
+    if settings.saved_hosts.len() > MAX_SAVED_HOSTS {
+        settings.saved_hosts.truncate(MAX_SAVED_HOSTS);
+        migration_warnings.push("A lista foi limitada a 50 anfitriões.");
+    }
+    if settings
+        .selected_host_index
+        .is_some_and(|index| index >= settings.saved_hosts.len())
+    {
+        settings.selected_host_index = None;
+        migration_warnings.push("A seleção de anfitrião inválida foi limpa.");
+    }
+
     let default_gain = AppSettings::default().monitor_gain_db;
     if !settings.monitor_gain_db.is_finite() {
         settings.monitor_gain_db = default_gain;
     } else {
         settings.monitor_gain_db = settings.monitor_gain_db.clamp(0.0, 18.0);
     }
-    (settings, None)
+    let warning = (!migration_warnings.is_empty()).then(|| migration_warnings.join(" "));
+    (settings, warning)
 }
 
 fn save_to(path: &Path, settings: &AppSettings) -> io::Result<()> {
+    if settings.saved_hosts.len() > MAX_SAVED_HOSTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a lista pode conter no máximo {MAX_SAVED_HOSTS} anfitriões"),
+        ));
+    }
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "caminho sem pasta"))?;
@@ -228,6 +279,12 @@ mod tests {
         let path = directory.join(SETTINGS_FILE);
         let settings = AppSettings {
             server_url: "192.168.1.20".to_owned(),
+            public_server_url: Some("my-room.example.net".to_owned()),
+            saved_hosts: vec![SavedHostProfile {
+                name: "Friend".to_owned(),
+                address: "192.168.1.20".to_owned(),
+            }],
+            selected_host_index: Some(0),
             monitor_gain_db: 12.0,
             create_room_mode: RoomMode::InternetTest,
             may_host: true,
@@ -285,6 +342,64 @@ mod tests {
         let loaded: AppSettings =
             serde_json::from_value(stored).expect("older settings files should remain compatible");
         assert!(loaded.show_local_preview);
+    }
+
+    #[test]
+    fn legacy_address_is_copied_to_invite_and_initial_host_profile() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).expect("test directory should be created");
+        let path = directory.join(SETTINGS_FILE);
+        let mut legacy =
+            serde_json::to_value(AppSettings::default()).expect("settings should serialize");
+        let object = legacy
+            .as_object_mut()
+            .expect("settings should serialize as an object");
+        object.insert(
+            "server_url".to_owned(),
+            serde_json::Value::String("friend.example.net".to_owned()),
+        );
+        object.remove("public_server_url");
+        object.remove("saved_hosts");
+        object.remove("selected_host_index");
+        fs::write(
+            &path,
+            serde_json::to_vec(&legacy).expect("legacy settings should serialize"),
+        )
+        .expect("legacy settings should be written");
+
+        let (loaded, warning) = load_from(&path);
+        assert_eq!(loaded.server_url, "friend.example.net");
+        assert_eq!(
+            loaded.public_server_url.as_deref(),
+            Some("friend.example.net")
+        );
+        assert_eq!(
+            loaded.saved_hosts,
+            vec![SavedHostProfile {
+                name: "Endereço anterior".to_owned(),
+                address: "friend.example.net".to_owned(),
+            }]
+        );
+        assert_eq!(loaded.selected_host_index, Some(0));
+        assert!(warning.is_some());
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn settings_are_limited_to_fifty_saved_hosts() {
+        let directory = temporary_directory();
+        let path = directory.join(SETTINGS_FILE);
+        let settings = AppSettings {
+            saved_hosts: (0..=MAX_SAVED_HOSTS)
+                .map(|index| SavedHostProfile {
+                    name: format!("Host {index}"),
+                    address: "192.168.1.20".to_owned(),
+                })
+                .collect(),
+            ..AppSettings::default()
+        };
+        let error = save_to(&path, &settings).expect_err("more than 50 hosts should be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
