@@ -61,6 +61,6 @@ Reavaliar `control_mesh.rs` (cerca de 1.800 linhas), `mf_video.rs` (cerca de 1.7
 Fazer as etapas na ordem acima. A primeira prioridade é `main.rs`; a segunda é o pipeline de vídeo. Atualizar as caixas de estado abaixo ao concluir cada etapa.
 
 - Etapa 1: concluída — interface extraída para módulos; `cargo fmt --all -- --check`, testes offline e build offline passaram.
-- Etapa 2: pendente
+- Etapa 2: concluída — ciclo de vida da sala, participantes/sucessão e compartilhamento em grupo extraídos para módulos; formatação, testes offline e build offline passaram.
 - Etapa 3: pendente
 - Etapa 4: pendente
