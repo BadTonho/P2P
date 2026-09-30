@@ -113,6 +113,7 @@ enum Command {
         source: LatestFrame,
         bitrate_bps: u32,
         include_system_audio: bool,
+        audio_source_override: Option<Box<dyn AudioSampleSource>>,
     },
     Signal {
         kind: SignalKind,
@@ -333,6 +334,23 @@ impl ScreenShareSession {
                 source,
                 bitrate_bps: bitrate_bps.clamp(250_000, MAX_PEER_MEDIA_BITRATE),
                 include_system_audio,
+                audio_source_override: None,
+            })
+            .map_err(|_| "A sessão WebRTC foi encerrada.".to_owned())
+    }
+
+    #[cfg(test)]
+    fn start_sending_with_test_audio(
+        &self,
+        source: LatestFrame,
+        audio_source: Box<dyn AudioSampleSource>,
+    ) -> Result<(), String> {
+        self.commands
+            .send(Command::StartSending {
+                source,
+                bitrate_bps: MAX_PEER_MEDIA_BITRATE,
+                include_system_audio: false,
+                audio_source_override: Some(audio_source),
             })
             .map_err(|_| "A sessão WebRTC foi encerrada.".to_owned())
     }
@@ -802,7 +820,7 @@ async fn run_session(
             command = commands.recv() => {
                 let Some(command) = command else { break };
         match command {
-            Command::StartSending { source, bitrate_bps, include_system_audio } => {
+            Command::StartSending { source, bitrate_bps, include_system_audio, audio_source_override } => {
                 if active_peer.is_some() {
                     let _ = events.send(ScreenShareEvent::Error(
                         "Já existe uma sessão de compartilhamento ativa.".to_owned(),
@@ -823,6 +841,7 @@ async fn run_session(
                     decoder_preference,
                     bitrate_bps,
                     include_system_audio,
+                    audio_source_override,
                     Arc::clone(&audio_playback_factory),
                 )
                 .await
@@ -1331,12 +1350,17 @@ async fn create_sender(
     decoder_preference: VideoDecoderPreference,
     bitrate_bps: u32,
     include_system_audio: bool,
+    audio_source_override: Option<Box<dyn AudioSampleSource>>,
     audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
 ) -> Result<PeerSession, String> {
-    let (system_audio, audio_setup_error) = if include_system_audio {
+    let include_audio = include_system_audio || audio_source_override.is_some();
+    let (system_audio, audio_setup_error) = if include_audio {
+        let mut audio_source_override = audio_source_override;
         let result = (|| {
-            let capture: Box<dyn AudioSampleSource> =
-                Box::new(SystemAudioCapture::start(metrics.session_id)?);
+            let capture: Box<dyn AudioSampleSource> = match audio_source_override.take() {
+                Some(capture) => capture,
+                None => Box::new(SystemAudioCapture::start(metrics.session_id)?),
+            };
             let (input_rate_hz, input_channels) = capture.input_format();
             tracing::info!(
                 screen_share_session = metrics.session_id,
@@ -2261,26 +2285,52 @@ mod tests {
     }
 
     #[test]
-    fn loopback_group_video_arrives_and_decodes_in_both_directions() {
+    fn loopback_group_audio_does_not_block_video_tracks_in_either_direction() {
         let context = egui::Context::default();
         let a_sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
-        let b_receiver = ScreenShareSession::new_loopback_with_decoder_preference(
+        let b_receive_audio_probe = Arc::new(SyntheticAudioProbe::default());
+        let b_receiver = ScreenShareSession::with_udp_address_and_audio_factory(
             context.clone(),
+            "127.0.0.1:0".to_owned(),
+            None,
+            None,
             VideoDecoderPreference::Cpu,
+            Arc::new(SyntheticAudioPlaybackFactory {
+                probe: Arc::clone(&b_receive_audio_probe),
+            }),
         )
         .unwrap();
         let b_sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
-        let a_receiver = ScreenShareSession::new_loopback_with_decoder_preference(
+        let a_receive_audio_probe = Arc::new(SyntheticAudioProbe::default());
+        let a_receiver = ScreenShareSession::with_udp_address_and_audio_factory(
             context,
+            "127.0.0.1:0".to_owned(),
+            None,
+            None,
             VideoDecoderPreference::Cpu,
+            Arc::new(SyntheticAudioPlaybackFactory {
+                probe: Arc::clone(&a_receive_audio_probe),
+            }),
         )
         .unwrap();
         let a_source = LatestFrame::default();
         let b_source = LatestFrame::default();
+        let a_audio_source_probe = Arc::new(SyntheticAudioProbe::default());
+        let b_audio_source_probe = Arc::new(SyntheticAudioProbe::default());
         a_source.publish(test_frame(1, 64));
         b_source.publish(test_frame(1, 192));
-        a_sender.start_sending(a_source.clone()).unwrap();
-        b_sender.start_sending(b_source.clone()).unwrap();
+        a_sender
+            .start_sending_with_test_audio(
+                a_source.clone(),
+                Box::new(SyntheticAudioSource::new(Arc::clone(&a_audio_source_probe))),
+            )
+            .unwrap();
+        b_sender
+            .start_sending_with_test_audio(
+                b_source.clone(),
+                Box::new(SyntheticAudioSource::new(Arc::clone(&b_audio_source_probe))),
+            )
+            .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut sequence = 1_u64;
@@ -2306,6 +2356,8 @@ mod tests {
                     && b_receive.decoded_frames > 0
                     && a_receive.published_frames > 0
                     && b_receive.published_frames > 0
+                    && a_receive_audio_probe.decoded_frames.load(Ordering::Relaxed) > 0
+                    && b_receive_audio_probe.decoded_frames.load(Ordering::Relaxed) > 0
                 {
                     break;
                 }
@@ -2335,6 +2387,44 @@ mod tests {
         assert!(b_send.sent_frames > 0 && a_receive.received_packets > 0);
         assert!(a_receive.decoded_frames > 0 && b_receive.decoded_frames > 0);
         assert!(a_receive.published_frames > 0 && b_receive.published_frames > 0);
+        assert!(
+            a_audio_source_probe
+                .source_callbacks
+                .load(Ordering::Relaxed)
+                > 0
+        );
+        assert!(
+            b_audio_source_probe
+                .source_callbacks
+                .load(Ordering::Relaxed)
+                > 0
+        );
+        assert!(
+            a_receive_audio_probe
+                .playback_factory_starts
+                .load(Ordering::Relaxed)
+                > 0
+        );
+        assert!(
+            b_receive_audio_probe
+                .playback_factory_starts
+                .load(Ordering::Relaxed)
+                > 0
+        );
+        assert!(a_receive_audio_probe.decoded_frames.load(Ordering::Relaxed) > 0);
+        assert!(b_receive_audio_probe.decoded_frames.load(Ordering::Relaxed) > 0);
+        assert!(
+            a_receive_audio_probe
+                .decoded_audible_samples
+                .load(Ordering::Relaxed)
+                > 0
+        );
+        assert!(
+            b_receive_audio_probe
+                .decoded_audible_samples
+                .load(Ordering::Relaxed)
+                > 0
+        );
         assert_eq!(a_send.track_ssrc, b_receive.track_ssrc);
         assert_eq!(b_send.track_ssrc, a_receive.track_ssrc);
     }

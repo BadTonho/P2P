@@ -836,7 +836,17 @@ fn should_decode_access_unit(waiting_for_idr: &mut bool, access_unit: &[u8]) -> 
 impl PeerEvents {
     pub(super) async fn receive_remote_track(&self, track: Arc<dyn TrackRemote>) {
         if track.kind().await == RtpCodecKind::Audio {
-            self.receive_remote_audio_track(track).await;
+            // The WebRTC driver awaits this callback while processing track events.
+            // Audio reception runs for the lifetime of the track, so doing it inline
+            // would block the driver from delivering the video track event on the same
+            // peer connection.
+            let session_id = self.metrics.session_id;
+            let events = self.events.clone();
+            let audio_playback_factory = Arc::clone(&self.audio_playback_factory);
+            tokio::spawn(async move {
+                Self::receive_remote_audio_track(track, session_id, events, audio_playback_factory)
+                    .await;
+            });
             return;
         }
         self.metrics
@@ -1593,8 +1603,12 @@ impl PeerEvents {
         });
     }
 
-    async fn receive_remote_audio_track(&self, track: Arc<dyn TrackRemote>) {
-        let session_id = self.metrics.session_id;
+    async fn receive_remote_audio_track(
+        track: Arc<dyn TrackRemote>,
+        session_id: u64,
+        events: std_mpsc::Sender<ScreenShareEvent>,
+        audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
+    ) {
         let ssrc = track.ssrcs().await.first().copied().unwrap_or_default();
         let track_kind = track.kind().await;
         tracing::info!(
@@ -1603,7 +1617,7 @@ impl PeerEvents {
             kind = ?track_kind,
             "Faixa Opus remota recebida; preparando decodificação e saída"
         );
-        let mut playback = match self.audio_playback_factory.start(session_id, ssrc) {
+        let mut playback = match audio_playback_factory.start(session_id, ssrc) {
             Ok(playback) => playback,
             Err(error) => {
                 tracing::error!(
@@ -1613,7 +1627,7 @@ impl PeerEvents {
                     error = %error,
                     "Não foi possível abrir a saída de áudio"
                 );
-                let _ = self.events.send(ScreenShareEvent::AudioError(format!(
+                let _ = events.send(ScreenShareEvent::AudioError(format!(
                     "O áudio remoto chegou, mas não foi possível abrir a saída do Windows: {error}"
                 )));
                 return;
@@ -1630,7 +1644,7 @@ impl PeerEvents {
                     error = %message,
                     "Decoder de áudio não pôde ser iniciado"
                 );
-                let _ = self.events.send(ScreenShareEvent::AudioError(message));
+                let _ = events.send(ScreenShareEvent::AudioError(message));
                 return;
             }
         };
@@ -1700,7 +1714,7 @@ impl PeerEvents {
                             error = %error,
                             "Saída de áudio remoto parou"
                         );
-                        let _ = self.events.send(ScreenShareEvent::AudioError(format!(
+                        let _ = events.send(ScreenShareEvent::AudioError(format!(
                             "A saída de áudio remoto parou: {error}"
                         )));
                         break;
@@ -1714,7 +1728,7 @@ impl PeerEvents {
                         stage = "audio_rtp_receive",
                         "A faixa RTP de áudio informou erro"
                     );
-                    let _ = self.events.send(ScreenShareEvent::AudioError(
+                    let _ = events.send(ScreenShareEvent::AudioError(
                         "A faixa RTP do áudio remoto informou erro.".to_owned(),
                     ));
                     break;
@@ -1742,9 +1756,7 @@ impl PeerEvents {
                     output_non_silent_delta,
                 );
                 if audio_state != last_audio_state {
-                    let _ = self
-                        .events
-                        .send(ScreenShareEvent::AudioState(audio_state.clone()));
+                    let _ = events.send(ScreenShareEvent::AudioState(audio_state.clone()));
                     last_audio_state = audio_state;
                 }
                 tracing::info!(
