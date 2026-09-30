@@ -1556,8 +1556,13 @@ async fn send_system_audio(
     let mut written_samples = 0_u64;
     let mut write_failures = 0_u64;
     let mut last_report_at = Instant::now();
+    let mut last_callbacks = capture.callbacks();
+    let mut last_input_frames = capture.input_frames();
     let mut last_capture_frames = capture.captured_frames();
     let mut last_dropped_frames = capture.dropped_frames();
+    let mut last_xruns = capture.xruns();
+    let mut last_device_changes = capture.device_changes();
+    let mut last_realtime_denied = capture.realtime_denied();
     let mut last_encoded_frames = 0_u64;
     let mut last_encoded_bytes = 0_u64;
     let mut last_written_samples = 0_u64;
@@ -1565,16 +1570,17 @@ async fn send_system_audio(
 
     loop {
         interval.tick().await;
-        if let Some(error) = capture.take_error() {
+        if let Some((kind, error)) = capture.take_error() {
             tracing::error!(
                 screen_share_session = session_id,
                 audio_track_ssrc = ssrc,
                 stage = "wasapi_loopback_callback",
+                error_kind = ?kind,
                 error = %error,
                 "Captura do áudio do sistema interrompida"
             );
             let _ = events.send(ScreenShareEvent::AudioError(format!(
-                "A captura do som do computador parou: {error}"
+                "A captura do som do computador parou ({kind:?}): {error}"
             )));
             break;
         }
@@ -1638,24 +1644,66 @@ async fn send_system_audio(
         }
 
         if last_report_at.elapsed() >= Duration::from_secs(5) {
+            let callbacks = capture.callbacks();
+            let input_frames = capture.input_frames();
             let captured = capture.captured_frames();
             let dropped = capture.dropped_frames();
-            tracing::info!(
-                screen_share_session = session_id,
-                audio_track_ssrc = ssrc,
-                interval_seconds = last_report_at.elapsed().as_secs_f64(),
-                captured_frames = captured.saturating_sub(last_capture_frames),
-                capture_queue_drops = dropped.saturating_sub(last_dropped_frames),
-                encoded_frames = encoded_frames.saturating_sub(last_encoded_frames),
-                encoded_bytes = encoded_bytes.saturating_sub(last_encoded_bytes),
-                rtp_samples_accepted = written_samples.saturating_sub(last_written_samples),
-                rtp_write_failures = write_failures.saturating_sub(last_write_failures),
-                pending_pcm_samples = filled,
-                "Resumo periódico do envio de áudio do sistema"
-            );
+            let xruns = capture.xruns();
+            let device_changes = capture.device_changes();
+            let realtime_denied = capture.realtime_denied();
+            let callback_delta = callbacks.saturating_sub(last_callbacks);
+            let input_frame_delta = input_frames.saturating_sub(last_input_frames);
+            let xrun_delta = xruns.saturating_sub(last_xruns);
+            let device_change_delta = device_changes.saturating_sub(last_device_changes);
+            let realtime_denied_delta = realtime_denied.saturating_sub(last_realtime_denied);
+            let interval_seconds = last_report_at.elapsed().as_secs_f64();
+            if xrun_delta + device_change_delta + realtime_denied_delta > 0 {
+                tracing::warn!(
+                    screen_share_session = session_id,
+                    audio_track_ssrc = ssrc,
+                    interval_seconds,
+                    capture_callbacks = callback_delta,
+                    input_frames = input_frame_delta,
+                    captured_frames = captured.saturating_sub(last_capture_frames),
+                    capture_queue_drops = dropped.saturating_sub(last_dropped_frames),
+                    xrun_warnings = xrun_delta,
+                    device_change_warnings = device_change_delta,
+                    realtime_priority_warnings = realtime_denied_delta,
+                    encoded_frames = encoded_frames.saturating_sub(last_encoded_frames),
+                    encoded_bytes = encoded_bytes.saturating_sub(last_encoded_bytes),
+                    rtp_samples_accepted = written_samples.saturating_sub(last_written_samples),
+                    rtp_write_failures = write_failures.saturating_sub(last_write_failures),
+                    pending_pcm_samples = filled,
+                    "Resumo de áudio com avisos recuperáveis; captura continua ativa"
+                );
+            } else {
+                tracing::info!(
+                    screen_share_session = session_id,
+                    audio_track_ssrc = ssrc,
+                    interval_seconds,
+                    capture_callbacks = callback_delta,
+                    input_frames = input_frame_delta,
+                    captured_frames = captured.saturating_sub(last_capture_frames),
+                    capture_queue_drops = dropped.saturating_sub(last_dropped_frames),
+                    xrun_warnings = xrun_delta,
+                    device_change_warnings = device_change_delta,
+                    realtime_priority_warnings = realtime_denied_delta,
+                    encoded_frames = encoded_frames.saturating_sub(last_encoded_frames),
+                    encoded_bytes = encoded_bytes.saturating_sub(last_encoded_bytes),
+                    rtp_samples_accepted = written_samples.saturating_sub(last_written_samples),
+                    rtp_write_failures = write_failures.saturating_sub(last_write_failures),
+                    pending_pcm_samples = filled,
+                    "Resumo periódico do envio de áudio do sistema"
+                );
+            }
             last_report_at = Instant::now();
+            last_callbacks = callbacks;
+            last_input_frames = input_frames;
             last_capture_frames = captured;
             last_dropped_frames = dropped;
+            last_xruns = xruns;
+            last_device_changes = device_changes;
+            last_realtime_denied = realtime_denied;
             last_encoded_frames = encoded_frames;
             last_encoded_bytes = encoded_bytes;
             last_written_samples = written_samples;
@@ -1668,6 +1716,12 @@ async fn send_system_audio(
         audio_track_ssrc = ssrc,
         encoded_frames,
         encoded_bytes,
+        capture_callbacks = capture.callbacks(),
+        input_frames = capture.input_frames(),
+        xrun_warnings = capture.xruns(),
+        device_change_warnings = capture.device_changes(),
+        realtime_priority_warnings = capture.realtime_denied(),
+        captured_frames = capture.captured_frames(),
         rtp_samples_accepted = written_samples,
         rtp_write_failures = write_failures,
         capture_queue_drops = capture.dropped_frames(),
@@ -1822,6 +1876,9 @@ mod tests {
                         receiver.handle_signal(kind, payload).unwrap();
                     }
                     ScreenShareEvent::Error(error) => panic!("sender session failed: {error}"),
+                    ScreenShareEvent::AudioError(error) => {
+                        panic!("sender audio session failed: {error}")
+                    }
                     ScreenShareEvent::ConnectionClosed => {
                         panic!("sender connection closed before receiving a frame")
                     }
@@ -1834,6 +1891,9 @@ mod tests {
                         sender.handle_signal(kind, payload).unwrap();
                     }
                     ScreenShareEvent::Error(error) => panic!("receiver session failed: {error}"),
+                    ScreenShareEvent::AudioError(error) => {
+                        panic!("receiver audio session failed: {error}")
+                    }
                     ScreenShareEvent::ConnectionClosed => {
                         panic!("receiver connection closed before receiving a frame")
                     }

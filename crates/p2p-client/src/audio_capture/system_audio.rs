@@ -16,9 +16,35 @@ pub(crate) struct SystemAudioCapture {
     consumer: Consumer<f32>,
     input_rate: u32,
     input_channels: usize,
-    captured_frames: Arc<AtomicU64>,
-    dropped_frames: Arc<AtomicU64>,
-    callback_error: Arc<Mutex<Option<String>>>,
+    diagnostics: Arc<CaptureDiagnostics>,
+}
+
+#[derive(Default)]
+struct CaptureDiagnostics {
+    callbacks: AtomicU64,
+    input_frames: AtomicU64,
+    captured_frames: AtomicU64,
+    dropped_frames: AtomicU64,
+    xruns: AtomicU64,
+    device_changes: AtomicU64,
+    realtime_denied: AtomicU64,
+    fatal_error: Mutex<Option<(cpal::ErrorKind, String)>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoverableCaptureError {
+    Xrun,
+    DeviceChanged,
+    RealtimeDenied,
+}
+
+fn classify_capture_error(kind: cpal::ErrorKind) -> Option<RecoverableCaptureError> {
+    match kind {
+        cpal::ErrorKind::Xrun => Some(RecoverableCaptureError::Xrun),
+        cpal::ErrorKind::DeviceChanged => Some(RecoverableCaptureError::DeviceChanged),
+        cpal::ErrorKind::RealtimeDenied => Some(RecoverableCaptureError::RealtimeDenied),
+        _ => None,
+    }
 }
 
 impl SystemAudioCapture {
@@ -38,9 +64,7 @@ impl SystemAudioCapture {
         let queue_capacity =
             (OPUS_SAMPLE_RATE as usize * OPUS_CHANNELS * CAPTURE_QUEUE_MILLIS / 1000).max(2);
         let (producer, consumer) = RingBuffer::<f32>::new(queue_capacity);
-        let captured_frames = Arc::new(AtomicU64::new(0));
-        let dropped_frames = Arc::new(AtomicU64::new(0));
-        let callback_error = Arc::new(Mutex::new(None));
+        let capture_diagnostics = Arc::new(CaptureDiagnostics::default());
 
         let stream = match sample_format {
             cpal::SampleFormat::I8 => build_loopback_stream::<i8>(
@@ -49,10 +73,7 @@ impl SystemAudioCapture {
                 input_channels,
                 input_rate,
                 producer,
-                &captured_frames,
-                &dropped_frames,
-                &callback_error,
-                session_id,
+                &capture_diagnostics,
             ),
             cpal::SampleFormat::I16 => build_loopback_stream::<i16>(
                 &device,
@@ -60,10 +81,7 @@ impl SystemAudioCapture {
                 input_channels,
                 input_rate,
                 producer,
-                &captured_frames,
-                &dropped_frames,
-                &callback_error,
-                session_id,
+                &capture_diagnostics,
             ),
             cpal::SampleFormat::I24 => build_loopback_stream::<cpal::I24>(
                 &device,
@@ -71,10 +89,7 @@ impl SystemAudioCapture {
                 input_channels,
                 input_rate,
                 producer,
-                &captured_frames,
-                &dropped_frames,
-                &callback_error,
-                session_id,
+                &capture_diagnostics,
             ),
             cpal::SampleFormat::I32 => build_loopback_stream::<i32>(
                 &device,
@@ -82,10 +97,7 @@ impl SystemAudioCapture {
                 input_channels,
                 input_rate,
                 producer,
-                &captured_frames,
-                &dropped_frames,
-                &callback_error,
-                session_id,
+                &capture_diagnostics,
             ),
             cpal::SampleFormat::I64 => build_loopback_stream::<i64>(
                 &device,
@@ -93,10 +105,7 @@ impl SystemAudioCapture {
                 input_channels,
                 input_rate,
                 producer,
-                &captured_frames,
-                &dropped_frames,
-                &callback_error,
-                session_id,
+                &capture_diagnostics,
             ),
             cpal::SampleFormat::U8 => build_loopback_stream::<u8>(
                 &device,
@@ -104,10 +113,7 @@ impl SystemAudioCapture {
                 input_channels,
                 input_rate,
                 producer,
-                &captured_frames,
-                &dropped_frames,
-                &callback_error,
-                session_id,
+                &capture_diagnostics,
             ),
             cpal::SampleFormat::U16 => build_loopback_stream::<u16>(
                 &device,
@@ -115,10 +121,7 @@ impl SystemAudioCapture {
                 input_channels,
                 input_rate,
                 producer,
-                &captured_frames,
-                &dropped_frames,
-                &callback_error,
-                session_id,
+                &capture_diagnostics,
             ),
             cpal::SampleFormat::U24 => build_loopback_stream::<cpal::U24>(
                 &device,
@@ -126,10 +129,7 @@ impl SystemAudioCapture {
                 input_channels,
                 input_rate,
                 producer,
-                &captured_frames,
-                &dropped_frames,
-                &callback_error,
-                session_id,
+                &capture_diagnostics,
             ),
             cpal::SampleFormat::U32 => build_loopback_stream::<u32>(
                 &device,
@@ -137,10 +137,7 @@ impl SystemAudioCapture {
                 input_channels,
                 input_rate,
                 producer,
-                &captured_frames,
-                &dropped_frames,
-                &callback_error,
-                session_id,
+                &capture_diagnostics,
             ),
             cpal::SampleFormat::U64 => build_loopback_stream::<u64>(
                 &device,
@@ -148,10 +145,7 @@ impl SystemAudioCapture {
                 input_channels,
                 input_rate,
                 producer,
-                &captured_frames,
-                &dropped_frames,
-                &callback_error,
-                session_id,
+                &capture_diagnostics,
             ),
             cpal::SampleFormat::F32 => build_loopback_stream::<f32>(
                 &device,
@@ -159,10 +153,7 @@ impl SystemAudioCapture {
                 input_channels,
                 input_rate,
                 producer,
-                &captured_frames,
-                &dropped_frames,
-                &callback_error,
-                session_id,
+                &capture_diagnostics,
             ),
             cpal::SampleFormat::F64 => build_loopback_stream::<f64>(
                 &device,
@@ -170,10 +161,7 @@ impl SystemAudioCapture {
                 input_channels,
                 input_rate,
                 producer,
-                &captured_frames,
-                &dropped_frames,
-                &callback_error,
-                session_id,
+                &capture_diagnostics,
             ),
             format => Err(format!(
                 "Formato de captura de áudio não suportado: {format:?}"
@@ -198,9 +186,7 @@ impl SystemAudioCapture {
             consumer,
             input_rate,
             input_channels,
-            captured_frames,
-            dropped_frames,
-            callback_error,
+            diagnostics: capture_diagnostics,
         })
     }
 
@@ -219,15 +205,36 @@ impl SystemAudioCapture {
     }
 
     pub(crate) fn captured_frames(&self) -> u64 {
-        self.captured_frames.load(Ordering::Relaxed)
+        self.diagnostics.captured_frames.load(Ordering::Relaxed)
     }
 
     pub(crate) fn dropped_frames(&self) -> u64 {
-        self.dropped_frames.load(Ordering::Relaxed)
+        self.diagnostics.dropped_frames.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn take_error(&self) -> Option<String> {
-        self.callback_error
+    pub(crate) fn callbacks(&self) -> u64 {
+        self.diagnostics.callbacks.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn input_frames(&self) -> u64 {
+        self.diagnostics.input_frames.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn xruns(&self) -> u64 {
+        self.diagnostics.xruns.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn device_changes(&self) -> u64 {
+        self.diagnostics.device_changes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn realtime_denied(&self) -> u64 {
+        self.diagnostics.realtime_denied.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn take_error(&self) -> Option<(cpal::ErrorKind, String)> {
+        self.diagnostics
+            .fatal_error
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
@@ -244,18 +251,14 @@ fn build_loopback_stream<T>(
     channels: usize,
     input_rate: u32,
     mut producer: Producer<f32>,
-    captured_frames: &Arc<AtomicU64>,
-    dropped_frames: &Arc<AtomicU64>,
-    callback_error: &Arc<Mutex<Option<String>>>,
-    session_id: u64,
+    diagnostics: &Arc<CaptureDiagnostics>,
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
 {
-    let captured_frames = Arc::clone(captured_frames);
-    let dropped_frames = Arc::clone(dropped_frames);
-    let callback_error = Arc::clone(callback_error);
+    let diagnostics = Arc::clone(diagnostics);
+    let error_diagnostics = Arc::clone(&diagnostics);
     let channels = channels.max(1);
     let rate_ratio = OPUS_SAMPLE_RATE as f64 / f64::from(input_rate.max(1));
     let mut resample_phase = 0.0_f64;
@@ -264,6 +267,10 @@ where
         .build_input_stream::<T, _, _>(
             config,
             move |input, _| {
+                diagnostics.callbacks.fetch_add(1, Ordering::Relaxed);
+                diagnostics
+                    .input_frames
+                    .fetch_add((input.len() / channels) as u64, Ordering::Relaxed);
                 for frame in input.chunks(channels) {
                     if frame.is_empty() {
                         continue;
@@ -279,25 +286,42 @@ where
                         if producer.slots() >= OPUS_CHANNELS {
                             let _ = producer.push(left.clamp(-1.0, 1.0));
                             let _ = producer.push(right.clamp(-1.0, 1.0));
-                            captured_frames.fetch_add(1, Ordering::Relaxed);
+                            diagnostics.captured_frames.fetch_add(1, Ordering::Relaxed);
                         } else {
-                            dropped_frames.fetch_add(1, Ordering::Relaxed);
+                            diagnostics.dropped_frames.fetch_add(1, Ordering::Relaxed);
                         }
                         resample_phase -= 1.0;
                     }
                 }
             },
             move |error| {
-                let detail = format!("Falha no callback do loopback de áudio: {error}");
-                tracing::error!(
-                    screen_share_session = session_id,
-                    stage = "wasapi_loopback_callback",
-                    error = %detail,
-                    "Captura de áudio do sistema falhou"
-                );
-                *callback_error
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail);
+                let kind = error.kind();
+                if let Some(recoverable) = classify_capture_error(kind) {
+                    match recoverable {
+                        RecoverableCaptureError::Xrun => {
+                            error_diagnostics.xruns.fetch_add(1, Ordering::Relaxed);
+                        }
+                        RecoverableCaptureError::DeviceChanged => {
+                            error_diagnostics
+                                .device_changes
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        RecoverableCaptureError::RealtimeDenied => {
+                            error_diagnostics
+                                .realtime_denied
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                } else {
+                    let detail = format!("Falha no callback do loopback de áudio: {error}");
+                    let mut fatal_error = error_diagnostics
+                        .fatal_error
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if fatal_error.is_none() {
+                        *fatal_error = Some((kind, detail));
+                    }
+                }
             },
             None,
         )
@@ -517,6 +541,40 @@ impl RemoteAudioPlayback {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RecoverableCaptureError, classify_capture_error};
+
+    #[test]
+    fn classifies_xrun_device_change_and_realtime_refusal_as_recoverable() {
+        assert_eq!(
+            classify_capture_error(cpal::ErrorKind::Xrun),
+            Some(RecoverableCaptureError::Xrun)
+        );
+        assert_eq!(
+            classify_capture_error(cpal::ErrorKind::DeviceChanged),
+            Some(RecoverableCaptureError::DeviceChanged)
+        );
+        assert_eq!(
+            classify_capture_error(cpal::ErrorKind::RealtimeDenied),
+            Some(RecoverableCaptureError::RealtimeDenied)
+        );
+    }
+
+    #[test]
+    fn treats_device_stream_and_backend_failures_as_fatal() {
+        assert_eq!(
+            classify_capture_error(cpal::ErrorKind::DeviceNotAvailable),
+            None
+        );
+        assert_eq!(
+            classify_capture_error(cpal::ErrorKind::StreamInvalidated),
+            None
+        );
+        assert_eq!(classify_capture_error(cpal::ErrorKind::BackendError), None);
     }
 }
 
