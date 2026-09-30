@@ -135,7 +135,7 @@ Tratar encerramento do compartilhamento, desconexões, acesso às salas e estado
 
 **Instalador e preferências:** o setup por usuário instala em `%LOCALAPPDATA%\Programs\P2P-Voz-e-tela`, sem exigir administrador. O aplicativo salva preferências em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json`; atualizações preservam o arquivo e a desinstalação o remove. Códigos de sala e credenciais temporárias não são persistidos. O script `scripts/build-installer.ps1` compila o `.exe` e o instalador Inno Setup localmente.
 
-**Versão:** a publicação inicial foi 1.0.0; o workspace está na versão 1.0.13 em desenvolvimento. A publicação desta versão ainda depende da validação do compartilhamento em grupo descrita na extensão da Etapa 5.
+**Versão:** a publicação inicial foi 1.0.0; o workspace está na versão 1.1.0. A validação do compartilhamento em grupo descrita na extensão da Etapa 5 continua pendente.
 
 **Falta validar:** instalar o setup, conferir a persistência das preferências e a remoção na desinstalação. Publicar os dois assets (`p2p-client.exe` e `P2P-Voz-e-tela-Setup.exe`) em um GitHub Release e validar uma atualização futura e a recuperação após falha. Também falta validar manualmente os cenários de rede da Etapa 7 entre duas casas, incluindo a rota TURN.
 
