@@ -223,6 +223,8 @@ fn log_group_session_diagnostics(
         rtp_in_bytes_interval = performance.inbound_rtp_bytes,
         rtp_in_lost_interval = performance.inbound_rtp_lost_delta,
         rtp_in_jitter_ms = metrics.inbound_rtp_jitter_ms,
+        rtp_reorder_window_ms = metrics.rtp_reorder_window_ms,
+        rtp_reorder_samples = metrics.rtp_reorder_samples,
         packets_accepted_interval = performance.received_packets,
         sequence_gaps_observed_interval = performance.observed_sequence_gaps,
         reordered_packets_recovered_interval = performance.recovered_reordered_packets,

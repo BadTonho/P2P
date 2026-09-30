@@ -97,7 +97,12 @@ const DXVA_ADAPTIVE_MIN_INPUTS: usize = 45;
 const DXVA_ADAPTIVE_MIN_OUTPUT_RATIO: f64 = 0.80;
 const MAX_CACHED_GOP_ACCESS_UNITS: usize = 240;
 const MAX_CACHED_GOP_BYTES: usize = 16 * 1024 * 1024;
-const RTP_REORDER_DELAY: Duration = Duration::from_millis(40);
+const INITIAL_RTP_REORDER_DELAY: Duration = Duration::from_millis(40);
+const MIN_RTP_REORDER_DELAY: Duration = Duration::from_millis(40);
+const MAX_RTP_REORDER_DELAY: Duration = Duration::from_millis(120);
+const RTP_REORDER_DELAY_SAFETY_MARGIN: Duration = Duration::from_millis(10);
+const RTP_REORDER_DELAY_SAMPLE_CAPACITY: usize = 32;
+const RTP_REORDER_DELAY_MIN_SAMPLES: usize = 4;
 const MAX_RTP_FRAME_AGE: Duration = Duration::from_millis(200);
 const MAX_PENDING_RTP_FRAMES: usize = 8;
 const MEDIA_UDP_PORT: u16 = 9002;
@@ -211,6 +216,8 @@ struct SharedMetrics {
     interval_duplicate_packets: AtomicU64,
     interval_confirmed_missing_packets: AtomicU64,
     interval_late_after_confirmed_packets: AtomicU64,
+    rtp_reorder_window_millis: AtomicU64,
+    rtp_reorder_delay_samples: AtomicU64,
     interval_sequence_gap_resyncs: AtomicU64,
     interval_assembled_access_units: AtomicU64,
     interval_assembly_errors: AtomicU64,

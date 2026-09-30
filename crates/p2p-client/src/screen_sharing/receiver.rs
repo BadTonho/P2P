@@ -6,8 +6,51 @@ struct RtpSequenceTracker {
     recent_seen: HashSet<u16>,
     recent_order: VecDeque<u16>,
     pending_missing: HashMap<u16, Instant>,
-    confirmed_missing: HashSet<u16>,
+    confirmed_missing: HashMap<u16, Instant>,
     confirmed_order: VecDeque<u16>,
+}
+
+#[derive(Debug)]
+struct AdaptiveRtpReorderWindow {
+    samples: VecDeque<Duration>,
+    delay: Duration,
+}
+
+impl Default for AdaptiveRtpReorderWindow {
+    fn default() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(RTP_REORDER_DELAY_SAMPLE_CAPACITY),
+            delay: INITIAL_RTP_REORDER_DELAY,
+        }
+    }
+}
+
+impl AdaptiveRtpReorderWindow {
+    fn observe(&mut self, sample: Duration) {
+        self.samples.push_back(sample);
+        while self.samples.len() > RTP_REORDER_DELAY_SAMPLE_CAPACITY {
+            self.samples.pop_front();
+        }
+        if self.samples.len() < RTP_REORDER_DELAY_MIN_SAMPLES {
+            return;
+        }
+
+        let mut sorted = self.samples.iter().copied().collect::<Vec<_>>();
+        sorted.sort_unstable();
+        let percentile_rank = sorted.len().saturating_mul(95).div_ceil(100);
+        let percentile_95 = sorted[percentile_rank.saturating_sub(1)];
+        self.delay = percentile_95
+            .saturating_add(RTP_REORDER_DELAY_SAFETY_MARGIN)
+            .clamp(MIN_RTP_REORDER_DELAY, MAX_RTP_REORDER_DELAY);
+    }
+
+    fn delay(&self) -> Duration {
+        self.delay
+    }
+
+    fn sample_count(&self) -> usize {
+        self.samples.len()
+    }
 }
 
 const MAX_BUFFERED_RTP_PACKETS: usize = 512;
@@ -78,11 +121,11 @@ impl RtpReorderBuffer {
         update
     }
 
-    fn expire(&mut self, now: Instant) -> RtpReorderUpdate {
+    fn expire(&mut self, now: Instant, reorder_delay: Duration) -> RtpReorderUpdate {
         let mut update = RtpReorderUpdate::default();
         let gap_expired = self
             .gap_since
-            .is_some_and(|since| now.saturating_duration_since(since) >= RTP_REORDER_DELAY);
+            .is_some_and(|since| now.saturating_duration_since(since) >= reorder_delay);
         if !gap_expired {
             return update;
         }
@@ -152,17 +195,32 @@ pub(super) struct RtpSequenceUpdate {
     pub(super) duplicate_packets: u64,
     pub(super) confirmed_missing_packets: u64,
     pub(super) late_after_confirmed_packets: u64,
+    pub(super) reorder_delay_sample: Option<Duration>,
 }
 
 impl RtpSequenceTracker {
-    fn observe(&mut self, sequence: u16, now: Instant) -> RtpSequenceUpdate {
-        let mut update = self.expire(now);
+    fn observe(
+        &mut self,
+        sequence: u16,
+        now: Instant,
+        reorder_delay: Duration,
+    ) -> RtpSequenceUpdate {
+        let mut update = self.expire(now, reorder_delay);
         if self.recent_seen.contains(&sequence) {
             update.duplicate_packets += 1;
             return update;
         }
 
-        if self.confirmed_missing.remove(&sequence) {
+        let recovered_since = self.pending_missing.remove(&sequence);
+        let confirmed_since = if recovered_since.is_none() {
+            self.confirmed_missing.remove(&sequence)
+        } else {
+            None
+        };
+        if let Some(since) = recovered_since.or(confirmed_since) {
+            update.reorder_delay_sample = Some(now.saturating_duration_since(since));
+        }
+        if confirmed_since.is_some() {
             update.late_after_confirmed_packets += 1;
         }
 
@@ -183,9 +241,9 @@ impl RtpSequenceTracker {
                         }
                     }
                     self.highest_sequence = Some(sequence);
-                } else if self.pending_missing.remove(&sequence).is_some() {
+                } else if recovered_since.is_some() {
                     update.recovered_reordered_packets += 1;
-                } else if update.late_after_confirmed_packets == 0 {
+                } else if confirmed_since.is_none() {
                     update.unmatched_out_of_order_packets += 1;
                 }
             }
@@ -195,17 +253,18 @@ impl RtpSequenceTracker {
         update
     }
 
-    fn expire(&mut self, now: Instant) -> RtpSequenceUpdate {
+    fn expire(&mut self, now: Instant, reorder_delay: Duration) -> RtpSequenceUpdate {
         let expired = self
             .pending_missing
             .iter()
             .filter_map(|(sequence, since)| {
-                (now.saturating_duration_since(*since) >= RTP_REORDER_DELAY).then_some(*sequence)
+                (now.saturating_duration_since(*since) >= reorder_delay)
+                    .then_some((*sequence, *since))
             })
             .collect::<Vec<_>>();
-        for sequence in &expired {
+        for (sequence, since) in &expired {
             self.pending_missing.remove(sequence);
-            self.confirmed_missing.insert(*sequence);
+            self.confirmed_missing.insert(*sequence, *since);
             self.confirmed_order.push_back(*sequence);
         }
         while self.confirmed_order.len() > RTP_SEQUENCE_HISTORY {
@@ -373,13 +432,17 @@ impl H264AccessUnitAssembler {
         self.discard_timestamp = resume_timestamp;
     }
 
-    fn take_ready(&mut self, now: Instant) -> Vec<Result<Vec<u8>, String>> {
+    fn take_ready(
+        &mut self,
+        now: Instant,
+        reorder_delay: Duration,
+    ) -> Vec<Result<Vec<u8>, String>> {
         let mut ready_timestamps = self
             .frames
             .iter()
             .filter_map(|(timestamp, frame)| {
                 let age = now.saturating_duration_since(frame.first_received);
-                (age >= RTP_REORDER_DELAY && frame.marker_seen || age >= MAX_RTP_FRAME_AGE)
+                (age >= reorder_delay && frame.marker_seen || age >= MAX_RTP_FRAME_AGE)
                     .then_some(*timestamp)
             })
             .collect::<Vec<_>>();
@@ -1436,6 +1499,9 @@ impl PeerEvents {
             let mut assembler = H264AccessUnitAssembler::default();
             let mut sequence_tracker = RtpSequenceTracker::default();
             let mut reorder_buffer = RtpReorderBuffer::default();
+            let mut reorder_window = AdaptiveRtpReorderWindow::default();
+            metrics
+                .record_rtp_reorder_window(reorder_window.delay(), reorder_window.sample_count());
             let mut keyframe_request_limiter = KeyframeRequestLimiter::default();
             let mut awaiting_sequence_recovery = false;
             let mut reorder_overflow_count = 0_u64;
@@ -1445,15 +1511,17 @@ impl PeerEvents {
             loop {
                 let mut reorder_update = RtpReorderUpdate::default();
                 let mut confirmed_sequence_loss = false;
+                let mut reorder_delay_sample = None;
+                let current_reorder_delay = reorder_window.delay();
                 tokio::select! {
                     _ = flush_pending.tick() => {
                         let now = Instant::now();
-                        let expired = sequence_tracker.expire(now);
+                        let expired = sequence_tracker.expire(now, current_reorder_delay);
                         if expired.confirmed_missing_packets > 0 {
                             metrics.record_sequence_update(expired);
                             confirmed_sequence_loss = true;
                         }
-                        reorder_update = reorder_buffer.expire(now);
+                        reorder_update = reorder_buffer.expire(now, current_reorder_delay);
                         confirmed_sequence_loss |= reorder_update.confirmed_missing_packets > 0;
                     }
                     request = keyframe_request_rx.recv() => {
@@ -1478,11 +1546,15 @@ impl PeerEvents {
                                 let sequence_update = sequence_tracker.observe(
                                     packet.header.sequence_number,
                                     now,
+                                    current_reorder_delay,
                                 );
+                                reorder_delay_sample = sequence_update.reorder_delay_sample;
                                 metrics.record_sequence_update(sequence_update);
                                 metrics.record_received_packet(&packet);
                                 if sequence_update.confirmed_missing_packets > 0 {
-                                    reorder_update.append(reorder_buffer.expire(now));
+                                    reorder_update.append(
+                                        reorder_buffer.expire(now, current_reorder_delay),
+                                    );
                                     confirmed_sequence_loss = true;
                                 }
                                 if sequence_update.duplicate_packets == 0
@@ -1510,6 +1582,13 @@ impl PeerEvents {
                         awaiting_sequence_recovery = true;
                     }
                     context.request_repaint();
+                }
+                if let Some(sample) = reorder_delay_sample {
+                    reorder_window.observe(sample);
+                    metrics.record_rtp_reorder_window(
+                        reorder_window.delay(),
+                        reorder_window.sample_count(),
+                    );
                 }
                 if reorder_update.overflowed {
                     reorder_overflow_count = reorder_overflow_count.saturating_add(1);
@@ -1539,7 +1618,7 @@ impl PeerEvents {
                     }
                 }
 
-                for result in assembler.take_ready(Instant::now()) {
+                for result in assembler.take_ready(Instant::now(), reorder_window.delay()) {
                     match result {
                         Ok(access_unit) => {
                             metrics.record_assembled_access_unit(&access_unit);
@@ -2067,10 +2146,75 @@ mod tests {
     fn rtp_sequence_tracker_handles_u16_wrap_without_false_gap() {
         let start = Instant::now();
         let mut tracker = RtpSequenceTracker::default();
-        tracker.observe(u16::MAX - 1, start);
-        assert_eq!(tracker.observe(u16::MAX, start), Default::default());
-        assert_eq!(tracker.observe(0, start), Default::default());
-        assert_eq!(tracker.observe(1, start), Default::default());
+        tracker.observe(u16::MAX - 1, start, INITIAL_RTP_REORDER_DELAY);
+        assert_eq!(
+            tracker.observe(u16::MAX, start, INITIAL_RTP_REORDER_DELAY),
+            Default::default()
+        );
+        assert_eq!(
+            tracker.observe(0, start, INITIAL_RTP_REORDER_DELAY),
+            Default::default()
+        );
+        assert_eq!(
+            tracker.observe(1, start, INITIAL_RTP_REORDER_DELAY),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn adaptive_reorder_window_uses_recent_p95_and_stays_within_limits() {
+        let mut window = AdaptiveRtpReorderWindow::default();
+        assert_eq!(window.delay(), Duration::from_millis(40));
+        assert_eq!(window.sample_count(), 0);
+
+        for delay_ms in [5, 10, 15] {
+            window.observe(Duration::from_millis(delay_ms));
+            assert_eq!(window.delay(), Duration::from_millis(40));
+        }
+        window.observe(Duration::from_millis(20));
+        assert_eq!(window.delay(), Duration::from_millis(40));
+
+        for _ in 0..4 {
+            window.observe(Duration::from_millis(70));
+        }
+        assert_eq!(window.delay(), Duration::from_millis(80));
+        assert_eq!(window.sample_count(), 8);
+
+        for _ in 0..4 {
+            window.observe(Duration::from_millis(500));
+        }
+        assert_eq!(window.delay(), MAX_RTP_REORDER_DELAY);
+
+        for _ in 0..RTP_REORDER_DELAY_SAMPLE_CAPACITY {
+            window.observe(Duration::from_millis(5));
+        }
+        assert_eq!(window.sample_count(), RTP_REORDER_DELAY_SAMPLE_CAPACITY);
+        assert_eq!(window.delay(), MIN_RTP_REORDER_DELAY);
+    }
+
+    #[test]
+    fn rtp_reorder_buffer_waits_until_the_adaptive_window_expires() {
+        let start = Instant::now();
+        let mut buffer = RtpReorderBuffer::default();
+        let adaptive_delay = Duration::from_millis(80);
+        buffer.push(rtp_packet(10, 100, false, &[0x41, 1]), start);
+        buffer.push(
+            rtp_packet(12, 100, true, &[0x41, 3]),
+            start + Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            buffer
+                .expire(start + Duration::from_millis(80), adaptive_delay)
+                .confirmed_missing_packets,
+            0
+        );
+        assert_eq!(
+            buffer
+                .expire(start + Duration::from_millis(81), adaptive_delay)
+                .confirmed_missing_packets,
+            1
+        );
     }
 
     #[test]
@@ -2078,10 +2222,16 @@ mod tests {
         let start = Instant::now();
         let mut tracker = RtpSequenceTracker::default();
 
-        assert_eq!(tracker.observe(10, start), Default::default());
-        assert_eq!(tracker.observe(11, start), Default::default());
         assert_eq!(
-            tracker.observe(11, start),
+            tracker.observe(10, start, INITIAL_RTP_REORDER_DELAY),
+            Default::default()
+        );
+        assert_eq!(
+            tracker.observe(11, start, INITIAL_RTP_REORDER_DELAY),
+            Default::default()
+        );
+        assert_eq!(
+            tracker.observe(11, start, INITIAL_RTP_REORDER_DELAY),
             super::RtpSequenceUpdate {
                 duplicate_packets: 1,
                 ..Default::default()
@@ -2089,39 +2239,49 @@ mod tests {
         );
 
         assert_eq!(
-            tracker.observe(13, start),
+            tracker.observe(13, start, INITIAL_RTP_REORDER_DELAY),
             super::RtpSequenceUpdate {
                 observed_gap_packets: 1,
                 ..Default::default()
             }
         );
         assert_eq!(
-            tracker.observe(12, start + Duration::from_millis(20)),
+            tracker.observe(
+                12,
+                start + Duration::from_millis(20),
+                INITIAL_RTP_REORDER_DELAY
+            ),
             super::RtpSequenceUpdate {
                 recovered_reordered_packets: 1,
+                reorder_delay_sample: Some(Duration::from_millis(20)),
                 ..Default::default()
             }
         );
         assert_eq!(
-            tracker.expire(start + Duration::from_millis(41)),
+            tracker.expire(start + Duration::from_millis(41), INITIAL_RTP_REORDER_DELAY),
             Default::default(),
             "o pacote reordenado preencheu a lacuna dentro dos 40 ms"
         );
 
         let mut lost_tracker = RtpSequenceTracker::default();
-        lost_tracker.observe(20, start);
-        lost_tracker.observe(22, start);
+        lost_tracker.observe(20, start, INITIAL_RTP_REORDER_DELAY);
+        lost_tracker.observe(22, start, INITIAL_RTP_REORDER_DELAY);
         assert_eq!(
-            lost_tracker.expire(start + Duration::from_millis(40)),
+            lost_tracker.expire(start + Duration::from_millis(40), INITIAL_RTP_REORDER_DELAY),
             super::RtpSequenceUpdate {
                 confirmed_missing_packets: 1,
                 ..Default::default()
             }
         );
         assert_eq!(
-            lost_tracker.observe(21, start + Duration::from_millis(41)),
+            lost_tracker.observe(
+                21,
+                start + Duration::from_millis(41),
+                INITIAL_RTP_REORDER_DELAY
+            ),
             super::RtpSequenceUpdate {
                 late_after_confirmed_packets: 1,
+                reorder_delay_sample: Some(Duration::from_millis(41)),
                 ..Default::default()
             }
         );
@@ -2152,7 +2312,10 @@ mod tests {
         );
         assert_eq!(
             buffer
-                .expire(start + RTP_REORDER_DELAY - Duration::from_nanos(1))
+                .expire(
+                    start + INITIAL_RTP_REORDER_DELAY - Duration::from_nanos(1),
+                    INITIAL_RTP_REORDER_DELAY
+                )
                 .confirmed_missing_packets,
             0
         );
@@ -2171,7 +2334,7 @@ mod tests {
         );
         assert_eq!(
             buffer
-                .expire(start + Duration::from_millis(60))
+                .expire(start + Duration::from_millis(60), INITIAL_RTP_REORDER_DELAY)
                 .confirmed_missing_packets,
             0
         );
@@ -2187,7 +2350,10 @@ mod tests {
             start + Duration::from_millis(1),
         );
 
-        let lost = buffer.expire(start + RTP_REORDER_DELAY + Duration::from_millis(1));
+        let lost = buffer.expire(
+            start + INITIAL_RTP_REORDER_DELAY + Duration::from_millis(1),
+            INITIAL_RTP_REORDER_DELAY,
+        );
         assert_eq!(lost.confirmed_missing_packets, 1);
         assert_eq!(lost.resume_timestamp, Some(200));
         assert_eq!(
@@ -2226,6 +2392,7 @@ mod tests {
     fn rtp_reorder_buffer_is_bounded_and_reorders_fu_a_before_assembly() {
         let start = Instant::now();
         let mut buffer = RtpReorderBuffer::default();
+        let adaptive_delay = Duration::from_millis(80);
         buffer.push(rtp_packet(9, 99, true, &[0x41, 1]), start);
         let mut assembler = H264AccessUnitAssembler::default();
 
@@ -2236,7 +2403,7 @@ mod tests {
         assert!(end.ordered_packets.is_empty());
         let start_fragment = buffer.push(
             rtp_packet(10, 100, false, &[28, 0x85, 0x88, 0x84]),
-            start + Duration::from_millis(2),
+            start + Duration::from_millis(70),
         );
         assert_eq!(
             start_fragment
@@ -2249,7 +2416,7 @@ mod tests {
         for packet in start_fragment.ordered_packets {
             assert!(assembler.push(packet).is_none());
         }
-        let ready = assembler.take_ready(start + Duration::from_millis(50));
+        let ready = assembler.take_ready(start + Duration::from_millis(120), adaptive_delay);
         let frame = ready
             .into_iter()
             .find_map(Result::ok)
@@ -2293,7 +2460,10 @@ mod tests {
             now + Duration::from_millis(1),
         );
 
-        let loss = buffer.expire(now + RTP_REORDER_DELAY + Duration::from_millis(1));
+        let loss = buffer.expire(
+            now + INITIAL_RTP_REORDER_DELAY + Duration::from_millis(1),
+            INITIAL_RTP_REORDER_DELAY,
+        );
         assert_eq!(loss.confirmed_missing_packets, 1);
         assembler.discard_incomplete_after_loss(loss.resume_timestamp);
         for packet in loss.ordered_packets {
@@ -2301,7 +2471,7 @@ mod tests {
         }
         assert!(
             assembler
-                .take_ready(now + Duration::from_millis(100))
+                .take_ready(now + Duration::from_millis(100), INITIAL_RTP_REORDER_DELAY)
                 .is_empty()
         );
 
@@ -2314,7 +2484,7 @@ mod tests {
         }
         assert!(
             assembler
-                .take_ready(now + Duration::from_millis(100))
+                .take_ready(now + Duration::from_millis(100), INITIAL_RTP_REORDER_DELAY)
                 .iter()
                 .any(|unit| unit
                     .as_ref()

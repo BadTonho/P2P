@@ -1514,6 +1514,8 @@ impl ClientUi {
                     rtc_rtp_in_bytes = metrics.inbound_rtp_bytes,
                     rtc_rtp_in_lost = metrics.inbound_rtp_lost,
                     rtc_rtp_in_jitter_ms = metrics.inbound_rtp_jitter_ms,
+                    rtp_reorder_window_ms = metrics.rtp_reorder_window_ms,
+                    rtp_reorder_samples = metrics.rtp_reorder_samples,
                     decoder_input_frames = metrics.decoder_input_frames,
                     decoder_input_interval = performance.decoder_input_frames,
                     decoder_no_output_frames = metrics.decoder_no_output_frames,
@@ -1695,6 +1697,8 @@ impl ClientUi {
                 decoded_frames = metrics.decoded_frames,
                 published_frames = metrics.published_frames,
                 decode_errors = metrics.decode_errors,
+                rtp_reorder_window_ms = metrics.rtp_reorder_window_ms,
+                rtp_reorder_samples = metrics.rtp_reorder_samples,
                 selected_ice_pair = %metrics.selected_ice_pair,
                 rtc_outbound = %metrics.rtc_outbound_summary,
                 rtc_inbound = %metrics.rtc_inbound_summary,
@@ -1999,7 +2003,12 @@ impl ClientUi {
                 metrics.ui_texture_updates,
                 metrics.pli_queue_overflow,
                 metrics.decode_errors,
-                metrics.h264_diagnostics
+                format!(
+                    "janela adaptativa RTP={} ms/{} amostras; {}",
+                    metrics.rtp_reorder_window_ms,
+                    metrics.rtp_reorder_samples,
+                    metrics.h264_diagnostics
+                )
             ),
         }
     }

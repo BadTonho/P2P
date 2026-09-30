@@ -56,6 +56,8 @@ pub struct ScreenShareMetrics {
     pub inbound_rtp_bytes: u64,
     pub inbound_rtp_lost: i64,
     pub inbound_rtp_jitter_ms: f64,
+    pub rtp_reorder_window_ms: u64,
+    pub rtp_reorder_samples: u64,
     pub encoder_backend: String,
     pub encoder_fallback_reason: Option<String>,
     pub decoder_backend: String,
@@ -211,6 +213,11 @@ impl SharedMetrics {
             inbound_rtp_bytes: rtc_stats.inbound_bytes,
             inbound_rtp_lost: rtc_stats.inbound_packets_lost,
             inbound_rtp_jitter_ms: rtc_stats.inbound_jitter_ms,
+            rtp_reorder_window_ms: self
+                .rtp_reorder_window_millis
+                .load(Ordering::Relaxed)
+                .max(INITIAL_RTP_REORDER_DELAY.as_millis() as u64),
+            rtp_reorder_samples: self.rtp_reorder_delay_samples.load(Ordering::Relaxed),
             encoder_backend: self
                 .encoder_backend
                 .lock()
@@ -565,6 +572,15 @@ impl SharedMetrics {
         flow.late_after_confirmed_packets += update.late_after_confirmed_packets;
     }
 
+    pub(super) fn record_rtp_reorder_window(&self, delay: Duration, sample_count: usize) {
+        self.rtp_reorder_window_millis.store(
+            delay.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        self.rtp_reorder_delay_samples
+            .store(sample_count as u64, Ordering::Relaxed);
+    }
+
     pub(super) fn record_sequence_gap_resync(&self) {
         self.interval_sequence_gap_resyncs
             .fetch_add(1, Ordering::Relaxed);
@@ -872,6 +888,7 @@ mod tests {
     #[test]
     fn media_interval_snapshot_reports_each_video_pipeline_stage() {
         let metrics = super::SharedMetrics::default();
+        metrics.record_rtp_reorder_window(Duration::from_millis(85), 12);
         metrics
             .interval_received_packets
             .store(12, std::sync::atomic::Ordering::Relaxed);
@@ -882,6 +899,7 @@ mod tests {
             duplicate_packets: 1,
             confirmed_missing_packets: 1,
             late_after_confirmed_packets: 1,
+            reorder_delay_sample: Some(Duration::from_millis(85)),
         });
         metrics.record_sequence_gap_resync();
         metrics.record_assembled_access_unit(&annex_b_access_unit(&[
@@ -898,6 +916,9 @@ mod tests {
         metrics.record_ui_texture_update();
 
         let interval = metrics.take_performance_snapshot();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.rtp_reorder_window_ms, 85);
+        assert_eq!(snapshot.rtp_reorder_samples, 12);
         assert_eq!(interval.received_packets, 12);
         assert_eq!(interval.observed_sequence_gaps, 2);
         assert_eq!(interval.recovered_reordered_packets, 1);

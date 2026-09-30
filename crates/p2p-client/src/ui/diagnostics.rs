@@ -129,6 +129,11 @@ impl ClientUi {
                     self.screen_share_metrics.inbound_rtp_jitter_ms
                 ));
                 ui.label(&self.screen_share_metrics.rtc_inbound_summary);
+                ui.label(format!(
+                    "Janela adaptativa de reordenação RTP: {} ms, com {} amostras recentes.",
+                    self.screen_share_metrics.rtp_reorder_window_ms,
+                    self.screen_share_metrics.rtp_reorder_samples
+                ));
                 if let Some(error) = &self.screen_share_metrics.last_decode_error {
                     ui.label(format!("Último erro H.264: {error}"));
                 }
