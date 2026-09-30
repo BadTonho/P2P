@@ -16,3 +16,12 @@
 Quando o usuário pedir para preparar uma versão para o GitHub, gere `target/release/p2p-client.exe` e `target/installer/P2P-Voz-e-tela-Setup.exe`, confira as versões e os hashes e explique como anexar ambos a um GitHub Release público, preservando os nomes exatos dos assets. Use `scripts/build-installer.ps1` e Inno Setup 6. Não gere `update-manifest.json`; a API do GitHub fornece os metadados usados pelo app.
 
 Antes de preparar uma versão, consulte `ATUALIZACOES.md`. Não publique nem crie releases externos sem autorização explícita.
+
+## Testes e prevenção de regressões
+
+- Em toda mudança de código, revise a suíte existente e adicione ou atualize testes automatizados para o comportamento alterado. Para uma correção de bug, prefira um teste de regressão que reproduza o defeito antes da correção.
+- Não remova, ignore nem enfraqueça um teste apenas para obter uma suíte verde. Se um teste falhar, investigue e corrija o código ou demonstre que a expectativa do teste estava errada; preserve e explique qualquer falha ainda não resolvida.
+- Execute primeiro os testes direcionados e, antes de concluir uma mudança de código, rode `cargo fmt --all -- --check`, `cargo test --workspace --locked` e `cargo build --workspace --locked`. Use `--offline` quando necessário e quando as dependências já estiverem em cache. No Windows, configure `RC` para o `rc.exe` do Windows SDK se o build exigir o compilador de recursos.
+- Mantenha os testes determinísticos e independentes de dispositivos físicos sempre que possível. Para áudio, vídeo, rede ou hardware, use fontes e sinks sintéticos, mocks ou loopback; não declare validado um caminho de ponta a ponta que esses testes não exercitam.
+- Se a plataforma, o dispositivo ou a rede real não puderem ser reproduzidos automaticamente, registre essa limitação e diferencie claramente testes unitários, loopback e validação manual. Nunca afirme que testes passaram se não foram executados com sucesso.
+- Ao concluir, informe os comandos executados, o resultado e as lacunas de cobertura relevantes. Mantenha a CI alinhada aos comandos de validação do workspace.
