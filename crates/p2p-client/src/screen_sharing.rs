@@ -53,8 +53,8 @@ use webrtc::peer_connection::{
 use webrtc::runtime::TokioRuntime;
 
 use crate::audio_capture::{
-    OPUS_CHANNELS, OPUS_FRAME_SAMPLES_PER_CHANNEL, OPUS_SAMPLE_RATE, RemoteAudioPlayback,
-    SystemAudioCapture,
+    AudioPlaybackFactory, AudioSampleSource, OPUS_CHANNELS, OPUS_FRAME_SAMPLES_PER_CHANNEL,
+    OPUS_SAMPLE_RATE, SystemAudioCapture, SystemAudioPlaybackFactory,
 };
 use crate::logging::safe_stun_endpoint;
 use crate::mf_video;
@@ -330,4 +330,5 @@ struct PeerEvents {
     stun_server: Option<String>,
     turn_enabled: bool,
     decoder_preference: VideoDecoderPreference,
+    audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
 }

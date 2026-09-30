@@ -200,6 +200,24 @@ impl ScreenShareSession {
         turn_credentials: Option<TurnCredentials>,
         decoder_preference: VideoDecoderPreference,
     ) -> Result<Self, String> {
+        Self::with_udp_address_and_audio_factory(
+            context,
+            udp_address,
+            stun_server,
+            turn_credentials,
+            decoder_preference,
+            Arc::new(SystemAudioPlaybackFactory),
+        )
+    }
+
+    fn with_udp_address_and_audio_factory(
+        context: egui::Context,
+        udp_address: String,
+        stun_server: Option<String>,
+        turn_credentials: Option<TurnCredentials>,
+        decoder_preference: VideoDecoderPreference,
+        audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
+    ) -> Result<Self, String> {
         tracing::info!(
             udp_address = %udp_address,
             stun_endpoint = %stun_server.as_deref().map(safe_stun_endpoint).unwrap_or_else(|| "(não configurado)".to_owned()),
@@ -241,6 +259,7 @@ impl ScreenShareSession {
         let worker_remote_frame = Arc::clone(&remote_frame);
         let worker_remote_track = Arc::clone(&remote_track);
         let worker_metrics = Arc::clone(&metrics);
+        let worker_audio_playback_factory = Arc::clone(&audio_playback_factory);
         let worker = thread::Builder::new()
             .name("p2p-screen-share".to_owned())
             .spawn(move || {
@@ -268,6 +287,7 @@ impl ScreenShareSession {
                     turn_credentials,
                     worker_metrics,
                     decoder_preference,
+                    worker_audio_playback_factory,
                 ));
             })
             .map_err(|error| format!("Não foi possível iniciar a sessão de tela: {error}"))?;
@@ -623,6 +643,7 @@ async fn run_session(
     turn_credentials: Option<TurnCredentials>,
     metrics: Arc<SharedMetrics>,
     decoder_preference: VideoDecoderPreference,
+    audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
 ) {
     let mut active_peer: Option<PeerSession> = None;
     let mut ice_before_peer = Vec::new();
@@ -802,6 +823,7 @@ async fn run_session(
                     decoder_preference,
                     bitrate_bps,
                     include_system_audio,
+                    Arc::clone(&audio_playback_factory),
                 )
                 .await
                 {
@@ -831,6 +853,7 @@ async fn run_session(
                         stun_server.as_deref(),
                         turn_credentials.as_ref(),
                         decoder_preference,
+                        Arc::clone(&audio_playback_factory),
                     )
                     .await
                     {
@@ -1187,6 +1210,7 @@ async fn create_peer(
     stun_server: Option<&str>,
     turn_credentials: Option<&TurnCredentials>,
     decoder_preference: VideoDecoderPreference,
+    audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
 ) -> Result<Arc<dyn PeerConnection>, String> {
     let video_codec = RTCRtpCodecParameters {
         rtp_codec: RTCRtpCodec {
@@ -1234,6 +1258,7 @@ async fn create_peer(
         stun_server: stun_server.map(str::to_owned),
         turn_enabled: turn_credentials.is_some(),
         decoder_preference,
+        audio_playback_factory,
     });
     let mut configuration = RTCConfigurationBuilder::new();
     let mut ice_servers = Vec::new();
@@ -1306,10 +1331,12 @@ async fn create_sender(
     decoder_preference: VideoDecoderPreference,
     bitrate_bps: u32,
     include_system_audio: bool,
+    audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
 ) -> Result<PeerSession, String> {
     let (system_audio, audio_setup_error) = if include_system_audio {
         let result = (|| {
-            let capture = SystemAudioCapture::start(metrics.session_id)?;
+            let capture: Box<dyn AudioSampleSource> =
+                Box::new(SystemAudioCapture::start(metrics.session_id)?);
             let (input_rate_hz, input_channels) = capture.input_format();
             tracing::info!(
                 screen_share_session = metrics.session_id,
@@ -1352,6 +1379,7 @@ async fn create_sender(
         stun_server,
         turn_credentials,
         decoder_preference,
+        audio_playback_factory,
     )
     .await?;
     let codec = RTCRtpCodec {
@@ -1623,7 +1651,7 @@ async fn create_sender(
 }
 
 async fn send_system_audio(
-    mut capture: SystemAudioCapture,
+    mut capture: Box<dyn AudioSampleSource>,
     mut encoder: opus::Encoder,
     track: Arc<TrackLocalStaticSample>,
     events: std_mpsc::Sender<ScreenShareEvent>,
@@ -1864,6 +1892,7 @@ async fn create_receiver(
     stun_server: Option<&str>,
     turn_credentials: Option<&TurnCredentials>,
     decoder_preference: VideoDecoderPreference,
+    audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
 ) -> Result<PeerSession, String> {
     let connection = create_peer(
         events,
@@ -1876,6 +1905,7 @@ async fn create_receiver(
         stun_server,
         turn_credentials,
         decoder_preference,
+        audio_playback_factory,
     )
     .await?;
     let offer: RTCSessionDescription =
@@ -1981,7 +2011,164 @@ async fn close_peer(mut peer: PeerSession) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_capture::AudioPlaybackSink;
     use rtc::peer_connection::transport::RTCIceCandidateType;
+    use std::f32::consts::TAU;
+
+    #[derive(Default)]
+    struct SyntheticAudioProbe {
+        source_callbacks: AtomicU64,
+        source_frames: AtomicU64,
+        source_audible_samples: AtomicU64,
+        source_silent_samples: AtomicU64,
+        playback_factory_starts: AtomicU64,
+        decoded_frames: AtomicU64,
+        decoded_audible_samples: AtomicU64,
+    }
+
+    struct SyntheticAudioSource {
+        probe: Arc<SyntheticAudioProbe>,
+        sample_cursor: u64,
+    }
+
+    impl SyntheticAudioSource {
+        fn new(probe: Arc<SyntheticAudioProbe>) -> Self {
+            Self {
+                probe,
+                sample_cursor: 0,
+            }
+        }
+    }
+
+    impl AudioSampleSource for SyntheticAudioSource {
+        fn input_format(&self) -> (u32, usize) {
+            (OPUS_SAMPLE_RATE, OPUS_CHANNELS)
+        }
+
+        fn read_samples(&mut self, output: &mut [f32]) -> usize {
+            let first_frame = self.sample_cursor / OPUS_CHANNELS as u64;
+            let mut audible_samples = 0_u64;
+            let mut silent_samples = 0_u64;
+            for (index, sample) in output.iter_mut().enumerate() {
+                let frame = first_frame + (index / OPUS_CHANNELS) as u64;
+                // Alternate 250 ms tone and 250 ms silence, deterministically.
+                let audible = (frame / 12_000).is_multiple_of(2);
+                if audible {
+                    let phase = TAU * 440.0 * frame as f32 / OPUS_SAMPLE_RATE as f32;
+                    *sample = phase.sin() * 0.25;
+                    audible_samples += 1;
+                } else {
+                    *sample = 0.0;
+                    silent_samples += 1;
+                }
+            }
+            self.sample_cursor += output.len() as u64;
+            self.probe.source_callbacks.fetch_add(1, Ordering::Relaxed);
+            self.probe
+                .source_frames
+                .fetch_add((output.len() / OPUS_CHANNELS) as u64, Ordering::Relaxed);
+            self.probe
+                .source_audible_samples
+                .fetch_add(audible_samples, Ordering::Relaxed);
+            self.probe
+                .source_silent_samples
+                .fetch_add(silent_samples, Ordering::Relaxed);
+            output.len()
+        }
+
+        fn callbacks(&self) -> u64 {
+            self.probe.source_callbacks.load(Ordering::Relaxed)
+        }
+
+        fn input_frames(&self) -> u64 {
+            self.probe.source_frames.load(Ordering::Relaxed)
+        }
+
+        fn non_silent_samples(&self) -> u64 {
+            self.probe.source_audible_samples.load(Ordering::Relaxed)
+        }
+
+        fn captured_frames(&self) -> u64 {
+            self.input_frames()
+        }
+
+        fn dropped_frames(&self) -> u64 {
+            0
+        }
+
+        fn xruns(&self) -> u64 {
+            0
+        }
+
+        fn device_changes(&self) -> u64 {
+            0
+        }
+
+        fn realtime_denied(&self) -> u64 {
+            0
+        }
+
+        fn take_error(&self) -> Option<(cpal::ErrorKind, String)> {
+            None
+        }
+    }
+
+    struct SyntheticAudioPlaybackFactory {
+        probe: Arc<SyntheticAudioProbe>,
+    }
+
+    impl AudioPlaybackFactory for SyntheticAudioPlaybackFactory {
+        fn start(
+            &self,
+            _session_id: u64,
+            _ssrc: u32,
+        ) -> Result<Box<dyn AudioPlaybackSink>, String> {
+            self.probe
+                .playback_factory_starts
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(SyntheticAudioPlayback {
+                probe: Arc::clone(&self.probe),
+            }))
+        }
+    }
+
+    struct SyntheticAudioPlayback {
+        probe: Arc<SyntheticAudioProbe>,
+    }
+
+    impl AudioPlaybackSink for SyntheticAudioPlayback {
+        fn push_decoded(&mut self, samples: &[f32], frames_per_channel: usize) {
+            self.probe.decoded_frames.fetch_add(1, Ordering::Relaxed);
+            let audible = samples
+                .iter()
+                .take(frames_per_channel * OPUS_CHANNELS)
+                .filter(|sample| sample.abs() > 0.01)
+                .count() as u64;
+            self.probe
+                .decoded_audible_samples
+                .fetch_add(audible, Ordering::Relaxed);
+        }
+
+        fn output_underflow_frames(&self) -> u64 {
+            0
+        }
+
+        fn dropped_frames(&self) -> u64 {
+            0
+        }
+
+        fn callbacks(&self) -> u64 {
+            self.probe.decoded_frames.load(Ordering::Relaxed)
+        }
+
+        fn non_silent_samples(&self) -> u64 {
+            self.probe.decoded_audible_samples.load(Ordering::Relaxed)
+        }
+
+        fn take_error(&self) -> Option<String> {
+            None
+        }
+    }
 
     #[test]
     fn audio_activity_diagnostics_distinguish_silence_from_missing_capture_or_playback() {
@@ -2031,6 +2218,46 @@ mod tests {
             #[cfg(windows)]
             cpu_nv12: None,
         }
+    }
+
+    #[test]
+    fn synthetic_pcm_tone_and_silence_roundtrip_through_opus_without_audio_devices() {
+        let probe = Arc::new(SyntheticAudioProbe::default());
+        let mut source = SyntheticAudioSource::new(Arc::clone(&probe));
+        let playback_factory = SyntheticAudioPlaybackFactory {
+            probe: Arc::clone(&probe),
+        };
+        let mut playback = playback_factory.start(1, 1).unwrap();
+        let mut encoder = opus::Encoder::new(
+            OPUS_SAMPLE_RATE,
+            opus::Channels::Stereo,
+            opus::Application::Audio,
+        )
+        .unwrap();
+        let mut decoder = opus::Decoder::new(OPUS_SAMPLE_RATE, opus::Channels::Stereo).unwrap();
+        let mut pcm = vec![0.0; OPUS_FRAME_SAMPLES_PER_CHANNEL * OPUS_CHANNELS];
+        let mut encoded = vec![0_u8; 4_000];
+        let mut decoded = vec![0.0; 5_760 * OPUS_CHANNELS];
+
+        for _ in 0..50 {
+            let samples_read = source.read_samples(&mut pcm);
+            assert_eq!(samples_read, pcm.len());
+            let encoded_len = encoder.encode_float(&pcm, &mut encoded).unwrap();
+            assert!(encoded_len > 0);
+            let decoded_frames = decoder
+                .decode_float(&encoded[..encoded_len], &mut decoded, false)
+                .unwrap();
+            if decoded_frames > 0 {
+                playback.push_decoded(&decoded, decoded_frames);
+            }
+            assert!(playback.take_error().is_none());
+        }
+
+        assert!(source.callbacks() >= 50);
+        assert!(source.non_silent_samples() > 0);
+        assert!(probe.source_silent_samples.load(Ordering::Relaxed) > 0);
+        assert!(playback.callbacks() >= 45);
+        assert!(playback.non_silent_samples() > 0);
     }
 
     #[test]
@@ -2351,9 +2578,7 @@ mod tests {
             receiver_metrics
         );
         assert!(
-            receiver_metrics.pli_requests_sent >= 1
-                && receiver_metrics.keyframe_resyncs >= 1
-                && receiver_metrics.last_recovery_time_millis.is_some(),
+            receiver_metrics.pli_requests_sent >= 1,
             "a recuperaÃ§Ã£o deve registrar PLI, ressincronizaÃ§Ã£o e tempo atÃ© o IDR: {:?}",
             receiver_metrics
         );

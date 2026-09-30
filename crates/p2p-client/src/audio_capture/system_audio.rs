@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use super::{AudioPlaybackFactory, AudioPlaybackSink, AudioSampleSource};
+
 pub(crate) const OPUS_SAMPLE_RATE: u32 = 48_000;
 pub(crate) const OPUS_CHANNELS: usize = 2;
 pub(crate) const OPUS_FRAME_SAMPLES_PER_CHANNEL: usize = 960;
@@ -247,6 +249,52 @@ impl SystemAudioCapture {
 
     pub(crate) fn input_format(&self) -> (u32, usize) {
         (self.input_rate, self.input_channels)
+    }
+}
+
+impl AudioSampleSource for SystemAudioCapture {
+    fn input_format(&self) -> (u32, usize) {
+        SystemAudioCapture::input_format(self)
+    }
+
+    fn read_samples(&mut self, output: &mut [f32]) -> usize {
+        SystemAudioCapture::read_samples(self, output)
+    }
+
+    fn callbacks(&self) -> u64 {
+        SystemAudioCapture::callbacks(self)
+    }
+
+    fn input_frames(&self) -> u64 {
+        SystemAudioCapture::input_frames(self)
+    }
+
+    fn non_silent_samples(&self) -> u64 {
+        SystemAudioCapture::non_silent_samples(self)
+    }
+
+    fn captured_frames(&self) -> u64 {
+        SystemAudioCapture::captured_frames(self)
+    }
+
+    fn dropped_frames(&self) -> u64 {
+        SystemAudioCapture::dropped_frames(self)
+    }
+
+    fn xruns(&self) -> u64 {
+        SystemAudioCapture::xruns(self)
+    }
+
+    fn device_changes(&self) -> u64 {
+        SystemAudioCapture::device_changes(self)
+    }
+
+    fn realtime_denied(&self) -> u64 {
+        SystemAudioCapture::realtime_denied(self)
+    }
+
+    fn take_error(&self) -> Option<(cpal::ErrorKind, String)> {
+        SystemAudioCapture::take_error(self)
     }
 }
 
@@ -581,6 +629,41 @@ impl RemoteAudioPlayback {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+    }
+}
+
+impl AudioPlaybackSink for RemoteAudioPlayback {
+    fn push_decoded(&mut self, samples: &[f32], frames_per_channel: usize) {
+        RemoteAudioPlayback::push_decoded(self, samples, frames_per_channel);
+    }
+
+    fn output_underflow_frames(&self) -> u64 {
+        RemoteAudioPlayback::output_underflow_frames(self)
+    }
+
+    fn dropped_frames(&self) -> u64 {
+        RemoteAudioPlayback::dropped_frames(self)
+    }
+
+    fn callbacks(&self) -> u64 {
+        RemoteAudioPlayback::callbacks(self)
+    }
+
+    fn non_silent_samples(&self) -> u64 {
+        RemoteAudioPlayback::non_silent_samples(self)
+    }
+
+    fn take_error(&self) -> Option<String> {
+        RemoteAudioPlayback::take_error(self)
+    }
+}
+
+pub(crate) struct SystemAudioPlaybackFactory;
+
+impl AudioPlaybackFactory for SystemAudioPlaybackFactory {
+    fn start(&self, session_id: u64, ssrc: u32) -> Result<Box<dyn AudioPlaybackSink>, String> {
+        RemoteAudioPlayback::start(session_id, ssrc)
+            .map(|playback| Box::new(playback) as Box<dyn AudioPlaybackSink>)
     }
 }
 

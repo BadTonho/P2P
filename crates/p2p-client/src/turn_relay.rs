@@ -216,7 +216,10 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::{build_config, hex};
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+    use std::sync::Mutex;
     use turn_server::config::Interface;
+
+    static TURN_PORT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn turn_configuration_uses_the_expected_udp_ports_and_credentials() {
@@ -253,6 +256,9 @@ mod tests {
 
     #[test]
     fn integrated_turn_server_releases_its_listener_when_dropped() {
+        let _lock = TURN_PORT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
         let probe = UdpSocket::bind(address).unwrap();
         let port = probe.local_addr().unwrap().port();
@@ -280,6 +286,9 @@ mod tests {
 
     #[test]
     fn integrated_turn_server_rejects_an_occupied_listener_port() {
+        let _lock = TURN_PORT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let listener = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let result = super::TurnRelayServer::start_with(

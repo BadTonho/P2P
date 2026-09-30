@@ -1303,4 +1303,103 @@ mod tests {
         app.queue_early_group_ice("peer-a", &generation, "late-candidate".to_owned());
         assert!(!app.pending_group_ice.contains_key(&key));
     }
+
+    #[test]
+    fn concurrent_group_sessions_route_ice_independently_and_ignore_closed_generation() {
+        let generation_a = group_generation_id("peer-a", 42);
+        let generation_b = group_generation_id("peer-b", 77);
+
+        assert_eq!(
+            route_group_signal("peer-a", &generation_a, SignalKind::Offer, true, None, None,),
+            GroupSignalRoute::IncomingOffer
+        );
+        assert_eq!(
+            route_group_signal("peer-b", &generation_b, SignalKind::Offer, true, None, None,),
+            GroupSignalRoute::IncomingOffer
+        );
+        assert_eq!(
+            route_group_signal(
+                "peer-a",
+                &generation_a,
+                SignalKind::Answer,
+                true,
+                Some(&generation_a),
+                None,
+            ),
+            GroupSignalRoute::Outbound
+        );
+        assert_eq!(
+            route_group_signal(
+                "peer-a",
+                &generation_b,
+                SignalKind::Answer,
+                true,
+                Some(&generation_a),
+                None,
+            ),
+            GroupSignalRoute::Ignore
+        );
+        assert_eq!(
+            route_group_signal(
+                "peer-a",
+                &generation_a,
+                SignalKind::IceCandidate,
+                true,
+                None,
+                None,
+            ),
+            GroupSignalRoute::QueueEarlyIce
+        );
+        assert_eq!(
+            route_group_signal(
+                "peer-b",
+                &generation_b,
+                SignalKind::IceCandidate,
+                true,
+                None,
+                None,
+            ),
+            GroupSignalRoute::QueueEarlyIce
+        );
+
+        let mut app = ClientUi::default();
+        app.queue_early_group_ice("peer-a", &generation_a, "candidate-a".to_owned());
+        app.queue_early_group_ice("peer-b", &generation_b, "candidate-b".to_owned());
+        let key_a = ("peer-a".to_owned(), generation_a.clone());
+        let key_b = ("peer-b".to_owned(), generation_b.clone());
+        assert_eq!(
+            app.pending_group_ice[&key_a]
+                .front()
+                .map(|candidate| candidate.payload.as_str()),
+            Some("candidate-a")
+        );
+        assert_eq!(
+            app.pending_group_ice[&key_b]
+                .front()
+                .map(|candidate| candidate.payload.as_str()),
+            Some("candidate-b")
+        );
+
+        app.mark_group_generation_closed("peer-a", generation_a.clone());
+        app.queue_early_group_ice("peer-a", &generation_a, "stale-candidate".to_owned());
+        assert!(!app.pending_group_ice.contains_key(&key_a));
+        assert_eq!(
+            app.pending_group_ice[&key_b]
+                .front()
+                .map(|candidate| candidate.payload.as_str()),
+            Some("candidate-b"),
+            "closing one generation must not disturb another session's ICE"
+        );
+        assert_eq!(
+            route_group_signal(
+                "peer-a",
+                &generation_a,
+                SignalKind::Answer,
+                true,
+                Some(&generation_b),
+                None,
+            ),
+            GroupSignalRoute::Ignore
+        );
+    }
 }

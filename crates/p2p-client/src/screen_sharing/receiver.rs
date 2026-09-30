@@ -1603,7 +1603,7 @@ impl PeerEvents {
             kind = ?track_kind,
             "Faixa Opus remota recebida; preparando decodificação e saída"
         );
-        let mut playback = match RemoteAudioPlayback::start(session_id, ssrc) {
+        let mut playback = match self.audio_playback_factory.start(session_id, ssrc) {
             Ok(playback) => playback,
             Err(error) => {
                 tracing::error!(

@@ -4,9 +4,36 @@ use std::sync::{Arc, Mutex};
 
 mod system_audio;
 pub(crate) use system_audio::{
-    OPUS_CHANNELS, OPUS_FRAME_SAMPLES_PER_CHANNEL, OPUS_SAMPLE_RATE, RemoteAudioPlayback,
-    SystemAudioCapture,
+    OPUS_CHANNELS, OPUS_FRAME_SAMPLES_PER_CHANNEL, OPUS_SAMPLE_RATE, SystemAudioCapture,
+    SystemAudioPlaybackFactory,
 };
+
+pub(crate) trait AudioSampleSource: Send {
+    fn input_format(&self) -> (u32, usize);
+    fn read_samples(&mut self, output: &mut [f32]) -> usize;
+    fn callbacks(&self) -> u64;
+    fn input_frames(&self) -> u64;
+    fn non_silent_samples(&self) -> u64;
+    fn captured_frames(&self) -> u64;
+    fn dropped_frames(&self) -> u64;
+    fn xruns(&self) -> u64;
+    fn device_changes(&self) -> u64;
+    fn realtime_denied(&self) -> u64;
+    fn take_error(&self) -> Option<(cpal::ErrorKind, String)>;
+}
+
+pub(crate) trait AudioPlaybackSink: Send {
+    fn push_decoded(&mut self, samples: &[f32], frames_per_channel: usize);
+    fn output_underflow_frames(&self) -> u64;
+    fn dropped_frames(&self) -> u64;
+    fn callbacks(&self) -> u64;
+    fn non_silent_samples(&self) -> u64;
+    fn take_error(&self) -> Option<String>;
+}
+
+pub(crate) trait AudioPlaybackFactory: Send + Sync {
+    fn start(&self, session_id: u64, ssrc: u32) -> Result<Box<dyn AudioPlaybackSink>, String>;
+}
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
