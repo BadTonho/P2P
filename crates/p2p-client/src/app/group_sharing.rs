@@ -22,6 +22,8 @@ fn log_group_session_diagnostics(
     session: &ScreenShareSession,
     role: &'static str,
     interval_seconds: Option<f64>,
+    phase: &'static str,
+    termination_reason: Option<&'static str>,
 ) {
     let metrics = session.metrics();
     let performance = session.take_performance_snapshot();
@@ -44,8 +46,11 @@ fn log_group_session_diagnostics(
         screen_share_session = metrics.session_id,
         track_ssrc = %track_ssrc,
         role,
+        phase,
+        termination_reason = termination_reason.unwrap_or(""),
         interval_seconds = ?interval_seconds,
         p2p_connected = metrics.p2p_connected,
+        video_track_seen = session.remote_video_track_seen(),
         route,
         selected_ice_pair = %selected_ice_pair,
         encoder_backend = %metrics.encoder_backend,
@@ -104,6 +109,14 @@ fn log_group_session_diagnostics(
     );
 }
 
+pub(super) fn log_final_group_session_diagnostics(
+    session: &ScreenShareSession,
+    role: &'static str,
+    termination_reason: &'static str,
+) {
+    log_group_session_diagnostics(session, role, None, "final", Some(termination_reason));
+}
+
 impl ClientUi {
     pub(super) fn group_sharing_compatible(&self) -> bool {
         group_screen_share_compatible(self.room_mode, &self.participants)
@@ -139,6 +152,9 @@ impl ClientUi {
             Ok(()) => {
                 self.group_local_sharing = enabled;
                 if !enabled {
+                    for session in self.group_outbound_sessions.values() {
+                        log_final_group_session_diagnostics(session, "sender", "share_stopped");
+                    }
                     self.group_outbound_sessions.clear();
                     self.group_outbound_ports.clear();
                 }
@@ -163,7 +179,9 @@ impl ClientUi {
             ) {
                 self.screen_share_status = Some(error);
             }
-            self.group_inbound_sessions.remove(peer_id);
+            if let Some(session) = self.group_inbound_sessions.remove(peer_id) {
+                log_final_group_session_diagnostics(&session, "receiver", "watch_stopped");
+            }
             self.group_inbound_ports.remove(peer_id);
             self.group_remote_textures.remove(peer_id);
             self.group_remote_sequences.remove(peer_id);
@@ -256,6 +274,9 @@ impl ClientUi {
                 String::new(),
             );
         }
+        for session in self.group_outbound_sessions.values() {
+            log_final_group_session_diagnostics(session, "sender", "bitrate_rebalance");
+        }
         self.group_outbound_sessions.clear();
         self.group_outbound_ports.clear();
         let bitrate = group_share_bitrate(viewers.len());
@@ -287,6 +308,12 @@ impl ClientUi {
             self.group_watched_shares.clear();
         }
         self.group_available_shares.clear();
+        for session in self.group_outbound_sessions.values() {
+            log_final_group_session_diagnostics(session, "sender", "room_media_stopped");
+        }
+        for session in self.group_inbound_sessions.values() {
+            log_final_group_session_diagnostics(session, "receiver", "room_media_stopped");
+        }
         self.group_outbound_sessions.clear();
         self.group_inbound_sessions.clear();
         self.group_outbound_ports.clear();
@@ -396,6 +423,8 @@ impl ClientUi {
             let mut states = Vec::new();
             let mut inbound_failed = false;
             let mut outbound_failed = false;
+            let mut inbound_termination_reason = "unknown";
+            let mut outbound_termination_reason = "unknown";
             if let Some(session) = self.group_inbound_sessions.get(&peer_id) {
                 while let Some(event) = session.try_recv() {
                     match event {
@@ -405,6 +434,7 @@ impl ClientUi {
                         ScreenShareEvent::State(state) => states.push(state),
                         ScreenShareEvent::Error(error) => {
                             inbound_failed = true;
+                            inbound_termination_reason = "session_error";
                             failures.push(error);
                         }
                         ScreenShareEvent::AudioError(error) => {
@@ -413,6 +443,7 @@ impl ClientUi {
                         }
                         ScreenShareEvent::ConnectionClosed => {
                             inbound_failed = true;
+                            inbound_termination_reason = "connection_closed";
                             failures.push("A conexão P2P foi encerrada.".to_owned());
                         }
                     }
@@ -454,6 +485,7 @@ impl ClientUi {
                         ScreenShareEvent::State(state) => states.push(state),
                         ScreenShareEvent::Error(error) => {
                             outbound_failed = true;
+                            outbound_termination_reason = "session_error";
                             failures.push(error);
                         }
                         ScreenShareEvent::AudioError(error) => {
@@ -462,6 +494,7 @@ impl ClientUi {
                         }
                         ScreenShareEvent::ConnectionClosed => {
                             outbound_failed = true;
+                            outbound_termination_reason = "connection_closed";
                             failures.push("A conexão P2P foi encerrada.".to_owned());
                         }
                     }
@@ -478,8 +511,10 @@ impl ClientUi {
                 {
                     if is_inbound {
                         inbound_failed = true;
+                        inbound_termination_reason = "signal_forward_failed";
                     } else {
                         outbound_failed = true;
+                        outbound_termination_reason = "signal_forward_failed";
                     }
                     failures.push(error);
                 }
@@ -494,7 +529,13 @@ impl ClientUi {
                     .insert(peer_id.clone(), error.clone());
             }
             if inbound_failed {
-                self.group_inbound_sessions.remove(&peer_id);
+                if let Some(session) = self.group_inbound_sessions.remove(&peer_id) {
+                    log_final_group_session_diagnostics(
+                        &session,
+                        "receiver",
+                        inbound_termination_reason,
+                    );
+                }
                 self.group_inbound_ports.remove(&peer_id);
                 self.group_remote_textures.remove(&peer_id);
                 self.group_remote_sequences.remove(&peer_id);
@@ -506,7 +547,13 @@ impl ClientUi {
                 );
             }
             if outbound_failed {
-                self.group_outbound_sessions.remove(&peer_id);
+                if let Some(session) = self.group_outbound_sessions.remove(&peer_id) {
+                    log_final_group_session_diagnostics(
+                        &session,
+                        "sender",
+                        outbound_termination_reason,
+                    );
+                }
                 self.group_outbound_ports.remove(&peer_id);
                 let _ = self.send_screen_share_signal_to_stream(
                     &peer_id,
@@ -529,10 +576,22 @@ impl ClientUi {
                 .last_group_metrics_log_at
                 .map(|last| last.elapsed().as_secs_f64());
             for session in self.group_outbound_sessions.values() {
-                log_group_session_diagnostics(session, "sender", interval_seconds);
+                log_group_session_diagnostics(
+                    session,
+                    "sender",
+                    interval_seconds,
+                    "periodic",
+                    None,
+                );
             }
             for session in self.group_inbound_sessions.values() {
-                log_group_session_diagnostics(session, "receiver", interval_seconds);
+                log_group_session_diagnostics(
+                    session,
+                    "receiver",
+                    interval_seconds,
+                    "periodic",
+                    None,
+                );
             }
 
             let outbound = self

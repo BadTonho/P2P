@@ -839,6 +839,16 @@ impl PeerEvents {
             self.receive_remote_audio_track(track).await;
             return;
         }
+        self.metrics
+            .remote_video_track_seen
+            .store(true, Ordering::Relaxed);
+        let remote_ssrc = track.ssrcs().await.first().copied();
+        tracing::info!(
+            screen_share_session = self.metrics.session_id,
+            media_kind = "video",
+            remote_track_ssrc = ?remote_ssrc,
+            "Faixa remota de vídeo detectada pelo callback WebRTC"
+        );
         if let Some(ssrc) = track.ssrcs().await.first().copied() {
             self.metrics.set_track_ssrc(ssrc);
             tracing::info!(

@@ -305,6 +305,10 @@ impl ScreenShareSession {
         self.metrics.snapshot()
     }
 
+    pub(crate) fn remote_video_track_seen(&self) -> bool {
+        self.metrics.remote_video_track_seen.load(Ordering::Relaxed)
+    }
+
     pub fn record_ui_texture_update(&self) {
         self.metrics.record_ui_texture_update();
     }
@@ -686,6 +690,23 @@ async fn run_session(
                     }) {
                         let packets = peer.metrics.received_packets.load(Ordering::Relaxed);
                         let decode_errors = peer.metrics.decode_errors.load(Ordering::Relaxed);
+                        let video_track_seen = peer
+                            .metrics
+                            .remote_video_track_seen
+                            .load(Ordering::Relaxed);
+                        let snapshot = peer.metrics.snapshot();
+                        tracing::warn!(
+                            screen_share_session = peer.metrics.session_id,
+                            stage = "first_video_timeout",
+                            video_track_seen,
+                            received_rtp_packets = packets,
+                            assembled_access_units = snapshot.received_delta_frames,
+                            decoder_inputs = snapshot.decoder_input_frames,
+                            decoded_frames = snapshot.decoded_frames,
+                            published_frames = snapshot.published_frames,
+                            decode_errors,
+                            "Sessão conectada sem publicar vídeo antes do timeout"
+                        );
                         let message = if packets == 0 {
                             format!(
                                 "P2P conectado, mas nenhum pacote de vídeo chegou em 5 segundos. Confirme que o emissor está enviando e que UDP {MEDIA_UDP_PORT} está permitido no firewall dos dois PCs."
@@ -785,14 +806,27 @@ async fn run_session(
                         continue;
                     };
                     let result = async {
-                        let answer = serde_json::from_str(&payload)
+                        let answer: RTCSessionDescription = serde_json::from_str(&payload)
                             .map_err(|error| format!("Resposta SDP inválida: {error}"))?;
+                        let media_summary = summarize_sdp_media(&answer.sdp);
+                        tracing::info!(
+                            screen_share_session = peer.metrics.session_id,
+                            stage = "remote_answer_received",
+                            media = %media_summary,
+                            "Resumo sanitizado da resposta remota"
+                        );
                         peer.connection
                             .set_remote_description(answer)
                             .await
                             .map_err(|error| {
                                 format!("Não foi possível aplicar a resposta SDP: {error}")
                             })?;
+                        tracing::info!(
+                            screen_share_session = peer.metrics.session_id,
+                            stage = "remote_answer_applied",
+                            media = %media_summary,
+                            "Resposta remota aplicada à conexão WebRTC"
+                        );
                         peer.remote_description_set = true;
                         Ok::<(), String>(())
                     }
@@ -1351,6 +1385,12 @@ async fn create_sender(
         .local_description()
         .await
         .ok_or_else(|| "O WebRTC não gerou a descrição local.".to_owned())?;
+    tracing::info!(
+        screen_share_session = metrics.session_id,
+        stage = "local_offer_created",
+        media = %summarize_sdp_media(&local_description.sdp),
+        "Resumo sanitizado da oferta local"
+    );
     let payload = serde_json::to_string(&local_description)
         .map_err(|error| format!("Não foi possível serializar a oferta WebRTC: {error}"))?;
     events
@@ -1401,6 +1441,11 @@ async fn create_sender(
         tracing::info!(
             screen_share_session = writer_metrics.session_id,
             track_ssrc = ssrc,
+            media_kind = "video",
+            codec = MIME_TYPE_H264,
+            payload_type = VIDEO_PAYLOAD_TYPE,
+            track_id = "p2p-screen-track",
+            stream_id = "p2p-screen-stream",
             "Faixa RTP de vídeo local identificada"
         );
         let mut sample_rx = sample_rx;
@@ -1755,12 +1800,25 @@ async fn create_receiver(
         decoder_preference,
     )
     .await?;
-    let offer =
+    let offer: RTCSessionDescription =
         serde_json::from_str(&payload).map_err(|error| format!("Oferta SDP inválida: {error}"))?;
+    let remote_offer_summary = summarize_sdp_media(&offer.sdp);
+    tracing::info!(
+        screen_share_session = metrics.session_id,
+        stage = "remote_offer_received",
+        media = %remote_offer_summary,
+        "Resumo sanitizado da oferta remota"
+    );
     connection
         .set_remote_description(offer)
         .await
         .map_err(|error| format!("Não foi possível aplicar a oferta WebRTC: {error}"))?;
+    tracing::info!(
+        screen_share_session = metrics.session_id,
+        stage = "remote_offer_applied",
+        media = %remote_offer_summary,
+        "Oferta remota aplicada à conexão WebRTC"
+    );
     let answer = connection
         .create_answer(None)
         .await
@@ -1773,6 +1831,12 @@ async fn create_receiver(
         .local_description()
         .await
         .ok_or_else(|| "O WebRTC não gerou a descrição de resposta.".to_owned())?;
+    tracing::info!(
+        screen_share_session = metrics.session_id,
+        stage = "local_answer_created",
+        media = %summarize_sdp_media(&local_description.sdp),
+        "Resumo sanitizado da resposta local"
+    );
     let answer_payload = serde_json::to_string(&local_description)
         .map_err(|error| format!("Não foi possível serializar a resposta WebRTC: {error}"))?;
     events

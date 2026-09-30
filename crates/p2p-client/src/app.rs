@@ -963,7 +963,13 @@ impl ClientUi {
                 if let Some(peer_id) = from_participant_id {
                     self.group_available_shares.remove(&peer_id);
                     self.group_watched_shares.remove(&peer_id);
-                    self.group_inbound_sessions.remove(&peer_id);
+                    if let Some(session) = self.group_inbound_sessions.remove(&peer_id) {
+                        group_sharing::log_final_group_session_diagnostics(
+                            &session,
+                            "receiver",
+                            "remote_share_unavailable",
+                        );
+                    }
                     self.group_inbound_ports.remove(&peer_id);
                     self.group_remote_textures.remove(&peer_id);
                     self.group_remote_sequences.remove(&peer_id);
@@ -983,7 +989,13 @@ impl ClientUi {
             }
             SignalKind::ScreenShareUnwatch => {
                 if let Some(viewer_id) = from_participant_id {
-                    self.group_outbound_sessions.remove(&viewer_id);
+                    if let Some(session) = self.group_outbound_sessions.remove(&viewer_id) {
+                        group_sharing::log_final_group_session_diagnostics(
+                            &session,
+                            "sender",
+                            "viewer_unwatched",
+                        );
+                    }
                     self.group_outbound_ports.remove(&viewer_id);
                     self.rebalance_group_outbound(context, None);
                 }
@@ -1183,7 +1195,13 @@ impl ClientUi {
                         && self.group_watched_shares.contains(*id)
                         && stream_id.as_deref() == Some(*id)
                 }) {
-                    self.group_inbound_sessions.remove(peer_id);
+                    if let Some(session) = self.group_inbound_sessions.remove(peer_id) {
+                        group_sharing::log_final_group_session_diagnostics(
+                            &session,
+                            "receiver",
+                            "remote_share_reconfigured",
+                        );
+                    }
                     self.group_inbound_ports.remove(peer_id);
                     self.group_remote_textures.remove(peer_id);
                     self.group_remote_sequences.remove(peer_id);
@@ -1608,6 +1626,16 @@ impl ClientUi {
                     ScreenShareRole::Requesting { .. } => "requesting",
                     ScreenShareRole::Idle => "idle",
                 },
+                phase = "final",
+                termination_reason = "local_stop",
+                video_track_seen = session.remote_video_track_seen(),
+                encoded_frames = metrics.encoded_frames,
+                sent_frames = metrics.sent_frames,
+                received_rtp_packets = metrics.received_packets,
+                inbound_rtp_packets = metrics.inbound_rtp_packets,
+                decoded_frames = metrics.decoded_frames,
+                published_frames = metrics.published_frames,
+                decode_errors = metrics.decode_errors,
                 selected_ice_pair = %metrics.selected_ice_pair,
                 rtc_outbound = %metrics.rtc_outbound_summary,
                 rtc_inbound = %metrics.rtc_inbound_summary,

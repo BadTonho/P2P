@@ -23,6 +23,7 @@ use rtc::peer_connection::configuration::media_engine::{
     MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine,
 };
 use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceServer};
+use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::RTCIceCandidateInit;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp::codec::h264::H264Packet;
@@ -67,6 +68,8 @@ mod h264;
 mod metrics;
 #[path = "screen_sharing/receiver.rs"]
 mod receiver;
+#[path = "screen_sharing/sdp_diagnostics.rs"]
+mod sdp_diagnostics;
 #[path = "screen_sharing/sender.rs"]
 mod sender;
 #[path = "screen_sharing/session.rs"]
@@ -75,6 +78,7 @@ use h264::*;
 use metrics::should_log_aggregate_error;
 pub use metrics::{MediaRoute, ScreenShareMetrics, ScreenSharePerformanceSnapshot};
 use receiver::{KeyframeRequestLimiter, PliReason, RtpSequenceUpdate};
+use sdp_diagnostics::summarize_sdp_media;
 use sender::{EncodedFrame, encode_latest_frames, unique_ssrc};
 #[cfg(test)]
 use sender::{encode_frame, openh264_encoder};
@@ -166,6 +170,7 @@ struct PeerStatsSnapshot {
 struct SharedMetrics {
     session_id: u64,
     track_ssrc: AtomicU64,
+    remote_video_track_seen: AtomicBool,
     p2p_connected: AtomicBool,
     route: AtomicU64,
     local_ice_candidates: AtomicU64,
