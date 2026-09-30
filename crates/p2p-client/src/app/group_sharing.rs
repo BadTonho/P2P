@@ -216,7 +216,9 @@ impl ClientUi {
             self.video_decoder_preference,
         ) {
             Ok(session) => {
-                if let Err(error) = session.start_sending_with_bitrate(source, bitrate) {
+                if let Err(error) =
+                    session.start_sending_with_options(source, bitrate, self.include_system_audio)
+                {
                     self.screen_share_status = Some(error);
                 } else {
                     self.group_outbound_ports.insert(viewer_id.clone(), port);
@@ -405,6 +407,10 @@ impl ClientUi {
                             inbound_failed = true;
                             failures.push(error);
                         }
+                        ScreenShareEvent::AudioError(error) => {
+                            tracing::error!(peer = %peer_id, stage = "audio_pipeline", error = %error, "Falha de áudio na sessão de grupo; vídeo continua ativo");
+                            states.push(error);
+                        }
                         ScreenShareEvent::ConnectionClosed => {
                             inbound_failed = true;
                             failures.push("A conexão P2P foi encerrada.".to_owned());
@@ -449,6 +455,10 @@ impl ClientUi {
                         ScreenShareEvent::Error(error) => {
                             outbound_failed = true;
                             failures.push(error);
+                        }
+                        ScreenShareEvent::AudioError(error) => {
+                            tracing::error!(peer = %peer_id, stage = "audio_pipeline", error = %error, "Falha de áudio na sessão de grupo; vídeo continua ativo");
+                            states.push(error);
                         }
                         ScreenShareEvent::ConnectionClosed => {
                             outbound_failed = true;

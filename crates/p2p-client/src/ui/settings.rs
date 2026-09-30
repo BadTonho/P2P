@@ -365,6 +365,13 @@ impl ClientUi {
 
     fn show_audio_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Áudio");
+        ui.group(|ui| {
+            ui.heading("Som da tela compartilhada");
+            ui.label("Na barra da sala, marque ‘Incluir som do computador’ antes de compartilhar para transmitir o áudio reproduzido no Windows.");
+            ui.small("A opção fica desligada por padrão. Ela captura a saída padrão do computador, não o microfone; a faixa Opus segue diretamente aos participantes que assistem à tela.");
+            ui.small("Falhas de captura, codificação, envio, recepção e reprodução ficam registradas por sessão nos logs. Uma falha de áudio não encerra a transmissão de vídeo.");
+        });
+        ui.add_space(8.0);
         ui.label("Teste o microfone padrão do Windows sem entrar em uma sala.");
 
         ui.add_space(8.0);

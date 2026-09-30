@@ -337,6 +337,24 @@ impl ClientUi {
 
     pub(super) fn show_room_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
+            let sharing = self.group_local_sharing
+                || matches!(&self.screen_share_role, ScreenShareRole::Sending { .. });
+            let audio_changed = ui
+                .add_enabled(
+                    !sharing,
+                    egui::Checkbox::new(
+                        &mut self.include_system_audio,
+                        "Incluir som do computador",
+                    ),
+                )
+                .changed();
+            if audio_changed {
+                self.save_preferences();
+                tracing::info!(
+                    include_system_audio = self.include_system_audio,
+                    "Preferência de áudio do sistema alterada"
+                );
+            }
             self.show_screen_source_menu(ui);
             if self.group_sharing_compatible() {
                 let can_share = self.peer_connected

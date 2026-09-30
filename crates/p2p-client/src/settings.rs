@@ -60,6 +60,8 @@ pub struct AppSettings {
     pub video_decoder_preference: VideoDecoderPreference,
     pub show_local_preview: bool,
     #[serde(default)]
+    pub include_system_audio: bool,
+    #[serde(default)]
     pub profile_display_name: String,
 }
 
@@ -79,6 +81,7 @@ impl Default for AppSettings {
             control_ipv4: None,
             video_decoder_preference: VideoDecoderPreference::Automatic,
             show_local_preview: true,
+            include_system_audio: false,
             profile_display_name: String::new(),
         }
     }

@@ -19,7 +19,9 @@ use rtc::interceptor::{
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
-use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MediaEngine};
+use rtc::peer_connection::configuration::media_engine::{
+    MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine,
+};
 use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceServer};
 use rtc::peer_connection::transport::RTCIceCandidateInit;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
@@ -49,6 +51,10 @@ use webrtc::peer_connection::{
 };
 use webrtc::runtime::TokioRuntime;
 
+use crate::audio_capture::{
+    OPUS_CHANNELS, OPUS_FRAME_SAMPLES_PER_CHANNEL, OPUS_SAMPLE_RATE, RemoteAudioPlayback,
+    SystemAudioCapture,
+};
 use crate::logging::safe_stun_endpoint;
 use crate::mf_video;
 use crate::screen_capture::{LatestFrame, PreviewFrame};
@@ -75,6 +81,7 @@ use sender::{encode_frame, openh264_encoder};
 pub use session::{ScreenShareEvent, ScreenShareSession};
 
 const VIDEO_PAYLOAD_TYPE: PayloadType = 102;
+const AUDIO_PAYLOAD_TYPE: PayloadType = 111;
 const VIDEO_CLOCK_RATE: u32 = 90_000;
 const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 30);
 const ENCODER_PACING_JITTER_TOLERANCE: Duration = Duration::from_micros(1_000);

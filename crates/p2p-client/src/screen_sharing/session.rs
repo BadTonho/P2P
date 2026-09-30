@@ -56,6 +56,7 @@ pub enum ScreenShareEvent {
     Signal { kind: SignalKind, payload: String },
     State(String),
     Error(String),
+    AudioError(String),
     ConnectionClosed,
 }
 
@@ -63,6 +64,7 @@ enum Command {
     StartSending {
         source: LatestFrame,
         bitrate_bps: u32,
+        include_system_audio: bool,
     },
     Signal {
         kind: SignalKind,
@@ -241,10 +243,28 @@ impl ScreenShareSession {
         source: LatestFrame,
         bitrate_bps: u32,
     ) -> Result<(), String> {
+        self.start_sending_with_options(source, bitrate_bps, false)
+    }
+
+    pub fn start_sending_with_audio(
+        &self,
+        source: LatestFrame,
+        include_system_audio: bool,
+    ) -> Result<(), String> {
+        self.start_sending_with_options(source, MAX_PEER_MEDIA_BITRATE, include_system_audio)
+    }
+
+    pub fn start_sending_with_options(
+        &self,
+        source: LatestFrame,
+        bitrate_bps: u32,
+        include_system_audio: bool,
+    ) -> Result<(), String> {
         self.commands
             .send(Command::StartSending {
                 source,
                 bitrate_bps: bitrate_bps.clamp(250_000, MAX_PEER_MEDIA_BITRATE),
+                include_system_audio,
             })
             .map_err(|_| "A sessão WebRTC foi encerrada.".to_owned())
     }
@@ -319,6 +339,7 @@ struct PeerSession {
     encoder_source: Option<LatestFrame>,
     encoder_task: Option<TokioJoinHandle<Result<(), String>>>,
     sample_writer_task: Option<TokioJoinHandle<()>>,
+    audio_task: Option<TokioJoinHandle<()>>,
     rtcp_feedback_task: Option<TokioJoinHandle<()>>,
     #[allow(dead_code)] // Usado pelo teste loopback para emitir o PLI de diagnóstico.
     remote_track: RemoteTrackStore,
@@ -691,7 +712,7 @@ async fn run_session(
             command = commands.recv() => {
                 let Some(command) = command else { break };
         match command {
-            Command::StartSending { source, bitrate_bps } => {
+            Command::StartSending { source, bitrate_bps, include_system_audio } => {
                 if active_peer.is_some() {
                     let _ = events.send(ScreenShareEvent::Error(
                         "Já existe uma sessão de compartilhamento ativa.".to_owned(),
@@ -711,6 +732,7 @@ async fn run_session(
                     turn_credentials.as_ref(),
                     decoder_preference,
                     bitrate_bps,
+                    include_system_audio,
                 )
                 .await
                 {
@@ -1093,6 +1115,20 @@ async fn create_peer(
     media_engine
         .register_codec(video_codec, RtpCodecKind::Video)
         .map_err(|error| format!("Não foi possível registrar H.264 no WebRTC: {error}"))?;
+    let opus_codec = RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: OPUS_SAMPLE_RATE,
+            channels: OPUS_CHANNELS as u16,
+            sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
+            rtcp_feedback: vec![],
+        },
+        payload_type: AUDIO_PAYLOAD_TYPE,
+        ..Default::default()
+    };
+    media_engine
+        .register_codec(opus_codec, RtpCodecKind::Audio)
+        .map_err(|error| format!("Não foi possível registrar Opus no WebRTC: {error}"))?;
     let interceptors = register_default_interceptors(Registry::new(), &mut media_engine)
         .map_err(|error| format!("Não foi possível preparar o WebRTC: {error}"))?;
     let interceptors = interceptors.with(Slot::Custom(14_000), PliForwarder::default());
@@ -1177,7 +1213,42 @@ async fn create_sender(
     turn_credentials: Option<&TurnCredentials>,
     decoder_preference: VideoDecoderPreference,
     bitrate_bps: u32,
+    include_system_audio: bool,
 ) -> Result<PeerSession, String> {
+    let (system_audio, audio_setup_error) = if include_system_audio {
+        let result = (|| {
+            let capture = SystemAudioCapture::start(metrics.session_id)?;
+            let (input_rate_hz, input_channels) = capture.input_format();
+            tracing::info!(
+                screen_share_session = metrics.session_id,
+                input_rate_hz,
+                input_channels,
+                opus_rate_hz = OPUS_SAMPLE_RATE,
+                "Pipeline de áudio do sistema preparado para envio"
+            );
+            let encoder = opus::Encoder::new(
+                OPUS_SAMPLE_RATE,
+                opus::Channels::Stereo,
+                opus::Application::Audio,
+            )
+            .map_err(|error| format!("Não foi possível iniciar o encoder Opus: {error}"))?;
+            Ok::<_, String>((capture, encoder))
+        })();
+        match result {
+            Ok(audio) => (Some(audio), None),
+            Err(error) => {
+                tracing::error!(
+                    screen_share_session = metrics.session_id,
+                    stage = "system_audio_setup",
+                    error = %error,
+                    "O som não será enviado; a transmissão de vídeo continuará"
+                );
+                (None, Some(error))
+            }
+        }
+    } else {
+        (None, None)
+    };
     let connection = create_peer(
         events,
         context,
@@ -1227,6 +1298,46 @@ async fn create_sender(
         .add_track(Arc::clone(&track) as Arc<dyn TrackLocal>)
         .await
         .map_err(|error| format!("Não foi possível adicionar a tela à conexão P2P: {error}"))?;
+
+    let audio_track = if system_audio.is_some() {
+        let codec = RTCRtpCodec {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: OPUS_SAMPLE_RATE,
+            channels: OPUS_CHANNELS as u16,
+            sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
+            rtcp_feedback: vec![],
+        };
+        let audio_ssrc = unique_ssrc();
+        let audio_track = Arc::new(
+            TrackLocalStaticSample::new(
+                Instant::now(),
+                MediaStreamTrack::new(
+                    "p2p-screen-audio-stream".to_owned(),
+                    "p2p-screen-audio-track".to_owned(),
+                    "Áudio do computador".to_owned(),
+                    RtpCodecKind::Audio,
+                    vec![RTCRtpEncodingParameters {
+                        rtp_coding_parameters: RTCRtpCodingParameters {
+                            ssrc: Some(audio_ssrc),
+                            ..Default::default()
+                        },
+                        codec,
+                        ..Default::default()
+                    }],
+                ),
+            )
+            .map_err(|error| format!("Não foi possível criar a faixa Opus: {error}"))?,
+        );
+        connection
+            .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
+            .await
+            .map_err(|error| {
+                format!("Não foi possível adicionar o áudio à conexão P2P: {error}")
+            })?;
+        Some(audio_track)
+    } else {
+        None
+    };
 
     let offer = connection
         .create_offer(None)
@@ -1370,9 +1481,25 @@ async fn create_sender(
         }
     });
 
+    let audio_task = match (system_audio, audio_track) {
+        (Some((capture, encoder)), Some(audio_track)) => {
+            let audio_events = events.clone();
+            let session_id = metrics.session_id;
+            Some(tokio::spawn(async move {
+                send_system_audio(capture, encoder, audio_track, audio_events, session_id).await;
+            }))
+        }
+        _ => None,
+    };
+
     let _ = events.send(ScreenShareEvent::State(
         "Oferta enviada; aguardando conexão P2P com o participante.".to_owned(),
     ));
+    if let Some(error) = audio_setup_error {
+        let _ = events.send(ScreenShareEvent::AudioError(format!(
+            "Não foi possível iniciar o som do computador; o vídeo continua: {error}"
+        )));
+    }
     Ok(PeerSession {
         connection,
         pending_ice: Vec::new(),
@@ -1385,10 +1512,167 @@ async fn create_sender(
         encoder_source: Some(encoder_source),
         encoder_task: Some(encoder_task),
         sample_writer_task: Some(sample_writer_task),
+        audio_task,
         rtcp_feedback_task: Some(rtcp_feedback_task),
         remote_track,
         keyframe_request_limiter: KeyframeRequestLimiter::default(),
     })
+}
+
+async fn send_system_audio(
+    mut capture: SystemAudioCapture,
+    mut encoder: opus::Encoder,
+    track: Arc<TrackLocalStaticSample>,
+    events: std_mpsc::Sender<ScreenShareEvent>,
+    session_id: u64,
+) {
+    let Some(ssrc) = track.ssrcs().await.first().copied() else {
+        let message = "A faixa Opus não recebeu um identificador RTP.".to_owned();
+        tracing::error!(
+            screen_share_session = session_id,
+            stage = "audio_track_bind",
+            "Faixa de áudio sem SSRC"
+        );
+        let _ = events.send(ScreenShareEvent::AudioError(message));
+        return;
+    };
+    tracing::info!(
+        screen_share_session = session_id,
+        audio_track_ssrc = ssrc,
+        codec = "Opus",
+        sample_rate_hz = OPUS_SAMPLE_RATE,
+        channels = OPUS_CHANNELS,
+        "Faixa RTP de áudio do sistema pronta"
+    );
+
+    let mut interval = tokio::time::interval(Duration::from_millis(20));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let frame_len = OPUS_FRAME_SAMPLES_PER_CHANNEL * OPUS_CHANNELS;
+    let mut pcm = vec![0.0_f32; frame_len];
+    let mut filled = 0_usize;
+    let mut encoded = vec![0_u8; 4_000];
+    let mut encoded_frames = 0_u64;
+    let mut encoded_bytes = 0_u64;
+    let mut written_samples = 0_u64;
+    let mut write_failures = 0_u64;
+    let mut last_report_at = Instant::now();
+    let mut last_capture_frames = capture.captured_frames();
+    let mut last_dropped_frames = capture.dropped_frames();
+    let mut last_encoded_frames = 0_u64;
+    let mut last_encoded_bytes = 0_u64;
+    let mut last_written_samples = 0_u64;
+    let mut last_write_failures = 0_u64;
+
+    loop {
+        interval.tick().await;
+        if let Some(error) = capture.take_error() {
+            tracing::error!(
+                screen_share_session = session_id,
+                audio_track_ssrc = ssrc,
+                stage = "wasapi_loopback_callback",
+                error = %error,
+                "Captura do áudio do sistema interrompida"
+            );
+            let _ = events.send(ScreenShareEvent::AudioError(format!(
+                "A captura do som do computador parou: {error}"
+            )));
+            break;
+        }
+
+        filled += capture.read_samples(&mut pcm[filled..]);
+        if filled == frame_len {
+            let encoded_len = match encoder.encode_float(&pcm, &mut encoded) {
+                Ok(length) if length > 0 => length,
+                Ok(_) => {
+                    tracing::warn!(
+                        screen_share_session = session_id,
+                        audio_track_ssrc = ssrc,
+                        stage = "opus_encode",
+                        "Encoder Opus produziu amostra vazia"
+                    );
+                    filled = 0;
+                    continue;
+                }
+                Err(error) => {
+                    let detail = format!("Falha ao codificar áudio com Opus: {error}");
+                    tracing::error!(
+                        screen_share_session = session_id,
+                        audio_track_ssrc = ssrc,
+                        stage = "opus_encode",
+                        error = %detail,
+                        "Encoder de áudio falhou"
+                    );
+                    let _ = events.send(ScreenShareEvent::AudioError(detail));
+                    break;
+                }
+            };
+            encoded_frames = encoded_frames.saturating_add(1);
+            encoded_bytes = encoded_bytes.saturating_add(encoded_len as u64);
+            let sample = Sample {
+                data: Bytes::copy_from_slice(&encoded[..encoded_len]),
+                duration: Duration::from_millis(20),
+                ..Sample::new(Instant::now())
+            };
+            match track
+                .sample_writer(ssrc, AUDIO_PAYLOAD_TYPE)
+                .write_sample(&sample)
+                .await
+            {
+                Ok(()) => written_samples = written_samples.saturating_add(1),
+                Err(error) => {
+                    write_failures = write_failures.saturating_add(1);
+                    let detail = format!("A faixa WebRTC recusou uma amostra Opus: {error}");
+                    tracing::error!(
+                        screen_share_session = session_id,
+                        audio_track_ssrc = ssrc,
+                        stage = "audio_rtp_write",
+                        error = %error,
+                        encoded_frames,
+                        "Falha ao enviar áudio pela faixa WebRTC"
+                    );
+                    let _ = events.send(ScreenShareEvent::AudioError(detail));
+                    break;
+                }
+            }
+            filled = 0;
+        }
+
+        if last_report_at.elapsed() >= Duration::from_secs(5) {
+            let captured = capture.captured_frames();
+            let dropped = capture.dropped_frames();
+            tracing::info!(
+                screen_share_session = session_id,
+                audio_track_ssrc = ssrc,
+                interval_seconds = last_report_at.elapsed().as_secs_f64(),
+                captured_frames = captured.saturating_sub(last_capture_frames),
+                capture_queue_drops = dropped.saturating_sub(last_dropped_frames),
+                encoded_frames = encoded_frames.saturating_sub(last_encoded_frames),
+                encoded_bytes = encoded_bytes.saturating_sub(last_encoded_bytes),
+                rtp_samples_accepted = written_samples.saturating_sub(last_written_samples),
+                rtp_write_failures = write_failures.saturating_sub(last_write_failures),
+                pending_pcm_samples = filled,
+                "Resumo periódico do envio de áudio do sistema"
+            );
+            last_report_at = Instant::now();
+            last_capture_frames = captured;
+            last_dropped_frames = dropped;
+            last_encoded_frames = encoded_frames;
+            last_encoded_bytes = encoded_bytes;
+            last_written_samples = written_samples;
+            last_write_failures = write_failures;
+        }
+    }
+
+    tracing::info!(
+        screen_share_session = session_id,
+        audio_track_ssrc = ssrc,
+        encoded_frames,
+        encoded_bytes,
+        rtp_samples_accepted = written_samples,
+        rtp_write_failures = write_failures,
+        capture_queue_drops = capture.dropped_frames(),
+        "Envio de áudio do sistema encerrado"
+    );
 }
 
 async fn create_receiver(
@@ -1458,6 +1742,7 @@ async fn create_receiver(
         encoder_source: None,
         encoder_task: None,
         sample_writer_task: None,
+        audio_task: None,
         rtcp_feedback_task: None,
         remote_track,
         keyframe_request_limiter: KeyframeRequestLimiter::default(),
@@ -1484,6 +1769,9 @@ async fn close_peer(mut peer: PeerSession) {
     }
     if let Some(writer) = peer.sample_writer_task.take() {
         writer.abort();
+    }
+    if let Some(audio_task) = peer.audio_task.take() {
+        audio_task.abort();
     }
     if let Some(feedback) = peer.rtcp_feedback_task.take() {
         feedback.abort();

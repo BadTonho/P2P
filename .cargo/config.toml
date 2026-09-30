@@ -1,0 +1,5 @@
+[env]
+# audiopus_sys bundles Opus with a CMake project that declares 2.8.12.
+# CMake 4 removed compatibility below 3.5, so provide the policy floor when
+# the dependency configures its bundled source.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

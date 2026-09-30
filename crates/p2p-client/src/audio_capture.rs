@@ -2,6 +2,12 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod system_audio;
+pub(crate) use system_audio::{
+    OPUS_CHANNELS, OPUS_FRAME_SAMPLES_PER_CHANNEL, OPUS_SAMPLE_RATE, RemoteAudioPlayback,
+    SystemAudioCapture,
+};
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 

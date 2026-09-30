@@ -8,7 +8,7 @@ Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao co
 - Aplicativo instalado primeiro no Windows.
 - Rust como linguagem principal.
 - egui/eframe para a interface gráfica.
-- Compartilhamento de tela como recurso principal. Chamada de voz fica como etapa opcional no final do roadmap.
+- Compartilhamento de tela como recurso principal. O áudio reproduzido pelo computador pode acompanhar a tela; chamada de voz pelo microfone fica como etapa opcional no final do roadmap.
 - Prioridade de mídia: implementar e validar a transmissão de tela antes de qualquer trabalho opcional de voz.
 - Salas locais/Radmin de sinalização e fila de sucessão para até oito participantes. O modo Internet de teste controlado fica limitado a duas pessoas e termina quando o anfitrião sai; não tem sucessão. O compartilhamento em grupo e a chamada de voz ficam para etapas posteriores; voz não é requisito para usar o compartilhamento de tela.
 - Sem câmera e sem chat de texto.
@@ -80,6 +80,8 @@ Usar o servidor da sala apenas para trocar pedido, oferta, resposta, candidatos 
 **Aceleração de vídeo:** no Windows, o aplicativo tenta usar codificadores H.264 de hardware do Media Foundation e decodificadores DXVA/Direct3D 11. Na captura de monitores por DXGI, o app tenta redimensionar e converter BGRA para NV12 na GPU e entregar a superfície D3D11 diretamente ao encoder. A prévia lê de volta apenas o quadro reduzido; se essa etapa ou a conversão GPU falhar, usa a cópia BGRA e o caminho atual por CPU. Captura de janela continua usando Windows Graphics Capture e pode exibir a borda amarela de privacidade. Se o encoder não aceitar a superfície, o app tenta a entrada NV12 pela CPU e depois OpenH264. O decoder DXVA também pode cair para OpenH264 se não publicar quadros. Interface e logs exibem os backends e os motivos de fallback. O formato continua H.264 Baseline, até 1280×720 e teto de 30 fps.
 
 **Pacing e diagnóstico:** o limitador aceita quadros com tolerância a pequenas variações nos callbacks, sem ultrapassar 30 FPS; quadros excedentes são descartados e uma imagem parada pode ser repetida a 1 FPS. Durante a sessão, a interface e os logs resumem a cada cinco segundos callbacks, quadros aceitos/descartados, leitura e preparação da prévia, conversão GPU, encoder, envio, recepção, decodificação e publicação.
+
+**Áudio do sistema na tela compartilhada:** opção desligada por padrão para capturar o áudio reproduzido na saída padrão do Windows; não captura o microfone e não transforma a sala em chamada de voz. O áudio segue em faixa Opus WebRTC direta junto da tela. Erros da captura, codificação, envio, recepção, decodificação ou saída são associados à sessão e à faixa nos logs, com métricas agregadas a cada cinco segundos. Uma falha de áudio não encerra o vídeo. Implementação compilada; falta validar manualmente captura e reprodução entre computadores e em salas com várias transmissões.
 
 **Validação automatizada local:** o NVIDIA H.264 Encoder MFT deste PC gerou SPS/PPS/IDR Baseline e o quadro foi decodificado pelo OpenH264, cobrindo a compatibilidade com receptores antigos. O Microsoft H264 Video Decoder MFT inicializou DXVA, mas não produziu quadros neste PC; o teste de loopback confirmou a troca para OpenH264 e a chegada da imagem.
 

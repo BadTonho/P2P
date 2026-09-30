@@ -17,6 +17,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 rand = "0.9"
 sha2 = "0.10"
 openh264 = { version = "0.9.8", features = ["source"] }
+opus = "0.3.1"
 rtrb = "0.4"
 rfd = { version = "0.16", default-features = false }
 rtc = "0.21"

@@ -1,12 +1,12 @@
 # Como usar o P2P — Voz e tela
 
-Este guia cobre a versão Windows 1.0.0. O aplicativo compartilha tela; chamada de voz, câmera e chat de texto ainda não estão disponíveis. A captura local fica na memória. Nenhum vídeo é gravado.
+O aplicativo compartilha a tela e pode incluir, opcionalmente, o áudio reproduzido pelo Windows. Isso não é uma chamada de voz: o microfone, a câmera e o chat de texto não são transmitidos. A captura local fica na memória; vídeo e áudio não são gravados.
 
 ## Instalar o aplicativo
 
 1. Baixe `P2P-Voz-e-tela-Setup.exe` no GitHub Release mais recente e execute-o. A instalação é feita no seu usuário e não exige administrador.
 2. Abra **P2P - Voz e tela** pelo menu Iniciar.
-3. O app lembra endereço do anfitrião, STUN, ganho de áudio, modo de criação, opção TURN, autorização para hospedagem e adaptador de controle. As preferências ficam neste computador e sobrevivem às atualizações. O código da sala e credenciais temporárias não são salvos.
+3. O app lembra endereço do anfitrião, STUN, ganho de áudio, inclusão do som do computador, modo de criação, opção TURN, autorização para hospedagem e adaptador de controle. As preferências ficam neste computador e sobrevivem às atualizações. O código da sala e credenciais temporárias não são salvos.
 4. Se preferir, o release também oferece `p2p-client.exe` para executar sem o instalador.
 
 Ao desinstalar pelo Windows, as preferências e a foto do perfil são removidas. Os logs de diagnóstico permanecem em `%LOCALAPPDATA%\P2P-Voz-e-tela\logs`.
@@ -18,7 +18,7 @@ Na tela inicial, **Seu perfil** permite informar um nome e escolher uma foto; am
 ## Antes de começar
 
 - Cada pessoa precisa executar o `p2p-client.exe` no Windows 10 versão 1803 ou posterior, ou Windows 11.
-- Para compartilhar a tela, a sala precisa ter exatamente duas pessoas. Salas locais/Radmin aceitam até oito participantes, mas o compartilhamento em grupo ainda não está disponível.
+- Salas locais/Radmin aceitam até oito participantes. O compartilhamento em grupo exige que todos estejam usando uma versão compatível.
 - Se o Windows Firewall perguntar, permita o aplicativo nas redes que você está usando. Não é preciso desligar o firewall.
 - Em **Configurações > Atualizações**, é possível procurar atualizações. Downloads e reinicialização para aplicar são iniciados por você e não ficam disponíveis durante uma sala.
 
@@ -28,6 +28,12 @@ Na tela inicial, **Seu perfil** permite informar um nome e escolher uma foto; am
 2. O anfitrião seleciona **Rede local / Radmin** e clica em **Criar sala**. Escolhe o adaptador cujo IPv4 o amigo pode alcançar e compartilha o endereço `ws://IP:9000` e o código da sala.
 3. O convidado seleciona **Rede local / Radmin** para escolher seu adaptador de controle, abre **Configurações > Conexão**, informa o endereço do anfitrião e volta à tela inicial. Digita o código e clica em **Entrar**.
 4. Os participantes escolhem uma tela ou janela. Em uma sala compatível com grupo, cada pessoa pode clicar em **Compartilhar minha tela**; quem quiser assistir escolhe **Assistir** na transmissão correspondente. As telas assistidas aparecem na grade. Em uma sala com cliente antigo, o compartilhamento continua no fluxo de duas pessoas, com pedido e aceite.
+
+## Áudio reproduzido pelo computador
+
+Antes de iniciar o compartilhamento, marque **Incluir som do computador** na barra da sala para enviar também o áudio que está tocando na saída padrão do Windows. A opção fica desligada por padrão e não usa o microfone. O áudio segue diretamente pela conexão WebRTC para quem recebe aquela tela; o servidor da sala não recebe a mídia. Para cada tela assistida, o app reproduz o áudio remoto pela saída padrão do participante.
+
+Se a captura de áudio falhar, o vídeo continua. Se a reprodução remota falhar, a tela continua sendo exibida. O app registra erros identificados por sessão e faixa, além de resumos a cada cinco segundos de captura, codificação Opus, pacotes RTP, decodificação e fila de reprodução. Use **Exportar logs** para salvar esse diagnóstico. Em salas com vários participantes, cada tela tem sua própria faixa de áudio; ouvir várias ao mesmo tempo pode misturar os sons.
 
 Portas para permitir no firewall:
 

@@ -835,6 +835,10 @@ fn should_decode_access_unit(waiting_for_idr: &mut bool, access_unit: &[u8]) -> 
 
 impl PeerEvents {
     pub(super) async fn receive_remote_track(&self, track: Arc<dyn TrackRemote>) {
+        if track.kind().await == RtpCodecKind::Audio {
+            self.receive_remote_audio_track(track).await;
+            return;
+        }
         if let Some(ssrc) = track.ssrcs().await.first().copied() {
             self.metrics.set_track_ssrc(ssrc);
             tracing::info!(
@@ -1577,6 +1581,164 @@ impl PeerEvents {
                 }
             }
         });
+    }
+
+    async fn receive_remote_audio_track(&self, track: Arc<dyn TrackRemote>) {
+        let session_id = self.metrics.session_id;
+        let ssrc = track.ssrcs().await.first().copied().unwrap_or_default();
+        let track_kind = track.kind().await;
+        tracing::info!(
+            screen_share_session = session_id,
+            audio_track_ssrc = ssrc,
+            kind = ?track_kind,
+            "Faixa Opus remota recebida; preparando decodificação e saída"
+        );
+        let mut playback = match RemoteAudioPlayback::start(session_id, ssrc) {
+            Ok(playback) => playback,
+            Err(error) => {
+                tracing::error!(
+                    screen_share_session = session_id,
+                    audio_track_ssrc = ssrc,
+                    stage = "audio_output_open",
+                    error = %error,
+                    "Não foi possível abrir a saída de áudio"
+                );
+                let _ = self.events.send(ScreenShareEvent::AudioError(format!(
+                    "O áudio remoto chegou, mas não foi possível abrir a saída do Windows: {error}"
+                )));
+                return;
+            }
+        };
+        let mut decoder = match opus::Decoder::new(OPUS_SAMPLE_RATE, opus::Channels::Stereo) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                let message = format!("Não foi possível iniciar o decoder Opus: {error}");
+                tracing::error!(
+                    screen_share_session = session_id,
+                    audio_track_ssrc = ssrc,
+                    stage = "opus_decoder_init",
+                    error = %message,
+                    "Decoder de áudio não pôde ser iniciado"
+                );
+                let _ = self.events.send(ScreenShareEvent::AudioError(message));
+                return;
+            }
+        };
+
+        let mut decoded = vec![0.0_f32; 5_760 * OPUS_CHANNELS];
+        let mut packets = 0_u64;
+        let mut bytes = 0_u64;
+        let mut decoded_frames = 0_u64;
+        let mut decoded_samples = 0_u64;
+        let mut decode_errors = 0_u64;
+        let mut last_report_at = Instant::now();
+        let mut last_packets = 0_u64;
+        let mut last_bytes = 0_u64;
+        let mut last_decoded_frames = 0_u64;
+        let mut last_decoded_samples = 0_u64;
+        let mut last_decode_errors = 0_u64;
+        let mut last_output_underruns = playback.output_underflow_frames();
+        let mut last_output_drops = playback.dropped_frames();
+
+        while let Some(event) = track.poll().await {
+            match event {
+                TrackRemoteEvent::OnRtpPacket(packet) => {
+                    packets = packets.saturating_add(1);
+                    bytes = bytes.saturating_add(packet.payload.len() as u64);
+                    match decoder.decode_float(&packet.payload, &mut decoded, false) {
+                        Ok(samples_per_channel) => {
+                            if samples_per_channel > 0 {
+                                decoded_frames = decoded_frames.saturating_add(1);
+                                decoded_samples = decoded_samples.saturating_add(
+                                    samples_per_channel.saturating_mul(OPUS_CHANNELS) as u64,
+                                );
+                                playback.push_decoded(&decoded, samples_per_channel);
+                            }
+                        }
+                        Err(error) => {
+                            decode_errors = decode_errors.saturating_add(1);
+                            if should_log_aggregate_error(decode_errors) {
+                                tracing::warn!(
+                                    screen_share_session = session_id,
+                                    audio_track_ssrc = ssrc,
+                                    stage = "opus_decode",
+                                    packet_bytes = packet.payload.len(),
+                                    decode_errors,
+                                    error = %error,
+                                    "Falha agregada ao decodificar áudio Opus"
+                                );
+                            }
+                        }
+                    }
+                    if let Some(error) = playback.take_error() {
+                        tracing::error!(
+                            screen_share_session = session_id,
+                            audio_track_ssrc = ssrc,
+                            stage = "audio_output_callback",
+                            error = %error,
+                            "Saída de áudio remoto parou"
+                        );
+                        let _ = self.events.send(ScreenShareEvent::AudioError(format!(
+                            "A saída de áudio remoto parou: {error}"
+                        )));
+                        break;
+                    }
+                }
+                TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnEnding => break,
+                TrackRemoteEvent::OnError => {
+                    tracing::error!(
+                        screen_share_session = session_id,
+                        audio_track_ssrc = ssrc,
+                        stage = "audio_rtp_receive",
+                        "A faixa RTP de áudio informou erro"
+                    );
+                    let _ = self.events.send(ScreenShareEvent::AudioError(
+                        "A faixa RTP do áudio remoto informou erro.".to_owned(),
+                    ));
+                    break;
+                }
+                _ => {}
+            }
+
+            if last_report_at.elapsed() >= Duration::from_secs(5) {
+                let output_underruns = playback.output_underflow_frames();
+                let output_drops = playback.dropped_frames();
+                tracing::info!(
+                    screen_share_session = session_id,
+                    audio_track_ssrc = ssrc,
+                    interval_seconds = last_report_at.elapsed().as_secs_f64(),
+                    rtp_packets = packets.saturating_sub(last_packets),
+                    rtp_payload_bytes = bytes.saturating_sub(last_bytes),
+                    opus_frames_decoded = decoded_frames.saturating_sub(last_decoded_frames),
+                    pcm_samples_decoded = decoded_samples.saturating_sub(last_decoded_samples),
+                    opus_decode_errors = decode_errors.saturating_sub(last_decode_errors),
+                    output_underrun_frames = output_underruns.saturating_sub(last_output_underruns),
+                    output_queue_drops = output_drops.saturating_sub(last_output_drops),
+                    "Resumo periódico da recepção de áudio"
+                );
+                last_report_at = Instant::now();
+                last_packets = packets;
+                last_bytes = bytes;
+                last_decoded_frames = decoded_frames;
+                last_decoded_samples = decoded_samples;
+                last_decode_errors = decode_errors;
+                last_output_underruns = output_underruns;
+                last_output_drops = output_drops;
+            }
+        }
+
+        tracing::info!(
+            screen_share_session = session_id,
+            audio_track_ssrc = ssrc,
+            rtp_packets = packets,
+            rtp_payload_bytes = bytes,
+            opus_frames_decoded = decoded_frames,
+            pcm_samples_decoded = decoded_samples,
+            opus_decode_errors = decode_errors,
+            output_underrun_frames = playback.output_underflow_frames(),
+            output_queue_drops = playback.dropped_frames(),
+            "Recepção da faixa de áudio encerrada"
+        );
     }
 }
 

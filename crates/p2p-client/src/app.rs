@@ -149,6 +149,7 @@ struct ClientUi {
     remote_screen_texture: Option<egui::TextureHandle>,
     remote_screen_sequence: u64,
     group_local_sharing: bool,
+    include_system_audio: bool,
     group_available_shares: HashSet<String>,
     group_watched_shares: HashSet<String>,
     group_outbound_sessions: HashMap<String, ScreenShareSession>,
@@ -347,6 +348,7 @@ impl ClientUi {
         settings.monitor_gain_db = self.monitor_gain_db;
         settings.video_decoder_preference = self.video_decoder_preference;
         settings.show_local_preview = self.show_local_preview;
+        settings.include_system_audio = self.include_system_audio;
         settings.profile_display_name = self.profile_display_name.clone();
         settings.create_room_mode = self.create_room_mode;
         settings.use_turn_on_create = self.use_turn_on_create;
@@ -366,6 +368,7 @@ impl ClientUi {
         self.monitor_gain_db = preferences.monitor_gain_db;
         self.video_decoder_preference = preferences.video_decoder_preference;
         self.show_local_preview = preferences.show_local_preview;
+        self.include_system_audio = preferences.include_system_audio;
         self.profile_display_name = preferences.profile_display_name;
         self.capture_preview_enabled
             .store(self.show_local_preview, Ordering::Relaxed);
@@ -1136,7 +1139,9 @@ impl ClientUi {
                         if let Some(capture) = self.screen_capture.as_ref() {
                             let _ = capture.take_performance_snapshot();
                         }
-                        if let Err(error) = session.start_sending(source) {
+                        if let Err(error) =
+                            session.start_sending_with_audio(source, self.include_system_audio)
+                        {
                             session.stop();
                             self.screen_share_role = ScreenShareRole::Idle;
                             self.screen_share_status = Some(error);
@@ -1511,6 +1516,10 @@ impl ClientUi {
                     tracing::error!(screen_share_session, error = %error, "Erro na sessão WebRTC de compartilhamento");
                     self.screen_share_status = Some(error);
                     stop_session = true;
+                }
+                ScreenShareEvent::AudioError(error) => {
+                    tracing::error!(screen_share_session, stage = "audio_pipeline", error = %error, "Falha de áudio isolada; vídeo continua ativo");
+                    self.screen_share_status = Some(error);
                 }
                 ScreenShareEvent::ConnectionClosed => {
                     tracing::warn!(
