@@ -4,6 +4,8 @@ use super::*;
 pub struct ScreenShareMetrics {
     pub session_id: u64,
     pub track_ssrc: Option<u32>,
+    pub outbound_video_ssrc: Option<u32>,
+    pub inbound_video_ssrc: Option<u32>,
     pub p2p_connected: bool,
     pub route: Option<MediaRoute>,
     pub local_ice_candidates: u64,
@@ -19,6 +21,7 @@ pub struct ScreenShareMetrics {
     pub sent_idr_frames: u64,
     pub sent_delta_frames: u64,
     pub received_packets: u64,
+    pub assembled_access_units: u64,
     pub received_delta_frames: u64,
     pub decoded_frames: u64,
     pub decoded_delta_frames: u64,
@@ -127,6 +130,8 @@ impl SharedMetrics {
                 0 => None,
                 ssrc => Some(ssrc as u32),
             },
+            outbound_video_ssrc: (rtc_stats.outbound_ssrc != 0).then_some(rtc_stats.outbound_ssrc),
+            inbound_video_ssrc: (rtc_stats.inbound_ssrc != 0).then_some(rtc_stats.inbound_ssrc),
             p2p_connected: self.p2p_connected.load(Ordering::Relaxed),
             route: match self.route.load(Ordering::Relaxed) {
                 1 => Some(MediaRoute::Direct),
@@ -146,6 +151,7 @@ impl SharedMetrics {
             sent_idr_frames: self.sent_idr_frames.load(Ordering::Relaxed),
             sent_delta_frames: self.sent_delta_frames.load(Ordering::Relaxed),
             received_packets: self.received_packets.load(Ordering::Relaxed),
+            assembled_access_units: h264_flow.assembled_access_units,
             received_delta_frames: h264_flow.assembled_delta_frames,
             decoded_frames: self.decoded_frames.load(Ordering::Relaxed),
             decoded_delta_frames: self.decoded_delta_frames.load(Ordering::Relaxed),

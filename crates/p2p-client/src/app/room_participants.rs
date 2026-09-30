@@ -60,6 +60,8 @@ impl ClientUi {
             .retain(|id| member_ids.contains(id));
         self.group_watched_shares
             .retain(|id| member_ids.contains(id));
+        self.group_auto_focus_pending
+            .retain(|id| member_ids.contains(id));
         self.group_outbound_sessions
             .retain(|id, _| member_ids.contains(id));
         self.group_inbound_sessions
@@ -72,6 +74,13 @@ impl ClientUi {
             .retain(|id, _| member_ids.contains(id));
         self.group_remote_sequences
             .retain(|id, _| member_ids.contains(id));
+        if self
+            .focused_group_screen
+            .as_ref()
+            .is_some_and(|id| id != "__local" && !member_ids.contains(id))
+        {
+            self.focused_group_screen = None;
+        }
         self.group_peer_status
             .retain(|id, _| member_ids.contains(id));
         if self.room_mode != RoomMode::Local

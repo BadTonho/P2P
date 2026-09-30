@@ -155,9 +155,11 @@ struct ClientUi {
     group_outbound_sessions: HashMap<String, ScreenShareSession>,
     group_inbound_sessions: HashMap<String, ScreenShareSession>,
     group_outbound_ports: HashMap<String, u16>,
+    group_outbound_target_bitrate_bps: Option<u32>,
     group_inbound_ports: HashMap<String, u16>,
     group_remote_textures: HashMap<String, egui::TextureHandle>,
     group_remote_sequences: HashMap<String, u64>,
+    group_auto_focus_pending: HashSet<String>,
     group_peer_status: HashMap<String, String>,
     focused_group_screen: Option<String>,
     last_group_metrics_log_at: Option<Instant>,
@@ -963,6 +965,7 @@ impl ClientUi {
                 if let Some(peer_id) = from_participant_id {
                     self.group_available_shares.remove(&peer_id);
                     self.group_watched_shares.remove(&peer_id);
+                    self.group_auto_focus_pending.remove(&peer_id);
                     if let Some(session) = self.group_inbound_sessions.remove(&peer_id) {
                         group_sharing::log_final_group_session_diagnostics(
                             &session,
@@ -973,6 +976,9 @@ impl ClientUi {
                     self.group_inbound_ports.remove(&peer_id);
                     self.group_remote_textures.remove(&peer_id);
                     self.group_remote_sequences.remove(&peer_id);
+                    if self.focused_group_screen.as_deref() == Some(peer_id.as_str()) {
+                        self.focused_group_screen = None;
+                    }
                 }
             }
             SignalKind::ScreenShareWatch => {
@@ -1195,6 +1201,7 @@ impl ClientUi {
                         && self.group_watched_shares.contains(*id)
                         && stream_id.as_deref() == Some(*id)
                 }) {
+                    self.group_auto_focus_pending.insert(peer_id.to_owned());
                     if let Some(session) = self.group_inbound_sessions.remove(peer_id) {
                         group_sharing::log_final_group_session_diagnostics(
                             &session,

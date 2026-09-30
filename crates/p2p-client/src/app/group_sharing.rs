@@ -18,6 +18,58 @@ fn next_group_media_port(used_ports: &HashSet<u16>) -> Option<u16> {
     (9002..=9009).find(|port| !used_ports.contains(port))
 }
 
+fn group_outbound_rebalance_needed(
+    current_viewers: &[String],
+    current_bitrate_bps: Option<u32>,
+    desired_viewers: &[String],
+    desired_bitrate_bps: u32,
+) -> bool {
+    current_viewers != desired_viewers || current_bitrate_bps != Some(desired_bitrate_bps)
+}
+
+fn group_video_pipeline_stage(
+    role: &str,
+    p2p_connected: bool,
+    remote_video_track_seen: bool,
+    metrics: &ScreenShareMetrics,
+) -> &'static str {
+    if role == "sender" {
+        if metrics.sent_frames == 0 {
+            return "encoder_not_sending_frames";
+        }
+        if metrics.outbound_rtp_packets == 0 {
+            return "frames_accepted_rtp_stats_pending_or_missing";
+        }
+        return "video_rtp_outbound";
+    }
+    if !p2p_connected {
+        return "waiting_for_p2p";
+    }
+    if !remote_video_track_seen {
+        return "no_remote_video_track";
+    }
+    if metrics.received_packets == 0 {
+        return "video_track_without_rtp_packets";
+    }
+    if metrics.assembled_access_units == 0 {
+        return "rtp_without_complete_h264_units";
+    }
+    if metrics.decoded_frames == 0 {
+        return "h264_units_not_decoded";
+    }
+    if metrics.published_frames == 0 {
+        return "decoded_frames_not_published";
+    }
+    if metrics.ui_texture_updates == 0 {
+        return "published_frames_without_texture_update";
+    }
+    "group_texture_updated"
+}
+
+fn should_auto_focus_group_screen(current_focus: Option<&str>) -> bool {
+    current_focus.is_none()
+}
+
 fn log_group_session_diagnostics(
     session: &ScreenShareSession,
     role: &'static str,
@@ -51,8 +103,17 @@ fn log_group_session_diagnostics(
         interval_seconds = ?interval_seconds,
         p2p_connected = metrics.p2p_connected,
         video_track_seen = session.remote_video_track_seen(),
+        video_pipeline_stage = group_video_pipeline_stage(
+            role,
+            metrics.p2p_connected,
+            session.remote_video_track_seen(),
+            &metrics,
+        ),
         route,
         selected_ice_pair = %selected_ice_pair,
+        video_ssrc = ?metrics.track_ssrc,
+        outbound_video_ssrc = ?metrics.outbound_video_ssrc,
+        inbound_video_ssrc = ?metrics.inbound_video_ssrc,
         encoder_backend = %metrics.encoder_backend,
         encoder_fallback = metrics.encoder_fallback_reason.as_deref().unwrap_or(""),
         decoder_backend = %metrics.decoder_backend,
@@ -157,6 +218,7 @@ impl ClientUi {
                     }
                     self.group_outbound_sessions.clear();
                     self.group_outbound_ports.clear();
+                    self.group_outbound_target_bitrate_bps = None;
                 }
                 self.screen_share_status = Some(if enabled {
                     "Sua tela está disponível. Cada participante escolhe se quer assistir."
@@ -172,6 +234,7 @@ impl ClientUi {
 
     pub(super) fn toggle_group_watch(&mut self, peer_id: &str) {
         if self.group_watched_shares.remove(peer_id) {
+            self.group_auto_focus_pending.remove(peer_id);
             if let Err(error) = self.send_screen_share_signal_to(
                 peer_id,
                 SignalKind::ScreenShareUnwatch,
@@ -194,6 +257,7 @@ impl ClientUi {
             ) {
                 Ok(()) => {
                     self.group_watched_shares.insert(peer_id.to_owned());
+                    self.group_auto_focus_pending.insert(peer_id.to_owned());
                     self.group_peer_status.insert(
                         peer_id.to_owned(),
                         "Pedido para assistir enviado…".to_owned(),
@@ -264,6 +328,27 @@ impl ClientUi {
         }
         viewers.sort();
         if viewers.is_empty() {
+            self.group_outbound_target_bitrate_bps = None;
+            return;
+        }
+        let mut current_viewers = self
+            .group_outbound_sessions
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        current_viewers.sort();
+        let bitrate = group_share_bitrate(viewers.len());
+        if !group_outbound_rebalance_needed(
+            &current_viewers,
+            self.group_outbound_target_bitrate_bps,
+            &viewers,
+            bitrate,
+        ) {
+            tracing::debug!(
+                viewers = viewers.len(),
+                target_bitrate_bps = bitrate,
+                "Ignorando reequilíbrio de compartilhamento sem mudança de espectadores ou taxa"
+            );
             return;
         }
         for viewer in self.group_outbound_sessions.keys() {
@@ -279,7 +364,7 @@ impl ClientUi {
         }
         self.group_outbound_sessions.clear();
         self.group_outbound_ports.clear();
-        let bitrate = group_share_bitrate(viewers.len());
+        self.group_outbound_target_bitrate_bps = Some(bitrate);
         for viewer in viewers {
             self.start_group_outbound(viewer, context, bitrate);
         }
@@ -317,9 +402,11 @@ impl ClientUi {
         self.group_outbound_sessions.clear();
         self.group_inbound_sessions.clear();
         self.group_outbound_ports.clear();
+        self.group_outbound_target_bitrate_bps = None;
         self.group_inbound_ports.clear();
         self.group_remote_textures.clear();
         self.group_remote_sequences.clear();
+        self.group_auto_focus_pending.clear();
         self.group_peer_status.clear();
         self.group_local_sharing = false;
         self.focused_group_screen = None;
@@ -471,6 +558,12 @@ impl ClientUi {
                                 ),
                             );
                         }
+                        session.record_ui_texture_update();
+                        if self.group_auto_focus_pending.remove(&peer_id)
+                            && should_auto_focus_group_screen(self.focused_group_screen.as_deref())
+                        {
+                            self.focused_group_screen = Some(peer_id.clone());
+                        }
                         self.group_remote_sequences
                             .insert(peer_id.clone(), frame.sequence);
                     }
@@ -540,6 +633,7 @@ impl ClientUi {
                 self.group_remote_textures.remove(&peer_id);
                 self.group_remote_sequences.remove(&peer_id);
                 self.group_watched_shares.remove(&peer_id);
+                self.group_auto_focus_pending.remove(&peer_id);
                 let _ = self.send_screen_share_signal_to(
                     &peer_id,
                     SignalKind::ScreenShareUnwatch,
@@ -677,5 +771,68 @@ mod tests {
             assert!(used.insert(port));
         }
         assert_eq!(next_group_media_port(&used), None);
+    }
+
+    #[test]
+    fn duplicate_rebalance_does_not_restart_unchanged_viewers() {
+        let current = vec!["viewer-a".to_owned(), "viewer-b".to_owned()];
+        assert!(!group_outbound_rebalance_needed(
+            &current,
+            Some(group_share_bitrate(current.len())),
+            &current,
+            group_share_bitrate(current.len()),
+        ));
+        assert!(group_outbound_rebalance_needed(
+            &current,
+            Some(group_share_bitrate(current.len())),
+            &["viewer-a".to_owned()],
+            group_share_bitrate(1),
+        ));
+        assert!(group_outbound_rebalance_needed(
+            &current,
+            Some(1_000_000),
+            &current,
+            2_000_000,
+        ));
+    }
+
+    #[test]
+    fn group_video_stage_identifies_the_first_missing_stage() {
+        let mut metrics = ScreenShareMetrics::default();
+        assert_eq!(
+            group_video_pipeline_stage("receiver", true, false, &metrics),
+            "no_remote_video_track"
+        );
+        assert_eq!(
+            group_video_pipeline_stage("receiver", true, true, &metrics),
+            "video_track_without_rtp_packets"
+        );
+        metrics.received_packets = 10;
+        assert_eq!(
+            group_video_pipeline_stage("receiver", true, true, &metrics),
+            "rtp_without_complete_h264_units"
+        );
+        metrics.assembled_access_units = 1;
+        assert_eq!(
+            group_video_pipeline_stage("receiver", true, true, &metrics),
+            "h264_units_not_decoded"
+        );
+        metrics.decoded_frames = 1;
+        metrics.published_frames = 1;
+        assert_eq!(
+            group_video_pipeline_stage("receiver", true, true, &metrics),
+            "published_frames_without_texture_update"
+        );
+        metrics.ui_texture_updates = 1;
+        assert_eq!(
+            group_video_pipeline_stage("receiver", true, true, &metrics),
+            "group_texture_updated"
+        );
+    }
+
+    #[test]
+    fn first_incoming_screen_auto_focuses_only_when_no_screen_is_focused() {
+        assert!(should_auto_focus_group_screen(None));
+        assert!(!should_auto_focus_group_screen(Some("another-screen")));
     }
 }

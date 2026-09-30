@@ -1905,6 +1905,224 @@ mod tests {
     use super::*;
     use rtc::peer_connection::transport::RTCIceCandidateType;
 
+    fn pump_signals(from: &ScreenShareSession, to: &ScreenShareSession, label: &str) {
+        for event in std::iter::from_fn(|| from.try_recv()) {
+            match event {
+                ScreenShareEvent::Signal { kind, payload } => {
+                    to.handle_signal(kind, payload)
+                        .unwrap_or_else(|error| panic!("{label} signal failed: {error}"));
+                }
+                ScreenShareEvent::Error(error) => panic!("{label} session failed: {error}"),
+                ScreenShareEvent::AudioError(error) => {
+                    panic!("{label} audio session failed: {error}")
+                }
+                ScreenShareEvent::ConnectionClosed => {
+                    panic!("{label} connection closed before receiving a frame")
+                }
+                ScreenShareEvent::State(_) => {}
+            }
+        }
+    }
+
+    fn test_frame(sequence: u64, value: u8) -> PreviewFrame {
+        PreviewFrame {
+            sequence,
+            width: 320,
+            height: 240,
+            rgba: vec![value; 320 * 240 * 4],
+            #[cfg(windows)]
+            gpu_nv12: None,
+            #[cfg(windows)]
+            cpu_nv12: None,
+        }
+    }
+
+    #[test]
+    fn loopback_group_video_arrives_and_decodes_in_both_directions() {
+        let context = egui::Context::default();
+        let a_sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
+        let b_receiver = ScreenShareSession::new_loopback_with_decoder_preference(
+            context.clone(),
+            VideoDecoderPreference::Cpu,
+        )
+        .unwrap();
+        let b_sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
+        let a_receiver = ScreenShareSession::new_loopback_with_decoder_preference(
+            context,
+            VideoDecoderPreference::Cpu,
+        )
+        .unwrap();
+        let a_source = LatestFrame::default();
+        let b_source = LatestFrame::default();
+        a_source.publish(test_frame(1, 64));
+        b_source.publish(test_frame(1, 192));
+        a_sender.start_sending(a_source.clone()).unwrap();
+        b_sender.start_sending(b_source.clone()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut sequence = 1_u64;
+        let mut next_frame = Instant::now() + FRAME_DURATION;
+        let mut a_received = false;
+        let mut b_received = false;
+        while Instant::now() < deadline {
+            pump_signals(&a_sender, &b_receiver, "A to B offer");
+            pump_signals(&b_receiver, &a_sender, "B to A answer");
+            pump_signals(&b_sender, &a_receiver, "B to A offer");
+            pump_signals(&a_receiver, &b_sender, "A to B answer");
+
+            a_received |= a_receiver.latest_remote_frame().is_some();
+            b_received |= b_receiver.latest_remote_frame().is_some();
+            if a_received && b_received {
+                let a_send = a_sender.metrics();
+                let b_send = b_sender.metrics();
+                let a_receive = a_receiver.metrics();
+                let b_receive = b_receiver.metrics();
+                if a_send.sent_frames > 0
+                    && b_send.sent_frames > 0
+                    && a_receive.decoded_frames > 0
+                    && b_receive.decoded_frames > 0
+                    && a_receive.published_frames > 0
+                    && b_receive.published_frames > 0
+                {
+                    break;
+                }
+            }
+
+            if Instant::now() >= next_frame {
+                sequence = sequence.saturating_add(1);
+                a_source.publish(test_frame(sequence, (sequence % 255) as u8));
+                b_source.publish(test_frame(sequence, (255 - sequence % 255) as u8));
+                next_frame += FRAME_DURATION;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let a_send = a_sender.metrics();
+        let b_send = b_sender.metrics();
+        let a_receive = a_receiver.metrics();
+        let b_receive = b_receiver.metrics();
+        a_receiver.stop();
+        b_receiver.stop();
+        a_sender.stop();
+        b_sender.stop();
+
+        assert!(a_received, "A deve receber vídeo de B: {a_receive:?}");
+        assert!(b_received, "B deve receber vídeo de A: {b_receive:?}");
+        assert!(a_send.sent_frames > 0 && b_receive.received_packets > 0);
+        assert!(b_send.sent_frames > 0 && a_receive.received_packets > 0);
+        assert!(a_receive.decoded_frames > 0 && b_receive.decoded_frames > 0);
+        assert!(a_receive.published_frames > 0 && b_receive.published_frames > 0);
+        assert_eq!(a_send.track_ssrc, b_receive.track_ssrc);
+        assert_eq!(b_send.track_ssrc, a_receive.track_ssrc);
+    }
+
+    #[test]
+    fn replacing_one_group_video_session_keeps_the_other_direction_active() {
+        let context = egui::Context::default();
+        let a_sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
+        let b_receiver = ScreenShareSession::new_loopback_with_decoder_preference(
+            context.clone(),
+            VideoDecoderPreference::Cpu,
+        )
+        .unwrap();
+        let b_sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
+        let a_receiver = ScreenShareSession::new_loopback_with_decoder_preference(
+            context.clone(),
+            VideoDecoderPreference::Cpu,
+        )
+        .unwrap();
+        let a_source = LatestFrame::default();
+        let b_source = LatestFrame::default();
+        a_source.publish(test_frame(1, 72));
+        b_source.publish(test_frame(1, 184));
+        a_sender.start_sending(a_source.clone()).unwrap();
+        b_sender.start_sending(b_source.clone()).unwrap();
+
+        let initial_deadline = Instant::now() + Duration::from_secs(20);
+        let mut sequence = 1_u64;
+        let mut next_frame = Instant::now() + FRAME_DURATION;
+        while Instant::now() < initial_deadline {
+            pump_signals(&a_sender, &b_receiver, "A to B initial offer");
+            pump_signals(&b_receiver, &a_sender, "B to A initial answer");
+            pump_signals(&b_sender, &a_receiver, "B to A initial offer");
+            pump_signals(&a_receiver, &b_sender, "A to B initial answer");
+            if b_receiver.metrics().decoded_frames > 0 && a_receiver.metrics().decoded_frames > 0 {
+                break;
+            }
+            if Instant::now() >= next_frame {
+                sequence = sequence.saturating_add(1);
+                a_source.publish(test_frame(sequence, (sequence % 255) as u8));
+                b_source.publish(test_frame(sequence, (255 - sequence % 255) as u8));
+                next_frame += FRAME_DURATION;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(b_receiver.metrics().decoded_frames > 0);
+        let a_to_b_before = b_receiver.metrics().decoded_frames;
+        let b_to_a_before = a_receiver.metrics().decoded_frames;
+        assert!(a_to_b_before > 0);
+
+        // Recreate only A -> B, as the group sender does when its stream is replaced.
+        a_sender.stop();
+        b_receiver.stop();
+        let replacement_sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
+        let replacement_receiver = ScreenShareSession::new_loopback_with_decoder_preference(
+            context,
+            VideoDecoderPreference::Cpu,
+        )
+        .unwrap();
+        replacement_sender.start_sending(a_source.clone()).unwrap();
+
+        let replacement_deadline = Instant::now() + Duration::from_secs(20);
+        let mut replacement_next_frame = Instant::now() + FRAME_DURATION;
+        while Instant::now() < replacement_deadline {
+            pump_signals(
+                &replacement_sender,
+                &replacement_receiver,
+                "A to B replacement offer",
+            );
+            pump_signals(
+                &replacement_receiver,
+                &replacement_sender,
+                "B to A replacement answer",
+            );
+            pump_signals(&b_sender, &a_receiver, "B to A preserved offer");
+            pump_signals(&a_receiver, &b_sender, "A to B preserved answer");
+
+            let replaced_direction_decoded = replacement_receiver.metrics().decoded_frames > 0;
+            let preserved_direction_decoded = a_receiver.metrics().decoded_frames > b_to_a_before;
+            if replaced_direction_decoded && preserved_direction_decoded {
+                break;
+            }
+            if Instant::now() >= replacement_next_frame {
+                sequence = sequence.saturating_add(1);
+                a_source.publish(test_frame(sequence, (sequence % 255) as u8));
+                b_source.publish(test_frame(sequence, (255 - sequence % 255) as u8));
+                replacement_next_frame += FRAME_DURATION;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let replacement_metrics = replacement_sender.metrics();
+        let replacement_received = replacement_receiver.metrics();
+        let preserved_sender_metrics = b_sender.metrics();
+        let preserved_receiver_metrics = a_receiver.metrics();
+        replacement_receiver.stop();
+        replacement_sender.stop();
+        a_receiver.stop();
+        b_sender.stop();
+
+        assert!(replacement_metrics.sent_frames > 0);
+        assert!(replacement_received.decoded_frames > 0);
+        assert!(replacement_received.published_frames > 0);
+        assert_eq!(
+            replacement_metrics.track_ssrc,
+            replacement_received.track_ssrc
+        );
+        assert!(preserved_sender_metrics.sent_frames > 0);
+        assert!(preserved_receiver_metrics.decoded_frames > b_to_a_before);
+    }
+
     #[test]
     fn loopback_webrtc_requests_pli_and_recovers_with_another_decodable_idr() {
         let context = egui::Context::default();
