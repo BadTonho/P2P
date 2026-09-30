@@ -232,6 +232,7 @@ pub(super) fn encode_latest_frames(
             continue;
         };
         validate_encoder_frame(&frame)?;
+        metrics.record_video_dimensions(frame.width, frame.height);
         let skipped_sequences = if is_new_capture_frame {
             pacer.last_sequence.map_or(0, |previous| {
                 frame.sequence.wrapping_sub(previous).saturating_sub(1)

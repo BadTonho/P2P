@@ -738,6 +738,7 @@ fn default_participant(connection_id: ConnectionId, order: u8) -> ParticipantInf
         control_address: String::new(),
         avatar_jpeg_base64: None,
         supports_group_screen_share: false,
+        supports_group_session_ids: false,
     }
 }
 
@@ -1207,6 +1208,7 @@ mod tests {
                     control_address: "192.168.1.2:9001".to_owned(),
                     avatar_jpeg_base64: Some(small_jpeg_base64()),
                     supports_group_screen_share: false,
+                    supports_group_session_ids: false,
                 },
             )
             .unwrap();
@@ -1237,6 +1239,7 @@ mod tests {
                     control_address: "192.168.1.3:9001".to_owned(),
                     avatar_jpeg_base64: Some(small_jpeg_base64()),
                     supports_group_screen_share: false,
+                    supports_group_session_ids: false,
                 },
             )
             .unwrap();
@@ -1294,6 +1297,7 @@ mod tests {
                     control_address: "192.168.1.2:9001".to_owned(),
                     avatar_jpeg_base64: Some(small_jpeg_base64()),
                     supports_group_screen_share: false,
+                    supports_group_session_ids: false,
                 },
             )
             .unwrap();
@@ -1328,6 +1332,7 @@ mod tests {
                     control_address: "192.168.1.3:9001".to_owned(),
                     avatar_jpeg_base64: Some(small_jpeg_base64()),
                     supports_group_screen_share: false,
+                    supports_group_session_ids: false,
                 },
             )
             .unwrap();
@@ -1388,6 +1393,7 @@ mod tests {
                 control_address: "192.168.1.2:9001".to_owned(),
                 avatar_jpeg_base64: None,
                 supports_group_screen_share: false,
+                supports_group_session_ids: false,
             },
             ParticipantInfo {
                 id: "candidate-id".to_owned(),
@@ -1397,6 +1403,7 @@ mod tests {
                 control_address: "192.168.1.3:9001".to_owned(),
                 avatar_jpeg_base64: None,
                 supports_group_screen_share: false,
+                supports_group_session_ids: false,
             },
             ParticipantInfo {
                 id: "guest-id".to_owned(),
@@ -1406,6 +1413,7 @@ mod tests {
                 control_address: "192.168.1.4:9001".to_owned(),
                 avatar_jpeg_base64: None,
                 supports_group_screen_share: false,
+                supports_group_session_ids: false,
             },
         ];
         let mut registry = RoomRegistry {
@@ -1437,6 +1445,7 @@ mod tests {
                     control_address: "192.168.1.3:9001".to_owned(),
                     avatar_jpeg_base64: None,
                     supports_group_screen_share: false,
+                    supports_group_session_ids: false,
                 },
             )
             .unwrap();
@@ -1471,6 +1480,7 @@ mod tests {
                     control_address: "192.168.1.2:9001".to_owned(),
                     avatar_jpeg_base64: None,
                     supports_group_screen_share: false,
+                    supports_group_session_ids: false,
                 },
             )
             .unwrap();

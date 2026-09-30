@@ -23,6 +23,7 @@ pub(crate) struct SystemAudioCapture {
 struct CaptureDiagnostics {
     callbacks: AtomicU64,
     input_frames: AtomicU64,
+    non_silent_samples: AtomicU64,
     captured_frames: AtomicU64,
     dropped_frames: AtomicU64,
     xruns: AtomicU64,
@@ -220,6 +221,10 @@ impl SystemAudioCapture {
         self.diagnostics.input_frames.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn non_silent_samples(&self) -> u64 {
+        self.diagnostics.non_silent_samples.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn xruns(&self) -> u64 {
         self.diagnostics.xruns.load(Ordering::Relaxed)
     }
@@ -271,6 +276,7 @@ where
                 diagnostics
                     .input_frames
                     .fetch_add((input.len() / channels) as u64, Ordering::Relaxed);
+                let mut non_silent_samples = 0_u64;
                 for frame in input.chunks(channels) {
                     if frame.is_empty() {
                         continue;
@@ -281,6 +287,8 @@ where
                     } else {
                         left
                     };
+                    non_silent_samples += u64::from(left.abs() > 0.001);
+                    non_silent_samples += u64::from(right.abs() > 0.001);
                     resample_phase += rate_ratio;
                     while resample_phase >= 1.0 {
                         if producer.slots() >= OPUS_CHANNELS {
@@ -293,6 +301,9 @@ where
                         resample_phase -= 1.0;
                     }
                 }
+                diagnostics
+                    .non_silent_samples
+                    .fetch_add(non_silent_samples, Ordering::Relaxed);
             },
             move |error| {
                 let kind = error.kind();
@@ -337,7 +348,14 @@ pub(crate) struct RemoteAudioPlayback {
     resample_phase: f64,
     output_underflow_frames: Arc<AtomicU64>,
     dropped_frames: Arc<AtomicU64>,
+    diagnostics: Arc<PlaybackDiagnostics>,
     callback_error: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Default)]
+struct PlaybackDiagnostics {
+    callbacks: AtomicU64,
+    non_silent_samples: AtomicU64,
 }
 
 impl RemoteAudioPlayback {
@@ -362,6 +380,7 @@ impl RemoteAudioPlayback {
         let (producer, consumer) = RingBuffer::<f32>::new(queue_capacity);
         let output_underflow_frames = Arc::new(AtomicU64::new(0));
         let dropped_frames = Arc::new(AtomicU64::new(0));
+        let diagnostics = Arc::new(PlaybackDiagnostics::default());
         let callback_error = Arc::new(Mutex::new(None));
         let stream = match sample_format {
             cpal::SampleFormat::I8 => build_playback_stream::<i8>(
@@ -371,6 +390,7 @@ impl RemoteAudioPlayback {
                 consumer,
                 &output_underflow_frames,
                 &callback_error,
+                &diagnostics,
                 session_id,
                 ssrc,
             ),
@@ -381,6 +401,7 @@ impl RemoteAudioPlayback {
                 consumer,
                 &output_underflow_frames,
                 &callback_error,
+                &diagnostics,
                 session_id,
                 ssrc,
             ),
@@ -391,6 +412,7 @@ impl RemoteAudioPlayback {
                 consumer,
                 &output_underflow_frames,
                 &callback_error,
+                &diagnostics,
                 session_id,
                 ssrc,
             ),
@@ -401,6 +423,7 @@ impl RemoteAudioPlayback {
                 consumer,
                 &output_underflow_frames,
                 &callback_error,
+                &diagnostics,
                 session_id,
                 ssrc,
             ),
@@ -411,6 +434,7 @@ impl RemoteAudioPlayback {
                 consumer,
                 &output_underflow_frames,
                 &callback_error,
+                &diagnostics,
                 session_id,
                 ssrc,
             ),
@@ -421,6 +445,7 @@ impl RemoteAudioPlayback {
                 consumer,
                 &output_underflow_frames,
                 &callback_error,
+                &diagnostics,
                 session_id,
                 ssrc,
             ),
@@ -431,6 +456,7 @@ impl RemoteAudioPlayback {
                 consumer,
                 &output_underflow_frames,
                 &callback_error,
+                &diagnostics,
                 session_id,
                 ssrc,
             ),
@@ -441,6 +467,7 @@ impl RemoteAudioPlayback {
                 consumer,
                 &output_underflow_frames,
                 &callback_error,
+                &diagnostics,
                 session_id,
                 ssrc,
             ),
@@ -451,6 +478,7 @@ impl RemoteAudioPlayback {
                 consumer,
                 &output_underflow_frames,
                 &callback_error,
+                &diagnostics,
                 session_id,
                 ssrc,
             ),
@@ -461,6 +489,7 @@ impl RemoteAudioPlayback {
                 consumer,
                 &output_underflow_frames,
                 &callback_error,
+                &diagnostics,
                 session_id,
                 ssrc,
             ),
@@ -471,6 +500,7 @@ impl RemoteAudioPlayback {
                 consumer,
                 &output_underflow_frames,
                 &callback_error,
+                &diagnostics,
                 session_id,
                 ssrc,
             ),
@@ -481,6 +511,7 @@ impl RemoteAudioPlayback {
                 consumer,
                 &output_underflow_frames,
                 &callback_error,
+                &diagnostics,
                 session_id,
                 ssrc,
             ),
@@ -508,6 +539,7 @@ impl RemoteAudioPlayback {
             resample_phase: 0.0,
             output_underflow_frames,
             dropped_frames,
+            diagnostics,
             callback_error,
         })
     }
@@ -534,6 +566,14 @@ impl RemoteAudioPlayback {
 
     pub(crate) fn dropped_frames(&self) -> u64 {
         self.dropped_frames.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn callbacks(&self) -> u64 {
+        self.diagnostics.callbacks.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn non_silent_samples(&self) -> u64 {
+        self.diagnostics.non_silent_samples.load(Ordering::Relaxed)
     }
 
     pub(crate) fn take_error(&self) -> Option<String> {
@@ -585,6 +625,7 @@ fn build_playback_stream<T>(
     mut consumer: Consumer<f32>,
     underflow_frames: &Arc<AtomicU64>,
     callback_error: &Arc<Mutex<Option<String>>>,
+    diagnostics: &Arc<PlaybackDiagnostics>,
     session_id: u64,
     ssrc: u32,
 ) -> Result<cpal::Stream, String>
@@ -593,6 +634,7 @@ where
 {
     let underflow_frames = Arc::clone(underflow_frames);
     let callback_error = Arc::clone(callback_error);
+    let diagnostics = Arc::clone(diagnostics);
     let channels = channels.max(1);
     let prime_samples = config.sample_rate as usize * OPUS_CHANNELS * PLAYBACK_PRIME_MILLIS / 1000;
     let mut primed = false;
@@ -600,6 +642,7 @@ where
         .build_output_stream::<T, _, _>(
             config,
             move |output, _| {
+                diagnostics.callbacks.fetch_add(1, Ordering::Relaxed);
                 if !primed {
                     if consumer.slots() < prime_samples {
                         output.fill(<T as cpal::Sample>::from_sample(0.0_f32));
@@ -608,6 +651,7 @@ where
                     primed = true;
                 }
                 let mut underrun = false;
+                let mut non_silent_samples = 0_u64;
                 for frame in output.chunks_mut(channels) {
                     let left = consumer.pop().ok();
                     let right = consumer.pop().ok();
@@ -624,9 +668,13 @@ where
                             1 => right,
                             _ => mono,
                         };
+                        non_silent_samples += u64::from(value.abs() > 0.001);
                         *sample = <T as cpal::Sample>::from_sample(value);
                     }
                 }
+                diagnostics
+                    .non_silent_samples
+                    .fetch_add(non_silent_samples, Ordering::Relaxed);
                 if underrun {
                     primed = false;
                 }

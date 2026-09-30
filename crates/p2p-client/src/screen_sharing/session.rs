@@ -55,9 +55,57 @@ impl Interceptor for PliForwarder {
 pub enum ScreenShareEvent {
     Signal { kind: SignalKind, payload: String },
     State(String),
+    AudioState(String),
     Error(String),
     AudioError(String),
     ConnectionClosed,
+}
+
+pub(super) fn capture_audio_state(
+    callbacks: u64,
+    non_silent_samples: u64,
+    encoded_frames: u64,
+    rtp_samples: u64,
+) -> String {
+    if callbacks == 0 {
+        "Áudio do sistema: o loopback não recebeu callbacks nesta janela; o vídeo segue independente."
+            .to_owned()
+    } else if non_silent_samples == 0 {
+        "Áudio do sistema: captura ativa e silenciosa nesta janela; silêncio não é erro.".to_owned()
+    } else if encoded_frames == 0 {
+        "Áudio do sistema: amostras audíveis capturadas, mas nenhum quadro Opus foi codificado nesta janela."
+            .to_owned()
+    } else {
+        format!(
+            "Áudio do sistema: {encoded_frames} quadros Opus codificados e {rtp_samples} aceitos pela faixa RTP nesta janela."
+        )
+    }
+}
+
+pub(super) fn playback_audio_state(
+    rtp_packets: u64,
+    decoded_frames: u64,
+    decoded_non_silent_samples: u64,
+    output_callbacks: u64,
+    output_non_silent_samples: u64,
+) -> String {
+    if rtp_packets == 0 {
+        "Áudio remoto: nenhum pacote RTP recebido nesta janela.".to_owned()
+    } else if decoded_frames == 0 {
+        "Áudio remoto: pacotes recebidos, mas nenhum quadro Opus decodificado nesta janela."
+            .to_owned()
+    } else if decoded_non_silent_samples == 0 {
+        "Áudio remoto: quadros Opus decodificados sem amostras audíveis; pode ser silêncio da fonte."
+            .to_owned()
+    } else if output_callbacks == 0 {
+        "Áudio remoto: áudio decodificado, mas a saída do Windows não executou callbacks nesta janela."
+            .to_owned()
+    } else if output_non_silent_samples == 0 {
+        "Áudio remoto: áudio decodificado, mas nenhuma amostra audível chegou à saída nesta janela."
+            .to_owned()
+    } else {
+        "Áudio remoto: decodificação e saída do Windows ativas.".to_owned()
+    }
 }
 
 enum Command {
@@ -1001,12 +1049,14 @@ fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
         snapshot.outbound_frames_encoded = outbound.frames_encoded;
         snapshot.outbound_frames_sent = outbound.frames_sent;
         snapshot.outbound_ssrc = outbound.sent_rtp_stream_stats.rtp_stream_stats.ssrc;
+        snapshot.outbound_nack_count = outbound.nack_count;
         snapshot.outbound_summary = format!(
-            "RTP de saída: {} pacotes / {} bytes; frames codificados/enviados {}/{}; SSRC {}; encoder RTC {}",
+            "RTP de saída: {} pacotes / {} bytes; frames codificados/enviados {}/{}; NACKs recebidos {}; SSRC {}; encoder RTC {}",
             snapshot.outbound_packets,
             snapshot.outbound_bytes,
             snapshot.outbound_frames_encoded,
             snapshot.outbound_frames_sent,
+            snapshot.outbound_nack_count,
             snapshot.outbound_ssrc,
             outbound.encoder_implementation,
         );
@@ -1024,6 +1074,8 @@ fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
         snapshot.inbound_packets = received.packets_received;
         snapshot.inbound_bytes = inbound.bytes_received;
         snapshot.inbound_packets_lost = received.packets_lost;
+        snapshot.inbound_nack_count = inbound.nack_count;
+        snapshot.inbound_pli_count = inbound.pli_count;
         snapshot.inbound_jitter_ms = rtp_jitter_ticks_to_ms(received.jitter, 90_000.0);
         snapshot.inbound_frames_received = inbound.frames_received;
         snapshot.inbound_frames_decoded = inbound.frames_decoded;
@@ -1031,16 +1083,22 @@ fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
         snapshot.inbound_frames_dropped = inbound.frames_dropped;
         snapshot.inbound_packets_discarded = inbound.packets_discarded;
         snapshot.inbound_ssrc = received.rtp_stream_stats.ssrc;
+        snapshot.inbound_frame_width = inbound.frame_width;
+        snapshot.inbound_frame_height = inbound.frame_height;
         snapshot.inbound_summary = format!(
-            "RTP de entrada: {} pacotes / {} bytes; perda reportada {}; jitter {:.1} ms; frames recebidos/decodificados/renderizados/descartados {}/{}/{}/{}; descartados no jitter buffer {}; SSRC {}; decoder RTC {}",
+            "RTP de entrada: {} pacotes / {} bytes; perda reportada {}; jitter {:.1} ms; NACKs enviados {}, PLI enviados {}; frames recebidos/decodificados/renderizados/descartados {}/{}/{}/{}; resolução {}x{}; descartados no jitter buffer {}; SSRC {}; decoder RTC {}",
             snapshot.inbound_packets,
             snapshot.inbound_bytes,
             snapshot.inbound_packets_lost,
             snapshot.inbound_jitter_ms,
+            snapshot.inbound_nack_count,
+            snapshot.inbound_pli_count,
             snapshot.inbound_frames_received,
             snapshot.inbound_frames_decoded,
             snapshot.inbound_frames_rendered,
             snapshot.inbound_frames_dropped,
+            snapshot.inbound_frame_width,
+            snapshot.inbound_frame_height,
             snapshot.inbound_packets_discarded,
             snapshot.inbound_ssrc,
             inbound.decoder_implementation,
@@ -1603,6 +1661,7 @@ async fn send_system_audio(
     let mut last_report_at = Instant::now();
     let mut last_callbacks = capture.callbacks();
     let mut last_input_frames = capture.input_frames();
+    let mut last_non_silent_samples = capture.non_silent_samples();
     let mut last_capture_frames = capture.captured_frames();
     let mut last_dropped_frames = capture.dropped_frames();
     let mut last_xruns = capture.xruns();
@@ -1612,6 +1671,7 @@ async fn send_system_audio(
     let mut last_encoded_bytes = 0_u64;
     let mut last_written_samples = 0_u64;
     let mut last_write_failures = 0_u64;
+    let mut last_audio_state = String::new();
 
     loop {
         interval.tick().await;
@@ -1691,6 +1751,7 @@ async fn send_system_audio(
         if last_report_at.elapsed() >= Duration::from_secs(5) {
             let callbacks = capture.callbacks();
             let input_frames = capture.input_frames();
+            let non_silent_samples = capture.non_silent_samples();
             let captured = capture.captured_frames();
             let dropped = capture.dropped_frames();
             let xruns = capture.xruns();
@@ -1698,10 +1759,23 @@ async fn send_system_audio(
             let realtime_denied = capture.realtime_denied();
             let callback_delta = callbacks.saturating_sub(last_callbacks);
             let input_frame_delta = input_frames.saturating_sub(last_input_frames);
+            let non_silent_delta = non_silent_samples.saturating_sub(last_non_silent_samples);
             let xrun_delta = xruns.saturating_sub(last_xruns);
             let device_change_delta = device_changes.saturating_sub(last_device_changes);
             let realtime_denied_delta = realtime_denied.saturating_sub(last_realtime_denied);
             let interval_seconds = last_report_at.elapsed().as_secs_f64();
+            let encoded_delta = encoded_frames.saturating_sub(last_encoded_frames);
+            let written_delta = written_samples.saturating_sub(last_written_samples);
+            let audio_state = capture_audio_state(
+                callback_delta,
+                non_silent_delta,
+                encoded_delta,
+                written_delta,
+            );
+            if audio_state != last_audio_state {
+                let _ = events.send(ScreenShareEvent::AudioState(audio_state.clone()));
+                last_audio_state = audio_state;
+            }
             if xrun_delta + device_change_delta + realtime_denied_delta > 0 {
                 tracing::warn!(
                     screen_share_session = session_id,
@@ -1709,6 +1783,7 @@ async fn send_system_audio(
                     interval_seconds,
                     capture_callbacks = callback_delta,
                     input_frames = input_frame_delta,
+                    non_silent_samples = non_silent_delta,
                     captured_frames = captured.saturating_sub(last_capture_frames),
                     capture_queue_drops = dropped.saturating_sub(last_dropped_frames),
                     xrun_warnings = xrun_delta,
@@ -1728,6 +1803,7 @@ async fn send_system_audio(
                     interval_seconds,
                     capture_callbacks = callback_delta,
                     input_frames = input_frame_delta,
+                    non_silent_samples = non_silent_delta,
                     captured_frames = captured.saturating_sub(last_capture_frames),
                     capture_queue_drops = dropped.saturating_sub(last_dropped_frames),
                     xrun_warnings = xrun_delta,
@@ -1744,6 +1820,7 @@ async fn send_system_audio(
             last_report_at = Instant::now();
             last_callbacks = callbacks;
             last_input_frames = input_frames;
+            last_non_silent_samples = non_silent_samples;
             last_capture_frames = captured;
             last_dropped_frames = dropped;
             last_xruns = xruns;
@@ -1763,6 +1840,7 @@ async fn send_system_audio(
         encoded_bytes,
         capture_callbacks = capture.callbacks(),
         input_frames = capture.input_frames(),
+        non_silent_samples = capture.non_silent_samples(),
         xrun_warnings = capture.xruns(),
         device_change_warnings = capture.device_changes(),
         realtime_priority_warnings = capture.realtime_denied(),
@@ -1905,6 +1983,23 @@ mod tests {
     use super::*;
     use rtc::peer_connection::transport::RTCIceCandidateType;
 
+    #[test]
+    fn audio_activity_diagnostics_distinguish_silence_from_missing_capture_or_playback() {
+        let capture_silent = capture_audio_state(120, 0, 0, 0);
+        assert!(capture_silent.contains("silenciosa"));
+        assert!(capture_silent.contains("silêncio não é erro"));
+        assert!(capture_audio_state(0, 0, 0, 0).contains("não recebeu callbacks"));
+        assert!(capture_audio_state(120, 240, 50, 50).contains("50 quadros Opus"));
+
+        let remote_silent = playback_audio_state(250, 250, 0, 300, 0);
+        assert!(remote_silent.contains("pode ser silêncio"));
+        assert!(playback_audio_state(0, 0, 0, 0, 0).contains("nenhum pacote RTP"));
+        assert!(playback_audio_state(250, 250, 1500, 0, 0).contains("não executou callbacks"));
+        assert!(
+            playback_audio_state(250, 250, 1500, 300, 6000).contains("saída do Windows ativas")
+        );
+    }
+
     fn pump_signals(from: &ScreenShareSession, to: &ScreenShareSession, label: &str) {
         for event in std::iter::from_fn(|| from.try_recv()) {
             match event {
@@ -1920,6 +2015,7 @@ mod tests {
                     panic!("{label} connection closed before receiving a frame")
                 }
                 ScreenShareEvent::State(_) => {}
+                ScreenShareEvent::AudioState(_) => {}
             }
         }
     }
@@ -2165,6 +2261,7 @@ mod tests {
                         panic!("sender connection closed before receiving a frame")
                     }
                     ScreenShareEvent::State(_) => {}
+                    ScreenShareEvent::AudioState(_) => {}
                 }
             }
             for event in std::iter::from_fn(|| receiver.try_recv()) {
@@ -2180,6 +2277,7 @@ mod tests {
                         panic!("receiver connection closed before receiving a frame")
                     }
                     ScreenShareEvent::State(_) => {}
+                    ScreenShareEvent::AudioState(_) => {}
                 }
             }
 

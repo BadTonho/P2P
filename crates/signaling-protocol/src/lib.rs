@@ -118,6 +118,10 @@ pub struct ParticipantInfo {
     pub avatar_jpeg_base64: Option<String>,
     #[serde(default)]
     pub supports_group_screen_share: bool,
+    /// Supports per-negotiation identifiers for group-screen-share signaling.
+    /// Missing on older clients, which must keep using the legacy two-person flow.
+    #[serde(default)]
+    pub supports_group_session_ids: bool,
 }
 
 /// Mensagens da conexão direta entre os clientes. Não transporta mídia.
@@ -236,6 +240,7 @@ mod tests {
 
         assert_eq!(participant.avatar_jpeg_base64, None);
         assert!(participant.supports_group_screen_share);
+        assert!(!participant.supports_group_session_ids);
         assert!(
             !serde_json::to_string(&participant)
                 .expect("participant should serialize")

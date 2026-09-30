@@ -1640,15 +1640,20 @@ impl PeerEvents {
         let mut bytes = 0_u64;
         let mut decoded_frames = 0_u64;
         let mut decoded_samples = 0_u64;
+        let mut decoded_non_silent_samples = 0_u64;
         let mut decode_errors = 0_u64;
         let mut last_report_at = Instant::now();
         let mut last_packets = 0_u64;
         let mut last_bytes = 0_u64;
         let mut last_decoded_frames = 0_u64;
         let mut last_decoded_samples = 0_u64;
+        let mut last_decoded_non_silent_samples = 0_u64;
         let mut last_decode_errors = 0_u64;
         let mut last_output_underruns = playback.output_underflow_frames();
         let mut last_output_drops = playback.dropped_frames();
+        let mut last_output_callbacks = playback.callbacks();
+        let mut last_output_non_silent_samples = playback.non_silent_samples();
+        let mut last_audio_state = String::new();
 
         while let Some(event) = track.poll().await {
             match event {
@@ -1662,6 +1667,13 @@ impl PeerEvents {
                                 decoded_samples = decoded_samples.saturating_add(
                                     samples_per_channel.saturating_mul(OPUS_CHANNELS) as u64,
                                 );
+                                decoded_non_silent_samples = decoded_non_silent_samples
+                                    .saturating_add(
+                                        decoded[..samples_per_channel * OPUS_CHANNELS]
+                                            .iter()
+                                            .filter(|sample| sample.abs() > 0.001)
+                                            .count() as u64,
+                                    );
                                 playback.push_decoded(&decoded, samples_per_channel);
                             }
                         }
@@ -1713,6 +1725,28 @@ impl PeerEvents {
             if last_report_at.elapsed() >= Duration::from_secs(5) {
                 let output_underruns = playback.output_underflow_frames();
                 let output_drops = playback.dropped_frames();
+                let output_callbacks = playback.callbacks();
+                let output_non_silent_samples = playback.non_silent_samples();
+                let packet_delta = packets.saturating_sub(last_packets);
+                let decoded_delta = decoded_frames.saturating_sub(last_decoded_frames);
+                let decoded_non_silent_delta =
+                    decoded_non_silent_samples.saturating_sub(last_decoded_non_silent_samples);
+                let output_callback_delta = output_callbacks.saturating_sub(last_output_callbacks);
+                let output_non_silent_delta =
+                    output_non_silent_samples.saturating_sub(last_output_non_silent_samples);
+                let audio_state = super::session::playback_audio_state(
+                    packet_delta,
+                    decoded_delta,
+                    decoded_non_silent_delta,
+                    output_callback_delta,
+                    output_non_silent_delta,
+                );
+                if audio_state != last_audio_state {
+                    let _ = self
+                        .events
+                        .send(ScreenShareEvent::AudioState(audio_state.clone()));
+                    last_audio_state = audio_state;
+                }
                 tracing::info!(
                     screen_share_session = session_id,
                     audio_track_ssrc = ssrc,
@@ -1721,7 +1755,10 @@ impl PeerEvents {
                     rtp_payload_bytes = bytes.saturating_sub(last_bytes),
                     opus_frames_decoded = decoded_frames.saturating_sub(last_decoded_frames),
                     pcm_samples_decoded = decoded_samples.saturating_sub(last_decoded_samples),
+                    pcm_non_silent_samples_decoded = decoded_non_silent_delta,
                     opus_decode_errors = decode_errors.saturating_sub(last_decode_errors),
+                    output_callbacks = output_callback_delta,
+                    output_non_silent_samples = output_non_silent_delta,
                     output_underrun_frames = output_underruns.saturating_sub(last_output_underruns),
                     output_queue_drops = output_drops.saturating_sub(last_output_drops),
                     "Resumo periódico da recepção de áudio"
@@ -1731,9 +1768,12 @@ impl PeerEvents {
                 last_bytes = bytes;
                 last_decoded_frames = decoded_frames;
                 last_decoded_samples = decoded_samples;
+                last_decoded_non_silent_samples = decoded_non_silent_samples;
                 last_decode_errors = decode_errors;
                 last_output_underruns = output_underruns;
                 last_output_drops = output_drops;
+                last_output_callbacks = output_callbacks;
+                last_output_non_silent_samples = output_non_silent_samples;
             }
         }
 
@@ -1744,7 +1784,10 @@ impl PeerEvents {
             rtp_payload_bytes = bytes,
             opus_frames_decoded = decoded_frames,
             pcm_samples_decoded = decoded_samples,
+            pcm_non_silent_samples_decoded = decoded_non_silent_samples,
             opus_decode_errors = decode_errors,
+            output_callbacks = playback.callbacks(),
+            output_non_silent_samples = playback.non_silent_samples(),
             output_underrun_frames = playback.output_underflow_frames(),
             output_queue_drops = playback.dropped_frames(),
             "Recepção da faixa de áudio encerrada"

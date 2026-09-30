@@ -6,6 +6,12 @@ pub struct ScreenShareMetrics {
     pub track_ssrc: Option<u32>,
     pub outbound_video_ssrc: Option<u32>,
     pub inbound_video_ssrc: Option<u32>,
+    pub capture_width: u32,
+    pub capture_height: u32,
+    pub encoder_width: u32,
+    pub encoder_height: u32,
+    pub decoder_width: u32,
+    pub decoder_height: u32,
     pub p2p_connected: bool,
     pub route: Option<MediaRoute>,
     pub local_ice_candidates: u64,
@@ -34,6 +40,8 @@ pub struct ScreenShareMetrics {
     pub ui_texture_updates: u64,
     pub pli_requests_sent: u64,
     pub pli_requests_received: u64,
+    pub nack_requests_sent: u64,
+    pub nack_requests_received: u64,
     pub pli_queue_overflow: u64,
     pub keyframe_resyncs: u64,
     pub last_recovery_time_millis: Option<u64>,
@@ -101,6 +109,8 @@ pub struct ScreenSharePerformanceSnapshot {
     pub ui_texture_updates: u64,
     pub pli_requests_sent: u64,
     pub pli_requests_received: u64,
+    pub nack_requests_sent: u64,
+    pub nack_requests_received: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +142,12 @@ impl SharedMetrics {
             },
             outbound_video_ssrc: (rtc_stats.outbound_ssrc != 0).then_some(rtc_stats.outbound_ssrc),
             inbound_video_ssrc: (rtc_stats.inbound_ssrc != 0).then_some(rtc_stats.inbound_ssrc),
+            capture_width: self.capture_width.load(Ordering::Relaxed) as u32,
+            capture_height: self.capture_height.load(Ordering::Relaxed) as u32,
+            encoder_width: self.encoder_width.load(Ordering::Relaxed) as u32,
+            encoder_height: self.encoder_height.load(Ordering::Relaxed) as u32,
+            decoder_width: rtc_stats.inbound_frame_width,
+            decoder_height: rtc_stats.inbound_frame_height,
             p2p_connected: self.p2p_connected.load(Ordering::Relaxed),
             route: match self.route.load(Ordering::Relaxed) {
                 1 => Some(MediaRoute::Direct),
@@ -164,6 +180,8 @@ impl SharedMetrics {
             ui_texture_updates: self.ui_texture_updates.load(Ordering::Relaxed),
             pli_requests_sent: h264_flow.pli_requests_sent,
             pli_requests_received: h264_flow.pli_requests_received,
+            nack_requests_sent: rtc_stats.inbound_nack_count as u64,
+            nack_requests_received: rtc_stats.outbound_nack_count as u64,
             pli_queue_overflow: h264_flow.pli_queue_overflow,
             keyframe_resyncs: h264_flow.keyframe_resyncs,
             last_recovery_time_millis: h264_flow.last_recovery_time_millis,
@@ -374,6 +392,18 @@ impl SharedMetrics {
                     .saturating_sub(previous.inbound_packets_lost),
                 Ordering::Relaxed,
             );
+            self.interval_nack_requests_sent.fetch_add(
+                snapshot
+                    .inbound_nack_count
+                    .saturating_sub(previous.inbound_nack_count) as u64,
+                Ordering::Relaxed,
+            );
+            self.interval_nack_requests_received.fetch_add(
+                snapshot
+                    .outbound_nack_count
+                    .saturating_sub(previous.outbound_nack_count) as u64,
+                Ordering::Relaxed,
+            );
         }
         *self
             .rtc_stats
@@ -422,6 +452,17 @@ impl SharedMetrics {
         self.encoder_input_frames.fetch_add(1, Ordering::Relaxed);
         self.interval_encoder_input_frames
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_video_dimensions(&self, width: u32, height: u32) {
+        self.capture_width
+            .store(u64::from(width), Ordering::Relaxed);
+        self.capture_height
+            .store(u64::from(height), Ordering::Relaxed);
+        self.encoder_width
+            .store(u64::from(width), Ordering::Relaxed);
+        self.encoder_height
+            .store(u64::from(height), Ordering::Relaxed);
     }
 
     pub(super) fn record_capture_frame_for_encoder(&self, repeated: bool) {
@@ -792,6 +833,10 @@ impl SharedMetrics {
             pli_requests_sent: self.interval_pli_requests_sent.swap(0, Ordering::Relaxed),
             pli_requests_received: self
                 .interval_pli_requests_received
+                .swap(0, Ordering::Relaxed),
+            nack_requests_sent: self.interval_nack_requests_sent.swap(0, Ordering::Relaxed),
+            nack_requests_received: self
+                .interval_nack_requests_received
                 .swap(0, Ordering::Relaxed),
         }
     }

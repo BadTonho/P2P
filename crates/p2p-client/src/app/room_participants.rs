@@ -37,6 +37,7 @@ impl ClientUi {
                 None
             },
             supports_group_screen_share: self.room_mode == RoomMode::Local,
+            supports_group_session_ids: self.room_mode == RoomMode::Local,
         }
     }
 
@@ -66,6 +67,14 @@ impl ClientUi {
             .retain(|id, _| member_ids.contains(id));
         self.group_inbound_sessions
             .retain(|id, _| member_ids.contains(id));
+        self.group_outbound_generations
+            .retain(|id, _| member_ids.contains(id));
+        self.group_inbound_generations
+            .retain(|id, _| member_ids.contains(id));
+        self.pending_group_ice
+            .retain(|(id, _), _| member_ids.contains(id));
+        self.closed_group_generations
+            .retain(|(id, _), _| member_ids.contains(id));
         self.group_outbound_ports
             .retain(|id, _| member_ids.contains(id));
         self.group_inbound_ports
@@ -83,6 +92,8 @@ impl ClientUi {
         }
         self.group_peer_status
             .retain(|id, _| member_ids.contains(id));
+        self.group_audio_status
+            .retain(|id, _| member_ids.contains(id));
         if self.room_mode != RoomMode::Local
             && (self.group_local_sharing
                 || !self.group_watched_shares.is_empty()
@@ -98,10 +109,11 @@ impl ClientUi {
                 || !self.group_outbound_sessions.is_empty())
         {
             self.stop_group_media(true);
-            self.screen_share_status = Some(
-                "O compartilhamento em grupo foi encerrado: todos os participantes precisam de uma versão compatível."
-                    .to_owned(),
-            );
+            self.screen_share_status = Some(if self.group_sharing_upgrade_required() {
+                "O compartilhamento em grupo foi encerrado: todos precisam da versão 1.1.3 para correlacionar cada sessão.".to_owned()
+            } else {
+                "O compartilhamento em grupo foi encerrado: todos os participantes precisam de uma versão compatível.".to_owned()
+            });
         }
         if self.participants.len() != 2 && !matches!(&self.screen_share_role, ScreenShareRole::Idle)
         {

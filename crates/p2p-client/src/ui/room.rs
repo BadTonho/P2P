@@ -445,6 +445,9 @@ impl ClientUi {
                 self.request_leave(ui.ctx());
             }
         });
+        if let Some(status) = self.audio_status.as_deref() {
+            ui.small(status);
+        }
     }
 
     fn show_screen_source_menu(&mut self, ui: &mut egui::Ui) {
@@ -552,7 +555,13 @@ impl ClientUi {
 
     fn show_group_watch_controls(&mut self, ui: &mut egui::Ui, participants: &[ParticipantInfo]) {
         if !self.group_sharing_compatible() {
-            if self.room_mode == RoomMode::Local && participants.len() > 2 {
+            if self.group_sharing_upgrade_required() {
+                Self::show_notice(
+                    ui,
+                    "Compartilhamento em grupo indisponível:",
+                    "Todos os participantes precisam da versão 1.1.3 para correlacionar cada transmissão com segurança.",
+                );
+            } else if self.room_mode == RoomMode::Local && participants.len() > 2 {
                 Self::show_notice(
                     ui,
                     "Compartilhamento em grupo indisponível:",
@@ -589,6 +598,14 @@ impl ClientUi {
                     ui.label("Sua tela está disponível");
                 }
             });
+            for (peer_id, status) in &self.group_audio_status {
+                let participant_name = participants
+                    .iter()
+                    .find(|participant| participant.id == *peer_id)
+                    .map(|participant| participant.display_name.as_str())
+                    .unwrap_or("participante");
+                ui.small(format!("Áudio de {participant_name}: {status}"));
+            }
         });
     }
 
