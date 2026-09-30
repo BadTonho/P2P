@@ -18,7 +18,7 @@ Na tela inicial, **Seu perfil** permite informar um nome e escolher uma foto; am
 ## Antes de começar
 
 - Cada pessoa precisa executar o `p2p-client.exe` no Windows 10 versão 1803 ou posterior, ou Windows 11.
-- Salas locais/Radmin aceitam até oito participantes. O compartilhamento em grupo com sessões correlacionadas exige a versão 1.1.3 em todos os participantes.
+- Salas locais/Radmin aceitam até oito participantes. O compartilhamento em grupo com sessões correlacionadas exige que todos usem um build com suporte a IDs de sessão.
 - Se o Windows Firewall perguntar, permita o aplicativo nas redes que você está usando. Não é preciso desligar o firewall.
 - Em **Configurações > Atualizações**, é possível procurar atualizações. Downloads e reinicialização para aplicar são iniciados por você e não ficam disponíveis durante uma sala.
 
@@ -43,7 +43,7 @@ Portas para permitir no firewall:
 
 No Radmin, escolham o adaptador e o endereço IPv4 da VPN. Todos precisam estar conectados à mesma rede virtual. A sucessão só funciona se os participantes elegíveis permitirem hospedagem e a malha de controle conseguir se conectar.
 
-O compartilhamento em grupo requer a versão 1.1.3 em todos os participantes, pois cada sessão usa um identificador próprio para ofertas, respostas e ICE. Versões anteriores podem continuar usando o fluxo tradicional entre duas pessoas, mas o compartilhamento em grupo fica desativado até todos atualizarem. A sala aceita até oito participantes, mas cada PC tem oito portas UDP de mídia disponíveis (9002–9009); sessões simultâneas de envio e recepção podem atingir esse limite antes de a sala chegar a oito pessoas. Se isso ocorrer, pare de assistir a uma tela que não seja necessária e tente novamente.
+O compartilhamento em grupo requer que todos usem um build com suporte a IDs próprios de sessão para ofertas, respostas e ICE. Builds anteriores podem continuar usando o fluxo tradicional entre duas pessoas, mas o compartilhamento em grupo fica desativado até todos atualizarem. A sala aceita até oito participantes, mas cada PC tem oito portas UDP de mídia disponíveis (9002–9009); sessões simultâneas de envio e recepção podem atingir esse limite antes de a sala chegar a oito pessoas. Se isso ocorrer, pare de assistir a uma tela que não seja necessária e tente novamente.
 
 ## Internet entre duas casas — teste controlado
 
