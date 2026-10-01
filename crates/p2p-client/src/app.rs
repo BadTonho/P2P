@@ -630,88 +630,110 @@ impl ClientUi {
         egui::CentralPanel::default().show(ui, |ui| {
             Self::apply_monochrome_style(ui);
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (icon, tooltip) = settings_navigation_button(self.settings_open);
-                        let response = ui
-                            .add_enabled(
-                                self.screen_picker.is_none(),
-                                egui::Button::new(egui::RichText::new(icon).size(18.0))
-                                    .min_size(egui::vec2(30.0, 26.0)),
-                            )
-                            .on_hover_text(tooltip);
-                        if response.clicked() {
-                            if self.settings_open {
-                                close_settings = true;
-                            } else {
-                                open_settings = true;
-                            }
-                        }
+                ui.columns(3, |columns| {
+                    let code_width = columns[1].available_width();
+                    columns[1].allocate_ui_with_layout(
+                        egui::vec2(code_width, 30.0),
+                        egui::Layout::from_main_dir_and_cross_align(
+                            egui::Direction::TopDown,
+                            egui::Align::Center,
+                        ),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                if let Some(code_label) =
+                                    room_header_code_label(self.room_code.as_deref())
+                                {
+                                    let response = ui
+                                        .add(
+                                            egui::Label::new(
+                                                egui::RichText::new(code_label).monospace(),
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text("Clique para copiar");
+                                    if response.clicked() {
+                                        if let Some(code) = &self.room_code {
+                                            ui.ctx().copy_text(code.clone());
+                                            self.code_copied_until =
+                                                Some(Instant::now() + Duration::from_secs(2));
+                                            ui.ctx().request_repaint_after(Duration::from_secs(2));
+                                        }
+                                    }
+                                    if copy_confirmation_visible(
+                                        self.code_copied_until,
+                                        Instant::now(),
+                                    ) {
+                                        ui.label("Código copiado");
+                                    }
+                                }
+                            });
+                        },
+                    );
 
-                        if let Some(action) =
-                            update_shortcut_action(&self.update_status, self.room_code.is_some())
-                        {
-                            let tooltip = update_shortcut_tooltip(
-                                &self.update_status,
-                                self.room_code.is_some(),
-                            )
-                            .unwrap_or_else(|| "Atualização".to_owned());
-                            let enabled = action != UpdateShortcutAction::DisabledForRoom
-                                && self.screen_picker.is_none();
+                    columns[2].with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let (icon, tooltip) = settings_navigation_button(self.settings_open);
                             let response = ui
                                 .add_enabled(
-                                    enabled,
-                                    egui::Button::new(egui::RichText::new("↻").size(18.0))
+                                    self.screen_picker.is_none(),
+                                    egui::Button::new(egui::RichText::new(icon).size(18.0))
                                         .min_size(egui::vec2(30.0, 26.0)),
                                 )
                                 .on_hover_text(tooltip);
                             if response.clicked() {
-                                match action {
-                                    UpdateShortcutAction::Download => {
-                                        if let UpdateStatus::Available(manifest) =
-                                            &self.update_status
-                                        {
-                                            let manifest = manifest.clone();
-                                            tracing::info!(
-                                                version = %manifest.version,
-                                                "Download de atualização iniciado pelo atalho"
-                                            );
-                                            self.updates.download(manifest.clone());
-                                            self.update_status = UpdateStatus::Downloading {
-                                                manifest,
-                                                received: 0,
-                                            };
-                                        }
-                                    }
-                                    UpdateShortcutAction::OpenUpdates => {
-                                        open_update_settings = true;
-                                    }
-                                    UpdateShortcutAction::DisabledForRoom => {}
+                                if self.settings_open {
+                                    close_settings = true;
+                                } else {
+                                    open_settings = true;
                                 }
                             }
-                        }
 
-                        if let Some(code_label) = room_header_code_label(self.room_code.as_deref())
-                        {
-                            let response = ui
-                                .add(
-                                    egui::Label::new(egui::RichText::new(code_label).monospace())
-                                        .sense(egui::Sense::click()),
+                            if let Some(action) = update_shortcut_action(
+                                &self.update_status,
+                                self.room_code.is_some(),
+                            ) {
+                                let tooltip = update_shortcut_tooltip(
+                                    &self.update_status,
+                                    self.room_code.is_some(),
                                 )
-                                .on_hover_text("Clique para copiar");
-                            if response.clicked() {
-                                if let Some(code) = &self.room_code {
-                                    ui.ctx().copy_text(code.clone());
-                                    self.code_copied_until =
-                                        Some(Instant::now() + Duration::from_secs(2));
-                                    ui.ctx().request_repaint_after(Duration::from_secs(2));
+                                .unwrap_or_else(|| "Atualização".to_owned());
+                                let enabled = action != UpdateShortcutAction::DisabledForRoom
+                                    && self.screen_picker.is_none();
+                                let response = ui
+                                    .add_enabled(
+                                        enabled,
+                                        egui::Button::new(egui::RichText::new("↻").size(18.0))
+                                            .min_size(egui::vec2(30.0, 26.0)),
+                                    )
+                                    .on_hover_text(tooltip);
+                                if response.clicked() {
+                                    match action {
+                                        UpdateShortcutAction::Download => {
+                                            if let UpdateStatus::Available(manifest) =
+                                                &self.update_status
+                                            {
+                                                let manifest = manifest.clone();
+                                                tracing::info!(
+                                                    version = %manifest.version,
+                                                    "Download de atualização iniciado pelo atalho"
+                                                );
+                                                self.updates.download(manifest.clone());
+                                                self.update_status = UpdateStatus::Downloading {
+                                                    manifest,
+                                                    received: 0,
+                                                };
+                                            }
+                                        }
+                                        UpdateShortcutAction::OpenUpdates => {
+                                            open_update_settings = true;
+                                        }
+                                        UpdateShortcutAction::DisabledForRoom => {}
+                                    }
                                 }
                             }
-                            if copy_confirmation_visible(self.code_copied_until, Instant::now()) {
-                                ui.label("Código copiado");
-                            }
-                        }
-                    });
+                        },
+                    );
                 });
 
                 if let Some(error) = self.logging.take_write_error() {

@@ -72,125 +72,6 @@ impl ClientUi {
             );
         }
 
-        egui::CollapsingHeader::new("Detalhes da sala")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(
-                    self.connection_status
-                        .as_deref()
-                        .unwrap_or("Conectado ao servidor."),
-                );
-                ui.label(if self.hosting_locally {
-                    "Este computador está hospedando a sala."
-                } else {
-                    "Você entrou na sala hospedada por outro participante."
-                });
-
-                ui.separator();
-                ui.heading("Convite");
-                if self.hosting_locally && self.room_mode == RoomMode::InternetTest {
-                    match signaling_ws_url(&self.public_server_url) {
-                        Ok(url) => {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.monospace(&url);
-                                if ui.button("Copiar endereço").clicked() {
-                                    ui.ctx().copy_text(url);
-                                }
-                            });
-                        }
-                        Err(_) => Self::show_notice(
-                            ui,
-                            "Endereço necessário:",
-                            "Configure o IPv4 público ou DDNS em Configurações > Conexão.",
-                        ),
-                    }
-                } else if self.hosting_locally {
-                    ui.label("Escolha o endereço que seu amigo consegue alcançar.");
-                    self.show_host_address_picker(ui);
-                } else {
-                    ui.label("Use o endereço informado pelo anfitrião em Configurações > Conexão.");
-                }
-
-                ui.separator();
-                ui.heading("Participantes e sucessão");
-                if participants.is_empty() {
-                    ui.label("Aguardando participantes…");
-                } else {
-                    for participant in &participants {
-                        ui.label(format!(
-                            "{} — ordem {}, {}",
-                            participant.display_name,
-                            participant.order,
-                            if self.room_mode == RoomMode::InternetTest {
-                                "sucessão desativada no modo Internet"
-                            } else if participant.id == self.current_leader_id {
-                                "anfitrião atual"
-                            } else if participant.may_host {
-                                "autorizado a hospedar"
-                            } else {
-                                "não autorizado a assumir"
-                            }
-                        ));
-                    }
-                }
-                if self.room_mode == RoomMode::InternetTest {
-                    ui.small("Esta sala aceita duas pessoas e termina quando o anfitrião sai ou perde a conexão.");
-                } else if participants.iter().all(|participant| !participant.may_host) {
-                    ui.small("Ninguém autorizou hospedagem automática; a sala termina se o anfitrião sair.");
-                }
-                if self.room_mode == RoomMode::Local {
-                    if let Some(status) = &self.control_status {
-                        ui.small(status);
-                    }
-                    let mut queue = self.control_queue.clone();
-                    queue.sort_by(|left, right| {
-                        right
-                            .eligible
-                            .cmp(&left.eligible)
-                            .then_with(|| left.loss_percent.total_cmp(&right.loss_percent))
-                            .then_with(|| left.jitter_ms.total_cmp(&right.jitter_ms))
-                            .then_with(|| left.latency_ms.total_cmp(&right.latency_ms))
-                            .then_with(|| left.participant.order.cmp(&right.participant.order))
-                    });
-                    for (index, candidate) in queue.iter().enumerate() {
-                        ui.label(format!(
-                            "{}. {}{}",
-                            index + 1,
-                            candidate.participant.display_name,
-                            if candidate.eligible { "" } else { " (inelegível)" }
-                        ));
-                    }
-                }
-
-                if self.peer_connected && ui.button("Testar sinalização").clicked() {
-                    self.diagnostic_status = Some("Enviando sinal de diagnóstico…".to_owned());
-                    if let Some(signaling) = &self.signaling {
-                        if let Err(error) = signaling.send_diagnostic() {
-                            self.diagnostic_status = Some(error);
-                        }
-                    }
-                }
-                if let Some(status) = &self.diagnostic_status {
-                    ui.small(status);
-                }
-                if self.hosting_locally && self.room_mode == RoomMode::Local {
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            !self.ending_room_explicitly,
-                            egui::Button::new(if self.ending_room_explicitly {
-                                "Encerrando sala…"
-                            } else {
-                                "Encerrar sala sem sucessor"
-                            }),
-                        )
-                        .clicked()
-                    {
-                        self.end_room_explicitly(ui.ctx());
-                    }
-                }
-            });
-
         ui.add_space(8.0);
         ui.heading("Participantes");
         if participants.is_empty() {
@@ -321,6 +202,125 @@ impl ClientUi {
         {
             Self::show_notice(ui, "Fallback da captura:", &reason);
         }
+
+        egui::CollapsingHeader::new("Detalhes da sala")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    self.connection_status
+                        .as_deref()
+                        .unwrap_or("Conectado ao servidor."),
+                );
+                ui.label(if self.hosting_locally {
+                    "Este computador está hospedando a sala."
+                } else {
+                    "Você entrou na sala hospedada por outro participante."
+                });
+
+                ui.separator();
+                ui.heading("Convite");
+                if self.hosting_locally && self.room_mode == RoomMode::InternetTest {
+                    match signaling_ws_url(&self.public_server_url) {
+                        Ok(url) => {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.monospace(&url);
+                                if ui.button("Copiar endereço").clicked() {
+                                    ui.ctx().copy_text(url);
+                                }
+                            });
+                        }
+                        Err(_) => Self::show_notice(
+                            ui,
+                            "Endereço necessário:",
+                            "Configure o IPv4 público ou DDNS em Configurações > Conexão.",
+                        ),
+                    }
+                } else if self.hosting_locally {
+                    ui.label("Escolha o endereço que seu amigo consegue alcançar.");
+                    self.show_host_address_picker(ui);
+                } else {
+                    ui.label("Use o endereço informado pelo anfitrião em Configurações > Conexão.");
+                }
+
+                ui.separator();
+                ui.heading("Participantes e sucessão");
+                if participants.is_empty() {
+                    ui.label("Aguardando participantes…");
+                } else {
+                    for participant in &participants {
+                        ui.label(format!(
+                            "{} — ordem {}, {}",
+                            participant.display_name,
+                            participant.order,
+                            if self.room_mode == RoomMode::InternetTest {
+                                "sucessão desativada no modo Internet"
+                            } else if participant.id == self.current_leader_id {
+                                "anfitrião atual"
+                            } else if participant.may_host {
+                                "autorizado a hospedar"
+                            } else {
+                                "não autorizado a assumir"
+                            }
+                        ));
+                    }
+                }
+                if self.room_mode == RoomMode::InternetTest {
+                    ui.small("Esta sala aceita duas pessoas e termina quando o anfitrião sai ou perde a conexão.");
+                } else if participants.iter().all(|participant| !participant.may_host) {
+                    ui.small("Ninguém autorizou hospedagem automática; a sala termina se o anfitrião sair.");
+                }
+                if self.room_mode == RoomMode::Local {
+                    if let Some(status) = &self.control_status {
+                        ui.small(status);
+                    }
+                    let mut queue = self.control_queue.clone();
+                    queue.sort_by(|left, right| {
+                        right
+                            .eligible
+                            .cmp(&left.eligible)
+                            .then_with(|| left.loss_percent.total_cmp(&right.loss_percent))
+                            .then_with(|| left.jitter_ms.total_cmp(&right.jitter_ms))
+                            .then_with(|| left.latency_ms.total_cmp(&right.latency_ms))
+                            .then_with(|| left.participant.order.cmp(&right.participant.order))
+                    });
+                    for (index, candidate) in queue.iter().enumerate() {
+                        ui.label(format!(
+                            "{}. {}{}",
+                            index + 1,
+                            candidate.participant.display_name,
+                            if candidate.eligible { "" } else { " (inelegível)" }
+                        ));
+                    }
+                }
+
+                if self.peer_connected && ui.button("Testar sinalização").clicked() {
+                    self.diagnostic_status = Some("Enviando sinal de diagnóstico…".to_owned());
+                    if let Some(signaling) = &self.signaling {
+                        if let Err(error) = signaling.send_diagnostic() {
+                            self.diagnostic_status = Some(error);
+                        }
+                    }
+                }
+                if let Some(status) = &self.diagnostic_status {
+                    ui.small(status);
+                }
+                if self.hosting_locally && self.room_mode == RoomMode::Local {
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            !self.ending_room_explicitly,
+                            egui::Button::new(if self.ending_room_explicitly {
+                                "Encerrando sala…"
+                            } else {
+                                "Encerrar sala sem sucessor"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.end_room_explicitly(ui.ctx());
+                    }
+                }
+            });
     }
 
     pub(super) fn show_room_toolbar(&mut self, ui: &mut egui::Ui) {
