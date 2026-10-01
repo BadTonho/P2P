@@ -6,7 +6,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::audio_capture::MicrophoneTest;
+use crate::audio_capture::{AudioApplication, MicrophoneTest};
 use crate::control_mesh::{ControlEvent, ControlMesh, QueueEntry};
 use crate::logging::{
     DiagnosticSnapshot, LoggingState, safe_signaling_endpoint, safe_stun_endpoint,
@@ -255,6 +255,10 @@ struct ClientUi {
     remote_screen_sequence: u64,
     group_local_sharing: bool,
     include_system_audio: bool,
+    excluded_audio_application_path: Option<String>,
+    available_audio_applications: Vec<AudioApplication>,
+    audio_applications_error: Option<String>,
+    audio_applications_loaded: bool,
     group_available_shares: HashSet<String>,
     group_watched_shares: HashSet<String>,
     group_outbound_sessions: HashMap<String, ScreenShareSession>,
@@ -469,6 +473,7 @@ impl ClientUi {
         settings.video_decoder_preference = self.video_decoder_preference;
         settings.show_local_preview = self.show_local_preview;
         settings.include_system_audio = self.include_system_audio;
+        settings.excluded_audio_application_path = self.excluded_audio_application_path.clone();
         settings.profile_display_name = self.profile_display_name.clone();
         settings.create_room_mode = self.create_room_mode;
         settings.use_turn_on_create = self.use_turn_on_create;
@@ -491,6 +496,7 @@ impl ClientUi {
         self.video_decoder_preference = preferences.video_decoder_preference;
         self.show_local_preview = preferences.show_local_preview;
         self.include_system_audio = preferences.include_system_audio;
+        self.excluded_audio_application_path = preferences.excluded_audio_application_path;
         self.profile_display_name = preferences.profile_display_name;
         self.capture_preview_enabled
             .store(self.show_local_preview, Ordering::Relaxed);
@@ -1390,9 +1396,11 @@ impl ClientUi {
                         if let Some(capture) = self.screen_capture.as_ref() {
                             let _ = capture.take_performance_snapshot();
                         }
-                        if let Err(error) =
-                            session.start_sending_with_audio(source, self.include_system_audio)
-                        {
+                        if let Err(error) = session.start_sending_with_audio_exclusion(
+                            source,
+                            self.include_system_audio,
+                            self.excluded_audio_application_path.clone(),
+                        ) {
                             session.stop();
                             self.screen_share_role = ScreenShareRole::Idle;
                             self.screen_share_status = Some(error);

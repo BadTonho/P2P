@@ -2,6 +2,7 @@ use super::super::{
     ClientUi, SettingsCategory, UpdateStatus, format_bytes, signaling_ws_url,
     validate_new_host_profile, validate_saved_host_profile,
 };
+use crate::audio_capture::available_audio_applications;
 use crate::screen_sharing;
 use crate::settings::{LoggingLevel, MAX_SAVED_HOSTS, SavedHostProfile, VideoDecoderPreference};
 use crate::update::UpdateManager;
@@ -397,11 +398,68 @@ impl ClientUi {
     }
 
     fn show_audio_settings(&mut self, ui: &mut egui::Ui) {
+        if !self.audio_applications_loaded {
+            self.refresh_audio_applications();
+        }
         ui.heading("Áudio");
         ui.group(|ui| {
             ui.heading("Som da tela compartilhada");
             ui.label("Na barra da sala, marque ‘Incluir som do computador’ antes de compartilhar para transmitir o áudio reproduzido no Windows.");
             ui.small("A opção fica desligada por padrão. Ela captura a saída padrão do computador, não o microfone; a faixa Opus segue diretamente aos participantes que assistem à tela.");
+            ui.separator();
+            ui.label("Não compartilhar o áudio de:");
+            let mut selected_path = self
+                .excluded_audio_application_path
+                .clone()
+                .unwrap_or_default();
+            let selected_label = if selected_path.is_empty() {
+                "Nenhum".to_owned()
+            } else {
+                self.available_audio_applications
+                    .iter()
+                    .find(|app| app.executable_path.eq_ignore_ascii_case(&selected_path))
+                    .map(|app| app.display_name.clone())
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(&selected_path)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("Aplicativo salvo")
+                            .to_owned()
+                    })
+            };
+            egui::ComboBox::from_id_salt("excluded-audio-application")
+                .selected_text(selected_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut selected_path, String::new(), "Nenhum");
+                    for app in &self.available_audio_applications {
+                        ui.selectable_value(
+                            &mut selected_path,
+                            app.executable_path.clone(),
+                            &app.display_name,
+                        );
+                    }
+                });
+            if selected_path.is_empty() {
+                if self.excluded_audio_application_path.take().is_some() {
+                    self.save_preferences();
+                }
+            } else if self.excluded_audio_application_path.as_deref() != Some(selected_path.as_str()) {
+                self.excluded_audio_application_path = Some(selected_path);
+                self.save_preferences();
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Atualizar lista").clicked() {
+                    self.refresh_audio_applications();
+                }
+                if self.available_audio_applications.is_empty() {
+                    ui.small("Abra um aplicativo que esteja reproduzindo áudio e atualize a lista.");
+                }
+            });
+            if let Some(error) = &self.audio_applications_error {
+                Self::show_notice(ui, "Lista de aplicativos:", error);
+            }
+            ui.small("O app selecionado e os processos filhos dele serão ignorados. A escolha é salva neste computador.");
+            ui.small("Se ele estiver fechado ao iniciar o áudio, o som completo será compartilhado até o app abrir. A exclusão exige Windows build 20348 ou posterior; sem suporte, o vídeo continua e o áudio não é enviado.");
             ui.small("Falhas de captura, codificação, envio, recepção e reprodução ficam registradas por sessão nos logs. Uma falha de áudio não encerra a transmissão de vídeo.");
         });
         ui.add_space(8.0);
@@ -469,6 +527,20 @@ impl ClientUi {
 
             ui.small("Se o acesso estiver bloqueado: Configurações > Privacidade e segurança > Microfone (no Windows 10, Privacidade > Microfone) > permitir acesso a aplicativos de área de trabalho.");
         });
+    }
+
+    fn refresh_audio_applications(&mut self) {
+        match available_audio_applications() {
+            Ok(applications) => {
+                self.available_audio_applications = applications;
+                self.audio_applications_error = None;
+            }
+            Err(error) => {
+                self.available_audio_applications.clear();
+                self.audio_applications_error = Some(error);
+            }
+        }
+        self.audio_applications_loaded = true;
     }
 
     fn show_video_settings(&mut self, ui: &mut egui::Ui) {

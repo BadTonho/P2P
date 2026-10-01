@@ -528,9 +528,12 @@ impl ClientUi {
             Ok(session) => {
                 let generation =
                     group_generation_id(&self.participant_id, session.metrics().session_id);
-                if let Err(error) =
-                    session.start_sending_with_options(source, bitrate, self.include_system_audio)
-                {
+                if let Err(error) = session.start_sending_with_options_and_exclusion(
+                    source,
+                    bitrate,
+                    self.include_system_audio,
+                    self.excluded_audio_application_path.clone(),
+                ) {
                     self.screen_share_status = Some(error);
                 } else {
                     self.group_outbound_ports.insert(viewer_id.clone(), port);

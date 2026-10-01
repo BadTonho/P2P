@@ -179,6 +179,7 @@ enum Command {
         source: LatestFrame,
         bitrate_bps: u32,
         include_system_audio: bool,
+        audio_exclusion_path: Option<String>,
         audio_source_override: Option<Box<dyn AudioSampleSource>>,
     },
     Signal {
@@ -455,17 +456,47 @@ impl ScreenShareSession {
         self.start_sending_with_options(source, MAX_PEER_MEDIA_BITRATE, include_system_audio)
     }
 
+    pub fn start_sending_with_audio_exclusion(
+        &self,
+        source: LatestFrame,
+        include_system_audio: bool,
+        audio_exclusion_path: Option<String>,
+    ) -> Result<(), String> {
+        self.start_sending_with_options_and_exclusion(
+            source,
+            MAX_PEER_MEDIA_BITRATE,
+            include_system_audio,
+            audio_exclusion_path,
+        )
+    }
+
     pub fn start_sending_with_options(
         &self,
         source: LatestFrame,
         bitrate_bps: u32,
         include_system_audio: bool,
     ) -> Result<(), String> {
+        self.start_sending_with_options_and_exclusion(
+            source,
+            bitrate_bps,
+            include_system_audio,
+            None,
+        )
+    }
+
+    pub fn start_sending_with_options_and_exclusion(
+        &self,
+        source: LatestFrame,
+        bitrate_bps: u32,
+        include_system_audio: bool,
+        audio_exclusion_path: Option<String>,
+    ) -> Result<(), String> {
         self.commands
             .send(Command::StartSending {
                 source,
                 bitrate_bps: bitrate_bps.clamp(250_000, MAX_PEER_MEDIA_BITRATE),
                 include_system_audio,
+                audio_exclusion_path,
                 audio_source_override: None,
             })
             .map_err(|_| "A sessão WebRTC foi encerrada.".to_owned())
@@ -482,6 +513,7 @@ impl ScreenShareSession {
                 source,
                 bitrate_bps: MAX_PEER_MEDIA_BITRATE,
                 include_system_audio: false,
+                audio_exclusion_path: None,
                 audio_source_override: Some(audio_source),
             })
             .map_err(|_| "A sessão WebRTC foi encerrada.".to_owned())
@@ -968,7 +1000,7 @@ async fn run_session(
             command = commands.recv() => {
                 let Some(command) = command else { break };
         match command {
-            Command::StartSending { source, bitrate_bps, include_system_audio, audio_source_override } => {
+            Command::StartSending { source, bitrate_bps, include_system_audio, audio_exclusion_path, audio_source_override } => {
                 if active_peer.is_some() {
                     let _ = events.send(ScreenShareEvent::Error(
                         "Já existe uma sessão de compartilhamento ativa.".to_owned(),
@@ -989,6 +1021,7 @@ async fn run_session(
                     decoder_preference,
                     bitrate_bps,
                     include_system_audio,
+                    audio_exclusion_path,
                     audio_source_override,
                     Arc::clone(&audio_playback_factory),
                     remote_audio_volume.clone(),
@@ -1524,6 +1557,7 @@ async fn create_sender(
     decoder_preference: VideoDecoderPreference,
     bitrate_bps: u32,
     include_system_audio: bool,
+    audio_exclusion_path: Option<String>,
     audio_source_override: Option<Box<dyn AudioSampleSource>>,
     audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
     remote_audio_volume: RemoteAudioVolume,
@@ -1534,7 +1568,10 @@ async fn create_sender(
         let result = (|| {
             let capture: Box<dyn AudioSampleSource> = match audio_source_override.take() {
                 Some(capture) => capture,
-                None => Box::new(SystemAudioCapture::start(metrics.session_id)?),
+                None => Box::new(SystemAudioCapture::start(
+                    metrics.session_id,
+                    audio_exclusion_path,
+                )?),
             };
             let (input_rate_hz, input_channels) = capture.input_format();
             tracing::info!(
@@ -1913,7 +1950,8 @@ async fn send_system_audio(
                 "Captura do áudio do sistema interrompida"
             );
             let _ = events.send(ScreenShareEvent::AudioError(format!(
-                "A captura do som do computador parou ({kind:?}): {error}"
+                "A captura do som do computador parou{}: {error}",
+                kind.map(|kind| format!(" ({kind:?})")).unwrap_or_default()
             )));
             break;
         }
@@ -2312,7 +2350,7 @@ mod tests {
             0
         }
 
-        fn take_error(&self) -> Option<(cpal::ErrorKind, String)> {
+        fn take_error(&self) -> Option<(Option<cpal::ErrorKind>, String)> {
             None
         }
     }

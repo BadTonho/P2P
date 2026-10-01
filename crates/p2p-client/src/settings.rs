@@ -82,6 +82,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub include_system_audio: bool,
     #[serde(default)]
+    pub excluded_audio_application_path: Option<String>,
+    #[serde(default)]
     pub profile_display_name: String,
     #[serde(
         default = "default_remote_audio_volume_percent",
@@ -154,6 +156,7 @@ impl Default for AppSettings {
             video_decoder_preference: VideoDecoderPreference::Automatic,
             show_local_preview: true,
             include_system_audio: false,
+            excluded_audio_application_path: None,
             profile_display_name: String::new(),
             remote_audio_default_volume_percent: default_remote_audio_volume_percent(),
             logging_level: LoggingLevel::default(),
@@ -380,6 +383,7 @@ mod tests {
             may_host: true,
             control_ipv4: Some(Ipv4Addr::new(26, 10, 20, 30)),
             video_decoder_preference: VideoDecoderPreference::PreferDxva,
+            excluded_audio_application_path: Some("C:\\Apps\\Music.exe".to_owned()),
             ..AppSettings::default()
         };
 
@@ -417,6 +421,35 @@ mod tests {
         assert_eq!(
             loaded.video_decoder_preference,
             VideoDecoderPreference::Automatic
+        );
+    }
+
+    #[test]
+    fn old_settings_default_excluded_audio_application_to_none() {
+        let mut stored =
+            serde_json::to_value(AppSettings::default()).expect("settings should serialize");
+        stored
+            .as_object_mut()
+            .expect("settings should serialize as an object")
+            .remove("excluded_audio_application_path");
+
+        let loaded: AppSettings = serde_json::from_value(stored)
+            .expect("older settings files should load without audio exclusion");
+        assert_eq!(loaded.excluded_audio_application_path, None);
+    }
+
+    #[test]
+    fn excluded_audio_application_path_is_saved_locally() {
+        let settings = AppSettings {
+            excluded_audio_application_path: Some("C:\\Apps\\Music.exe".to_owned()),
+            ..AppSettings::default()
+        };
+        let stored = serde_json::to_value(&settings).expect("settings should serialize");
+        let loaded: AppSettings =
+            serde_json::from_value(stored).expect("settings should deserialize");
+        assert_eq!(
+            loaded.excluded_audio_application_path.as_deref(),
+            Some("C:\\Apps\\Music.exe")
         );
     }
 

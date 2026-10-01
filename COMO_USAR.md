@@ -75,3 +75,9 @@ O atualizador consulta o último release público do [repositório no GitHub](ht
 ## Nível de logs
 
 Em **Configurações > Geral**, escolha **Desativados**, **Avisos e erros** ou **Detalhados**. O padrão é **Avisos e erros**; os logs detalhados ficam desligados. **Desativados** não cria arquivos de sessão e preserva os logs antigos. **Exportar logs** continua disponível por ação manual e, com os logs desativados, exporta somente o relatório de diagnóstico, sem histórico de eventos.
+
+## Excluir um aplicativo do áudio
+
+Abra **Configurações > Áudio**, atualize a lista e escolha o aplicativo em **Não compartilhar o áudio de**. A escolha fica somente nas preferências deste computador e identifica o executável, não o PID. A captura exclui a instância selecionada e os processos filhos dela.
+
+Se o aplicativo estiver fechado quando o compartilhamento de áudio começar, o som completo do computador será enviado até ele abrir; a captura então troca para o modo seletivo e pode haver uma breve pausa. Em Windows anterior ao build 20348, o vídeo continua, mas o áudio não é enviado quando uma exclusão está configurada. O áudio é transmitido normalmente quando a opção de inclusão de som do computador está desligada.

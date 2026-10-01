@@ -1,9 +1,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
+#[cfg(windows)]
+use super::process_loopback::{
+    InitialCaptureRoute, ProcessLoopbackCapture, find_process_id, initial_capture_route,
+    process_loopback_supported, should_switch_to_process_tree,
+};
 use super::{
     AudioPlaybackFactory, AudioPlaybackSink, AudioSampleSource, RemoteAudioVolume,
     scale_remote_audio_sample,
@@ -12,29 +18,49 @@ use super::{
 pub(crate) const OPUS_SAMPLE_RATE: u32 = 48_000;
 pub(crate) const OPUS_CHANNELS: usize = 2;
 pub(crate) const OPUS_FRAME_SAMPLES_PER_CHANNEL: usize = 960;
-const CAPTURE_QUEUE_MILLIS: usize = 250;
+pub(super) const CAPTURE_QUEUE_MILLIS: usize = 250;
 const PLAYBACK_QUEUE_MILLIS: usize = 250;
 const PLAYBACK_PRIME_MILLIS: usize = 40;
 
 pub(crate) struct SystemAudioCapture {
-    _stream: cpal::Stream,
+    stream: Option<cpal::Stream>,
+    #[cfg(windows)]
+    process_capture: Option<ProcessLoopbackCapture>,
     consumer: Consumer<f32>,
     input_rate: u32,
     input_channels: usize,
     diagnostics: Arc<CaptureDiagnostics>,
+    #[cfg(windows)]
+    excluded_application_path: Option<String>,
+    #[cfg(windows)]
+    excluded_process_id: Option<u32>,
+    #[cfg(windows)]
+    last_process_scan: Instant,
 }
 
 #[derive(Default)]
-struct CaptureDiagnostics {
-    callbacks: AtomicU64,
-    input_frames: AtomicU64,
-    non_silent_samples: AtomicU64,
-    captured_frames: AtomicU64,
-    dropped_frames: AtomicU64,
-    xruns: AtomicU64,
-    device_changes: AtomicU64,
-    realtime_denied: AtomicU64,
-    fatal_error: Mutex<Option<(cpal::ErrorKind, String)>>,
+pub(super) struct CaptureDiagnostics {
+    pub(super) callbacks: AtomicU64,
+    pub(super) input_frames: AtomicU64,
+    pub(super) non_silent_samples: AtomicU64,
+    pub(super) captured_frames: AtomicU64,
+    pub(super) dropped_frames: AtomicU64,
+    pub(super) xruns: AtomicU64,
+    pub(super) device_changes: AtomicU64,
+    pub(super) realtime_denied: AtomicU64,
+    fatal_error: Mutex<Option<(Option<cpal::ErrorKind>, String)>>,
+}
+
+impl CaptureDiagnostics {
+    pub(super) fn set_fatal_error(&self, kind: Option<cpal::ErrorKind>, message: String) {
+        let mut fatal_error = self
+            .fatal_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if fatal_error.is_none() {
+            *fatal_error = Some((kind, message));
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +80,73 @@ fn classify_capture_error(kind: cpal::ErrorKind) -> Option<RecoverableCaptureErr
 }
 
 impl SystemAudioCapture {
-    pub(crate) fn start(session_id: u64) -> Result<Self, String> {
+    pub(crate) fn start(
+        session_id: u64,
+        excluded_application_path: Option<String>,
+    ) -> Result<Self, String> {
+        #[cfg(not(windows))]
+        if excluded_application_path.is_some() {
+            return Err("A exclusão de aplicativos no áudio está disponível somente no Windows compatível. O vídeo continuará, mas o áudio não será enviado.".to_owned());
+        }
+        #[cfg(windows)]
+        let process_loopback_is_supported = if excluded_application_path.is_some() {
+            process_loopback_supported()?
+        } else {
+            true
+        };
+        #[cfg(windows)]
+        if matches!(
+            initial_capture_route(
+                excluded_application_path.is_some(),
+                process_loopback_is_supported,
+                None
+            ),
+            InitialCaptureRoute::BlockUnsupported
+        ) {
+            return Err("A exclusão de aplicativos do áudio exige Windows build 20348 ou posterior. O vídeo continuará, mas o áudio não será enviado.".to_owned());
+        }
+        let capture_diagnostics = Arc::new(CaptureDiagnostics::default());
+        #[cfg(windows)]
+        let excluded_process_id = match excluded_application_path.as_deref() {
+            Some(path) => find_process_id(path)?,
+            None => None,
+        };
+        #[cfg(windows)]
+        let initial_route = initial_capture_route(
+            excluded_application_path.is_some(),
+            process_loopback_is_supported,
+            excluded_process_id,
+        );
+
+        #[cfg(windows)]
+        if let InitialCaptureRoute::ExcludeProcessTree(process_id) = initial_route {
+            let queue_capacity =
+                (OPUS_SAMPLE_RATE as usize * OPUS_CHANNELS * CAPTURE_QUEUE_MILLIS / 1000).max(2);
+            let (producer, consumer) = RingBuffer::<f32>::new(queue_capacity);
+            let process_capture = ProcessLoopbackCapture::start(
+                process_id,
+                producer,
+                Arc::clone(&capture_diagnostics),
+            )?;
+            tracing::info!(
+                screen_share_session = session_id,
+                audio_capture = "WASAPI process loopback",
+                excluded_process_tree = true,
+                "Captura seletiva de áudio iniciada"
+            );
+            return Ok(Self {
+                stream: None,
+                process_capture: Some(process_capture),
+                consumer,
+                input_rate: OPUS_SAMPLE_RATE,
+                input_channels: OPUS_CHANNELS,
+                diagnostics: capture_diagnostics,
+                excluded_application_path,
+                excluded_process_id: Some(process_id),
+                last_process_scan: Instant::now(),
+            });
+        }
+
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| {
             "O Windows não disponibilizou uma saída de áudio padrão para capturar o som do computador.".to_owned()
@@ -70,8 +162,6 @@ impl SystemAudioCapture {
         let queue_capacity =
             (OPUS_SAMPLE_RATE as usize * OPUS_CHANNELS * CAPTURE_QUEUE_MILLIS / 1000).max(2);
         let (producer, consumer) = RingBuffer::<f32>::new(queue_capacity);
-        let capture_diagnostics = Arc::new(CaptureDiagnostics::default());
-
         let stream = match sample_format {
             cpal::SampleFormat::I8 => build_loopback_stream::<i8>(
                 &device,
@@ -187,16 +277,35 @@ impl SystemAudioCapture {
             "Captura do áudio reproduzido pelo computador iniciada"
         );
 
-        Ok(Self {
-            _stream: stream,
+        let capture = Self {
+            stream: Some(stream),
+            #[cfg(windows)]
+            process_capture: None,
             consumer,
             input_rate,
             input_channels,
             diagnostics: capture_diagnostics,
-        })
+            #[cfg(windows)]
+            excluded_application_path,
+            #[cfg(windows)]
+            excluded_process_id: None,
+            #[cfg(windows)]
+            last_process_scan: Instant::now() - Duration::from_secs(1),
+        };
+        #[cfg(windows)]
+        if capture.excluded_application_path.is_some() {
+            tracing::info!(
+                screen_share_session = session_id,
+                audio_capture = "WASAPI loopback via CPAL; selected process not running",
+                "A captura completa do áudio será usada até o aplicativo selecionado iniciar"
+            );
+        }
+        Ok(capture)
     }
 
     pub(crate) fn read_samples(&mut self, output: &mut [f32]) -> usize {
+        #[cfg(windows)]
+        self.update_excluded_process();
         let mut read = 0;
         while read < output.len() {
             match self.consumer.pop() {
@@ -242,7 +351,7 @@ impl SystemAudioCapture {
         self.diagnostics.realtime_denied.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn take_error(&self) -> Option<(cpal::ErrorKind, String)> {
+    pub(crate) fn take_error(&self) -> Option<(Option<cpal::ErrorKind>, String)> {
         self.diagnostics
             .fatal_error
             .lock()
@@ -252,6 +361,56 @@ impl SystemAudioCapture {
 
     pub(crate) fn input_format(&self) -> (u32, usize) {
         (self.input_rate, self.input_channels)
+    }
+
+    #[cfg(windows)]
+    fn update_excluded_process(&mut self) {
+        let Some(path) = self.excluded_application_path.as_deref() else {
+            return;
+        };
+        if self.last_process_scan.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.last_process_scan = Instant::now();
+        let process_id = match find_process_id(path) {
+            Ok(Some(process_id)) => process_id,
+            Ok(None) => return,
+            Err(error) => {
+                self.stream.take();
+                self.process_capture.take();
+                self.diagnostics.set_fatal_error(None, error);
+                return;
+            }
+        };
+        if !should_switch_to_process_tree(self.excluded_process_id, process_id) {
+            return;
+        }
+        if let Err(error) = self.switch_to_excluded_process(process_id) {
+            self.stream.take();
+            self.process_capture.take();
+            self.diagnostics.set_fatal_error(None, error);
+        }
+    }
+
+    #[cfg(windows)]
+    fn switch_to_excluded_process(&mut self, process_id: u32) -> Result<(), String> {
+        let queue_capacity =
+            (OPUS_SAMPLE_RATE as usize * OPUS_CHANNELS * CAPTURE_QUEUE_MILLIS / 1000).max(2);
+        let (producer, consumer) = RingBuffer::<f32>::new(queue_capacity);
+        let process_capture =
+            ProcessLoopbackCapture::start(process_id, producer, Arc::clone(&self.diagnostics))?;
+        self.stream.take();
+        self.process_capture = Some(process_capture);
+        self.consumer = consumer;
+        self.input_rate = OPUS_SAMPLE_RATE;
+        self.input_channels = OPUS_CHANNELS;
+        self.excluded_process_id = Some(process_id);
+        tracing::info!(
+            audio_capture = "WASAPI process loopback",
+            excluded_process_tree = true,
+            "Exclusão seletiva de aplicativo aplicada à captura de áudio"
+        );
+        Ok(())
     }
 }
 
@@ -296,7 +455,7 @@ impl AudioSampleSource for SystemAudioCapture {
         SystemAudioCapture::realtime_denied(self)
     }
 
-    fn take_error(&self) -> Option<(cpal::ErrorKind, String)> {
+    fn take_error(&self) -> Option<(Option<cpal::ErrorKind>, String)> {
         SystemAudioCapture::take_error(self)
     }
 }
@@ -381,7 +540,7 @@ where
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if fatal_error.is_none() {
-                        *fatal_error = Some((kind, detail));
+                        *fatal_error = Some((Some(kind), detail));
                     }
                 }
             },

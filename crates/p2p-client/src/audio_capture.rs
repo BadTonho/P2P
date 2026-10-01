@@ -2,11 +2,27 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(windows)]
+mod process_loopback;
 mod system_audio;
+#[cfg(windows)]
+pub(crate) use process_loopback::{AudioApplication, available_audio_applications};
 pub(crate) use system_audio::{
     OPUS_CHANNELS, OPUS_FRAME_SAMPLES_PER_CHANNEL, OPUS_SAMPLE_RATE, SystemAudioCapture,
     SystemAudioPlaybackFactory,
 };
+
+#[cfg(not(windows))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AudioApplication {
+    pub(crate) display_name: String,
+    pub(crate) executable_path: String,
+}
+
+#[cfg(not(windows))]
+pub(crate) fn available_audio_applications() -> Result<Vec<AudioApplication>, String> {
+    Ok(Vec::new())
+}
 
 #[derive(Clone)]
 pub(crate) struct RemoteAudioVolume {
@@ -54,7 +70,7 @@ pub(crate) trait AudioSampleSource: Send {
     fn xruns(&self) -> u64;
     fn device_changes(&self) -> u64;
     fn realtime_denied(&self) -> u64;
-    fn take_error(&self) -> Option<(cpal::ErrorKind, String)>;
+    fn take_error(&self) -> Option<(Option<cpal::ErrorKind>, String)>;
 }
 
 pub(crate) trait AudioPlaybackSink: Send {
