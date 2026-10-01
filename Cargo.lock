@@ -3416,7 +3416,7 @@ dependencies = [
 
 [[package]]
 name = "p2p-client"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4723,7 +4723,7 @@ dependencies = [
 
 [[package]]
 name = "signaling-protocol"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4731,7 +4731,7 @@ dependencies = [
 
 [[package]]
 name = "signaling-server"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
