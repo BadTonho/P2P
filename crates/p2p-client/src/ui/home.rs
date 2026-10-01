@@ -1,6 +1,91 @@
 use super::super::{ClientUi, RoomMode, signaling_ws_url};
 use eframe::egui;
 
+const PROFILE_AVATAR_SIZE: f32 = 48.0;
+const PROFILE_NAME_INLINE_MIN_WIDTH: f32 = 280.0;
+
+#[derive(Default)]
+struct ProfileCardActions {
+    choose_avatar: bool,
+    remove_avatar: bool,
+}
+
+fn show_room_mode_selector(ui: &mut egui::Ui, mode: &mut RoomMode) -> egui::Response {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Modo:");
+        ui.selectable_value(mode, RoomMode::Local, "Rede local / Radmin");
+        ui.selectable_value(mode, RoomMode::InternetTest, "Internet (teste)");
+    })
+    .response
+}
+
+fn show_profile_card(
+    ui: &mut egui::Ui,
+    display_name: &mut String,
+    avatar: Option<&egui::TextureHandle>,
+    has_saved_avatar: bool,
+) -> (egui::Response, ProfileCardActions) {
+    let mut actions = ProfileCardActions::default();
+    let response = ui.group(|ui| {
+        ui.heading("Seu perfil");
+        ui.horizontal(|ui| {
+            if let Some(texture) = avatar {
+                ui.add(
+                    egui::Image::new((
+                        texture.id(),
+                        egui::vec2(PROFILE_AVATAR_SIZE, PROFILE_AVATAR_SIZE),
+                    ))
+                    .fit_to_exact_size(egui::vec2(
+                        PROFILE_AVATAR_SIZE,
+                        PROFILE_AVATAR_SIZE,
+                    )),
+                );
+            }
+
+            ui.vertical(|ui| {
+                if ui.available_width() >= PROFILE_NAME_INLINE_MIN_WIDTH {
+                    ui.horizontal(|ui| {
+                        ui.label("Nome na sala");
+                        ui.add(
+                            egui::TextEdit::singleline(display_name)
+                                .hint_text("Se ficar vazio, aparecerá Participante N")
+                                .char_limit(32)
+                                .desired_width(ui.available_width().min(360.0)),
+                        );
+                    });
+                } else {
+                    ui.label("Nome na sala (opcional)");
+                    ui.add(
+                        egui::TextEdit::singleline(display_name)
+                            .hint_text("Se ficar vazio, aparecerá Participante N")
+                            .char_limit(32)
+                            .desired_width(ui.available_width().min(360.0)),
+                    );
+                }
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .small_button(if has_saved_avatar {
+                            "Alterar foto"
+                        } else {
+                            "Escolher foto"
+                        })
+                        .clicked()
+                    {
+                        actions.choose_avatar = true;
+                    }
+                    if has_saved_avatar && ui.small_button("Remover foto").clicked() {
+                        actions.remove_avatar = true;
+                    }
+                });
+            });
+        });
+        ui.small("O nome aparece em qualquer sala. A foto é compartilhada apenas em salas Rede local / Radmin.");
+    });
+
+    (response.response, actions)
+}
+
 impl ClientUi {
     pub(super) fn show_home(&mut self, ui: &mut egui::Ui) {
         if !self.addresses_loaded {
@@ -8,22 +93,10 @@ impl ClientUi {
         }
 
         self.show_profile_card(ui);
-        ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            ui.heading("Modo da sala");
-            ui.selectable_value(
-                &mut self.create_room_mode,
-                RoomMode::Local,
-                "Rede local / Radmin",
-            );
-            ui.selectable_value(
-                &mut self.create_room_mode,
-                RoomMode::InternetTest,
-                "Internet (teste)",
-            );
-        });
         ui.add_space(4.0);
+
+        show_room_mode_selector(ui, &mut self.create_room_mode);
+        ui.add_space(2.0);
 
         if self.create_room_mode == RoomMode::Local {
             ui.group(|ui| {
@@ -94,51 +167,19 @@ impl ClientUi {
     }
 
     fn show_profile_card(&mut self, ui: &mut egui::Ui) {
-        let mut choose_avatar = false;
-        let mut remove_avatar = false;
-        ui.group(|ui| {
-            ui.heading("Seu perfil");
-            ui.horizontal(|ui| {
-                if let Some(texture) = self.local_profile_avatar_texture(ui.ctx()) {
-                    ui.add(
-                        egui::Image::new((texture.id(), egui::vec2(64.0, 64.0)))
-                            .fit_to_exact_size(egui::vec2(64.0, 64.0)),
-                    );
-                }
-                ui.vertical(|ui| {
-                    ui.label("Nome na sala (opcional)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.profile_display_name)
-                            .hint_text("Se ficar vazio, aparecerá Participante N")
-                            .char_limit(32)
-                            .desired_width(ui.available_width().min(360.0)),
-                    );
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(if self.profile_avatar_jpeg.is_some() {
-                                "Alterar foto"
-                            } else {
-                                "Escolher foto"
-                            })
-                            .clicked()
-                        {
-                            choose_avatar = true;
-                        }
-                        if self.profile_avatar_jpeg.is_some()
-                            && ui.button("Remover foto").clicked()
-                        {
-                            remove_avatar = true;
-                        }
-                    });
-                });
-            });
-            ui.small("O nome aparece em qualquer sala. A foto é compartilhada apenas em salas Rede local / Radmin.");
-        });
+        let avatar = self.local_profile_avatar_texture(ui.ctx());
+        let has_saved_avatar = self.profile_avatar_jpeg.is_some();
+        let (_, actions) = show_profile_card(
+            ui,
+            &mut self.profile_display_name,
+            avatar.as_ref(),
+            has_saved_avatar,
+        );
 
-        if choose_avatar {
+        if actions.choose_avatar {
             self.choose_profile_avatar();
         }
-        if remove_avatar {
+        if actions.remove_avatar {
             self.remove_profile_avatar();
         }
         if let Some(error) = self.profile_avatar_error.clone() {
@@ -227,5 +268,65 @@ impl ClientUi {
         if manage_hosts {
             self.open_connection_settings();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RoomMode, show_profile_card, show_room_mode_selector};
+    use eframe::egui;
+
+    fn render_profile_and_mode(width: f32) -> (egui::Rect, egui::Rect, RoomMode) {
+        let context = egui::Context::default();
+        let mut profile_rect = None;
+        let mut mode_rect = None;
+        let mut display_name = "Tonho".to_owned();
+        let mut mode = RoomMode::Local;
+
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 480.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let avatar = ui.ctx().load_texture(
+                        "profile-layout-test-avatar",
+                        egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                        egui::TextureOptions::default(),
+                    );
+                    let (profile, _) =
+                        show_profile_card(ui, &mut display_name, Some(&avatar), true);
+                    profile_rect = Some(profile.rect);
+                    ui.add_space(4.0);
+                    mode_rect = Some(show_room_mode_selector(ui, &mut mode).rect);
+                });
+            },
+        );
+        output.textures_delta.clear();
+
+        (
+            profile_rect.expect("profile card should be laid out"),
+            mode_rect.expect("room mode selector should be laid out"),
+            mode,
+        )
+    }
+
+    #[test]
+    fn profile_and_room_mode_fit_wide_and_narrow_layouts() {
+        let (wide_profile, wide_mode, wide_selection) = render_profile_and_mode(640.0);
+        let (narrow_profile, narrow_mode, narrow_selection) = render_profile_and_mode(340.0);
+
+        assert!(wide_profile.height() < narrow_profile.height());
+        assert!(wide_profile.height() < 120.0);
+        assert!(narrow_profile.right() <= 340.0);
+        assert!(narrow_mode.right() <= 340.0);
+        assert_eq!(wide_selection, RoomMode::Local);
+        assert_eq!(narrow_selection, RoomMode::Local);
+        assert!(wide_mode.min.y >= wide_profile.max.y);
+        assert!(narrow_mode.min.y >= narrow_profile.max.y);
     }
 }
