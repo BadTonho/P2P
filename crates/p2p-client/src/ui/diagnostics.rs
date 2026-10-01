@@ -2,10 +2,19 @@ use super::super::{ClientUi, RoomMode, ScreenShareRole};
 use eframe::egui;
 
 impl ClientUi {
-    pub(super) fn show_diagnostics(&self, ui: &mut egui::Ui, open_logs_directory: &mut bool) {
+    pub(super) fn show_diagnostics(
+        &self,
+        ui: &mut egui::Ui,
+        open_logs_directory: &mut bool,
+        export_logs: &mut bool,
+    ) {
         egui::CollapsingHeader::new("Diagnóstico")
             .default_open(false)
             .show(ui, |ui| {
+                if ui.button("Exportar logs").clicked() {
+                    *export_logs = true;
+                }
+
                 ui.label("Log desta execução");
                 ui.horizontal_wrapped(|ui| {
                     ui.label(self.logging.current_log_file_label());

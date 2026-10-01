@@ -36,6 +36,14 @@ const GROUP_SCREEN_MAX_AGGREGATE_BITRATE: u32 = 8_000_000;
 const GROUP_SCREEN_MAX_PEER_BITRATE: u32 = 4_000_000;
 const GROUP_SIGNAL_ID_PREFIX: &str = "p2p-group-session-v1";
 
+fn settings_navigation_button(settings_open: bool) -> (&'static str, &'static str) {
+    if settings_open {
+        ("←", "Voltar")
+    } else {
+        ("⚙", "Configurações")
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsCategory {
     #[default]
@@ -534,44 +542,6 @@ impl ClientUi {
         let mut open_settings = false;
         let mut close_settings = false;
         let mut export_logs = false;
-        egui::Panel::top("app-header")
-            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)))
-            .show(ui, |ui| {
-                Self::apply_monochrome_style(ui);
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.heading("P2P - Voz e tela");
-                        ui.label(
-                            "Salas locais ou teste pela internet; compartilhamento de tela P2P, sem áudio",
-                        );
-                    });
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            export_logs = ui.button("Exportar logs").clicked();
-                            if self.settings_open {
-                                close_settings = ui.button("Voltar").clicked();
-                            } else {
-                                open_settings = ui
-                                    .add_enabled(
-                                        self.screen_picker.is_none(),
-                                        egui::Button::new("Configurações"),
-                                    )
-                                    .clicked();
-                            }
-                        },
-                    );
-                });
-            });
-
-        if export_logs {
-            self.export_logs();
-        }
-        if open_settings {
-            self.open_settings();
-        } else if close_settings {
-            self.close_settings();
-        }
 
         if self.room_code.is_some() && !self.settings_open {
             egui::Panel::bottom("room-controls")
@@ -587,6 +557,26 @@ impl ClientUi {
         egui::CentralPanel::default().show(ui, |ui| {
             Self::apply_monochrome_style(ui);
             egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (icon, tooltip) = settings_navigation_button(self.settings_open);
+                        let response = ui
+                            .add_enabled(
+                                self.screen_picker.is_none(),
+                                egui::Button::new(egui::RichText::new(icon).size(18.0))
+                                    .min_size(egui::vec2(30.0, 26.0)),
+                            )
+                            .on_hover_text(tooltip);
+                        if response.clicked() {
+                            if self.settings_open {
+                                close_settings = true;
+                            } else {
+                                open_settings = true;
+                            }
+                        }
+                    });
+                });
+
                 if let Some(error) = self.logging.take_write_error() {
                     self.logging.export_message = Some(format!(
                         "Falha ao gravar logs: {error}. Confira a pasta de logs em Diagnóstico."
@@ -640,9 +630,17 @@ impl ClientUi {
                     ui::show_home(self, ui);
                 }
 
-                ui::show_diagnostics(self, ui, &mut open_logs_directory);
+                ui::show_diagnostics(self, ui, &mut open_logs_directory, &mut export_logs);
             });
         });
+        if export_logs {
+            self.export_logs();
+        }
+        if open_settings {
+            self.open_settings();
+        } else if close_settings {
+            self.close_settings();
+        }
         if open_logs_directory {
             self.open_logs_directory();
         }
@@ -2289,11 +2287,17 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_public_ipv4_candidate, signaling_ws_url, validate_new_host_profile,
-        validate_saved_host_profile,
+        is_public_ipv4_candidate, settings_navigation_button, signaling_ws_url,
+        validate_new_host_profile, validate_saved_host_profile,
     };
     use crate::settings::{MAX_SAVED_HOSTS, SavedHostProfile};
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn settings_navigation_uses_icon_only_with_accessible_tooltip() {
+        assert_eq!(settings_navigation_button(false), ("⚙", "Configurações"));
+        assert_eq!(settings_navigation_button(true), ("←", "Voltar"));
+    }
 
     #[test]
     fn signaling_address_accepts_ipv4_or_ddns_with_fixed_port() {

@@ -30,6 +30,7 @@ pub(super) fn show_diagnostics(
     app: &mut ClientUi,
     ui: &mut egui::Ui,
     open_logs_directory: &mut bool,
+    export_logs: &mut bool,
 ) {
-    app.show_diagnostics(ui, open_logs_directory);
+    app.show_diagnostics(ui, open_logs_directory, export_logs);
 }
