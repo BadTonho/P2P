@@ -111,38 +111,27 @@ fn copy_confirmation_visible(expires_at: Option<Instant>, now: Instant) -> bool 
     expires_at.is_some_and(|expires_at| now < expires_at)
 }
 
-fn show_centered_header_row(
-    ui: &mut egui::Ui,
-    side_width: f32,
-    add_center: impl FnOnce(&mut egui::Ui),
-    add_right: impl FnOnce(&mut egui::Ui),
-) -> egui::Rect {
-    const HEIGHT: f32 = 30.0;
-
+fn allocate_app_header_row(ui: &mut egui::Ui, height: f32) -> egui::Rect {
     let width = ui.available_width();
-    let side_width = side_width.min(width / 2.0);
-    let center_width = (width - side_width * 2.0).max(0.0);
-    let response = ui.allocate_ui_with_layout(
-        egui::vec2(width, HEIGHT),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |row| {
-            let row_rect = row.max_rect();
-            row.spacing_mut().item_spacing.x = 0.0;
-            row.allocate_space(egui::vec2(side_width, HEIGHT));
-            let _ = row.allocate_ui_with_layout(
-                egui::vec2(center_width, HEIGHT),
-                egui::Layout::top_down(egui::Align::Center),
-                add_center,
-            );
-            let _ = row.allocate_ui_with_layout(
-                egui::vec2(side_width, HEIGHT),
-                egui::Layout::right_to_left(egui::Align::Center),
-                add_right,
-            );
-            row_rect
-        },
-    );
-    response.inner
+    ui.allocate_space(egui::vec2(width, height)).1
+}
+
+fn centered_header_rect(row: egui::Rect, size: egui::Vec2) -> egui::Rect {
+    egui::Rect::from_center_size(row.center(), size)
+}
+
+fn right_aligned_header_rect(
+    row: egui::Rect,
+    size: egui::Vec2,
+    offset_from_right: f32,
+) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            row.right() - offset_from_right - size.x,
+            row.center().y - size.y / 2.0,
+        ),
+        size,
+    )
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -676,63 +665,88 @@ impl ClientUi {
                         .unwrap_or_else(|| "Atualização".to_owned());
                 let picker_open = self.screen_picker.is_some();
                 let settings_open = self.settings_open;
-                let mut code_clicked = false;
-                let mut settings_clicked = false;
-                let mut update_clicked = false;
-                let right_width = if header_update_action.is_some() {
-                    72.0
+                let header_height = if show_copy_confirmation && code_label.is_some() {
+                    48.0
                 } else {
-                    38.0
+                    30.0
                 };
+                let header_rect = allocate_app_header_row(ui, header_height);
+                let button_size = egui::vec2(30.0, 26.0);
+                let mut code_clicked = false;
 
-                show_centered_header_row(
-                    ui,
-                    right_width,
-                    |ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        ui.horizontal(|ui| {
-                            if let Some(code_label) = code_label {
-                                let response = ui
-                                    .add(
-                                        egui::Label::new(
-                                            egui::RichText::new(code_label).monospace(),
-                                        )
-                                        .sense(egui::Sense::click()),
-                                    )
-                                    .on_hover_text("Clique para copiar");
-                                code_clicked = response.clicked();
-                                if show_copy_confirmation {
-                                    ui.label("Código copiado");
-                                }
-                            }
-                        });
-                    },
-                    |ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        let (icon, tooltip) = settings_navigation_button(settings_open);
-                        let response = ui
-                            .add_enabled(
-                                !picker_open,
-                                egui::Button::new(egui::RichText::new(icon).size(18.0))
-                                    .min_size(egui::vec2(30.0, 26.0)),
-                            )
-                            .on_hover_text(tooltip);
-                        settings_clicked = response.clicked();
+                if let Some(code_label) = code_label {
+                    let text_color = ui.visuals().text_color();
+                    let code_galley = ui.painter().layout_no_wrap(
+                        code_label,
+                        egui::TextStyle::Monospace.resolve(ui.style()),
+                        text_color,
+                    );
+                    let code_band = egui::Rect::from_min_max(
+                        header_rect.min,
+                        egui::pos2(header_rect.max.x, header_rect.min.y + 30.0),
+                    );
+                    let code_rect = centered_header_rect(code_band, code_galley.size());
+                    let response = ui
+                        .interact(
+                            code_rect,
+                            egui::Id::new("copy-room-code"),
+                            egui::Sense::click(),
+                        )
+                        .on_hover_text("Clique para copiar");
+                    ui.painter().galley(code_rect.min, code_galley, text_color);
+                    code_clicked = response.clicked();
 
-                        if let Some(action) = header_update_action {
-                            let enabled =
-                                action != UpdateShortcutAction::DisabledForRoom && !picker_open;
-                            let response = ui
-                                .add_enabled(
-                                    enabled,
-                                    egui::Button::new(egui::RichText::new("↻").size(18.0))
-                                        .min_size(egui::vec2(30.0, 26.0)),
-                                )
-                                .on_hover_text(&header_update_tooltip);
-                            update_clicked = response.clicked();
-                        }
-                    },
+                    if show_copy_confirmation {
+                        let confirmation_galley = ui.painter().layout_no_wrap(
+                            "Código copiado".to_owned(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                            text_color,
+                        );
+                        let confirmation_band = egui::Rect::from_min_max(
+                            egui::pos2(header_rect.min.x, header_rect.min.y + 30.0),
+                            header_rect.max,
+                        );
+                        let confirmation_rect =
+                            centered_header_rect(confirmation_band, confirmation_galley.size());
+                        ui.painter()
+                            .galley(confirmation_rect.min, confirmation_galley, text_color);
+                    }
+                }
+
+                let settings_rect = right_aligned_header_rect(header_rect, button_size, 0.0);
+                let mut settings_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("settings-navigation-button")
+                        .max_rect(settings_rect),
                 );
+                let (icon, tooltip) = settings_navigation_button(settings_open);
+                let settings_response = settings_ui
+                    .add_enabled(
+                        !picker_open,
+                        egui::Button::new(egui::RichText::new(icon).size(18.0))
+                            .min_size(button_size),
+                    )
+                    .on_hover_text(tooltip);
+                let settings_clicked = settings_response.clicked();
+
+                let mut update_clicked = false;
+                if let Some(action) = header_update_action {
+                    let update_rect = right_aligned_header_rect(header_rect, button_size, 68.0);
+                    let mut update_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .id_salt("update-shortcut-button")
+                            .max_rect(update_rect),
+                    );
+                    let enabled = action != UpdateShortcutAction::DisabledForRoom && !picker_open;
+                    let response = update_ui
+                        .add_enabled(
+                            enabled,
+                            egui::Button::new(egui::RichText::new("↻").size(18.0))
+                                .min_size(button_size),
+                        )
+                        .on_hover_text(&header_update_tooltip);
+                    update_clicked = response.clicked();
+                }
 
                 if code_clicked {
                     if let Some(code) = room_code {
@@ -2463,10 +2477,11 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpdateShortcutAction, UpdateStatus, copy_confirmation_visible, egui,
-        is_public_ipv4_candidate, room_header_code_label, settings_navigation_button,
-        show_centered_header_row, signaling_ws_url, update_shortcut_action,
-        update_shortcut_tooltip, validate_new_host_profile, validate_saved_host_profile,
+        UpdateShortcutAction, UpdateStatus, allocate_app_header_row, centered_header_rect,
+        copy_confirmation_visible, egui, is_public_ipv4_candidate, right_aligned_header_rect,
+        room_header_code_label, settings_navigation_button, signaling_ws_url,
+        update_shortcut_action, update_shortcut_tooltip, validate_new_host_profile,
+        validate_saved_host_profile,
     };
     use crate::settings::{MAX_SAVED_HOSTS, SavedHostProfile};
     use crate::update::UpdateManifest;
@@ -2511,10 +2526,11 @@ mod tests {
     }
 
     #[test]
-    fn header_row_stays_compact_and_keeps_center_independent_of_right_controls() {
+    fn header_row_stays_compact_and_centers_code_while_right_aligning_controls() {
         let context = egui::Context::default();
         let mut header_rect = None;
         let mut center_rect = None;
+        let mut settings_rect = None;
         let mut following_content_rect = None;
 
         let mut output = context.run_ui(
@@ -2527,12 +2543,11 @@ mod tests {
             },
             |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    header_rect = Some(show_centered_header_row(
-                        ui,
-                        72.0,
-                        |center_ui| center_rect = Some(center_ui.max_rect()),
-                        |_| {},
-                    ));
+                    let row = allocate_app_header_row(ui, 30.0);
+                    header_rect = Some(row);
+                    center_rect = Some(centered_header_rect(row, egui::vec2(140.0, 20.0)));
+                    settings_rect =
+                        Some(right_aligned_header_rect(row, egui::vec2(30.0, 26.0), 0.0));
                     ui.add_space(12.0);
                     following_content_rect = Some(ui.allocate_space(egui::vec2(10.0, 10.0)).1);
                 });
@@ -2542,14 +2557,13 @@ mod tests {
 
         let header_rect = header_rect.expect("header row should be laid out");
         let center_rect = center_rect.expect("center column should be laid out");
+        let settings_rect = settings_rect.expect("settings control should be laid out");
         let following_content_rect =
             following_content_rect.expect("following content should be laid out");
 
         assert!((header_rect.height() - 30.0).abs() < 0.1);
-        assert!(
-            (center_rect.center().x - header_rect.center().x).abs() < 0.1,
-            "center rect {center_rect:?} was not centered in header {header_rect:?}"
-        );
+        assert!((center_rect.center().x - header_rect.center().x).abs() < 0.1);
+        assert!((settings_rect.right() - header_rect.right()).abs() < 0.1);
         assert!(following_content_rect.min.y - header_rect.max.y < 50.0);
     }
 
