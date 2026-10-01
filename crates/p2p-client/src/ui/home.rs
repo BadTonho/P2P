@@ -3,6 +3,8 @@ use eframe::egui;
 
 const PROFILE_AVATAR_SIZE: f32 = 48.0;
 const PROFILE_NAME_INLINE_MIN_WIDTH: f32 = 280.0;
+const PRIMARY_ACTION_HEIGHT: f32 = 30.0;
+const JOIN_BUTTON_WIDTH: f32 = 96.0;
 
 #[derive(Default)]
 struct ProfileCardActions {
@@ -69,6 +71,66 @@ fn show_control_network_window(ui: &mut egui::Ui, app: &mut ClientUi) {
             });
     });
     app.control_network_window_open = open;
+}
+
+fn primary_action_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    width: f32,
+    enabled: bool,
+) -> egui::Response {
+    let (fill, text_color) = if enabled {
+        (egui::Color32::from_gray(215), egui::Color32::BLACK)
+    } else {
+        let visuals = &ui.visuals().widgets.noninteractive;
+        (visuals.bg_fill, visuals.fg_stroke.color)
+    };
+
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(label).strong().color(text_color))
+            .fill(fill)
+            .min_size(egui::vec2(width, PRIMARY_ACTION_HEIGHT)),
+    )
+}
+
+fn room_actions_enabled(connecting: bool, update_blocks_actions: bool) -> bool {
+    !connecting && !update_blocks_actions
+}
+
+fn join_action_enabled(
+    has_code: bool,
+    valid_address: bool,
+    connecting: bool,
+    update_blocks_actions: bool,
+) -> bool {
+    has_code && valid_address && room_actions_enabled(connecting, update_blocks_actions)
+}
+
+fn show_host_picker_and_manage<'a>(
+    ui: &mut egui::Ui,
+    selected_label: &str,
+    selected_host_index: &mut Option<usize>,
+    saved_hosts: impl Iterator<Item = (usize, &'a str)>,
+) -> (egui::Response, egui::Response) {
+    let mut manage_response = None;
+    let row = ui.horizontal_wrapped(|ui| {
+        egui::ComboBox::from_id_salt("join-host-profile")
+            .selected_text(selected_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(selected_host_index, None, "Endereço manual");
+                for (index, name) in saved_hosts {
+                    ui.selectable_value(selected_host_index, Some(index), name);
+                }
+            });
+
+        manage_response = Some(ui.small_button("Gerenciar anfitriões"));
+    });
+
+    (
+        row.response,
+        manage_response.expect("host management button should be laid out"),
+    )
 }
 
 fn show_profile_card(
@@ -232,13 +294,9 @@ impl ClientUi {
         ui.group(|ui| {
             ui.heading("Criar sala");
             ui.label("Hospede neste computador e compartilhe o código com seu amigo.");
-            if ui
-                .add_enabled(
-                    !self.connecting && !self.update_blocks_room_actions(),
-                    egui::Button::new("Criar sala"),
-                )
-                .clicked()
-            {
+            let enabled = room_actions_enabled(self.connecting, self.update_blocks_room_actions());
+            let response = primary_action_button(ui, "Criar sala", ui.available_width(), enabled);
+            if response.clicked() {
                 self.start_hosting();
             }
         });
@@ -253,18 +311,16 @@ impl ClientUi {
                 .and_then(|index| self.saved_hosts.get(index))
                 .map(|profile| profile.name.as_str())
                 .unwrap_or("Endereço manual");
-            egui::ComboBox::from_id_salt("join-host-profile")
-                .selected_text(selected_label)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.selected_host_index, None, "Endereço manual");
-                    for (index, profile) in self.saved_hosts.iter().enumerate() {
-                        ui.selectable_value(
-                            &mut self.selected_host_index,
-                            Some(index),
-                            &profile.name,
-                        );
-                    }
-                });
+            let (_, manage_response) = show_host_picker_and_manage(
+                ui,
+                selected_label,
+                &mut self.selected_host_index,
+                self.saved_hosts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, profile)| (index, profile.name.as_str())),
+            );
+            manage_hosts = manage_response.clicked();
             if let Some(index) = self.selected_host_index {
                 if let Some(profile) = self.saved_hosts.get(index) {
                     ui.small(format!("Endereço: {}", profile.address));
@@ -279,13 +335,13 @@ impl ClientUi {
                         .desired_width(ui.available_width().min(420.0)),
                 );
             }
-            if ui.small_button("Gerenciar anfitriões").clicked() {
-                manage_hosts = true;
-            }
             ui.label("Digite o código da sala:");
-            ui.horizontal(|ui| {
-                let field_width = (ui.available_width() - 72.0).max(100.0);
-                ui.add(
+            ui.horizontal_wrapped(|ui| {
+                let field_width =
+                    (ui.available_width() - JOIN_BUTTON_WIDTH - ui.spacing().item_spacing.x)
+                        .max(80.0);
+                ui.add_sized(
+                    egui::vec2(field_width, PRIMARY_ACTION_HEIGHT),
                     egui::TextEdit::singleline(&mut self.join_code)
                         .hint_text("Código da sala")
                         .desired_width(field_width),
@@ -293,14 +349,18 @@ impl ClientUi {
 
                 let address = self.join_address();
                 let valid_address = signaling_ws_url(address).is_ok();
-                let has_code = !self.join_code.trim().is_empty()
-                    && valid_address
-                    && !self.connecting
-                    && !self.update_blocks_room_actions();
-                if ui
-                    .add_enabled(has_code, egui::Button::new("Entrar"))
-                    .clicked()
-                {
+                let enabled = join_action_enabled(
+                    !self.join_code.trim().is_empty(),
+                    valid_address,
+                    self.connecting,
+                    self.update_blocks_room_actions(),
+                );
+                let response = primary_action_button(ui, "Entrar", JOIN_BUTTON_WIDTH, enabled);
+                let clicked = response.clicked();
+                if self.join_code.trim().is_empty() {
+                    response.on_hover_text("Digite o código da sala para habilitar Entrar.");
+                }
+                if clicked {
                     let code = self.join_code.trim().to_ascii_uppercase();
                     self.start_join(code);
                 }
@@ -314,8 +374,98 @@ impl ClientUi {
 
 #[cfg(test)]
 mod tests {
-    use super::{RoomMode, show_network_window, show_profile_card, show_room_mode_selector};
+    use super::{
+        JOIN_BUTTON_WIDTH, PRIMARY_ACTION_HEIGHT, RoomMode, join_action_enabled,
+        primary_action_button, room_actions_enabled, show_host_picker_and_manage,
+        show_network_window, show_profile_card, show_room_mode_selector,
+    };
     use eframe::egui;
+
+    struct HomeActionLayout {
+        create_card: egui::Rect,
+        create_button: egui::Rect,
+        join_card: egui::Rect,
+        host_row: egui::Rect,
+        manage_button: egui::Rect,
+        code_field: egui::Rect,
+        join_button: egui::Rect,
+        create_enabled: bool,
+        join_enabled: bool,
+    }
+
+    fn render_home_action_layout(width: f32) -> HomeActionLayout {
+        let context = egui::Context::default();
+        let mut layout = None;
+        let mut selected_host = None;
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 260.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let create = ui.group(|ui| {
+                    ui.heading("Criar sala");
+                    let button =
+                        primary_action_button(ui, "Criar sala", ui.available_width(), true);
+                    (button.rect, button.enabled())
+                });
+
+                let join = ui.group(|ui| {
+                    let (host_row, manage_button) = show_host_picker_and_manage(
+                        ui,
+                        "Endereço manual",
+                        &mut selected_host,
+                        std::iter::empty(),
+                    );
+                    ui.label("Digite o código da sala:");
+                    let mut code = String::new();
+                    let mut field_rect = None;
+                    let mut button_rect = None;
+                    let mut button_enabled = false;
+                    ui.horizontal_wrapped(|ui| {
+                        let field_width = (ui.available_width()
+                            - JOIN_BUTTON_WIDTH
+                            - ui.spacing().item_spacing.x)
+                            .max(80.0);
+                        field_rect = Some(
+                            ui.add_sized(
+                                egui::vec2(field_width, PRIMARY_ACTION_HEIGHT),
+                                egui::TextEdit::singleline(&mut code),
+                            )
+                            .rect,
+                        );
+                        let response = primary_action_button(ui, "Entrar", JOIN_BUTTON_WIDTH, true);
+                        button_rect = Some(response.rect);
+                        button_enabled = response.enabled();
+                    });
+                    (
+                        host_row.rect,
+                        manage_button.rect,
+                        field_rect.expect("code field should be laid out"),
+                        button_rect.expect("join button should be laid out"),
+                        button_enabled,
+                    )
+                });
+
+                layout = Some(HomeActionLayout {
+                    create_card: create.response.rect,
+                    create_button: create.inner.0,
+                    join_card: join.response.rect,
+                    host_row: join.inner.0,
+                    manage_button: join.inner.1,
+                    code_field: join.inner.2,
+                    join_button: join.inner.3,
+                    create_enabled: create.inner.1,
+                    join_enabled: join.inner.4,
+                });
+            },
+        );
+        output.textures_delta.clear();
+        layout.expect("home action cards should be laid out")
+    }
 
     fn render_profile_and_mode(width: f32) -> (egui::Rect, egui::Rect, RoomMode) {
         let context = egui::Context::default();
@@ -371,6 +521,46 @@ mod tests {
         assert_eq!(narrow_selection, RoomMode::Local);
         assert!(wide_mode.min.y >= wide_profile.max.y);
         assert!(narrow_mode.min.y >= narrow_profile.max.y);
+    }
+
+    #[test]
+    fn primary_actions_and_host_controls_fit_wide_and_narrow_layouts() {
+        for width in [640.0, 280.0] {
+            let layout = render_home_action_layout(width);
+
+            assert!(layout.create_enabled);
+            assert!(layout.join_enabled);
+            assert!(layout.create_button.height() >= PRIMARY_ACTION_HEIGHT);
+            assert!(layout.join_button.height() >= PRIMARY_ACTION_HEIGHT);
+            assert!((layout.join_button.width() - JOIN_BUTTON_WIDTH).abs() < 1.0);
+            assert!((layout.code_field.center().y - layout.join_button.center().y).abs() < 1.0);
+            assert!(layout.create_button.width() >= layout.create_card.width() - 24.0);
+            assert!(layout.manage_button.width() < layout.join_card.width() * 0.75);
+            assert!(layout.create_button.right() <= width);
+            assert!(layout.host_row.right() <= width);
+            assert!(layout.manage_button.right() <= width);
+            assert!(layout.code_field.right() <= width);
+            assert!(layout.join_button.right() <= width);
+
+            if width > 500.0 {
+                assert!(layout.manage_button.center().y - layout.host_row.min.y < 24.0);
+            } else {
+                assert!(layout.host_row.height() >= layout.manage_button.height());
+            }
+        }
+    }
+
+    #[test]
+    fn room_action_enablement_preserves_connection_and_code_requirements() {
+        assert!(room_actions_enabled(false, false));
+        assert!(!room_actions_enabled(true, false));
+        assert!(!room_actions_enabled(false, true));
+
+        assert!(join_action_enabled(true, true, false, false));
+        assert!(!join_action_enabled(false, true, false, false));
+        assert!(!join_action_enabled(true, false, false, false));
+        assert!(!join_action_enabled(true, true, true, false));
+        assert!(!join_action_enabled(true, true, false, true));
     }
 
     #[test]
