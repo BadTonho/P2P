@@ -44,6 +44,65 @@ fn settings_navigation_button(settings_open: bool) -> (&'static str, &'static st
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateShortcutAction {
+    Download,
+    OpenUpdates,
+    DisabledForRoom,
+}
+
+fn update_shortcut_action(
+    status: &UpdateStatus,
+    room_active: bool,
+) -> Option<UpdateShortcutAction> {
+    let action = match status {
+        UpdateStatus::Available(_) => UpdateShortcutAction::Download,
+        UpdateStatus::Downloading { .. }
+        | UpdateStatus::CancellingDownload(_)
+        | UpdateStatus::Downloaded { .. } => UpdateShortcutAction::OpenUpdates,
+        UpdateStatus::Checking
+        | UpdateStatus::UpToDate
+        | UpdateStatus::PreparingToApply
+        | UpdateStatus::Applying
+        | UpdateStatus::Failed(_) => return None,
+    };
+
+    Some(if room_active {
+        UpdateShortcutAction::DisabledForRoom
+    } else {
+        action
+    })
+}
+
+fn update_shortcut_tooltip(status: &UpdateStatus, room_active: bool) -> Option<String> {
+    let (version, description) = match status {
+        UpdateStatus::Available(manifest) => (&manifest.version, "Baixar atualização"),
+        UpdateStatus::Downloading { manifest, .. } => {
+            (&manifest.version, "Ver progresso do download")
+        }
+        UpdateStatus::CancellingDownload(manifest) => {
+            (&manifest.version, "Ver cancelamento do download")
+        }
+        UpdateStatus::Downloaded { manifest, .. } => (&manifest.version, "Ver atualização baixada"),
+        UpdateStatus::Checking
+        | UpdateStatus::UpToDate
+        | UpdateStatus::PreparingToApply
+        | UpdateStatus::Applying
+        | UpdateStatus::Failed(_) => return None,
+    };
+
+    Some(if room_active {
+        let verb = if matches!(status, UpdateStatus::Downloaded { .. }) {
+            "aplicar"
+        } else {
+            "baixar"
+        };
+        format!("Saia da sala para {verb} a atualização {version}")
+    } else {
+        format!("{description} {version}")
+    })
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsCategory {
     #[default]
@@ -574,6 +633,49 @@ impl ClientUi {
                                 open_settings = true;
                             }
                         }
+
+                        if let Some(action) =
+                            update_shortcut_action(&self.update_status, self.room_code.is_some())
+                        {
+                            let tooltip = update_shortcut_tooltip(
+                                &self.update_status,
+                                self.room_code.is_some(),
+                            )
+                            .unwrap_or_else(|| "Atualização".to_owned());
+                            let enabled = action != UpdateShortcutAction::DisabledForRoom
+                                && self.screen_picker.is_none();
+                            let response = ui
+                                .add_enabled(
+                                    enabled,
+                                    egui::Button::new(egui::RichText::new("↻").size(18.0))
+                                        .min_size(egui::vec2(30.0, 26.0)),
+                                )
+                                .on_hover_text(tooltip);
+                            if response.clicked() {
+                                match action {
+                                    UpdateShortcutAction::Download => {
+                                        if let UpdateStatus::Available(manifest) =
+                                            &self.update_status
+                                        {
+                                            let manifest = manifest.clone();
+                                            tracing::info!(
+                                                version = %manifest.version,
+                                                "Download de atualização iniciado pelo atalho"
+                                            );
+                                            self.updates.download(manifest.clone());
+                                            self.update_status = UpdateStatus::Downloading {
+                                                manifest,
+                                                received: 0,
+                                            };
+                                        }
+                                    }
+                                    UpdateShortcutAction::OpenUpdates => {
+                                        open_update_settings = true;
+                                    }
+                                    UpdateShortcutAction::DisabledForRoom => {}
+                                }
+                            }
+                        }
                     });
                 });
 
@@ -595,24 +697,6 @@ impl ClientUi {
                     }
                 }
 
-                let update_notice = match &self.update_status {
-                    UpdateStatus::Available(manifest) => {
-                        Some(format!("A versão {} está disponível.", manifest.version))
-                    }
-                    UpdateStatus::Downloaded { manifest, .. } => Some(format!(
-                        "A versão {} foi baixada; reinicie para aplicar.",
-                        manifest.version
-                    )),
-                    _ => None,
-                };
-                if let Some(notice) = update_notice {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(notice).strong());
-                        if ui.button("Ver atualização").clicked() {
-                            open_update_settings = true;
-                        }
-                    });
-                }
                 ui.add_space(12.0);
 
                 if open_update_settings {
@@ -2287,16 +2371,117 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_public_ipv4_candidate, settings_navigation_button, signaling_ws_url,
+        UpdateShortcutAction, UpdateStatus, is_public_ipv4_candidate, settings_navigation_button,
+        signaling_ws_url, update_shortcut_action, update_shortcut_tooltip,
         validate_new_host_profile, validate_saved_host_profile,
     };
     use crate::settings::{MAX_SAVED_HOSTS, SavedHostProfile};
+    use crate::update::UpdateManifest;
     use std::net::Ipv4Addr;
+
+    fn update_manifest() -> UpdateManifest {
+        UpdateManifest {
+            version: "1.2.3".to_owned(),
+            download_url: "https://example.test/p2p-client.exe".to_owned(),
+            size_bytes: 10,
+            sha256: "a".repeat(64),
+        }
+    }
 
     #[test]
     fn settings_navigation_uses_icon_only_with_accessible_tooltip() {
         assert_eq!(settings_navigation_button(false), ("⚙", "Configurações"));
         assert_eq!(settings_navigation_button(true), ("←", "Voltar"));
+    }
+
+    #[test]
+    fn update_shortcut_is_hidden_when_no_actionable_update_exists() {
+        let statuses = [
+            UpdateStatus::Checking,
+            UpdateStatus::UpToDate,
+            UpdateStatus::PreparingToApply,
+            UpdateStatus::Applying,
+            UpdateStatus::Failed("network error".to_owned()),
+        ];
+
+        for status in statuses {
+            assert_eq!(update_shortcut_action(&status, false), None);
+            assert_eq!(update_shortcut_action(&status, true), None);
+            assert_eq!(update_shortcut_tooltip(&status, false), None);
+        }
+    }
+
+    #[test]
+    fn available_update_shortcut_downloads_only_outside_a_room() {
+        let status = UpdateStatus::Available(update_manifest());
+
+        assert_eq!(
+            update_shortcut_action(&status, false),
+            Some(UpdateShortcutAction::Download)
+        );
+        assert_eq!(
+            update_shortcut_action(&status, true),
+            Some(UpdateShortcutAction::DisabledForRoom)
+        );
+        assert!(
+            update_shortcut_tooltip(&status, false)
+                .unwrap()
+                .contains("1.2.3")
+        );
+        let room_tooltip = update_shortcut_tooltip(&status, true).unwrap();
+        assert!(room_tooltip.contains("Saia da sala"));
+        assert!(room_tooltip.contains("baixar"));
+        assert!(room_tooltip.contains("1.2.3"));
+    }
+
+    #[test]
+    fn update_shortcut_opens_update_settings_while_downloading_or_downloaded() {
+        let manifest = update_manifest();
+        let statuses = [
+            UpdateStatus::Downloading {
+                manifest: manifest.clone(),
+                received: 5,
+            },
+            UpdateStatus::CancellingDownload(manifest.clone()),
+            UpdateStatus::Downloaded {
+                manifest,
+                path: std::path::PathBuf::from("update.exe"),
+            },
+        ];
+
+        for status in statuses {
+            assert_eq!(
+                update_shortcut_action(&status, false),
+                Some(UpdateShortcutAction::OpenUpdates)
+            );
+            assert_eq!(
+                update_shortcut_action(&status, true),
+                Some(UpdateShortcutAction::DisabledForRoom)
+            );
+            assert!(
+                update_shortcut_tooltip(&status, false)
+                    .unwrap()
+                    .contains("1.2.3")
+            );
+        }
+    }
+
+    #[test]
+    fn downloaded_update_shortcut_does_not_apply_automatically() {
+        let status = UpdateStatus::Downloaded {
+            manifest: update_manifest(),
+            path: std::path::PathBuf::from("update.exe"),
+        };
+
+        assert_eq!(
+            update_shortcut_action(&status, false),
+            Some(UpdateShortcutAction::OpenUpdates)
+        );
+        assert!(
+            update_shortcut_tooltip(&status, true)
+                .unwrap()
+                .contains("aplicar")
+        );
     }
 
     #[test]
