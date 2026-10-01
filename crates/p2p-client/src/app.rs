@@ -203,6 +203,7 @@ struct ClientUi {
     selected_host_address: usize,
     preferred_control_ipv4: Option<Ipv4Addr>,
     addresses_loaded: bool,
+    control_network_window_open: bool,
     participant_id: String,
     may_host: bool,
     participants: Vec<ParticipantInfo>,

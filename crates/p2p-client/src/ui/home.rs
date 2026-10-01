@@ -10,13 +10,65 @@ struct ProfileCardActions {
     remove_avatar: bool,
 }
 
-fn show_room_mode_selector(ui: &mut egui::Ui, mode: &mut RoomMode) -> egui::Response {
-    ui.horizontal_wrapped(|ui| {
+fn show_room_mode_selector(
+    ui: &mut egui::Ui,
+    mode: &mut RoomMode,
+    open_network_window: &mut bool,
+) -> (egui::Response, egui::Response) {
+    let mut network_button = None;
+    let row = ui.horizontal_wrapped(|ui| {
         ui.label("Modo:");
         ui.selectable_value(mode, RoomMode::Local, "Rede local / Radmin");
         ui.selectable_value(mode, RoomMode::InternetTest, "Internet (teste)");
-    })
-    .response
+        let response = ui.small_button("Configurar rede…");
+        if response.clicked() {
+            *open_network_window = true;
+        }
+        network_button = Some(response);
+    });
+
+    (
+        row.response,
+        network_button.expect("network settings button should be laid out"),
+    )
+}
+
+fn show_network_window(
+    context: &egui::Context,
+    open: &mut bool,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    if !*open {
+        return false;
+    }
+
+    egui::Window::new("Rede de controle da sala")
+        .id(egui::Id::new("control-network-settings-window"))
+        .open(open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(480.0)
+        .show(context, add_contents)
+        .is_some()
+}
+
+fn show_control_network_window(ui: &mut egui::Ui, app: &mut ClientUi) {
+    let mut open = app.control_network_window_open;
+    show_network_window(ui.ctx(), &mut open, |window| {
+        window.label("Escolha o endereço que seu amigo consegue alcançar.");
+        app.show_control_address_picker(window);
+        window.checkbox(
+            &mut app.may_host,
+            "Permitir que este computador seja escolhido para hospedar futuramente",
+        );
+        window.collapsing("Requisitos de rede", |window| {
+                window.label("A interface selecionada será usada para controle e vídeo.");
+                window.label("Libere TCP 9001 e UDP 9002–9009 no firewall do Windows.");
+                window.label("Use Radmin VPN quando o amigo entrar pelo endereço Radmin; use Ethernet/Wi-Fi na rede local.");
+                window.label("A permissão para hospedar só permite assumir a sala se o anfitrião sair.");
+            });
+    });
+    app.control_network_window_open = open;
 }
 
 fn show_profile_card(
@@ -95,26 +147,15 @@ impl ClientUi {
         self.show_profile_card(ui);
         ui.add_space(4.0);
 
-        show_room_mode_selector(ui, &mut self.create_room_mode);
+        show_room_mode_selector(
+            ui,
+            &mut self.create_room_mode,
+            &mut self.control_network_window_open,
+        );
+        show_control_network_window(ui, self);
         ui.add_space(2.0);
 
-        if self.create_room_mode == RoomMode::Local {
-            ui.group(|ui| {
-                ui.heading("Rede de controle da sala");
-                ui.label("Escolha o endereço que seu amigo consegue alcançar.");
-                self.show_control_address_picker(ui);
-                ui.checkbox(
-                    &mut self.may_host,
-                    "Permitir que este computador seja escolhido para hospedar futuramente",
-                );
-                ui.collapsing("Requisitos de rede", |ui| {
-                    ui.label("A interface selecionada será usada para controle e vídeo.");
-                    ui.label("Libere TCP 9001 e UDP 9002–9009 no firewall do Windows.");
-                    ui.label("Use Radmin VPN quando o amigo entrar pelo endereço Radmin; use Ethernet/Wi-Fi na rede local.");
-                    ui.label("A permissão para hospedar só permite assumir a sala se o anfitrião sair.");
-                });
-            });
-        } else {
+        if self.create_room_mode == RoomMode::InternetTest {
             ui.group(|ui| {
                 ui.heading("Teste controlado pela internet");
                 ui.label("Até duas pessoas. O anfitrião precisa permanecer online.");
@@ -273,7 +314,7 @@ impl ClientUi {
 
 #[cfg(test)]
 mod tests {
-    use super::{RoomMode, show_profile_card, show_room_mode_selector};
+    use super::{RoomMode, show_network_window, show_profile_card, show_room_mode_selector};
     use eframe::egui;
 
     fn render_profile_and_mode(width: f32) -> (egui::Rect, egui::Rect, RoomMode) {
@@ -282,6 +323,7 @@ mod tests {
         let mut mode_rect = None;
         let mut display_name = "Tonho".to_owned();
         let mut mode = RoomMode::Local;
+        let mut popup_open = false;
 
         let mut output = context.run_ui(
             egui::RawInput {
@@ -302,7 +344,8 @@ mod tests {
                         show_profile_card(ui, &mut display_name, Some(&avatar), true);
                     profile_rect = Some(profile.rect);
                     ui.add_space(4.0);
-                    mode_rect = Some(show_room_mode_selector(ui, &mut mode).rect);
+                    let (mode_row, _) = show_room_mode_selector(ui, &mut mode, &mut popup_open);
+                    mode_rect = Some(mode_row.rect);
                 });
             },
         );
@@ -328,5 +371,99 @@ mod tests {
         assert_eq!(narrow_selection, RoomMode::Local);
         assert!(wide_mode.min.y >= wide_profile.max.y);
         assert!(narrow_mode.min.y >= narrow_profile.max.y);
+    }
+
+    #[test]
+    fn configure_network_button_opens_the_floating_window() {
+        let context = egui::Context::default();
+        let mut open = false;
+        let mut mode = RoomMode::Local;
+        let mut button_rect = None;
+
+        let mut first_frame = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 120.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let (_, button) = show_room_mode_selector(ui, &mut mode, &mut open);
+                button_rect = Some(button.rect);
+            },
+        );
+        first_frame.textures_delta.clear();
+        assert!(!open);
+
+        let position = button_rect
+            .expect("network settings button should be laid out")
+            .center();
+        let mut second_frame = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 120.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                show_room_mode_selector(ui, &mut mode, &mut open);
+            },
+        );
+        second_frame.textures_delta.clear();
+
+        assert!(open);
+
+        let mut shown = false;
+        let mut third_frame = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                shown = show_network_window(ui.ctx(), &mut open, |window| {
+                    window.label("Configuração de rede");
+                });
+            },
+        );
+        third_frame.textures_delta.clear();
+        assert!(shown);
+
+        open = false;
+        let mut fourth_frame = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                shown = show_network_window(ui.ctx(), &mut open, |window| {
+                    window.label("Configuração de rede");
+                });
+            },
+        );
+        fourth_frame.textures_delta.clear();
+        assert!(!shown);
     }
 }
