@@ -26,6 +26,7 @@ use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceServer}
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::RTCIceCandidateInit;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
 use rtc::rtp::codec::h264::H264Packet;
 use rtc::rtp::packet::Packet as RtpPacket;
 use rtc::rtp::packetizer::Depacketizer;
@@ -77,6 +78,9 @@ mod session;
 use h264::*;
 use metrics::should_log_aggregate_error;
 pub use metrics::{MediaRoute, ScreenShareMetrics, ScreenSharePerformanceSnapshot};
+pub(crate) use metrics::{
+    h264_pipeline_interval_label, optional_count_label, rtp_recovery_interval_label,
+};
 use receiver::{KeyframeRequestLimiter, PliReason, RtpSequenceUpdate};
 use sdp_diagnostics::summarize_sdp_media;
 use sender::{EncodedFrame, encode_latest_frames, unique_ssrc};
@@ -157,8 +161,12 @@ struct PeerStatsSnapshot {
     outbound_frames_encoded: u32,
     outbound_frames_sent: u32,
     outbound_ssrc: u32,
-    outbound_nack_count: u32,
-    inbound_nack_count: u32,
+    outbound_nack_count: Option<u64>,
+    inbound_nack_count: Option<u64>,
+    outbound_retransmitted_packets: Option<u64>,
+    outbound_retransmitted_bytes: Option<u64>,
+    inbound_retransmitted_packets: Option<u64>,
+    inbound_retransmitted_bytes: Option<u64>,
     inbound_pli_count: u32,
     inbound_packets: u64,
     inbound_bytes: u64,
@@ -230,8 +238,10 @@ struct SharedMetrics {
     interval_ui_texture_updates: AtomicU64,
     interval_pli_requests_sent: AtomicU64,
     interval_pli_requests_received: AtomicU64,
-    interval_nack_requests_sent: AtomicU64,
-    interval_nack_requests_received: AtomicU64,
+    nack_packets_received_observed: AtomicU64,
+    nack_received_media_ssrc: AtomicU64,
+    interval_nack_packets_received_observed: AtomicU64,
+    rtp_recovery_interval: Mutex<RtpRecoveryInterval>,
     interval_encoder_input_frames: AtomicU64,
     interval_new_capture_frames: AtomicU64,
     interval_repeated_capture_frames: AtomicU64,
@@ -270,6 +280,45 @@ struct SharedMetrics {
     rtc_inbound_summary: Mutex<String>,
     rtc_stats: Mutex<PeerStatsSnapshot>,
     h264_flow: Mutex<H264FlowDiagnostics>,
+    #[cfg(test)]
+    test_drop_next_outbound_rtp: AtomicBool,
+    #[cfg(test)]
+    test_dropped_outbound_rtp: AtomicU64,
+}
+
+#[derive(Default)]
+struct RtpRecoveryInterval {
+    nack_packets_sent: CounterInterval,
+    nack_packets_received: CounterInterval,
+    retransmitted_packets_sent: CounterInterval,
+    retransmitted_bytes_sent: CounterInterval,
+    retransmitted_packets_received: CounterInterval,
+    retransmitted_bytes_received: CounterInterval,
+}
+
+#[derive(Default)]
+struct CounterInterval {
+    total: u64,
+    has_sample: bool,
+    had_unknown_sample: bool,
+}
+
+impl CounterInterval {
+    fn observe(&mut self, current: Option<u64>, previous: Option<u64>) {
+        match (current, previous) {
+            (Some(current), Some(previous)) => {
+                self.total = self.total.saturating_add(current.saturating_sub(previous));
+                self.has_sample = true;
+            }
+            _ => self.had_unknown_sample = true,
+        }
+    }
+
+    fn take(&mut self) -> Option<u64> {
+        let value = (self.has_sample && !self.had_unknown_sample).then_some(self.total);
+        *self = Self::default();
+        value
+    }
 }
 
 #[derive(Default)]
@@ -298,6 +347,16 @@ struct H264FlowDiagnostics {
     assembled_with_pps: u64,
     assembled_with_idr: u64,
     assembled_delta_frames: u64,
+    assembled_idr_with_parameters: u64,
+    assembled_idr_without_parameters: u64,
+    assembled_no_frame_units: u64,
+    dropped_recovery_gate_waiting_for_idr: u64,
+    dropped_worker_waiting_for_idr: u64,
+    dropped_stale_generation: u64,
+    decoder_queue_accepted: u64,
+    decoder_queue_disconnected: u64,
+    decoder_inputs_live: u64,
+    decoder_inputs_cached_replay: u64,
     assembly_errors: u64,
     marker_timeouts: u64,
     sequence_hole_errors: u64,
@@ -325,6 +384,23 @@ struct H264FlowDiagnostics {
     last_encoded_nals: String,
     last_access_unit: String,
     last_assembly_error: Option<String>,
+    interval: H264FlowInterval,
+}
+
+#[derive(Default)]
+struct H264FlowInterval {
+    assembled_idr_with_parameters: u64,
+    assembled_idr_without_parameters: u64,
+    assembled_delta_units: u64,
+    assembled_no_frame_units: u64,
+    dropped_recovery_gate_waiting_for_idr: u64,
+    dropped_worker_waiting_for_idr: u64,
+    dropped_stale_generation: u64,
+    decoder_queue_accepted: u64,
+    decoder_queue_full: u64,
+    decoder_queue_disconnected: u64,
+    decoder_inputs_live: u64,
+    decoder_inputs_cached_replay: u64,
 }
 
 struct PeerEvents {

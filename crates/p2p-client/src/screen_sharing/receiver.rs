@@ -1018,7 +1018,7 @@ impl PeerEvents {
                                         if let Some(idr) = cached_idr.as_deref() {
                                             let before = worker_metrics.decoded_frames.load(Ordering::Relaxed);
                                             if should_decode_access_unit(&mut cpu_waiting_for_idr, idr) {
-                                                worker_metrics.record_decoder_input();
+                                                worker_metrics.record_decoder_input_cached_replay();
                                                 if let Some(active_decoder) = decoder.as_mut() {
                                                     let failure = decode_h264_access_unit(
                                                         idr,
@@ -1066,7 +1066,7 @@ impl PeerEvents {
                         };
                         let current_generation = worker_generation.load(Ordering::Relaxed);
                         if queued.generation != current_generation {
-                            worker_metrics.record_drop_waiting_for_idr();
+                            worker_metrics.record_drop_stale_generation();
                             continue;
                         }
                         if queued.generation != generation_seen {
@@ -1248,7 +1248,7 @@ impl PeerEvents {
                         }
 
                         if !should_decode_access_unit(&mut cpu_waiting_for_idr, &access_unit) {
-                            worker_metrics.record_drop_waiting_for_idr();
+                            worker_metrics.record_drop_worker_waiting_for_idr();
                             continue;
                         }
 
@@ -1257,7 +1257,7 @@ impl PeerEvents {
                                 active_decoder,
                                 ActiveH264Decoder::MediaFoundation(_)
                             );
-                            worker_metrics.record_decoder_input();
+                            worker_metrics.record_decoder_input_live();
                             let decoded_before =
                                 worker_metrics.decoded_frames.load(Ordering::Relaxed);
                             let hardware_error = decode_h264_access_unit(
@@ -1424,7 +1424,7 @@ impl PeerEvents {
                                                     replay_failed = true;
                                                     break;
                                                 }
-                                                worker_metrics.record_decoder_input();
+                                                worker_metrics.record_decoder_input_cached_replay();
                                                 replayed_access_units += 1;
                                                 let Some(active_decoder) = decoder.as_mut() else {
                                                     replay_failed = true;
@@ -1630,7 +1630,7 @@ impl PeerEvents {
                             // reference chain. Keep them out of the decoder until a complete
                             // IDR with parameter sets is accepted by its bounded queue.
                             if awaiting_sequence_recovery && !is_valid_recovery_idr {
-                                metrics.record_drop_waiting_for_idr();
+                                metrics.record_drop_recovery_gate_waiting_for_idr();
                                 continue;
                             }
                             match decoder_tx.try_send(QueuedAccessUnit {
@@ -1638,6 +1638,7 @@ impl PeerEvents {
                                 bytes: access_unit,
                             }) {
                                 Ok(()) => {
+                                    metrics.record_decoder_queue_accepted();
                                     if is_valid_recovery_idr {
                                         awaiting_sequence_recovery = false;
                                     }
@@ -1656,6 +1657,7 @@ impl PeerEvents {
                                     context.request_repaint();
                                 }
                                 Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                                    metrics.record_decoder_queue_disconnected();
                                     let _ = events.send(ScreenShareEvent::Error(
                                         "O worker do decodificador H.264 foi encerrado.".to_owned(),
                                     ));

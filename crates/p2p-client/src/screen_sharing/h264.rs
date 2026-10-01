@@ -4,6 +4,29 @@ pub(super) enum H264FrameKind {
     Delta,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum H264AccessUnitClass {
+    IdrWithParameters,
+    IdrWithoutParameters,
+    Delta,
+    NoFrame,
+}
+
+pub(super) fn classify_h264_access_unit_diagnostics(nals: &[u8]) -> H264AccessUnitClass {
+    let has_idr = nals.contains(&5);
+    if has_idr {
+        if nals.contains(&7) && nals.contains(&8) {
+            H264AccessUnitClass::IdrWithParameters
+        } else {
+            H264AccessUnitClass::IdrWithoutParameters
+        }
+    } else if nals.iter().any(|nal_type| (1..=4).contains(nal_type)) {
+        H264AccessUnitClass::Delta
+    } else {
+        H264AccessUnitClass::NoFrame
+    }
+}
+
 pub(super) fn classify_h264_access_unit(nals: &[u8]) -> Option<H264FrameKind> {
     if nals.contains(&5) {
         Some(H264FrameKind::Idr)

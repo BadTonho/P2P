@@ -150,3 +150,13 @@ Se a chamada de voz for desejada depois que o compartilhamento de tela estiver p
 ## Como pedir a próxima etapa
 
 Use o número e o nome da etapa, por exemplo: **“Vamos fazer a etapa 1 — Preparar o projeto Rust.”** A chamada de voz está na etapa opcional final e pode ser ignorada.
+
+### Diagnóstico H.264 e NACK — versão 1.1.5
+
+Separar a classificação das unidades H.264 montadas (IDR com SPS/PPS, IDR sem parâmetros, delta e sem quadro) e contabilizar os destinos por etapa: bloqueio de recuperação, espera por IDR no worker, geração antiga, admissão na fila, fila cheia/encerrada e entrada ao vivo ou reprodução em cache no decoder. Os resumos periódicos e finais são isolados por sessão e SSRC.
+
+Correlacionar NACK enviado pelo receptor e recebido pelo emissor, além de pacotes/bytes retransmitidos quando a estatística WebRTC estiver disponível. Contadores ausentes são registrados como desconhecidos; NACK representa pacotes RTCP, não sequências solicitadas.
+
+**Validação automatizada:** testes de classificação, destinos, reinício dos intervalos, isolamento e estatísticas opcionais; loopback WebRTC com perda RTP controlada mantendo RTCP ativo.
+
+**Validação manual pendente:** comparar os logs dos dois PCs durante compartilhamento real e conferir SSRC, NACK e retransmissões por sessão. Os testes locais não substituem a comparação em rede física.

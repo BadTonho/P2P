@@ -4,6 +4,7 @@ use super::*;
 struct PliForwarder {
     read_queue: VecDeque<TaggedPacket>,
     write_queue: VecDeque<TaggedPacket>,
+    metrics: Option<Arc<SharedMetrics>>,
 }
 
 impl sansio::Protocol<TaggedPacket, TaggedPacket, ()> for PliForwarder {
@@ -15,6 +16,13 @@ impl sansio::Protocol<TaggedPacket, TaggedPacket, ()> for PliForwarder {
 
     fn handle_read(&mut self, mut message: TaggedPacket) -> Result<(), Self::Error> {
         if let InterceptorPacket::Rtcp(packets) = &message.message.packet {
+            if let Some(metrics) = &self.metrics {
+                for packet in packets {
+                    if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
+                        metrics.record_inbound_nack_packet(nack.media_ssrc);
+                    }
+                }
+            }
             let pli_packets = packets
                 .iter()
                 .filter(|packet| packet.as_any().is::<PictureLossIndication>())
@@ -45,6 +53,64 @@ impl sansio::Protocol<TaggedPacket, TaggedPacket, ()> for PliForwarder {
 }
 
 impl Interceptor for PliForwarder {
+    fn bind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_local_stream(&mut self, _info: &StreamInfo) {}
+    fn bind_remote_stream(&mut self, _info: &StreamInfo) {}
+    fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestRtpLossInjector {
+    read_queue: VecDeque<TaggedPacket>,
+    write_queue: VecDeque<TaggedPacket>,
+    metrics: Option<Arc<SharedMetrics>>,
+}
+
+#[cfg(test)]
+impl sansio::Protocol<TaggedPacket, TaggedPacket, ()> for TestRtpLossInjector {
+    type Rout = TaggedPacket;
+    type Wout = TaggedPacket;
+    type Eout = ();
+    type Error = InterceptorError;
+    type Time = Instant;
+
+    fn handle_read(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
+        self.read_queue.push_back(message);
+        Ok(())
+    }
+
+    fn poll_read(&mut self) -> Option<Self::Rout> {
+        self.read_queue.pop_front()
+    }
+
+    fn handle_write(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
+        if matches!(&message.message.packet, InterceptorPacket::Rtp(_))
+            && self.metrics.as_ref().is_some_and(|metrics| {
+                metrics
+                    .test_drop_next_outbound_rtp
+                    .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            })
+        {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .test_dropped_outbound_rtp
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+        self.write_queue.push_back(message);
+        Ok(())
+    }
+
+    fn poll_write(&mut self) -> Option<Self::Wout> {
+        self.write_queue.pop_front()
+    }
+}
+
+#[cfg(test)]
+impl Interceptor for TestRtpLossInjector {
     fn bind_local_stream(&mut self, _info: &StreamInfo) {}
     fn unbind_local_stream(&mut self, _info: &StreamInfo) {}
     fn bind_remote_stream(&mut self, _info: &StreamInfo) {}
@@ -368,6 +434,13 @@ impl ScreenShareSession {
         self.commands
             .send(Command::RequestKeyFrameForTest)
             .map_err(|_| "A sessÃ£o WebRTC foi encerrada.".to_owned())
+    }
+
+    #[cfg(test)]
+    fn drop_next_outbound_rtp_for_test(&self) {
+        self.metrics
+            .test_drop_next_outbound_rtp
+            .store(true, Ordering::Relaxed);
     }
 
     pub fn handle_signal(&self, kind: SignalKind, payload: String) -> Result<(), String> {
@@ -1091,14 +1164,18 @@ fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
         snapshot.outbound_frames_encoded = outbound.frames_encoded;
         snapshot.outbound_frames_sent = outbound.frames_sent;
         snapshot.outbound_ssrc = outbound.sent_rtp_stream_stats.rtp_stream_stats.ssrc;
-        snapshot.outbound_nack_count = outbound.nack_count;
+        snapshot.outbound_nack_count = Some(u64::from(outbound.nack_count));
+        snapshot.outbound_retransmitted_packets = Some(outbound.retransmitted_packets_sent);
+        snapshot.outbound_retransmitted_bytes = Some(outbound.retransmitted_bytes_sent);
         snapshot.outbound_summary = format!(
-            "RTP de saída: {} pacotes / {} bytes; frames codificados/enviados {}/{}; NACKs recebidos {}; SSRC {}; encoder RTC {}",
+            "RTP de saída: {} pacotes / {} bytes; frames codificados/enviados {}/{}; pacotes NACK recebidos {}; retransmissões enviadas {} pacotes / {} bytes; SSRC {}; encoder RTC {}",
             snapshot.outbound_packets,
             snapshot.outbound_bytes,
             snapshot.outbound_frames_encoded,
             snapshot.outbound_frames_sent,
-            snapshot.outbound_nack_count,
+            snapshot.outbound_nack_count.unwrap_or_default(),
+            snapshot.outbound_retransmitted_packets.unwrap_or_default(),
+            snapshot.outbound_retransmitted_bytes.unwrap_or_default(),
             snapshot.outbound_ssrc,
             outbound.encoder_implementation,
         );
@@ -1116,7 +1193,9 @@ fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
         snapshot.inbound_packets = received.packets_received;
         snapshot.inbound_bytes = inbound.bytes_received;
         snapshot.inbound_packets_lost = received.packets_lost;
-        snapshot.inbound_nack_count = inbound.nack_count;
+        snapshot.inbound_nack_count = Some(u64::from(inbound.nack_count));
+        snapshot.inbound_retransmitted_packets = Some(inbound.retransmitted_packets_received);
+        snapshot.inbound_retransmitted_bytes = Some(inbound.retransmitted_bytes_received);
         snapshot.inbound_pli_count = inbound.pli_count;
         snapshot.inbound_jitter_ms = rtp_jitter_ticks_to_ms(received.jitter, 90_000.0);
         snapshot.inbound_frames_received = inbound.frames_received;
@@ -1128,13 +1207,15 @@ fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
         snapshot.inbound_frame_width = inbound.frame_width;
         snapshot.inbound_frame_height = inbound.frame_height;
         snapshot.inbound_summary = format!(
-            "RTP de entrada: {} pacotes / {} bytes; perda reportada {}; jitter {:.1} ms; NACKs enviados {}, PLI enviados {}; frames recebidos/decodificados/renderizados/descartados {}/{}/{}/{}; resolução {}x{}; descartados no jitter buffer {}; SSRC {}; decoder RTC {}",
+            "RTP de entrada: {} pacotes / {} bytes; perda reportada {}; jitter {:.1} ms; pacotes NACK enviados {}, PLI enviados {}; retransmissões recebidas {} pacotes / {} bytes; frames recebidos/decodificados/renderizados/descartados {}/{}/{}/{}; resolução {}x{}; descartados no jitter buffer {}; SSRC {}; decoder RTC {}",
             snapshot.inbound_packets,
             snapshot.inbound_bytes,
             snapshot.inbound_packets_lost,
             snapshot.inbound_jitter_ms,
-            snapshot.inbound_nack_count,
+            snapshot.inbound_nack_count.unwrap_or_default(),
             snapshot.inbound_pli_count,
+            snapshot.inbound_retransmitted_packets.unwrap_or_default(),
+            snapshot.inbound_retransmitted_bytes.unwrap_or_default(),
             snapshot.inbound_frames_received,
             snapshot.inbound_frames_decoded,
             snapshot.inbound_frames_rendered,
@@ -1266,7 +1347,21 @@ async fn create_peer(
         .map_err(|error| format!("Não foi possível registrar Opus no WebRTC: {error}"))?;
     let interceptors = register_default_interceptors(Registry::new(), &mut media_engine)
         .map_err(|error| format!("Não foi possível preparar o WebRTC: {error}"))?;
-    let interceptors = interceptors.with(Slot::Custom(14_000), PliForwarder::default());
+    let interceptors = interceptors.with(
+        Slot::Custom(14_000),
+        PliForwarder {
+            metrics: Some(Arc::clone(&metrics)),
+            ..PliForwarder::default()
+        },
+    );
+    #[cfg(test)]
+    let interceptors = interceptors.with(
+        Slot::Custom(3_000),
+        TestRtpLossInjector {
+            metrics: Some(Arc::clone(&metrics)),
+            ..TestRtpLossInjector::default()
+        },
+    );
     let handler = Arc::new(PeerEvents {
         events: events.clone(),
         context,
@@ -2693,6 +2788,89 @@ mod tests {
             receiver_metrics
         );
     }
+
+    #[test]
+    fn loopback_controlled_rtp_loss_correlates_nack_packet_stats() {
+        let context = egui::Context::default();
+        let sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
+        let receiver = ScreenShareSession::new_loopback_with_decoder_preference(
+            context,
+            VideoDecoderPreference::Cpu,
+        )
+        .unwrap();
+        let source = LatestFrame::default();
+        source.publish(test_frame(1, 64));
+        sender.start_sending(source.clone()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut sequence = 1_u64;
+        let mut next_frame = Instant::now() + FRAME_DURATION;
+        let mut loss_requested = false;
+        let mut nack_stats_correlated = false;
+        while Instant::now() < deadline {
+            pump_signals(&sender, &receiver, "loss-test offer");
+            pump_signals(&receiver, &sender, "loss-test answer");
+
+            if !loss_requested && receiver.metrics().decoded_frames >= 2 {
+                sender.drop_next_outbound_rtp_for_test();
+                loss_requested = true;
+            }
+            let sender_metrics = sender.metrics();
+            let receiver_metrics = receiver.metrics();
+            let injected = sender
+                .metrics
+                .test_dropped_outbound_rtp
+                .load(Ordering::Relaxed)
+                > 0;
+            if injected
+                && receiver_metrics
+                    .nack_packets_sent
+                    .is_some_and(|count| count > 0)
+                && sender_metrics.nack_packets_received_observed > 0
+                && receiver_metrics.nack_packets_sent
+                    == Some(sender_metrics.nack_packets_received_observed)
+            {
+                nack_stats_correlated = true;
+                break;
+            }
+
+            if Instant::now() >= next_frame {
+                sequence = sequence.saturating_add(1);
+                source.publish(test_frame(sequence, (sequence % 251) as u8));
+                next_frame += FRAME_DURATION;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let sender_metrics = sender.metrics();
+        let receiver_metrics = receiver.metrics();
+        let injected_packets = sender
+            .metrics
+            .test_dropped_outbound_rtp
+            .load(Ordering::Relaxed);
+        receiver.stop();
+        sender.stop();
+
+        assert!(
+            loss_requested,
+            "the test must wait for decoded video before loss injection"
+        );
+        assert_eq!(
+            injected_packets, 1,
+            "exactly one video RTP packet is dropped"
+        );
+        assert!(
+            nack_stats_correlated,
+            "the receiver's NACK count should match packets observed in the sender's inbound RTCP interceptor; sender={sender_metrics:?}, receiver={receiver_metrics:?}"
+        );
+        assert!(sender_metrics.nack_packets_received.is_some());
+        // The RTC exposes retransmission counters in this build, so zero is a known result rather
+        // than missing data. This diagnostic test measures NACK delivery; it does not change or
+        // assume the negotiated retransmission behavior.
+        assert!(sender_metrics.retransmitted_packets_sent.is_some());
+        assert!(receiver_metrics.retransmitted_packets_received.is_some());
+    }
+
     #[test]
     fn rtp_jitter_ticks_are_converted_to_milliseconds() {
         assert!((rtp_jitter_ticks_to_ms(317.0, 90_000.0) - 3.522_222_2).abs() < 0.001);
