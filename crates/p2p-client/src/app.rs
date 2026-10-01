@@ -111,6 +111,40 @@ fn copy_confirmation_visible(expires_at: Option<Instant>, now: Instant) -> bool 
     expires_at.is_some_and(|expires_at| now < expires_at)
 }
 
+fn show_centered_header_row(
+    ui: &mut egui::Ui,
+    side_width: f32,
+    add_center: impl FnOnce(&mut egui::Ui),
+    add_right: impl FnOnce(&mut egui::Ui),
+) -> egui::Rect {
+    const HEIGHT: f32 = 30.0;
+
+    let width = ui.available_width();
+    let side_width = side_width.min(width / 2.0);
+    let center_width = (width - side_width * 2.0).max(0.0);
+    let response = ui.allocate_ui_with_layout(
+        egui::vec2(width, HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |row| {
+            let row_rect = row.max_rect();
+            row.spacing_mut().item_spacing.x = 0.0;
+            row.allocate_space(egui::vec2(side_width, HEIGHT));
+            let _ = row.allocate_ui_with_layout(
+                egui::vec2(center_width, HEIGHT),
+                egui::Layout::top_down(egui::Align::Center),
+                add_center,
+            );
+            let _ = row.allocate_ui_with_layout(
+                egui::vec2(side_width, HEIGHT),
+                egui::Layout::right_to_left(egui::Align::Center),
+                add_right,
+            );
+            row_rect
+        },
+    );
+    response.inner
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsCategory {
     #[default]
@@ -630,111 +664,112 @@ impl ClientUi {
         egui::CentralPanel::default().show(ui, |ui| {
             Self::apply_monochrome_style(ui);
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.columns(3, |columns| {
-                    let code_width = columns[1].available_width();
-                    columns[1].allocate_ui_with_layout(
-                        egui::vec2(code_width, 30.0),
-                        egui::Layout::from_main_dir_and_cross_align(
-                            egui::Direction::TopDown,
-                            egui::Align::Center,
-                        ),
-                        |ui| {
-                            ui.horizontal(|ui| {
-                                if let Some(code_label) =
-                                    room_header_code_label(self.room_code.as_deref())
-                                {
-                                    let response = ui
-                                        .add(
-                                            egui::Label::new(
-                                                egui::RichText::new(code_label).monospace(),
-                                            )
-                                            .sense(egui::Sense::click()),
-                                        )
-                                        .on_hover_text("Clique para copiar");
-                                    if response.clicked() {
-                                        if let Some(code) = &self.room_code {
-                                            ui.ctx().copy_text(code.clone());
-                                            self.code_copied_until =
-                                                Some(Instant::now() + Duration::from_secs(2));
-                                            ui.ctx().request_repaint_after(Duration::from_secs(2));
-                                        }
-                                    }
-                                    if copy_confirmation_visible(
-                                        self.code_copied_until,
-                                        Instant::now(),
-                                    ) {
-                                        ui.label("Código copiado");
-                                    }
-                                }
-                            });
-                        },
-                    );
+                let room_code = self.room_code.clone();
+                let code_label = room_header_code_label(room_code.as_deref());
+                let show_copy_confirmation =
+                    copy_confirmation_visible(self.code_copied_until, Instant::now());
+                let header_update_status = self.update_status.clone();
+                let header_update_action =
+                    update_shortcut_action(&header_update_status, room_code.is_some());
+                let header_update_tooltip =
+                    update_shortcut_tooltip(&header_update_status, room_code.is_some())
+                        .unwrap_or_else(|| "Atualização".to_owned());
+                let picker_open = self.screen_picker.is_some();
+                let settings_open = self.settings_open;
+                let mut code_clicked = false;
+                let mut settings_clicked = false;
+                let mut update_clicked = false;
+                let right_width = if header_update_action.is_some() {
+                    72.0
+                } else {
+                    38.0
+                };
 
-                    columns[2].with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let (icon, tooltip) = settings_navigation_button(self.settings_open);
+                show_centered_header_row(
+                    ui,
+                    right_width,
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.horizontal(|ui| {
+                            if let Some(code_label) = code_label {
+                                let response = ui
+                                    .add(
+                                        egui::Label::new(
+                                            egui::RichText::new(code_label).monospace(),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_text("Clique para copiar");
+                                code_clicked = response.clicked();
+                                if show_copy_confirmation {
+                                    ui.label("Código copiado");
+                                }
+                            }
+                        });
+                    },
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let (icon, tooltip) = settings_navigation_button(settings_open);
+                        let response = ui
+                            .add_enabled(
+                                !picker_open,
+                                egui::Button::new(egui::RichText::new(icon).size(18.0))
+                                    .min_size(egui::vec2(30.0, 26.0)),
+                            )
+                            .on_hover_text(tooltip);
+                        settings_clicked = response.clicked();
+
+                        if let Some(action) = header_update_action {
+                            let enabled =
+                                action != UpdateShortcutAction::DisabledForRoom && !picker_open;
                             let response = ui
                                 .add_enabled(
-                                    self.screen_picker.is_none(),
-                                    egui::Button::new(egui::RichText::new(icon).size(18.0))
+                                    enabled,
+                                    egui::Button::new(egui::RichText::new("↻").size(18.0))
                                         .min_size(egui::vec2(30.0, 26.0)),
                                 )
-                                .on_hover_text(tooltip);
-                            if response.clicked() {
-                                if self.settings_open {
-                                    close_settings = true;
-                                } else {
-                                    open_settings = true;
-                                }
-                            }
+                                .on_hover_text(&header_update_tooltip);
+                            update_clicked = response.clicked();
+                        }
+                    },
+                );
 
-                            if let Some(action) = update_shortcut_action(
-                                &self.update_status,
-                                self.room_code.is_some(),
-                            ) {
-                                let tooltip = update_shortcut_tooltip(
-                                    &self.update_status,
-                                    self.room_code.is_some(),
-                                )
-                                .unwrap_or_else(|| "Atualização".to_owned());
-                                let enabled = action != UpdateShortcutAction::DisabledForRoom
-                                    && self.screen_picker.is_none();
-                                let response = ui
-                                    .add_enabled(
-                                        enabled,
-                                        egui::Button::new(egui::RichText::new("↻").size(18.0))
-                                            .min_size(egui::vec2(30.0, 26.0)),
-                                    )
-                                    .on_hover_text(tooltip);
-                                if response.clicked() {
-                                    match action {
-                                        UpdateShortcutAction::Download => {
-                                            if let UpdateStatus::Available(manifest) =
-                                                &self.update_status
-                                            {
-                                                let manifest = manifest.clone();
-                                                tracing::info!(
-                                                    version = %manifest.version,
-                                                    "Download de atualização iniciado pelo atalho"
-                                                );
-                                                self.updates.download(manifest.clone());
-                                                self.update_status = UpdateStatus::Downloading {
-                                                    manifest,
-                                                    received: 0,
-                                                };
-                                            }
-                                        }
-                                        UpdateShortcutAction::OpenUpdates => {
-                                            open_update_settings = true;
-                                        }
-                                        UpdateShortcutAction::DisabledForRoom => {}
-                                    }
-                                }
+                if code_clicked {
+                    if let Some(code) = room_code {
+                        ui.ctx().copy_text(code);
+                        self.code_copied_until = Some(Instant::now() + Duration::from_secs(2));
+                        ui.ctx().request_repaint_after(Duration::from_secs(2));
+                    }
+                }
+                if settings_clicked {
+                    if settings_open {
+                        close_settings = true;
+                    } else {
+                        open_settings = true;
+                    }
+                }
+                if update_clicked {
+                    match header_update_action {
+                        Some(UpdateShortcutAction::Download) => {
+                            if let UpdateStatus::Available(manifest) = &header_update_status {
+                                let manifest = manifest.clone();
+                                tracing::info!(
+                                    version = %manifest.version,
+                                    "Download de atualização iniciado pelo atalho"
+                                );
+                                self.updates.download(manifest.clone());
+                                self.update_status = UpdateStatus::Downloading {
+                                    manifest,
+                                    received: 0,
+                                };
                             }
-                        },
-                    );
-                });
+                        }
+                        Some(UpdateShortcutAction::OpenUpdates) => {
+                            open_update_settings = true;
+                        }
+                        Some(UpdateShortcutAction::DisabledForRoom) | None => {}
+                    }
+                }
 
                 if let Some(error) = self.logging.take_write_error() {
                     self.logging.export_message = Some(format!(
@@ -2428,10 +2463,10 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpdateShortcutAction, UpdateStatus, copy_confirmation_visible, is_public_ipv4_candidate,
-        room_header_code_label, settings_navigation_button, signaling_ws_url,
-        update_shortcut_action, update_shortcut_tooltip, validate_new_host_profile,
-        validate_saved_host_profile,
+        UpdateShortcutAction, UpdateStatus, copy_confirmation_visible, egui,
+        is_public_ipv4_candidate, room_header_code_label, settings_navigation_button,
+        show_centered_header_row, signaling_ws_url, update_shortcut_action,
+        update_shortcut_tooltip, validate_new_host_profile, validate_saved_host_profile,
     };
     use crate::settings::{MAX_SAVED_HOSTS, SavedHostProfile};
     use crate::update::UpdateManifest;
@@ -2473,6 +2508,49 @@ mod tests {
         ));
         assert!(!copy_confirmation_visible(Some(expires_at), expires_at));
         assert!(!copy_confirmation_visible(None, now));
+    }
+
+    #[test]
+    fn header_row_stays_compact_and_keeps_center_independent_of_right_controls() {
+        let context = egui::Context::default();
+        let mut header_rect = None;
+        let mut center_rect = None;
+        let mut following_content_rect = None;
+
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    header_rect = Some(show_centered_header_row(
+                        ui,
+                        72.0,
+                        |center_ui| center_rect = Some(center_ui.max_rect()),
+                        |_| {},
+                    ));
+                    ui.add_space(12.0);
+                    following_content_rect = Some(ui.allocate_space(egui::vec2(10.0, 10.0)).1);
+                });
+            },
+        );
+        output.textures_delta.clear();
+
+        let header_rect = header_rect.expect("header row should be laid out");
+        let center_rect = center_rect.expect("center column should be laid out");
+        let following_content_rect =
+            following_content_rect.expect("following content should be laid out");
+
+        assert!((header_rect.height() - 30.0).abs() < 0.1);
+        assert!(
+            (center_rect.center().x - header_rect.center().x).abs() < 0.1,
+            "center rect {center_rect:?} was not centered in header {header_rect:?}"
+        );
+        assert!(following_content_rect.min.y - header_rect.max.y < 50.0);
     }
 
     #[test]
