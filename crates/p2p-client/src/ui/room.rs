@@ -75,18 +75,6 @@ impl ClientUi {
         egui::CollapsingHeader::new("Detalhes da sala")
             .default_open(false)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(format!("Código: {}", self.room_code.as_deref().unwrap_or("")));
-                    if ui.button("Copiar código").clicked() {
-                        if let Some(code) = &self.room_code {
-                            ui.ctx().copy_text(code.clone());
-                            self.code_copied = true;
-                        }
-                    }
-                });
-                if self.code_copied {
-                    ui.small("Código copiado para a área de transferência.");
-                }
                 ui.label(
                     self.connection_status
                         .as_deref()

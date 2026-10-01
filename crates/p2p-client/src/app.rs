@@ -103,6 +103,14 @@ fn update_shortcut_tooltip(status: &UpdateStatus, room_active: bool) -> Option<S
     })
 }
 
+fn room_header_code_label(room_code: Option<&str>) -> Option<String> {
+    room_code.map(|code| format!("Código: {code}"))
+}
+
+fn copy_confirmation_visible(expires_at: Option<Instant>, now: Instant) -> bool {
+    expires_at.is_some_and(|expires_at| now < expires_at)
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsCategory {
     #[default]
@@ -136,7 +144,7 @@ enum UpdateStatus {
 struct ClientUi {
     room_code: Option<String>,
     join_code: String,
-    code_copied: bool,
+    code_copied_until: Option<Instant>,
     settings_open: bool,
     settings_category: SettingsCategory,
     server_url: String,
@@ -565,6 +573,12 @@ impl ClientUi {
         Self::apply_monochrome_style(ui);
         let context = ui.ctx().clone();
         let preferences_before_frame = self.preferences_snapshot();
+        if self
+            .code_copied_until
+            .is_some_and(|expires_at| Instant::now() >= expires_at)
+        {
+            self.code_copied_until = None;
+        }
         if self.microphone.is_some()
             || (self.screen_capture.is_some()
                 && self.show_local_preview
@@ -674,6 +688,27 @@ impl ClientUi {
                                     }
                                     UpdateShortcutAction::DisabledForRoom => {}
                                 }
+                            }
+                        }
+
+                        if let Some(code_label) = room_header_code_label(self.room_code.as_deref())
+                        {
+                            let response = ui
+                                .add(
+                                    egui::Label::new(egui::RichText::new(code_label).monospace())
+                                        .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text("Clique para copiar");
+                            if response.clicked() {
+                                if let Some(code) = &self.room_code {
+                                    ui.ctx().copy_text(code.clone());
+                                    self.code_copied_until =
+                                        Some(Instant::now() + Duration::from_secs(2));
+                                    ui.ctx().request_repaint_after(Duration::from_secs(2));
+                                }
+                            }
+                            if copy_confirmation_visible(self.code_copied_until, Instant::now()) {
+                                ui.label("Código copiado");
                             }
                         }
                     });
@@ -2371,9 +2406,10 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpdateShortcutAction, UpdateStatus, is_public_ipv4_candidate, settings_navigation_button,
-        signaling_ws_url, update_shortcut_action, update_shortcut_tooltip,
-        validate_new_host_profile, validate_saved_host_profile,
+        UpdateShortcutAction, UpdateStatus, copy_confirmation_visible, is_public_ipv4_candidate,
+        room_header_code_label, settings_navigation_button, signaling_ws_url,
+        update_shortcut_action, update_shortcut_tooltip, validate_new_host_profile,
+        validate_saved_host_profile,
     };
     use crate::settings::{MAX_SAVED_HOSTS, SavedHostProfile};
     use crate::update::UpdateManifest;
@@ -2392,6 +2428,29 @@ mod tests {
     fn settings_navigation_uses_icon_only_with_accessible_tooltip() {
         assert_eq!(settings_navigation_button(false), ("⚙", "Configurações"));
         assert_eq!(settings_navigation_button(true), ("←", "Voltar"));
+    }
+
+    #[test]
+    fn room_code_is_available_for_the_header_only_when_in_a_room() {
+        assert_eq!(room_header_code_label(None), None);
+        assert_eq!(
+            room_header_code_label(Some("033918DD")),
+            Some("Código: 033918DD".to_owned())
+        );
+    }
+
+    #[test]
+    fn room_code_copy_confirmation_expires_after_two_seconds() {
+        let now = std::time::Instant::now();
+        let expires_at = now + std::time::Duration::from_secs(2);
+
+        assert!(copy_confirmation_visible(Some(expires_at), now));
+        assert!(copy_confirmation_visible(
+            Some(expires_at),
+            now + std::time::Duration::from_millis(1999)
+        ));
+        assert!(!copy_confirmation_visible(Some(expires_at), expires_at));
+        assert!(!copy_confirmation_visible(None, now));
     }
 
     #[test]

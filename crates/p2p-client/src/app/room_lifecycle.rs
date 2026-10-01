@@ -3,7 +3,7 @@ use super::*;
 impl ClientUi {
     pub(super) fn enter_room(&mut self, code: String) {
         self.room_code = Some(code);
-        self.code_copied = false;
+        self.code_copied_until = None;
         self.handoff_error = None;
         self.microphone_error = None;
         self.connection_error = None;
@@ -772,7 +772,7 @@ impl ClientUi {
         self.leave_after_handoff = false;
         self.ending_room_explicitly = false;
         self.join_code.clear();
-        self.code_copied = false;
+        self.code_copied_until = None;
         self.microphone_error = None;
         self.screen_status = None;
         self.screen_share_status = None;
