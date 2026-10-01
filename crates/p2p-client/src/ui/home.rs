@@ -4,7 +4,7 @@ use eframe::egui;
 const PROFILE_AVATAR_SIZE: f32 = 48.0;
 const PROFILE_NAME_INLINE_MIN_WIDTH: f32 = 280.0;
 const PRIMARY_ACTION_HEIGHT: f32 = 30.0;
-const JOIN_BUTTON_WIDTH: f32 = 96.0;
+const PRIMARY_ACTION_WIDTH: f32 = 120.0;
 
 #[derive(Default)]
 struct ProfileCardActions {
@@ -79,19 +79,49 @@ fn primary_action_button(
     width: f32,
     enabled: bool,
 ) -> egui::Response {
-    let (fill, text_color) = if enabled {
-        (egui::Color32::from_gray(215), egui::Color32::BLACK)
+    ui.scope(|ui| {
+        configure_action_button_visuals(ui.visuals_mut());
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(egui::RichText::new(label).strong())
+                .min_size(egui::vec2(width, PRIMARY_ACTION_HEIGHT)),
+        )
+    })
+    .inner
+}
+
+fn configure_action_button_visuals(visuals: &mut egui::Visuals) {
+    let (normal, hovered, active, disabled) = if visuals.dark_mode {
+        (
+            (43, 105, 225),
+            (58, 145, 245),
+            (35, 165, 245),
+            (35, 72, 120),
+        )
     } else {
-        let visuals = &ui.visuals().widgets.noninteractive;
-        (visuals.bg_fill, visuals.fg_stroke.color)
+        (
+            (238, 125, 35),
+            (224, 78, 25),
+            (210, 58, 20),
+            (238, 195, 150),
+        )
     };
 
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(egui::RichText::new(label).strong().color(text_color))
-            .fill(fill)
-            .min_size(egui::vec2(width, PRIMARY_ACTION_HEIGHT)),
-    )
+    set_action_button_visual(&mut visuals.widgets.inactive, normal);
+    set_action_button_visual(&mut visuals.widgets.hovered, hovered);
+    set_action_button_visual(&mut visuals.widgets.active, active);
+    set_action_button_visual(&mut visuals.widgets.open, hovered);
+    set_action_button_visual(&mut visuals.widgets.noninteractive, disabled);
+}
+
+fn set_action_button_visual(
+    widget: &mut egui::style::WidgetVisuals,
+    (fill, border, text): (u8, u8, u8),
+) {
+    widget.bg_fill = egui::Color32::from_gray(fill);
+    widget.weak_bg_fill = egui::Color32::from_gray(fill);
+    widget.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(border));
+    widget.fg_stroke.color = egui::Color32::from_gray(text);
 }
 
 fn room_actions_enabled(connecting: bool, update_blocks_actions: bool) -> bool {
@@ -295,7 +325,7 @@ impl ClientUi {
             ui.heading("Criar sala");
             ui.label("Hospede neste computador e compartilhe o código com seu amigo.");
             let enabled = room_actions_enabled(self.connecting, self.update_blocks_room_actions());
-            let response = primary_action_button(ui, "Criar sala", ui.available_width(), enabled);
+            let response = primary_action_button(ui, "Criar sala", PRIMARY_ACTION_WIDTH, enabled);
             if response.clicked() {
                 self.start_hosting();
             }
@@ -338,7 +368,7 @@ impl ClientUi {
             ui.label("Digite o código da sala:");
             ui.horizontal_wrapped(|ui| {
                 let field_width =
-                    (ui.available_width() - JOIN_BUTTON_WIDTH - ui.spacing().item_spacing.x)
+                    (ui.available_width() - PRIMARY_ACTION_WIDTH - ui.spacing().item_spacing.x)
                         .max(80.0);
                 ui.add_sized(
                     egui::vec2(field_width, PRIMARY_ACTION_HEIGHT),
@@ -355,7 +385,7 @@ impl ClientUi {
                     self.connecting,
                     self.update_blocks_room_actions(),
                 );
-                let response = primary_action_button(ui, "Entrar", JOIN_BUTTON_WIDTH, enabled);
+                let response = primary_action_button(ui, "Entrar", PRIMARY_ACTION_WIDTH, enabled);
                 let clicked = response.clicked();
                 if self.join_code.trim().is_empty() {
                     response.on_hover_text("Digite o código da sala para habilitar Entrar.");
@@ -375,9 +405,10 @@ impl ClientUi {
 #[cfg(test)]
 mod tests {
     use super::{
-        JOIN_BUTTON_WIDTH, PRIMARY_ACTION_HEIGHT, RoomMode, join_action_enabled,
-        primary_action_button, room_actions_enabled, show_host_picker_and_manage,
-        show_network_window, show_profile_card, show_room_mode_selector,
+        PRIMARY_ACTION_HEIGHT, PRIMARY_ACTION_WIDTH, RoomMode, configure_action_button_visuals,
+        join_action_enabled, primary_action_button, room_actions_enabled,
+        show_host_picker_and_manage, show_network_window, show_profile_card,
+        show_room_mode_selector,
     };
     use eframe::egui;
 
@@ -393,7 +424,7 @@ mod tests {
         join_enabled: bool,
     }
 
-    fn render_home_action_layout(width: f32) -> HomeActionLayout {
+    fn render_home_action_layout(width: f32, code_value: &str) -> HomeActionLayout {
         let context = egui::Context::default();
         let mut layout = None;
         let mut selected_host = None;
@@ -408,8 +439,12 @@ mod tests {
             |ui| {
                 let create = ui.group(|ui| {
                     ui.heading("Criar sala");
-                    let button =
-                        primary_action_button(ui, "Criar sala", ui.available_width(), true);
+                    let button = primary_action_button(
+                        ui,
+                        "Criar sala",
+                        PRIMARY_ACTION_WIDTH,
+                        room_actions_enabled(false, false),
+                    );
                     (button.rect, button.enabled())
                 });
 
@@ -421,13 +456,13 @@ mod tests {
                         std::iter::empty(),
                     );
                     ui.label("Digite o código da sala:");
-                    let mut code = String::new();
+                    let mut code = code_value.to_owned();
                     let mut field_rect = None;
                     let mut button_rect = None;
                     let mut button_enabled = false;
                     ui.horizontal_wrapped(|ui| {
                         let field_width = (ui.available_width()
-                            - JOIN_BUTTON_WIDTH
+                            - PRIMARY_ACTION_WIDTH
                             - ui.spacing().item_spacing.x)
                             .max(80.0);
                         field_rect = Some(
@@ -437,7 +472,12 @@ mod tests {
                             )
                             .rect,
                         );
-                        let response = primary_action_button(ui, "Entrar", JOIN_BUTTON_WIDTH, true);
+                        let response = primary_action_button(
+                            ui,
+                            "Entrar",
+                            PRIMARY_ACTION_WIDTH,
+                            join_action_enabled(!code.trim().is_empty(), true, false, false),
+                        );
                         button_rect = Some(response.rect);
                         button_enabled = response.enabled();
                     });
@@ -526,15 +566,18 @@ mod tests {
     #[test]
     fn primary_actions_and_host_controls_fit_wide_and_narrow_layouts() {
         for width in [640.0, 280.0] {
-            let layout = render_home_action_layout(width);
+            let layout = render_home_action_layout(width, "");
 
             assert!(layout.create_enabled);
-            assert!(layout.join_enabled);
+            assert!(!layout.join_enabled);
             assert!(layout.create_button.height() >= PRIMARY_ACTION_HEIGHT);
             assert!(layout.join_button.height() >= PRIMARY_ACTION_HEIGHT);
-            assert!((layout.join_button.width() - JOIN_BUTTON_WIDTH).abs() < 1.0);
+            assert!((layout.create_button.width() - PRIMARY_ACTION_WIDTH).abs() < 1.0);
+            assert!((layout.join_button.width() - PRIMARY_ACTION_WIDTH).abs() < 1.0);
             assert!((layout.code_field.center().y - layout.join_button.center().y).abs() < 1.0);
-            assert!(layout.create_button.width() >= layout.create_card.width() - 24.0);
+            assert!(layout.create_button.left() >= layout.create_card.left());
+            assert!(layout.create_button.left() - layout.create_card.left() < 20.0);
+            assert!(layout.create_button.right() < layout.create_card.right());
             assert!(layout.manage_button.width() < layout.join_card.width() * 0.75);
             assert!(layout.create_button.right() <= width);
             assert!(layout.host_row.right() <= width);
@@ -547,6 +590,75 @@ mod tests {
             } else {
                 assert!(layout.host_row.height() >= layout.manage_button.height());
             }
+
+            let enabled_layout = render_home_action_layout(width, "ABCD1234");
+            assert!(enabled_layout.join_enabled);
+        }
+    }
+
+    #[test]
+    fn action_button_palette_is_neutral_and_distinguishes_interaction_states() {
+        for mut visuals in [egui::Visuals::dark(), egui::Visuals::light()] {
+            configure_action_button_visuals(&mut visuals);
+            let widgets = visuals.widgets;
+
+            for color in [
+                widgets.inactive.bg_fill,
+                widgets.inactive.bg_stroke.color,
+                widgets.inactive.fg_stroke.color,
+                widgets.hovered.bg_fill,
+                widgets.active.bg_fill,
+                widgets.noninteractive.bg_fill,
+            ] {
+                assert_eq!(color.r(), color.g());
+                assert_eq!(color.g(), color.b());
+            }
+            assert_ne!(widgets.inactive.bg_fill, widgets.hovered.bg_fill);
+            assert_ne!(widgets.hovered.bg_fill, widgets.active.bg_fill);
+            assert_ne!(widgets.inactive.bg_stroke.color, egui::Color32::TRANSPARENT);
+            assert_ne!(
+                widgets.noninteractive.bg_stroke.color,
+                egui::Color32::TRANSPARENT
+            );
+
+            if visuals.dark_mode {
+                assert!(widgets.inactive.fg_stroke.color.r() > widgets.inactive.bg_fill.r());
+                assert!(
+                    widgets.noninteractive.fg_stroke.color.r() > widgets.noninteractive.bg_fill.r()
+                );
+            } else {
+                assert!(widgets.inactive.fg_stroke.color.r() < widgets.inactive.bg_fill.r());
+                assert!(
+                    widgets.noninteractive.fg_stroke.color.r() < widgets.noninteractive.bg_fill.r()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn action_button_visual_changes_are_scoped_to_the_button() {
+        for theme in [egui::Visuals::dark(), egui::Visuals::light()] {
+            let context = egui::Context::default();
+            context.set_visuals(theme);
+            let mut unchanged = false;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(240.0, 80.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let before = ui.visuals().clone();
+                    let response =
+                        primary_action_button(ui, "Criar sala", PRIMARY_ACTION_WIDTH, false);
+                    unchanged = *ui.visuals() == before;
+                    assert!(!response.enabled());
+                },
+            );
+            output.textures_delta.clear();
+            assert!(unchanged);
         }
     }
 
