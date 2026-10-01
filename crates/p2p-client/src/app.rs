@@ -14,7 +14,9 @@ use crate::logging::{
 use crate::profile;
 use crate::screen_capture::{MonitorOption, PendingScreenCapture, ScreenCapture};
 use crate::screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
-use crate::settings::{AppSettings, MAX_SAVED_HOSTS, SavedHostProfile, VideoDecoderPreference};
+use crate::settings::{
+    AppSettings, LoggingLevel, MAX_SAVED_HOSTS, SavedHostProfile, VideoDecoderPreference,
+};
 use crate::signaling_client::{SignalingClient, SignalingEvent};
 use crate::turn_relay::{TurnCredentials, TurnRelayServer, TurnRoomConfig};
 use crate::update::{UpdateEvent, UpdateManager, UpdateManifest};
@@ -138,6 +140,7 @@ fn right_aligned_header_rect(
 enum SettingsCategory {
     #[default]
     Audio,
+    General,
     Connection,
     Video,
     Updates,
@@ -272,6 +275,7 @@ struct ClientUi {
     last_group_metrics_log_at: Option<Instant>,
     screen_share_metrics: ScreenShareMetrics,
     logging: LoggingState,
+    logging_level: LoggingLevel,
     last_screen_metrics_log_at: Option<Instant>,
     last_control_link_state: Option<(usize, usize)>,
     last_control_metrics_log_at: Option<Instant>,
@@ -461,6 +465,7 @@ impl ClientUi {
         settings.stun_server_url = self.stun_server_url.clone();
         settings.monitor_gain_db = self.monitor_gain_db;
         settings.remote_audio_default_volume_percent = self.remote_audio_default_volume_percent;
+        settings.logging_level = self.logging_level;
         settings.video_decoder_preference = self.video_decoder_preference;
         settings.show_local_preview = self.show_local_preview;
         settings.include_system_audio = self.include_system_audio;
@@ -482,6 +487,7 @@ impl ClientUi {
         self.stun_server_url = preferences.stun_server_url;
         self.monitor_gain_db = preferences.monitor_gain_db;
         self.remote_audio_default_volume_percent = preferences.remote_audio_default_volume_percent;
+        self.logging_level = preferences.logging_level;
         self.video_decoder_preference = preferences.video_decoder_preference;
         self.show_local_preview = preferences.show_local_preview;
         self.include_system_audio = preferences.include_system_audio;
@@ -2145,11 +2151,7 @@ impl ClientUi {
         DiagnosticSnapshot {
             log_directory: self.logging.actual_log_directory_label(),
             current_log_file: self.logging.current_log_file_label(),
-            logging_status: self
-                .logging
-                .startup_message
-                .clone()
-                .unwrap_or_else(|| "ativo".to_owned()),
+            logging_status: self.logging.status_label(),
             room_mode: match self.room_mode {
                 RoomMode::Local => "local/Radmin",
                 RoomMode::InternetTest => "internet (teste)",
@@ -2428,12 +2430,12 @@ pub(super) fn run() -> eframe::Result {
         std::process::exit(exit_code);
     }
     let mut app = ClientUi::default();
-    app.logging = LoggingState::initialize();
-    logging::install_panic_hook();
-    app.updates.check();
     app.microphone_level_dbfs = -60.0;
     let (preferences, settings_warning) = settings::load();
     app.apply_preferences(preferences);
+    app.logging = LoggingState::initialize(app.logging_level);
+    logging::install_panic_hook();
+    app.updates.check();
     app.settings_error = settings_warning;
     match profile::load_avatar() {
         Ok(avatar) => app.profile_avatar_jpeg = avatar,

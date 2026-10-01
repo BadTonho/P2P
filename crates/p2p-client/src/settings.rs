@@ -32,6 +32,25 @@ pub enum VideoDecoderPreference {
     Cpu,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoggingLevel {
+    Disabled,
+    #[default]
+    WarningsAndErrors,
+    Detailed,
+}
+
+impl LoggingLevel {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "Desativados",
+            Self::WarningsAndErrors => "Avisos e erros",
+            Self::Detailed => "Detalhados",
+        }
+    }
+}
+
 impl VideoDecoderPreference {
     pub const fn label(self) -> &'static str {
         match self {
@@ -69,6 +88,8 @@ pub struct AppSettings {
         deserialize_with = "deserialize_volume_percent"
     )]
     pub remote_audio_default_volume_percent: u8,
+    #[serde(default)]
+    pub logging_level: LoggingLevel,
 }
 
 const fn default_remote_audio_volume_percent() -> u8 {
@@ -135,6 +156,7 @@ impl Default for AppSettings {
             include_system_audio: false,
             profile_display_name: String::new(),
             remote_audio_default_volume_percent: default_remote_audio_volume_percent(),
+            logging_level: LoggingLevel::default(),
         }
     }
 }
@@ -353,6 +375,7 @@ mod tests {
             selected_host_index: Some(0),
             monitor_gain_db: 12.0,
             remote_audio_default_volume_percent: 63,
+            logging_level: LoggingLevel::Detailed,
             create_room_mode: RoomMode::InternetTest,
             may_host: true,
             control_ipv4: Some(Ipv4Addr::new(26, 10, 20, 30)),
@@ -437,6 +460,38 @@ mod tests {
         let loaded: AppSettings =
             serde_json::from_value(stored).expect("older settings files should remain compatible");
         assert_eq!(loaded.remote_audio_default_volume_percent, 100);
+    }
+
+    #[test]
+    fn older_settings_default_logging_to_warnings_and_errors() {
+        let mut stored =
+            serde_json::to_value(AppSettings::default()).expect("settings should serialize");
+        stored
+            .as_object_mut()
+            .expect("settings should serialize as an object")
+            .remove("logging_level");
+
+        let loaded: AppSettings =
+            serde_json::from_value(stored).expect("older settings should remain compatible");
+        assert_eq!(loaded.logging_level, LoggingLevel::WarningsAndErrors);
+    }
+
+    #[test]
+    fn logging_level_is_persisted() {
+        for logging_level in [
+            LoggingLevel::Disabled,
+            LoggingLevel::WarningsAndErrors,
+            LoggingLevel::Detailed,
+        ] {
+            let stored = serde_json::to_value(AppSettings {
+                logging_level,
+                ..AppSettings::default()
+            })
+            .expect("settings should serialize");
+            let loaded: AppSettings =
+                serde_json::from_value(stored).expect("settings should deserialize");
+            assert_eq!(loaded.logging_level, logging_level);
+        }
     }
 
     #[test]

@@ -23,7 +23,13 @@ impl ClientUi {
                             ui.ctx().copy_text(path.display().to_string());
                         }
                     }
-                    if ui.small_button("Abrir pasta de logs").clicked() {
+                    if ui
+                        .add_enabled(
+                            self.logging.log_directory().is_some(),
+                            egui::Button::new("Abrir pasta de logs").small(),
+                        )
+                        .clicked()
+                    {
                         *open_logs_directory = true;
                     }
                 });

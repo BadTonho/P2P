@@ -3,7 +3,7 @@ use super::super::{
     validate_new_host_profile, validate_saved_host_profile,
 };
 use crate::screen_sharing;
-use crate::settings::{MAX_SAVED_HOSTS, SavedHostProfile, VideoDecoderPreference};
+use crate::settings::{LoggingLevel, MAX_SAVED_HOSTS, SavedHostProfile, VideoDecoderPreference};
 use crate::update::UpdateManager;
 use eframe::egui;
 
@@ -30,6 +30,7 @@ impl ClientUi {
     fn show_settings_categories(&mut self, ui: &mut egui::Ui, horizontal: bool) {
         let mut show = |ui: &mut egui::Ui| {
             for (category, label) in [
+                (SettingsCategory::General, "Geral"),
                 (SettingsCategory::Audio, "Áudio"),
                 (SettingsCategory::Connection, "Conexão"),
                 (SettingsCategory::Video, "Vídeo"),
@@ -50,11 +51,43 @@ impl ClientUi {
 
     fn show_settings_content(&mut self, ui: &mut egui::Ui) {
         match self.settings_category {
+            SettingsCategory::General => self.show_general_settings(ui),
             SettingsCategory::Audio => self.show_audio_settings(ui),
             SettingsCategory::Connection => self.show_connection_settings(ui),
             SettingsCategory::Video => self.show_video_settings(ui),
             SettingsCategory::Updates => self.show_update_settings(ui),
         }
+    }
+
+    fn show_general_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Geral");
+        ui.group(|ui| {
+            ui.heading("Registro de logs");
+            ui.label("Escolha quantos eventos o aplicativo grava neste computador.");
+
+            let mut selected_level = self.logging_level;
+            egui::ComboBox::from_id_salt("logging-level")
+                .selected_text(selected_level.label())
+                .show_ui(ui, |ui| {
+                    for level in [
+                        LoggingLevel::Disabled,
+                        LoggingLevel::WarningsAndErrors,
+                        LoggingLevel::Detailed,
+                    ] {
+                        ui.selectable_value(&mut selected_level, level, level.label());
+                    }
+                });
+
+            if selected_level != self.logging_level {
+                self.logging_level = selected_level;
+                self.logging.set_level(selected_level);
+            }
+
+            ui.small(
+                "Padrão: somente avisos e erros. Logs detalhados incluem informações e depuração.",
+            );
+            ui.small("Desativados não cria arquivos de sessão; logs antigos são preservados.");
+        });
     }
 
     fn show_update_settings(&mut self, ui: &mut egui::Ui) {

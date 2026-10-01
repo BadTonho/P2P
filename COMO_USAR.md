@@ -71,3 +71,7 @@ STUN ajuda a procurar uma rota direta e não retransmite mídia. TURN retransmit
 ## Atualizações publicadas pelo GitHub
 
 O atualizador consulta o último release público do [repositório no GitHub](https://github.com/BadTonho/P2P/releases/latest) e procura o asset `p2p-client.exe`. Consulte [ATUALIZACOES.md](ATUALIZACOES.md) para publicar uma nova versão. Não é necessário criar ou enviar um manifesto separado.
+
+## Nível de logs
+
+Em **Configurações > Geral**, escolha **Desativados**, **Avisos e erros** ou **Detalhados**. O padrão é **Avisos e erros**; os logs detalhados ficam desligados. **Desativados** não cria arquivos de sessão e preserva os logs antigos. **Exportar logs** continua disponível por ação manual e, com os logs desativados, exporta somente o relatório de diagnóstico, sem histórico de eventos.

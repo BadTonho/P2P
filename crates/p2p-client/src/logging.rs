@@ -4,10 +4,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::settings::LoggingLevel;
 use time::{Date, Duration, OffsetDateTime};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::time::UtcTime;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
 
 const LOG_FOLDER_NAME: &str = "P2P-Voz-e-tela";
 const LOG_FILE_PREFIX: &str = "p2p-";
@@ -114,11 +117,16 @@ fn current_srtp_context(ssrc: Option<u32>) -> String {
     describe_srtp_context(&registry, ssrc)
 }
 
+type FilterReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+
 #[derive(Default)]
 pub struct LoggingState {
     log_directory: Option<PathBuf>,
     current_log_file: Option<PathBuf>,
     last_write_error: Option<Arc<Mutex<Option<String>>>>,
+    sink: Option<Arc<Mutex<RollingSink>>>,
+    filter_reload: Option<FilterReloadHandle>,
+    level: LoggingLevel,
     pub startup_message: Option<String>,
     pub export_message: Option<String>,
 }
@@ -165,14 +173,41 @@ struct SharedLogWriter {
 }
 
 struct RollingSink {
-    path: PathBuf,
+    path: Option<PathBuf>,
     file: Option<File>,
+    stderr_fallback: bool,
     duplicate_packet_warnings: HashMap<Option<u32>, u64>,
     duplicate_packet_warning_order: VecDeque<Option<u32>>,
 }
 
-fn default_log_filter() -> EnvFilter {
-    EnvFilter::new("info,p2p_client=debug")
+impl RollingSink {
+    fn inactive() -> Self {
+        Self {
+            path: None,
+            file: None,
+            stderr_fallback: false,
+            duplicate_packet_warnings: HashMap::new(),
+            duplicate_packet_warning_order: VecDeque::new(),
+        }
+    }
+}
+
+fn log_filter(level: LoggingLevel) -> EnvFilter {
+    match level {
+        LoggingLevel::Disabled => EnvFilter::new("off"),
+        LoggingLevel::WarningsAndErrors => EnvFilter::new("warn"),
+        LoggingLevel::Detailed => EnvFilter::new("info,p2p_client=debug"),
+    }
+}
+
+fn should_open_log_file(level: LoggingLevel) -> bool {
+    level != LoggingLevel::Disabled
+}
+
+fn open_log_file_if_enabled(level: LoggingLevel, open: impl FnOnce()) {
+    if should_open_log_file(level) {
+        open();
+    }
 }
 
 fn is_duplicate_packet_warning(line: &str) -> bool {
@@ -225,78 +260,124 @@ struct LogLine {
 }
 
 impl LoggingState {
-    pub fn initialize() -> Self {
-        let (log_directory, startup_message, rolling_sink) = match open_log_directory() {
-            Ok((directory, startup_message, sink)) => {
-                (Some(directory), startup_message, Some(sink))
-            }
-            Err((primary_error, fallback_error)) => (
-                None,
-                Some(format!(
-                    "Não foi possível iniciar os logs persistentes. Pasta principal: {primary_error}. Pasta temporária: {fallback_error}."
-                )),
-                None,
-            ),
-        };
-
-        let Some(directory) = log_directory else {
-            let mut state = Self {
-                startup_message,
-                ..Self::default()
-            };
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_timer(UtcTime::rfc_3339())
-                .with_env_filter(default_log_filter())
-                .finish();
-            if let Err(error) = install_subscriber(subscriber) {
-                state.startup_message = Some(format!(
-                    "{} Logger indisponível: {error}",
-                    state.startup_message.unwrap_or_default()
-                ));
-            }
-            return state;
-        };
-
-        let rolling_sink = rolling_sink.expect("directory implies an opened sink");
-        let current_log_file = Some(rolling_sink.path.clone());
-        let sink = Arc::new(Mutex::new(rolling_sink));
+    pub fn initialize(level: LoggingLevel) -> Self {
+        let sink = Arc::new(Mutex::new(RollingSink::inactive()));
         let last_error = Arc::new(Mutex::new(None));
         let writer = SharedLogWriter {
-            sink,
+            sink: Arc::clone(&sink),
             last_error: Arc::clone(&last_error),
         };
-        let subscriber = tracing_subscriber::fmt()
+
+        let (filter_layer, filter_reload) = reload::Layer::new(log_filter(level));
+        let format_layer = tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_target(true)
             .with_thread_ids(true)
             .with_thread_names(true)
             .with_timer(UtcTime::rfc_3339())
-            .with_env_filter(default_log_filter())
-            .with_writer(writer)
-            .finish();
+            .with_writer(writer);
+        let subscriber = tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(format_layer);
 
         let mut state = Self {
-            log_directory: Some(directory),
-            current_log_file,
+            log_directory: existing_log_directory(),
+            current_log_file: None,
             last_write_error: Some(last_error),
-            startup_message,
+            sink: Some(sink),
+            filter_reload: Some(filter_reload),
+            level,
+            startup_message: None,
             export_message: None,
         };
+        open_log_file_if_enabled(level, || state.activate_log_file());
         if let Err(error) = install_subscriber(subscriber) {
-            state.startup_message = Some(format!("Não foi possível ativar o logger: {error}"));
+            state.filter_reload = None;
+            state.startup_message = Some(format!(
+                "N\u{00e3}o foi poss\u{00ed}vel ativar o logger: {error}"
+            ));
         }
-
         tracing::info!(
             app_version = env!("CARGO_PKG_VERSION"),
             build_version_marker = crate::update::build_version_marker(),
             os = std::env::consts::OS,
             architecture = std::env::consts::ARCH,
-            log_directory = state.log_directory_label(),
+            log_directory = state.actual_log_directory_label(),
             log_file = state.current_log_file_label(),
             "Aplicativo iniciado; logger persistente pronto"
         );
         state
+    }
+
+    pub fn set_level(&mut self, level: LoggingLevel) {
+        self.set_level_with(level, open_log_directory);
+    }
+
+    fn set_level_with(
+        &mut self,
+        level: LoggingLevel,
+        open_log_directory: impl FnOnce() -> Result<
+            (PathBuf, Option<String>, RollingSink),
+            (String, String),
+        >,
+    ) {
+        if self.level == level {
+            return;
+        }
+        if level != LoggingLevel::Disabled && self.current_log_file.is_none() {
+            self.activate_log_file_with(open_log_directory);
+        }
+        if let Some(filter_reload) = &self.filter_reload {
+            if let Err(error) = filter_reload.reload(log_filter(level)) {
+                self.startup_message = Some(format!(
+                    "N\u{00e3}o foi poss\u{00ed}vel alterar o n\u{00ed}vel dos logs: {error}"
+                ));
+                return;
+            }
+        }
+        self.level = level;
+    }
+
+    fn activate_log_file(&mut self) {
+        self.activate_log_file_with(open_log_directory);
+    }
+
+    fn activate_log_file_with(
+        &mut self,
+        open_log_directory: impl FnOnce() -> Result<
+            (PathBuf, Option<String>, RollingSink),
+            (String, String),
+        >,
+    ) {
+        match open_log_directory() {
+            Ok((directory, startup_message, rolling_sink)) => {
+                self.current_log_file = rolling_sink.path.clone();
+                self.log_directory = Some(directory);
+                self.startup_message = startup_message;
+                if let Some(sink) = &self.sink {
+                    *sink
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = rolling_sink;
+                }
+            }
+            Err((primary_error, fallback_error)) => {
+                self.startup_message = Some(format!(
+                    "N\u{00e3}o foi poss\u{00ed}vel iniciar os logs persistentes. Pasta principal: {primary_error}. Pasta tempor\u{00e1}ria: {fallback_error}."
+                ));
+                if let Some(sink) = &self.sink {
+                    sink.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .stderr_fallback = true;
+                }
+            }
+        }
+    }
+
+    pub fn status_label(&self) -> String {
+        match &self.startup_message {
+            Some(message) => format!("{}; {message}", self.level.label()),
+            None => self.level.label().to_owned(),
+        }
     }
 
     pub fn take_write_error(&self) -> Option<String> {
@@ -362,15 +443,19 @@ impl LoggingState {
             }
         }
         output.push_str("\nDados excluídos: código da sala, tokens, payloads de sinalização e conteúdo de áudio/vídeo/tela.\n");
-        output.push_str("\n========== LOG DESTA EXECUÇÃO ==========\n");
+        if self.level != LoggingLevel::Disabled {
+            output.push_str("\n========== LOG DESTA EXECUCAO ==========\n");
+        }
 
-        if let Some(current_log_file) = &self.current_log_file {
+        if self.level == LoggingLevel::Disabled {
+            output.push_str("Logs de eventos desativados; esta exportacao contem apenas o relatorio de diagnostico.\n");
+        } else if let Some(current_log_file) = &self.current_log_file {
             output.push_str(&fs::read_to_string(current_log_file)?);
             if !output.ends_with('\n') {
                 output.push('\n');
             }
         } else {
-            output.push_str("Logger persistente indisponível nesta execução.\n");
+            output.push_str("Logger persistente indisponivel nesta execucao.\n");
         }
 
         if let (Some(parent), Some(log_directory)) = (destination.parent(), self.log_directory()) {
@@ -398,7 +483,13 @@ impl LoggingState {
         self.log_directory
             .as_ref()
             .map(|directory| directory.display().to_string())
-            .unwrap_or_else(|| "(indisponível)".to_owned())
+            .unwrap_or_else(|| {
+                if self.level == LoggingLevel::Disabled {
+                    "(logs desativados; nenhuma pasta criada)".to_owned()
+                } else {
+                    "(indisponivel)".to_owned()
+                }
+            })
     }
 
     pub fn current_log_file(&self) -> Option<&Path> {
@@ -409,14 +500,24 @@ impl LoggingState {
         self.current_log_file
             .as_ref()
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "(indisponível)".to_owned())
+            .unwrap_or_else(|| {
+                if self.level == LoggingLevel::Disabled {
+                    "(desativados nesta execucao)".to_owned()
+                } else {
+                    "(indisponivel)".to_owned()
+                }
+            })
     }
 
     pub fn open_log_directory(&self) -> io::Result<()> {
         let Some(directory) = &self.log_directory else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "A pasta de logs não está disponível.",
+                if self.level == LoggingLevel::Disabled {
+                    "Logs desativados; nenhuma pasta foi criada."
+                } else {
+                    "A pasta de logs nao esta disponivel."
+                },
             ));
         };
 
@@ -432,22 +533,8 @@ impl LoggingState {
             let _ = directory;
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Abrir a pasta de logs está disponível apenas no Windows.",
+                "Abrir a pasta de logs esta disponivel apenas no Windows.",
             ))
-        }
-    }
-
-    pub fn log_directory_label(&self) -> &'static str {
-        if self.log_directory.is_none() {
-            "(indisponível)"
-        } else if self
-            .startup_message
-            .as_deref()
-            .is_some_and(|message| message.contains("pasta temporária"))
-        {
-            "%TEMP%\\P2P-Voz-e-tela\\logs-fallback"
-        } else {
-            "%LOCALAPPDATA%\\P2P-Voz-e-tela\\logs"
         }
     }
 }
@@ -533,8 +620,9 @@ impl RollingSink {
             .create_new(true)
             .open(&path)?;
         Ok(Self {
-            path,
+            path: Some(path),
             file: Some(file),
+            stderr_fallback: false,
             duplicate_packet_warnings: HashMap::new(),
             duplicate_packet_warning_order: VecDeque::new(),
         })
@@ -577,6 +665,13 @@ impl RollingSink {
                 file.write_all(b"\n")?;
             }
             file.flush()?;
+        } else if self.stderr_fallback {
+            let mut stderr = io::stderr().lock();
+            stderr.write_all(bytes)?;
+            if !bytes.ends_with(b"\n") {
+                stderr.write_all(b"\n")?;
+            }
+            stderr.flush()?;
         }
         Ok(())
     }
@@ -585,18 +680,23 @@ impl RollingSink {
 #[cfg(test)]
 mod filter_tests {
     use super::{
-        SrtpContextRegistry, SrtpTrackContext, default_log_filter, describe_srtp_context,
-        duplicate_packet_ssrc, increment_duplicate_warning_count, is_duplicate_packet_warning,
+        SrtpContextRegistry, SrtpTrackContext, describe_srtp_context, duplicate_packet_ssrc,
+        increment_duplicate_warning_count, is_duplicate_packet_warning, log_filter,
         register_srtp_track_context, remove_srtp_contexts_for_session, srtp_context_registry,
     };
+    use crate::settings::LoggingLevel;
     use std::collections::{HashMap, VecDeque};
 
     #[test]
-    fn app_debug_is_retained_while_dependencies_use_info_default() {
-        let filter = default_log_filter();
-        let directives = filter.to_string();
-        assert!(directives.contains("p2p_client=debug"));
-        assert!(directives.contains("info"));
+    fn configured_log_levels_map_to_the_expected_filters() {
+        assert_eq!(log_filter(LoggingLevel::Disabled).to_string(), "off");
+        assert_eq!(
+            log_filter(LoggingLevel::WarningsAndErrors).to_string(),
+            "warn"
+        );
+        let detailed = log_filter(LoggingLevel::Detailed).to_string();
+        assert!(detailed.contains("p2p_client=debug"));
+        assert!(detailed.contains("info"));
     }
 
     #[test]
@@ -711,6 +811,19 @@ mod filter_tests {
     }
 }
 
+fn existing_log_directory() -> Option<PathBuf> {
+    let primary = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(|value| PathBuf::from(value).join(LOG_FOLDER_NAME).join("logs"));
+    if let Some(directory) = primary.filter(|directory| directory.is_dir()) {
+        return Some(directory);
+    }
+    let fallback = std::env::temp_dir()
+        .join(LOG_FOLDER_NAME)
+        .join("logs-fallback");
+    fallback.is_dir().then_some(fallback)
+}
+
 fn open_log_directory() -> Result<(PathBuf, Option<String>, RollingSink), (String, String)> {
     let fallback = std::env::temp_dir()
         .join(LOG_FOLDER_NAME)
@@ -801,11 +914,14 @@ fn prune_logs(directory: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiagnosticSnapshot, LOG_FILE_PREFIX, LoggingState, RollingSink, date_key, prune_logs,
-        safe_signaling_endpoint,
+        DiagnosticSnapshot, LOG_FILE_PREFIX, LoggingState, RollingSink, SharedLogWriter, date_key,
+        log_filter, open_log_file_if_enabled, prune_logs, safe_signaling_endpoint,
     };
+    use crate::settings::LoggingLevel;
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use time::{Duration, OffsetDateTime};
+    use tracing_subscriber::layer::SubscriberExt;
 
     #[test]
     fn date_key_is_sortable_iso_date() {
@@ -823,7 +939,7 @@ mod tests {
             OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         let mut sink = RollingSink::open(directory.clone()).unwrap();
-        let current_log = sink.path.clone();
+        let current_log = sink.path.clone().unwrap();
         sink.write_line("evento de teste: captura iniciada".as_bytes())
             .unwrap();
         drop(sink);
@@ -832,6 +948,121 @@ mod tests {
             fs::read_to_string(current_log).unwrap(),
             "evento de teste: captura iniciada\n"
         );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn disabled_start_does_not_open_or_create_a_log_directory() {
+        let directory = std::env::temp_dir().join(format!(
+            "p2p-log-disabled-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let mut opened = false;
+        open_log_file_if_enabled(LoggingLevel::Disabled, || {
+            opened = true;
+            fs::create_dir_all(&directory).unwrap();
+        });
+        assert!(!opened);
+        assert!(!directory.exists());
+        open_log_file_if_enabled(LoggingLevel::WarningsAndErrors, || {
+            opened = true;
+            fs::create_dir_all(&directory).unwrap();
+        });
+        assert!(opened);
+        assert!(directory.exists());
+        fs::remove_dir_all(&directory).unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn enabling_logs_mid_session_creates_a_file_and_keeps_previous_logs() {
+        let directory = std::env::temp_dir().join(format!(
+            "p2p-log-enable-later-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let previous_log = directory.join(format!(
+            "{LOG_FILE_PREFIX}{}-120000-123456789-1.log",
+            date_key(OffsetDateTime::now_utc().date())
+        ));
+        fs::write(&previous_log, "previous session\n").unwrap();
+        let mut state = LoggingState {
+            log_directory: Some(directory.clone()),
+            sink: Some(Arc::new(Mutex::new(RollingSink::inactive()))),
+            level: LoggingLevel::Disabled,
+            ..LoggingState::default()
+        };
+
+        state.set_level_with(LoggingLevel::Disabled, || {
+            panic!("disabled must not open logs")
+        });
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        assert!(previous_log.exists());
+
+        state.set_level_with(LoggingLevel::WarningsAndErrors, || {
+            RollingSink::open(directory.clone())
+                .map(|sink| (directory.clone(), None, sink))
+                .map_err(|error| (error.to_string(), error.to_string()))
+        });
+
+        assert!(state.current_log_file().is_some_and(|path| path.exists()));
+        assert!(previous_log.exists());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn log_filter_changes_apply_to_events_immediately() {
+        let directory = std::env::temp_dir().join(format!(
+            "p2p-log-levels-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let sink = Arc::new(Mutex::new(RollingSink::open(directory.clone()).unwrap()));
+        let log_path = sink.lock().unwrap().path.clone().unwrap();
+        let last_error = Arc::new(Mutex::new(None));
+        let writer = SharedLogWriter {
+            sink: Arc::clone(&sink),
+            last_error: Arc::clone(&last_error),
+        };
+        let (filter_layer, filter_reload) =
+            tracing_subscriber::reload::Layer::new(log_filter(LoggingLevel::WarningsAndErrors));
+        let format_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(writer);
+        let subscriber = tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(format_layer);
+        let mut state = LoggingState {
+            log_directory: Some(directory.clone()),
+            current_log_file: Some(log_path.clone()),
+            last_write_error: Some(last_error),
+            sink: Some(sink),
+            filter_reload: Some(filter_reload),
+            level: LoggingLevel::WarningsAndErrors,
+            ..LoggingState::default()
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("info_before_detail");
+            tracing::warn!("warning_kept");
+            tracing::error!("error_kept");
+            state.set_level(LoggingLevel::Detailed);
+            tracing::info!("info_after_detail");
+            tracing::debug!(target: "p2p_client::test", "debug_after_detail");
+            state.set_level(LoggingLevel::Disabled);
+            tracing::error!("error_after_disable");
+        });
+
+        let contents = fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("warning_kept"));
+        assert!(contents.contains("error_kept"));
+        assert!(contents.contains("info_after_detail"));
+        assert!(contents.contains("debug_after_detail"));
+        assert!(!contents.contains("info_before_detail"));
+        assert!(!contents.contains("error_after_disable"));
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -915,6 +1146,39 @@ mod tests {
         assert!(!contents.contains("ROOM-CODE-SECRET"));
         assert!(!contents.to_ascii_lowercase().contains("token="));
         assert!(!contents.contains("ROOM-CODE-SECRET"));
+        let _ = fs::remove_file(export);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn disabled_export_contains_diagnostics_without_event_history() {
+        let directory = std::env::temp_dir().join(format!(
+            "p2p-log-export-disabled-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let current_log = directory.join("current.log");
+        fs::write(&current_log, "private_event_history=true\n").unwrap();
+        let export = std::env::temp_dir().join(format!(
+            "p2p-diagnostic-disabled-{}-{}.log",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let state = LoggingState {
+            log_directory: Some(directory.clone()),
+            current_log_file: Some(current_log),
+            level: LoggingLevel::Disabled,
+            ..LoggingState::default()
+        };
+
+        state
+            .export_to(&export, &DiagnosticSnapshot::default())
+            .unwrap();
+
+        let contents = fs::read_to_string(&export).unwrap();
+        assert!(contents.contains("esta exportacao contem apenas o relatorio de diagnostico"));
+        assert!(!contents.contains("private_event_history"));
         let _ = fs::remove_file(export);
         let _ = fs::remove_dir_all(directory);
     }
