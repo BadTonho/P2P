@@ -8,6 +8,41 @@ pub(crate) use system_audio::{
     SystemAudioPlaybackFactory,
 };
 
+#[derive(Clone)]
+pub(crate) struct RemoteAudioVolume {
+    percent: Arc<AtomicU32>,
+}
+
+impl RemoteAudioVolume {
+    pub(crate) fn new(percent: u32) -> Self {
+        Self {
+            percent: Arc::new(AtomicU32::new(percent.min(100))),
+        }
+    }
+
+    pub(crate) fn percent(&self) -> u32 {
+        self.percent.load(Ordering::Relaxed).min(100)
+    }
+
+    pub(crate) fn set_percent(&self, percent: u32) {
+        self.percent.store(percent.min(100), Ordering::Relaxed);
+    }
+
+    pub(crate) fn gain(&self) -> f32 {
+        self.percent() as f32 / 100.0
+    }
+}
+
+impl Default for RemoteAudioVolume {
+    fn default() -> Self {
+        Self::new(100)
+    }
+}
+
+pub(crate) fn scale_remote_audio_sample(sample: f32, gain: f32) -> f32 {
+    sample * gain
+}
+
 pub(crate) trait AudioSampleSource: Send {
     fn input_format(&self) -> (u32, usize);
     fn read_samples(&mut self, output: &mut [f32]) -> usize;
@@ -32,7 +67,61 @@ pub(crate) trait AudioPlaybackSink: Send {
 }
 
 pub(crate) trait AudioPlaybackFactory: Send + Sync {
-    fn start(&self, session_id: u64, ssrc: u32) -> Result<Box<dyn AudioPlaybackSink>, String>;
+    fn start(
+        &self,
+        session_id: u64,
+        ssrc: u32,
+        volume: RemoteAudioVolume,
+    ) -> Result<Box<dyn AudioPlaybackSink>, String>;
+}
+
+#[cfg(test)]
+mod remote_volume_tests {
+    use super::{RemoteAudioVolume, scale_remote_audio_sample};
+
+    #[test]
+    fn remote_volume_scales_samples_at_zero_half_and_full() {
+        assert_eq!(
+            scale_remote_audio_sample(0.8, RemoteAudioVolume::new(0).gain()),
+            0.0
+        );
+        assert_eq!(
+            scale_remote_audio_sample(0.8, RemoteAudioVolume::new(50).gain()),
+            0.4
+        );
+        assert_eq!(
+            scale_remote_audio_sample(0.8, RemoteAudioVolume::new(100).gain()),
+            0.8
+        );
+    }
+
+    #[test]
+    fn remote_volume_changes_are_visible_to_playback_without_restarting() {
+        let volume = RemoteAudioVolume::new(100);
+        let playback_control = volume.clone();
+        assert_eq!(scale_remote_audio_sample(0.6, playback_control.gain()), 0.6);
+
+        volume.set_percent(50);
+        assert_eq!(scale_remote_audio_sample(0.6, playback_control.gain()), 0.3);
+
+        volume.set_percent(0);
+        assert_eq!(scale_remote_audio_sample(0.6, playback_control.gain()), 0.0);
+    }
+
+    #[test]
+    fn remote_volume_is_independent_per_session_and_inherits_default() {
+        let saved_default = 73;
+        let first_session = RemoteAudioVolume::new(saved_default);
+        let second_session = RemoteAudioVolume::new(saved_default);
+
+        first_session.set_percent(25);
+
+        assert_eq!(first_session.percent(), 25);
+        assert_eq!(second_session.percent(), saved_default);
+
+        let future_session = RemoteAudioVolume::new(saved_default);
+        assert_eq!(future_session.percent(), saved_default);
+    }
 }
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};

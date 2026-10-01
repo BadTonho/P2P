@@ -906,9 +906,16 @@ impl PeerEvents {
             let session_id = self.metrics.session_id;
             let events = self.events.clone();
             let audio_playback_factory = Arc::clone(&self.audio_playback_factory);
+            let remote_audio_volume = self.remote_audio_volume.clone();
             tokio::spawn(async move {
-                Self::receive_remote_audio_track(track, session_id, events, audio_playback_factory)
-                    .await;
+                Self::receive_remote_audio_track(
+                    track,
+                    session_id,
+                    events,
+                    audio_playback_factory,
+                    remote_audio_volume,
+                )
+                .await;
             });
             return;
         }
@@ -1689,6 +1696,7 @@ impl PeerEvents {
         session_id: u64,
         events: std_mpsc::Sender<ScreenShareEvent>,
         audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
+        remote_audio_volume: RemoteAudioVolume,
     ) {
         let ssrc = track.ssrcs().await.first().copied().unwrap_or_default();
         let track_kind = track.kind().await;
@@ -1698,7 +1706,8 @@ impl PeerEvents {
             kind = ?track_kind,
             "Faixa Opus remota recebida; preparando decodificação e saída"
         );
-        let mut playback = match audio_playback_factory.start(session_id, ssrc) {
+        let mut playback = match audio_playback_factory.start(session_id, ssrc, remote_audio_volume)
+        {
             Ok(playback) => playback,
             Err(error) => {
                 tracing::error!(

@@ -516,13 +516,14 @@ impl ClientUi {
                 return;
             }
         };
-        match ScreenShareSession::new_with_port(
+        match ScreenShareSession::new_with_port_and_audio_volume(
             context.clone(),
             address,
             port,
             None,
             None,
             self.video_decoder_preference,
+            self.remote_audio_default_volume_percent,
         ) {
             Ok(session) => {
                 let generation =
@@ -757,13 +758,14 @@ impl ClientUi {
                         return;
                     }
                 };
-            match ScreenShareSession::new_with_port(
+            match ScreenShareSession::new_with_port_and_audio_volume(
                 context.clone(),
                 address,
                 port,
                 None,
                 None,
                 self.video_decoder_preference,
+                self.remote_audio_default_volume_percent,
             ) {
                 Ok(session) => {
                     self.group_inbound_ports.insert(peer_id.clone(), port);

@@ -197,6 +197,7 @@ pub struct ScreenShareSession {
     #[allow(dead_code)] // Usado pelo teste loopback para provocar um PLI explícito.
     remote_track: RemoteTrackStore,
     metrics: Arc<SharedMetrics>,
+    remote_audio_volume: RemoteAudioVolume,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -208,13 +209,32 @@ impl ScreenShareSession {
         turn_credentials: Option<TurnCredentials>,
         decoder_preference: VideoDecoderPreference,
     ) -> Result<Self, String> {
-        Self::new_with_port(
+        Self::new_with_audio_volume(
+            context,
+            bind_ipv4,
+            stun_server,
+            turn_credentials,
+            decoder_preference,
+            100,
+        )
+    }
+
+    pub fn new_with_audio_volume(
+        context: egui::Context,
+        bind_ipv4: Ipv4Addr,
+        stun_server: Option<String>,
+        turn_credentials: Option<TurnCredentials>,
+        decoder_preference: VideoDecoderPreference,
+        remote_audio_volume_percent: u8,
+    ) -> Result<Self, String> {
+        Self::new_with_port_and_audio_volume(
             context,
             bind_ipv4,
             MEDIA_UDP_PORT,
             stun_server,
             turn_credentials,
             decoder_preference,
+            remote_audio_volume_percent,
         )
     }
 
@@ -226,18 +246,40 @@ impl ScreenShareSession {
         turn_credentials: Option<TurnCredentials>,
         decoder_preference: VideoDecoderPreference,
     ) -> Result<Self, String> {
+        Self::new_with_port_and_audio_volume(
+            context,
+            bind_ipv4,
+            udp_port,
+            stun_server,
+            turn_credentials,
+            decoder_preference,
+            100,
+        )
+    }
+
+    pub fn new_with_port_and_audio_volume(
+        context: egui::Context,
+        bind_ipv4: Ipv4Addr,
+        udp_port: u16,
+        stun_server: Option<String>,
+        turn_credentials: Option<TurnCredentials>,
+        decoder_preference: VideoDecoderPreference,
+        remote_audio_volume_percent: u8,
+    ) -> Result<Self, String> {
         if let Some(server) = stun_server.as_deref() {
             if let Err(error) = validate_stun_uri(server) {
                 tracing::error!(reason = %error, "URI STUN recusada antes de iniciar WebRTC");
                 return Err(error);
             }
         }
-        Self::with_udp_address(
+        Self::with_udp_address_and_audio_volume(
             context,
             format!("{bind_ipv4}:{udp_port}"),
             stun_server,
             turn_credentials,
             decoder_preference,
+            Arc::new(SystemAudioPlaybackFactory),
+            remote_audio_volume_percent,
         )
     }
 
@@ -285,6 +327,26 @@ impl ScreenShareSession {
         decoder_preference: VideoDecoderPreference,
         audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
     ) -> Result<Self, String> {
+        Self::with_udp_address_and_audio_volume(
+            context,
+            udp_address,
+            stun_server,
+            turn_credentials,
+            decoder_preference,
+            audio_playback_factory,
+            100,
+        )
+    }
+
+    fn with_udp_address_and_audio_volume(
+        context: egui::Context,
+        udp_address: String,
+        stun_server: Option<String>,
+        turn_credentials: Option<TurnCredentials>,
+        decoder_preference: VideoDecoderPreference,
+        audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
+        remote_audio_volume_percent: u8,
+    ) -> Result<Self, String> {
         tracing::info!(
             udp_address = %udp_address,
             stun_endpoint = %stun_server.as_deref().map(safe_stun_endpoint).unwrap_or_else(|| "(não configurado)".to_owned()),
@@ -327,6 +389,8 @@ impl ScreenShareSession {
         let worker_remote_track = Arc::clone(&remote_track);
         let worker_metrics = Arc::clone(&metrics);
         let worker_audio_playback_factory = Arc::clone(&audio_playback_factory);
+        let remote_audio_volume = RemoteAudioVolume::new(u32::from(remote_audio_volume_percent));
+        let worker_remote_audio_volume = remote_audio_volume.clone();
         let worker = thread::Builder::new()
             .name("p2p-screen-share".to_owned())
             .spawn(move || {
@@ -355,6 +419,7 @@ impl ScreenShareSession {
                     worker_metrics,
                     decoder_preference,
                     worker_audio_playback_factory,
+                    worker_remote_audio_volume,
                 ));
             })
             .map_err(|error| format!("Não foi possível iniciar a sessão de tela: {error}"))?;
@@ -365,6 +430,7 @@ impl ScreenShareSession {
             remote_frame,
             remote_track,
             metrics,
+            remote_audio_volume,
             worker: Some(worker),
         })
     }
@@ -462,6 +528,14 @@ impl ScreenShareSession {
 
     pub fn metrics(&self) -> ScreenShareMetrics {
         self.metrics.snapshot()
+    }
+
+    pub fn remote_audio_volume_percent(&self) -> u8 {
+        self.remote_audio_volume.percent() as u8
+    }
+
+    pub fn set_remote_audio_volume_percent(&self, percent: u8) {
+        self.remote_audio_volume.set_percent(u32::from(percent));
     }
 
     pub(crate) fn remote_video_track_seen(&self) -> bool {
@@ -735,6 +809,7 @@ async fn run_session(
     metrics: Arc<SharedMetrics>,
     decoder_preference: VideoDecoderPreference,
     audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
+    remote_audio_volume: RemoteAudioVolume,
 ) {
     let mut active_peer: Option<PeerSession> = None;
     let mut ice_before_peer = Vec::new();
@@ -916,6 +991,7 @@ async fn run_session(
                     include_system_audio,
                     audio_source_override,
                     Arc::clone(&audio_playback_factory),
+                    remote_audio_volume.clone(),
                 )
                 .await
                 {
@@ -946,6 +1022,7 @@ async fn run_session(
                         turn_credentials.as_ref(),
                         decoder_preference,
                         Arc::clone(&audio_playback_factory),
+                        remote_audio_volume.clone(),
                     )
                     .await
                     {
@@ -1311,6 +1388,7 @@ async fn create_peer(
     turn_credentials: Option<&TurnCredentials>,
     decoder_preference: VideoDecoderPreference,
     audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
+    remote_audio_volume: RemoteAudioVolume,
 ) -> Result<Arc<dyn PeerConnection>, String> {
     let video_codec = RTCRtpCodecParameters {
         rtp_codec: RTCRtpCodec {
@@ -1373,6 +1451,7 @@ async fn create_peer(
         turn_enabled: turn_credentials.is_some(),
         decoder_preference,
         audio_playback_factory,
+        remote_audio_volume,
     });
     let mut configuration = RTCConfigurationBuilder::new();
     let mut ice_servers = Vec::new();
@@ -1447,6 +1526,7 @@ async fn create_sender(
     include_system_audio: bool,
     audio_source_override: Option<Box<dyn AudioSampleSource>>,
     audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
+    remote_audio_volume: RemoteAudioVolume,
 ) -> Result<PeerSession, String> {
     let include_audio = include_system_audio || audio_source_override.is_some();
     let (system_audio, audio_setup_error) = if include_audio {
@@ -1499,6 +1579,7 @@ async fn create_sender(
         turn_credentials,
         decoder_preference,
         audio_playback_factory,
+        remote_audio_volume,
     )
     .await?;
     let codec = RTCRtpCodec {
@@ -2012,6 +2093,7 @@ async fn create_receiver(
     turn_credentials: Option<&TurnCredentials>,
     decoder_preference: VideoDecoderPreference,
     audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
+    remote_audio_volume: RemoteAudioVolume,
 ) -> Result<PeerSession, String> {
     let connection = create_peer(
         events,
@@ -2025,6 +2107,7 @@ async fn create_receiver(
         turn_credentials,
         decoder_preference,
         audio_playback_factory,
+        remote_audio_volume,
     )
     .await?;
     let offer: RTCSessionDescription =
@@ -2133,6 +2216,7 @@ mod tests {
     use crate::audio_capture::AudioPlaybackSink;
     use rtc::peer_connection::transport::RTCIceCandidateType;
     use std::f32::consts::TAU;
+    use std::sync::atomic::AtomicU32;
 
     #[derive(Default)]
     struct SyntheticAudioProbe {
@@ -2143,6 +2227,7 @@ mod tests {
         playback_factory_starts: AtomicU64,
         decoded_frames: AtomicU64,
         decoded_audible_samples: AtomicU64,
+        decoded_output_peak_max_bits: AtomicU32,
     }
 
     struct SyntheticAudioSource {
@@ -2241,27 +2326,39 @@ mod tests {
             &self,
             _session_id: u64,
             _ssrc: u32,
+            volume: RemoteAudioVolume,
         ) -> Result<Box<dyn AudioPlaybackSink>, String> {
             self.probe
                 .playback_factory_starts
                 .fetch_add(1, Ordering::Relaxed);
             Ok(Box::new(SyntheticAudioPlayback {
                 probe: Arc::clone(&self.probe),
+                volume,
             }))
         }
     }
 
     struct SyntheticAudioPlayback {
         probe: Arc<SyntheticAudioProbe>,
+        volume: RemoteAudioVolume,
     }
 
     impl AudioPlaybackSink for SyntheticAudioPlayback {
         fn push_decoded(&mut self, samples: &[f32], frames_per_channel: usize) {
             self.probe.decoded_frames.fetch_add(1, Ordering::Relaxed);
+            let gain = self.volume.gain();
+            let peak = samples
+                .iter()
+                .take(frames_per_channel * OPUS_CHANNELS)
+                .map(|sample| (sample * gain).abs())
+                .fold(0.0_f32, f32::max);
+            self.probe
+                .decoded_output_peak_max_bits
+                .fetch_max(peak.to_bits(), Ordering::Relaxed);
             let audible = samples
                 .iter()
                 .take(frames_per_channel * OPUS_CHANNELS)
-                .filter(|sample| sample.abs() > 0.01)
+                .filter(|sample| (*sample * gain).abs() > 0.01)
                 .count() as u64;
             self.probe
                 .decoded_audible_samples
@@ -2346,7 +2443,9 @@ mod tests {
         let playback_factory = SyntheticAudioPlaybackFactory {
             probe: Arc::clone(&probe),
         };
-        let mut playback = playback_factory.start(1, 1).unwrap();
+        let mut playback = playback_factory
+            .start(1, 1, RemoteAudioVolume::default())
+            .unwrap();
         let mut encoder = opus::Encoder::new(
             OPUS_SAMPLE_RATE,
             opus::Channels::Stereo,
@@ -2380,6 +2479,38 @@ mod tests {
     }
 
     #[test]
+    fn remote_audio_volume_is_independent_between_sessions_and_inherited_by_new_sessions() {
+        let make_session = || {
+            ScreenShareSession::with_udp_address_and_audio_volume(
+                egui::Context::default(),
+                "127.0.0.1:0".to_owned(),
+                None,
+                None,
+                VideoDecoderPreference::Cpu,
+                Arc::new(SyntheticAudioPlaybackFactory {
+                    probe: Arc::new(SyntheticAudioProbe::default()),
+                }),
+                73,
+            )
+            .unwrap()
+        };
+        let first = make_session();
+        let second = make_session();
+
+        first.set_remote_audio_volume_percent(20);
+
+        assert_eq!(first.remote_audio_volume_percent(), 20);
+        assert_eq!(second.remote_audio_volume_percent(), 73);
+
+        let future = make_session();
+        assert_eq!(future.remote_audio_volume_percent(), 73);
+
+        first.stop();
+        second.stop();
+        future.stop();
+    }
+
+    #[test]
     fn loopback_group_audio_does_not_block_video_tracks_in_either_direction() {
         let context = egui::Context::default();
         let a_sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
@@ -2408,6 +2539,8 @@ mod tests {
             }),
         )
         .unwrap();
+        a_receiver.set_remote_audio_volume_percent(50);
+        b_receiver.set_remote_audio_volume_percent(0);
         let a_source = LatestFrame::default();
         let b_source = LatestFrame::default();
         let a_audio_source_probe = Arc::new(SyntheticAudioProbe::default());
@@ -2432,6 +2565,7 @@ mod tests {
         let mut next_frame = Instant::now() + FRAME_DURATION;
         let mut a_received = false;
         let mut b_received = false;
+        let mut b_volume_changed_after_frames = None;
         while Instant::now() < deadline {
             pump_signals(&a_sender, &b_receiver, "A to B offer");
             pump_signals(&b_receiver, &a_sender, "B to A answer");
@@ -2440,6 +2574,20 @@ mod tests {
 
             a_received |= a_receiver.latest_remote_frame().is_some();
             b_received |= b_receiver.latest_remote_frame().is_some();
+            let b_audio_frames = b_receive_audio_probe.decoded_frames.load(Ordering::Relaxed);
+            if b_volume_changed_after_frames.is_none() && b_audio_frames > 0 {
+                assert_eq!(
+                    f32::from_bits(
+                        b_receive_audio_probe
+                            .decoded_output_peak_max_bits
+                            .load(Ordering::Relaxed)
+                    ),
+                    0.0,
+                    "0% deve silenciar a sessÃ£o antes da alteraÃ§Ã£o ao vivo"
+                );
+                b_receiver.set_remote_audio_volume_percent(100);
+                b_volume_changed_after_frames = Some(b_audio_frames);
+            }
             if a_received && b_received {
                 let a_send = a_sender.metrics();
                 let b_send = b_sender.metrics();
@@ -2452,7 +2600,18 @@ mod tests {
                     && a_receive.published_frames > 0
                     && b_receive.published_frames > 0
                     && a_receive_audio_probe.decoded_frames.load(Ordering::Relaxed) > 0
-                    && b_receive_audio_probe.decoded_frames.load(Ordering::Relaxed) > 0
+                    && b_volume_changed_after_frames
+                        .is_some_and(|baseline| b_audio_frames >= baseline.saturating_add(5))
+                    && f32::from_bits(
+                        a_receive_audio_probe
+                            .decoded_output_peak_max_bits
+                            .load(Ordering::Relaxed),
+                    ) > 0.01
+                    && f32::from_bits(
+                        b_receive_audio_probe
+                            .decoded_output_peak_max_bits
+                            .load(Ordering::Relaxed),
+                    ) > 0.01
                 {
                     break;
                 }
@@ -2471,6 +2630,8 @@ mod tests {
         let b_send = b_sender.metrics();
         let a_receive = a_receiver.metrics();
         let b_receive = b_receiver.metrics();
+        let a_volume_percent = a_receiver.remote_audio_volume_percent();
+        let b_volume_percent = b_receiver.remote_audio_volume_percent();
         a_receiver.stop();
         b_receiver.stop();
         a_sender.stop();
@@ -2508,6 +2669,8 @@ mod tests {
         );
         assert!(a_receive_audio_probe.decoded_frames.load(Ordering::Relaxed) > 0);
         assert!(b_receive_audio_probe.decoded_frames.load(Ordering::Relaxed) > 0);
+        assert_eq!(a_volume_percent, 50);
+        assert_eq!(b_volume_percent, 100);
         assert!(
             a_receive_audio_probe
                 .decoded_audible_samples
@@ -2519,6 +2682,20 @@ mod tests {
                 .decoded_audible_samples
                 .load(Ordering::Relaxed)
                 > 0
+        );
+        assert!(
+            f32::from_bits(
+                a_receive_audio_probe
+                    .decoded_output_peak_max_bits
+                    .load(Ordering::Relaxed)
+            ) > 0.01
+        );
+        assert!(
+            f32::from_bits(
+                b_receive_audio_probe
+                    .decoded_output_peak_max_bits
+                    .load(Ordering::Relaxed)
+            ) > 0.01
         );
         assert_eq!(a_send.track_ssrc, b_receive.track_ssrc);
         assert_eq!(b_send.track_ssrc, a_receive.track_ssrc);

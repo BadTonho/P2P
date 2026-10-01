@@ -55,7 +55,7 @@ use webrtc::runtime::TokioRuntime;
 
 use crate::audio_capture::{
     AudioPlaybackFactory, AudioSampleSource, OPUS_CHANNELS, OPUS_FRAME_SAMPLES_PER_CHANNEL,
-    OPUS_SAMPLE_RATE, SystemAudioCapture, SystemAudioPlaybackFactory,
+    OPUS_SAMPLE_RATE, RemoteAudioVolume, SystemAudioCapture, SystemAudioPlaybackFactory,
 };
 use crate::logging::safe_stun_endpoint;
 use crate::mf_video;
@@ -414,4 +414,5 @@ struct PeerEvents {
     turn_enabled: bool,
     decoder_preference: VideoDecoderPreference,
     audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
+    remote_audio_volume: RemoteAudioVolume,
 }

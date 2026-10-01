@@ -221,6 +221,7 @@ struct ClientUi {
     microphone_level: f32,
     microphone_level_dbfs: f32,
     monitor_gain_db: f32,
+    remote_audio_default_volume_percent: u8,
     video_decoder_preference: VideoDecoderPreference,
     microphone_error: Option<String>,
     microphone_monitor_error: Option<String>,
@@ -458,6 +459,7 @@ impl ClientUi {
         settings.selected_host_index = self.selected_host_index;
         settings.stun_server_url = self.stun_server_url.clone();
         settings.monitor_gain_db = self.monitor_gain_db;
+        settings.remote_audio_default_volume_percent = self.remote_audio_default_volume_percent;
         settings.video_decoder_preference = self.video_decoder_preference;
         settings.show_local_preview = self.show_local_preview;
         settings.include_system_audio = self.include_system_audio;
@@ -478,6 +480,7 @@ impl ClientUi {
             .filter(|index| *index < self.saved_hosts.len());
         self.stun_server_url = preferences.stun_server_url;
         self.monitor_gain_db = preferences.monitor_gain_db;
+        self.remote_audio_default_volume_percent = preferences.remote_audio_default_volume_percent;
         self.video_decoder_preference = preferences.video_decoder_preference;
         self.show_local_preview = preferences.show_local_preview;
         self.include_system_audio = preferences.include_system_audio;
@@ -1300,12 +1303,13 @@ impl ClientUi {
                     }
                 };
 
-                match ScreenShareSession::new(
+                match ScreenShareSession::new_with_audio_volume(
                     context.clone(),
                     bind_ipv4,
                     self.stun_server_for_room(),
                     self.turn_credentials_for_room(),
                     self.video_decoder_preference,
+                    self.remote_audio_default_volume_percent,
                 ) {
                     Ok(session) => {
                         let metrics = session.metrics();
@@ -1367,12 +1371,13 @@ impl ClientUi {
                         return;
                     }
                 };
-                match ScreenShareSession::new(
+                match ScreenShareSession::new_with_audio_volume(
                     context.clone(),
                     bind_ipv4,
                     self.stun_server_for_room(),
                     self.turn_credentials_for_room(),
                     self.video_decoder_preference,
+                    self.remote_audio_default_volume_percent,
                 ) {
                     Ok(session) => {
                         if let Some(capture) = self.screen_capture.as_ref() {

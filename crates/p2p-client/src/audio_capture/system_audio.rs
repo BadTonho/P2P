@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use super::{AudioPlaybackFactory, AudioPlaybackSink, AudioSampleSource};
+use super::{
+    AudioPlaybackFactory, AudioPlaybackSink, AudioSampleSource, RemoteAudioVolume,
+    scale_remote_audio_sample,
+};
 
 pub(crate) const OPUS_SAMPLE_RATE: u32 = 48_000;
 pub(crate) const OPUS_CHANNELS: usize = 2;
@@ -404,10 +407,15 @@ pub(crate) struct RemoteAudioPlayback {
 struct PlaybackDiagnostics {
     callbacks: AtomicU64,
     non_silent_samples: AtomicU64,
+    volume: RemoteAudioVolume,
 }
 
 impl RemoteAudioPlayback {
-    pub(crate) fn start(session_id: u64, ssrc: u32) -> Result<Self, String> {
+    pub(crate) fn start(
+        session_id: u64,
+        ssrc: u32,
+        volume: RemoteAudioVolume,
+    ) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| {
             "Nenhuma saída padrão do Windows está disponível para reproduzir o áudio recebido."
@@ -428,7 +436,10 @@ impl RemoteAudioPlayback {
         let (producer, consumer) = RingBuffer::<f32>::new(queue_capacity);
         let output_underflow_frames = Arc::new(AtomicU64::new(0));
         let dropped_frames = Arc::new(AtomicU64::new(0));
-        let diagnostics = Arc::new(PlaybackDiagnostics::default());
+        let diagnostics = Arc::new(PlaybackDiagnostics {
+            volume,
+            ..PlaybackDiagnostics::default()
+        });
         let callback_error = Arc::new(Mutex::new(None));
         let stream = match sample_format {
             cpal::SampleFormat::I8 => build_playback_stream::<i8>(
@@ -661,8 +672,13 @@ impl AudioPlaybackSink for RemoteAudioPlayback {
 pub(crate) struct SystemAudioPlaybackFactory;
 
 impl AudioPlaybackFactory for SystemAudioPlaybackFactory {
-    fn start(&self, session_id: u64, ssrc: u32) -> Result<Box<dyn AudioPlaybackSink>, String> {
-        RemoteAudioPlayback::start(session_id, ssrc)
+    fn start(
+        &self,
+        session_id: u64,
+        ssrc: u32,
+        volume: RemoteAudioVolume,
+    ) -> Result<Box<dyn AudioPlaybackSink>, String> {
+        RemoteAudioPlayback::start(session_id, ssrc, volume)
             .map(|playback| Box::new(playback) as Box<dyn AudioPlaybackSink>)
     }
 }
@@ -733,6 +749,7 @@ where
                     }
                     primed = true;
                 }
+                let volume_gain = diagnostics.volume.gain();
                 let mut underrun = false;
                 let mut non_silent_samples = 0_u64;
                 for frame in output.chunks_mut(channels) {
@@ -751,6 +768,7 @@ where
                             1 => right,
                             _ => mono,
                         };
+                        let value = scale_remote_audio_sample(value, volume_gain);
                         non_silent_samples += u64::from(value.abs() > 0.001);
                         *sample = <T as cpal::Sample>::from_sample(value);
                     }

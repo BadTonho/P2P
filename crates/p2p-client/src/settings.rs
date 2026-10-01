@@ -3,7 +3,8 @@ use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Unexpected, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use signaling_protocol::RoomMode;
 
 const SETTINGS_DIRECTORY: &str = "P2P-Voz-e-tela";
@@ -63,6 +64,56 @@ pub struct AppSettings {
     pub include_system_audio: bool,
     #[serde(default)]
     pub profile_display_name: String,
+    #[serde(
+        default = "default_remote_audio_volume_percent",
+        deserialize_with = "deserialize_volume_percent"
+    )]
+    pub remote_audio_default_volume_percent: u8,
+}
+
+const fn default_remote_audio_volume_percent() -> u8 {
+    100
+}
+
+fn deserialize_volume_percent<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct VolumePercentVisitor;
+
+    impl Visitor<'_> for VolumePercentVisitor {
+        type Value = u8;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an integer volume percentage")
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.clamp(0, 100) as u8)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.min(100) as u8)
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if !value.is_finite() {
+                return Err(E::invalid_value(Unexpected::Float(value), &self));
+            }
+            Ok(value.round().clamp(0.0, 100.0) as u8)
+        }
+    }
+
+    deserializer.deserialize_any(VolumePercentVisitor)
 }
 
 impl Default for AppSettings {
@@ -83,6 +134,7 @@ impl Default for AppSettings {
             show_local_preview: true,
             include_system_audio: false,
             profile_display_name: String::new(),
+            remote_audio_default_volume_percent: default_remote_audio_volume_percent(),
         }
     }
 }
@@ -190,6 +242,8 @@ fn load_from(path: &Path) -> (AppSettings, Option<String>) {
     } else {
         settings.monitor_gain_db = settings.monitor_gain_db.clamp(0.0, 18.0);
     }
+    settings.remote_audio_default_volume_percent =
+        settings.remote_audio_default_volume_percent.min(100);
     let warning = (!migration_warnings.is_empty()).then(|| migration_warnings.join(" "));
     (settings, warning)
 }
@@ -213,6 +267,8 @@ fn save_to(path: &Path, settings: &AppSettings) -> io::Result<()> {
     } else {
         stored.monitor_gain_db = stored.monitor_gain_db.clamp(0.0, 18.0);
     }
+    stored.remote_audio_default_volume_percent =
+        stored.remote_audio_default_volume_percent.min(100);
 
     let temporary_path = path.with_extension("json.tmp");
     let mut file = File::create(&temporary_path)?;
@@ -296,6 +352,7 @@ mod tests {
             }],
             selected_host_index: Some(0),
             monitor_gain_db: 12.0,
+            remote_audio_default_volume_percent: 63,
             create_room_mode: RoomMode::InternetTest,
             may_host: true,
             control_ipv4: Some(Ipv4Addr::new(26, 10, 20, 30)),
@@ -366,6 +423,70 @@ mod tests {
         let loaded: AppSettings =
             serde_json::from_value(stored).expect("older settings files should remain compatible");
         assert!(loaded.profile_display_name.is_empty());
+    }
+
+    #[test]
+    fn older_settings_default_remote_audio_volume_to_full() {
+        let mut stored =
+            serde_json::to_value(AppSettings::default()).expect("settings should serialize");
+        stored
+            .as_object_mut()
+            .expect("settings should serialize as an object")
+            .remove("remote_audio_default_volume_percent");
+
+        let loaded: AppSettings =
+            serde_json::from_value(stored).expect("older settings files should remain compatible");
+        assert_eq!(loaded.remote_audio_default_volume_percent, 100);
+    }
+
+    #[test]
+    fn remote_audio_volume_percent_is_clamped_when_loading_and_saving() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).expect("test directory should be created");
+        let path = directory.join(SETTINGS_FILE);
+
+        let mut stored = serde_json::to_value(AppSettings::default())
+            .expect("settings should serialize")
+            .as_object()
+            .expect("settings should serialize as an object")
+            .clone();
+        stored.insert(
+            "remote_audio_default_volume_percent".to_owned(),
+            serde_json::json!(140),
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec(&stored).expect("settings should serialize"),
+        )
+        .expect("settings should be written");
+
+        let (loaded, warning) = load_from(&path);
+        assert_eq!(loaded.remote_audio_default_volume_percent, 100);
+        assert!(warning.is_none());
+
+        let mut settings = loaded;
+        settings.remote_audio_default_volume_percent = 200;
+        save_to(&path, &settings).expect("settings should save with a clamped value");
+        let (loaded, _) = load_from(&path);
+        assert_eq!(loaded.remote_audio_default_volume_percent, 100);
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn remote_audio_volume_percent_clamps_negative_values_to_zero() {
+        let mut stored =
+            serde_json::to_value(AppSettings::default()).expect("settings should serialize");
+        stored
+            .as_object_mut()
+            .expect("settings should serialize as an object")
+            .insert(
+                "remote_audio_default_volume_percent".to_owned(),
+                serde_json::json!(-15),
+            );
+
+        let loaded: AppSettings =
+            serde_json::from_value(stored).expect("negative percentages should be clamped");
+        assert_eq!(loaded.remote_audio_default_volume_percent, 0);
     }
 
     #[test]

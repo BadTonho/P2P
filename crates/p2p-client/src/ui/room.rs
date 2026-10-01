@@ -1,8 +1,27 @@
-use super::super::{ClientUi, RoomMode, ScreenShareRole, signaling_ws_url};
+use super::super::{ClientUi, RoomMode, ScreenShareRole, ScreenShareSession, signaling_ws_url};
 use crate::screen_capture::ScreenCapture;
 use eframe::egui;
 use signaling_protocol::ParticipantInfo;
 use std::sync::{Arc, atomic::Ordering};
+
+fn remote_audio_volume_context_menu(response: egui::Response, current_percent: u8) -> Option<u8> {
+    let mut changed_volume = None;
+    response.context_menu(|ui| {
+        ui.label("Volume da transmissão");
+        let mut percent = f32::from(current_percent);
+        if ui
+            .add(
+                egui::Slider::new(&mut percent, 0.0..=100.0)
+                    .integer()
+                    .suffix("%"),
+            )
+            .changed()
+        {
+            changed_volume = Some(percent.round().clamp(0.0, 100.0) as u8);
+        }
+    });
+    changed_volume
+}
 
 impl ClientUi {
     pub(super) fn show_room(&mut self, ui: &mut egui::Ui) {
@@ -109,6 +128,12 @@ impl ClientUi {
         ui.add_space(8.0);
         let stage_width = ui.available_width();
         let stage_height = ui.available_height().clamp(280.0, 680.0);
+        let direct_remote_volume = self
+            .screen_share_session
+            .as_ref()
+            .map(ScreenShareSession::remote_audio_volume_percent)
+            .unwrap_or(self.remote_audio_default_volume_percent);
+        let mut direct_volume_change = None;
         egui::Frame::group(ui.style()).show(ui, |stage| {
             stage.set_min_size(egui::vec2(stage_width, stage_height));
             if self.group_sharing_compatible() {
@@ -125,9 +150,14 @@ impl ClientUi {
                             let image_size = source * scale.max(0.01);
                             stage.vertical_centered(|ui| {
                                 ui.add_space(((stage_height - image_size.y) * 0.5).max(0.0));
-                                ui.add(
+                                let response = ui.add(
                                     egui::Image::new((texture.id(), source))
-                                        .fit_to_exact_size(image_size),
+                                        .fit_to_exact_size(image_size)
+                                        .sense(egui::Sense::click()),
+                                );
+                                direct_volume_change = remote_audio_volume_context_menu(
+                                    response,
+                                    direct_remote_volume,
                                 );
                             });
                         } else {
@@ -194,6 +224,13 @@ impl ClientUi {
                 }
             }
         });
+
+        if let Some(volume) = direct_volume_change {
+            if let Some(session) = self.screen_share_session.as_ref() {
+                session.set_remote_audio_volume_percent(volume);
+            }
+            self.remote_audio_default_volume_percent = volume;
+        }
 
         if let Some(reason) = self
             .screen_capture
@@ -601,6 +638,12 @@ impl ClientUi {
         let focused = self.focused_group_screen.clone();
         if let Some(id) = focused.as_deref() {
             if let Some(texture) = self.group_remote_textures.get(id) {
+                let current_volume = self
+                    .group_inbound_sessions
+                    .get(id)
+                    .map(ScreenShareSession::remote_audio_volume_percent)
+                    .unwrap_or(self.remote_audio_default_volume_percent);
+                let mut volume_change = None;
                 let source = texture.size_vec2();
                 let available = ui.available_size();
                 let scale = (available.x / source.x)
@@ -608,14 +651,22 @@ impl ClientUi {
                     .min(1.0);
                 ui.vertical_centered(|ui| {
                     ui.add_space(((stage_height - source.y * scale.max(0.01)) * 0.5).max(0.0));
-                    ui.add(
+                    let response = ui.add(
                         egui::Image::new((texture.id(), source))
-                            .fit_to_exact_size(source * scale.max(0.01)),
+                            .fit_to_exact_size(source * scale.max(0.01))
+                            .sense(egui::Sense::click()),
                     );
+                    volume_change = remote_audio_volume_context_menu(response, current_volume);
                     if ui.button("Voltar à grade").clicked() {
                         self.focused_group_screen = None;
                     }
                 });
+                if let Some(volume) = volume_change {
+                    if let Some(session) = self.group_inbound_sessions.get(id) {
+                        session.set_remote_audio_volume_percent(volume);
+                    }
+                    self.remote_audio_default_volume_percent = volume;
+                }
                 return;
             }
             if id == "__local" {
@@ -675,14 +726,23 @@ impl ClientUi {
                         .find(|p| p.id == peer_id)
                         .map(|p| p.display_name.clone())
                         .unwrap_or_else(|| "Participante".to_owned());
+                    let current_volume = self
+                        .group_inbound_sessions
+                        .get(&peer_id)
+                        .map(ScreenShareSession::remote_audio_volume_percent)
+                        .unwrap_or(self.remote_audio_default_volume_percent);
+                    let mut volume_change = None;
                     egui::Frame::group(ui.style()).show(ui, |tile| {
                         tile.set_min_size(egui::vec2(300.0, 195.0));
                         tile.label(name);
                         if let Some(texture) = self.group_remote_textures.get(&peer_id) {
-                            tile.add(
+                            let response = tile.add(
                                 egui::Image::new((texture.id(), texture.size_vec2()))
-                                    .fit_to_exact_size(egui::vec2(280.0, 158.0)),
+                                    .fit_to_exact_size(egui::vec2(280.0, 158.0))
+                                    .sense(egui::Sense::click()),
                             );
+                            volume_change =
+                                remote_audio_volume_context_menu(response, current_volume);
                             if tile.button("Ampliar").clicked() {
                                 self.focused_group_screen = Some(peer_id.clone());
                             }
@@ -695,6 +755,12 @@ impl ClientUi {
                             );
                         }
                     });
+                    if let Some(volume) = volume_change {
+                        if let Some(session) = self.group_inbound_sessions.get(&peer_id) {
+                            session.set_remote_audio_volume_percent(volume);
+                        }
+                        self.remote_audio_default_volume_percent = volume;
+                    }
                 }
                 if !self.group_local_sharing && self.group_watched_shares.is_empty() {
                     ui.vertical_centered(|ui| {
