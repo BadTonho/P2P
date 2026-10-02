@@ -421,6 +421,7 @@ impl ClientUi {
                 self.group_local_sharing = enabled;
                 self.audio_status = None;
                 if !enabled {
+                    self.clear_local_preview();
                     let generations = self
                         .group_outbound_generations
                         .iter()
@@ -667,6 +668,7 @@ impl ClientUi {
         self.group_peer_status.clear();
         self.group_audio_status.clear();
         self.group_local_sharing = false;
+        self.clear_local_preview();
         self.audio_status = None;
         self.focused_group_screen = None;
     }

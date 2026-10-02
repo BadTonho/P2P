@@ -399,6 +399,7 @@ impl ClientUi {
                     .checkbox(&mut self.show_local_preview, "Mostrar minha prévia")
                     .changed();
                 if preview_changed {
+                    self.clear_local_preview();
                     self.capture_preview_enabled
                         .store(self.show_local_preview, Ordering::Relaxed);
                     self.save_preferences();
@@ -439,6 +440,7 @@ impl ClientUi {
                     .checkbox(&mut self.show_local_preview, "Mostrar minha prévia")
                     .changed();
                 if preview_changed {
+                    self.clear_local_preview();
                     self.capture_preview_enabled
                         .store(self.show_local_preview, Ordering::Relaxed);
                     tracing::info!(
@@ -541,6 +543,7 @@ impl ClientUi {
                         Arc::clone(&self.capture_preview_enabled),
                     ) {
                         Ok(capture) => {
+                            self.clear_local_preview();
                             self.screen_capture = Some(capture);
                             self.screen_status = Some(
                                 "Captura DXGI ativa; o app não adiciona a borda de captura do Windows."

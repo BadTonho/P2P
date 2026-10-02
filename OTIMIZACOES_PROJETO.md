@@ -4,28 +4,39 @@
 
 Reduzir trabalho repetido na interface, captura e processamento de vídeo, além de evitar interrupções desnecessárias das sessões em grupo.
 
-Estas sugestões resultam da leitura do código atual. Ainda não foram implementadas nem medidas e não demonstram a causa do FPS baixo. As sugestões específicas de áudio estão em [OTIMIZACOES_AUDIO.md](OTIMIZACOES_AUDIO.md).
+Estas sugestões resultam da leitura do código. O item 1 foi implementado e verificado automaticamente; os demais continuam como propostas. Ainda não há medição de ganho de CPU ou FPS, e estas oportunidades não demonstram a causa do FPS baixo. As sugestões específicas de áudio estão em [OTIMIZACOES_AUDIO.md](OTIMIZACOES_AUDIO.md).
 
 ## Oportunidades identificadas
 
 | Área | Situação atual e proposta | Escopo estimado |
 |---|---|---|
-| Prévia local | O mesmo quadro pode ser convertido e reenviado à GPU em vários ciclos da interface. Atualizar a textura somente quando chegar um quadro novo. | Pequeno |
+| Prévia local | Implementado: a textura é atualizada somente para um quadro novo ou quando precisa ser recriada. Verificação visual em monitores reais pendente. | Pequeno |
 | Captura e decoder DXVA | As texturas usadas para leitura pela CPU são criadas novamente a cada quadro. Reutilizá-las enquanto dispositivo, dimensões e formato permanecerem compatíveis. | Médio |
 | Caminho GPU | A captura lê NV12 de volta para a CPU mesmo com a prévia desligada. Avaliar uma leitura somente quando necessária para a prévia ou para o fallback do encoder. | Médio |
 | Sessões em grupo | O reequilíbrio encerra e recria todas as sessões de envio. Preservar as conexões existentes quando entra ou sai um espectador, considerando mudanças de bitrate. | Médio |
 | Codificação de vídeo | Existe um encoder por espectador. Avaliar uma codificação compartilhada para espectadores com configurações compatíveis. | Grande |
 | Logs | A escrita ocorre na própria thread que registra o evento. Avaliar uma fila limitada e um worker para escrita. | Médio |
 
-## 1. Atualizar a prévia somente com quadro novo
+## 1. Atualizar a prévia somente com quadro novo — implementado
 
 **Arquivo:** `crates/p2p-client/src/app.rs`, no método `refresh_screen`.
 
-- Guardar a sequência do último quadro enviado à textura local.
-- Converter e atualizar a textura somente quando a sequência mudar.
-- Limpar essa referência ao trocar ou encerrar a captura.
-- Garantir que reabrir a prévia mostre o quadro atual, inclusive quando a imagem estiver parada.
-- Testar quadro repetido, quadro novo, troca de captura e reativação da prévia.
+- A chave do último quadro apresentado guarda sequência, largura e altura. A conversão e a atualização da textura ocorrem quando a chave muda ou a textura precisa ser recriada.
+- A textura, a chave e a falha de conversão são limpas ao ocultar a prévia, iniciar uma captura DXGI ou pelo seletor do Windows, encerrar o compartilhamento, perder a fonte ou sair da sala.
+- Reabrir a prévia usa o último quadro disponível, inclusive quando há somente NV12 pela CPU. Essa conversão utiliza o auxiliar existente e não exige uma nova captura para mostrar uma imagem parada.
+- Quadros sem dados utilizáveis não avançam a chave apresentada. Uma falha de conversão é mostrada no estado de captura existente e não encerra a transmissão; o mesmo quadro com falha não é tentado novamente até mudar a chave ou reativar a prévia.
+- Os auxiliares internos são exercitados com egui e quadros sintéticos, sem depender de monitor físico ou renderizador GPU.
+
+**Validações executadas em 2026-10-02, versão 1.2.2:**
+
+- Antes da correção, o teste de regressão reproduziu **10 atualizações de textura em 10 ciclos** com o mesmo quadro. Após a correção, o mesmo teste confirmou **1 atualização em 10 ciclos**.
+- Foram adicionados 11 testes para repetição de quadro, nova sequência, dimensões diferentes, volta da sequência, recriação da textura, ocultar/reativar, ausência de dados, conversão NV12, falhas e limpeza do estado nos caminhos de encerramento.
+- `cargo test -p p2p-client local_preview --locked --offline -- --nocapture`: **13 testes passaram**, incluindo dois testes existentes encontrados pelo filtro.
+- `cargo fmt --all -- --check`: **passou**.
+- `cargo test --workspace --locked --offline`: **176 testes passaram** (163 no cliente, 2 no protocolo e 11 no servidor), sem falhas ou testes ignorados.
+- `cargo build --workspace --locked --offline`: **passou**; gerou o executável de desenvolvimento em `target/debug/p2p-client.exe`. O compilador de recursos do Windows SDK foi configurado em `RC`.
+
+**Pendente:** conferir visualmente imagem parada e em movimento, alternar a prévia e trocar os monitores reais. Os testes comprovam a eliminação de atualizações duplicadas e a restauração com dados sintéticos; não medem ganho de FPS nem validam DXGI real. Nenhum release ou instalador foi gerado nesta etapa.
 
 ## 2. Reutilizar texturas de leitura e avaliar buffers reutilizáveis
 
@@ -86,7 +97,7 @@ O ganho deve ser medido especialmente com logs detalhados ativados.
 
 ## Ordem recomendada
 
-1. Prévia somente com quadro novo.
+1. Prévia somente com quadro novo — implementação e verificações automatizadas concluídas; conferência visual pendente.
 2. Reutilização das texturas de leitura.
 3. Preservação das sessões de grupo.
 4. Leitura GPU → CPU somente quando necessária.

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::{
@@ -12,7 +13,7 @@ use crate::logging::{
     DiagnosticSnapshot, LoggingState, safe_signaling_endpoint, safe_stun_endpoint,
 };
 use crate::profile;
-use crate::screen_capture::{MonitorOption, PendingScreenCapture, ScreenCapture};
+use crate::screen_capture::{MonitorOption, PendingScreenCapture, PreviewFrame, ScreenCapture};
 use crate::screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
 use crate::settings::{
     AppSettings, LoggingLevel, MAX_SAVED_HOSTS, SavedHostProfile, VideoDecoderPreference,
@@ -37,6 +38,67 @@ const TURN_CONFIG_SIGNAL_PREFIX: &str = "p2p-turn-room-config-v1:";
 const GROUP_SCREEN_MAX_AGGREGATE_BITRATE: u32 = 8_000_000;
 const GROUP_SCREEN_MAX_PEER_BITRATE: u32 = 4_000_000;
 const GROUP_SIGNAL_ID_PREFIX: &str = "p2p-group-session-v1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalPreviewFrameKey {
+    sequence: u64,
+    width: u32,
+    height: u32,
+}
+
+impl From<&PreviewFrame> for LocalPreviewFrameKey {
+    fn from(frame: &PreviewFrame) -> Self {
+        Self {
+            sequence: frame.sequence,
+            width: frame.width,
+            height: frame.height,
+        }
+    }
+}
+
+fn local_preview_image(frame: &PreviewFrame) -> Result<Option<egui::ColorImage>, String> {
+    if frame.rgba.is_empty() {
+        #[cfg(windows)]
+        if frame.cpu_nv12.is_none() {
+            return Ok(None);
+        }
+        #[cfg(not(windows))]
+        return Ok(None);
+    }
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let expected_bytes = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| "O quadro da prévia tem dimensões inválidas.".to_owned())?;
+    let rgba = if !frame.rgba.is_empty() {
+        Cow::Borrowed(frame.rgba.as_slice())
+    } else {
+        #[cfg(windows)]
+        {
+            if width % 2 != 0 || height % 2 != 0 {
+                return Err("O quadro NV12 da prévia precisa de dimensões pares.".to_owned());
+            }
+            let nv12 = frame.cpu_nv12.as_ref().expect("NV12 availability checked");
+            // Reopening a static preview must not wait for another DXGI frame.
+            Cow::Owned(crate::mf_video::cpu_nv12_to_rgba(
+                nv12,
+                frame.width,
+                frame.height,
+            )?)
+        }
+        #[cfg(not(windows))]
+        return Ok(None);
+    };
+    if rgba.len() != expected_bytes {
+        return Err("Os dados RGBA da prévia estão incompletos.".to_owned());
+    }
+    Ok(Some(egui::ColorImage::from_rgba_unmultiplied(
+        [width, height],
+        &rgba,
+    )))
+}
 
 fn settings_navigation_button(settings_open: bool) -> (&'static str, &'static str) {
     if settings_open {
@@ -243,6 +305,8 @@ struct ClientUi {
     monitor_menu_open: bool,
     dxgi_capture_error: Option<String>,
     screen_texture: Option<egui::TextureHandle>,
+    local_preview_frame_key: Option<LocalPreviewFrameKey>,
+    local_preview_failure: Option<(LocalPreviewFrameKey, String)>,
     show_local_preview: bool,
     capture_preview_enabled: Arc<AtomicBool>,
     screen_status: Option<String>,
@@ -1013,7 +1077,7 @@ impl ClientUi {
         self.capture_preview_enabled
             .store(preview_active, Ordering::Relaxed);
         if !preview_active {
-            self.screen_texture = None;
+            self.clear_local_preview();
         }
 
         let picker_result = if self.settings_open {
@@ -1028,6 +1092,7 @@ impl ClientUi {
             self.screen_picker = None;
             match result {
                 Ok(Some(capture)) => {
+                    self.clear_local_preview();
                     self.screen_capture = Some(capture);
                     self.screen_status =
                         Some("A prévia atualiza enquanto a captura estiver ativa.".to_owned());
@@ -1046,27 +1111,11 @@ impl ClientUi {
         }
 
         let Some(capture) = self.screen_capture.as_mut() else {
+            self.clear_local_preview();
             return;
         };
 
-        if preview_active
-            && let Some(frame) = capture.latest_frame()
-            && !frame.rgba.is_empty()
-        {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                &frame.rgba,
-            );
-            if let Some(texture) = self.screen_texture.as_mut() {
-                texture.set(image, egui::TextureOptions::LINEAR);
-            } else {
-                self.screen_texture = Some(context.load_texture(
-                    "screen-preview",
-                    image,
-                    egui::TextureOptions::LINEAR,
-                ));
-            }
-        }
+        let frame = capture.latest_frame();
 
         if capture.source_closed() {
             self.stop_screen_share(true);
@@ -1080,7 +1129,7 @@ impl ClientUi {
         if let Some(result) = capture.poll_finished() {
             self.stop_screen_share(true);
             self.screen_capture = None;
-            self.screen_texture = None;
+            self.clear_local_preview();
             self.screen_status = Some(match result {
                 Ok(()) => "A captura da tela foi encerrada pelo Windows.".to_owned(),
                 Err(error) => {
@@ -1090,7 +1139,68 @@ impl ClientUi {
                     format!("A captura da tela falhou: {error}")
                 }
             });
+            return;
         }
+        self.refresh_local_preview(context, preview_active, frame.as_deref());
+    }
+
+    fn refresh_local_preview(
+        &mut self,
+        context: &egui::Context,
+        preview_active: bool,
+        frame: Option<&PreviewFrame>,
+    ) {
+        if !preview_active {
+            self.clear_local_preview();
+            return;
+        }
+        let Some(frame) = frame else {
+            return;
+        };
+        let key = LocalPreviewFrameKey::from(frame);
+        if (self.local_preview_frame_key == Some(key) && self.screen_texture.is_some())
+            || self
+                .local_preview_failure
+                .as_ref()
+                .is_some_and(|(failed_key, _)| *failed_key == key)
+        {
+            return;
+        }
+        let image = match local_preview_image(frame) {
+            Ok(Some(image)) => image,
+            Ok(None) => return,
+            Err(error) => {
+                self.clear_local_preview();
+                let message = format!(
+                    "Não foi possível mostrar a prévia local; a transmissão continua: {error}"
+                );
+                self.screen_status = Some(message.clone());
+                self.local_preview_failure = Some((key, message));
+                return;
+            }
+        };
+        if let Some(texture) = self.screen_texture.as_mut() {
+            texture.set(image, egui::TextureOptions::LINEAR);
+        } else {
+            self.screen_texture =
+                Some(context.load_texture("screen-preview", image, egui::TextureOptions::LINEAR));
+        }
+        self.local_preview_frame_key = Some(key);
+        self.clear_local_preview_failure();
+    }
+
+    fn clear_local_preview_failure(&mut self) {
+        if let Some((_, message)) = self.local_preview_failure.take()
+            && self.screen_status.as_deref() == Some(message.as_str())
+        {
+            self.screen_status = None;
+        }
+    }
+
+    fn clear_local_preview(&mut self) {
+        self.screen_texture = None;
+        self.local_preview_frame_key = None;
+        self.clear_local_preview_failure();
     }
 
     fn stop_screen_capture(&mut self) {
@@ -1099,7 +1209,7 @@ impl ClientUi {
             .screen_capture
             .take()
             .map_or(Ok(()), |mut capture| capture.stop());
-        self.screen_texture = None;
+        self.clear_local_preview();
         self.screen_status = Some(match result {
             Ok(()) => "Captura da tela parada.".to_owned(),
             Err(error) => {
@@ -1940,7 +2050,7 @@ impl ClientUi {
         self.remote_screen_texture = None;
         self.remote_screen_sequence = 0;
         if was_sending {
-            self.screen_texture = None;
+            self.clear_local_preview();
             self.capture_preview_enabled.store(false, Ordering::Relaxed);
         }
         if was_active {
@@ -2510,6 +2620,380 @@ mod tests {
             size_bytes: 10,
             sha256: "a".repeat(64),
         }
+    }
+
+    fn local_preview_frame(
+        sequence: u64,
+        width: u32,
+        height: u32,
+    ) -> crate::screen_capture::PreviewFrame {
+        crate::screen_capture::PreviewFrame {
+            sequence,
+            width,
+            height,
+            rgba: vec![96; (width * height * 4) as usize],
+            #[cfg(windows)]
+            gpu_nv12: None,
+            #[cfg(windows)]
+            cpu_nv12: None,
+        }
+    }
+
+    fn render_local_preview(
+        app: &mut super::ClientUi,
+        context: &egui::Context,
+        active: bool,
+        frame: Option<&crate::screen_capture::PreviewFrame>,
+    ) -> usize {
+        let previous_id = app.screen_texture.as_ref().map(egui::TextureHandle::id);
+        let mut output = context.run_ui(egui::RawInput::default(), |_| {
+            app.refresh_local_preview(context, active, frame);
+        });
+        let texture_id = app
+            .screen_texture
+            .as_ref()
+            .map(egui::TextureHandle::id)
+            .or(previous_id);
+        let uploads = texture_id
+            .and_then(|id| output.textures_delta.set.get(&id))
+            .map_or(0, |deltas| deltas.len());
+        // The tests inspect upload requests without a GPU renderer.
+        output.textures_delta.clear();
+        uploads
+    }
+
+    #[cfg(windows)]
+    fn local_preview_nv12_frame(sequence: u64) -> crate::screen_capture::PreviewFrame {
+        let mut frame = local_preview_frame(sequence, 2, 2);
+        frame.rgba.clear();
+        frame.cpu_nv12 = Some(std::sync::Arc::new(crate::screen_capture::CpuNv12Frame {
+            bytes: std::sync::Arc::new(vec![16, 16, 16, 16, 128, 128]),
+            stride: 2,
+        }));
+        frame
+    }
+
+    #[test]
+    fn local_preview_repeated_frame_uploads_only_once() {
+        let context = egui::Context::default();
+        let mut app = super::ClientUi::default();
+        let frame = local_preview_frame(1, 2, 2);
+        let mut uploads = 0;
+        for _ in 0..10 {
+            uploads += render_local_preview(&mut app, &context, true, Some(&frame));
+        }
+        assert_eq!(
+            uploads, 1,
+            "the same captured frame must not be uploaded on every UI cycle"
+        );
+    }
+
+    #[test]
+    fn local_preview_updates_for_new_sequence_dimensions_and_sequence_wrap() {
+        let context = egui::Context::default();
+        let mut app = super::ClientUi::default();
+        let frames = [
+            local_preview_frame(u64::MAX, 2, 2),
+            local_preview_frame(0, 2, 2),
+            local_preview_frame(0, 4, 2),
+            local_preview_frame(0, 4, 4),
+        ];
+        let mut texture_id = None;
+        for frame in &frames {
+            assert_eq!(
+                render_local_preview(&mut app, &context, true, Some(frame)),
+                1
+            );
+            let texture = app.screen_texture.as_ref().unwrap();
+            assert_eq!(
+                texture.size(),
+                [frame.width as usize, frame.height as usize]
+            );
+            assert_eq!(*texture_id.get_or_insert(texture.id()), texture.id());
+            assert_eq!(
+                app.local_preview_frame_key,
+                Some(super::LocalPreviewFrameKey::from(frame))
+            );
+            assert_eq!(
+                render_local_preview(&mut app, &context, true, Some(frame)),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn local_preview_recreates_missing_texture_for_the_same_frame() {
+        let context = egui::Context::default();
+        let mut app = super::ClientUi::default();
+        let frame = local_preview_frame(1, 2, 2);
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            1
+        );
+        let previous_id = app.screen_texture.take().unwrap().id();
+        assert!(app.local_preview_frame_key.is_some());
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            1
+        );
+        assert_ne!(app.screen_texture.as_ref().unwrap().id(), previous_id);
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            0
+        );
+    }
+
+    #[test]
+    fn local_preview_hide_and_reopen_restores_a_static_frame_once() {
+        let context = egui::Context::default();
+        let mut app = super::ClientUi::default();
+        let frame = local_preview_frame(1, 2, 2);
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            1
+        );
+        assert_eq!(
+            render_local_preview(&mut app, &context, false, Some(&frame)),
+            0
+        );
+        assert!(app.screen_texture.is_none());
+        assert!(app.local_preview_frame_key.is_none());
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            1
+        );
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            0
+        );
+    }
+
+    #[test]
+    fn local_preview_absent_data_does_not_advance_the_presented_key() {
+        let context = egui::Context::default();
+        let mut app = super::ClientUi::default();
+        let mut frame = local_preview_frame(1, 2, 2);
+        frame.rgba.clear();
+        assert_eq!(render_local_preview(&mut app, &context, true, None), 0);
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            0
+        );
+        assert!(app.screen_texture.is_none());
+        assert!(app.local_preview_frame_key.is_none());
+        assert!(app.local_preview_failure.is_none());
+        assert!(app.screen_status.is_none());
+        frame.rgba = vec![96; 16];
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            1
+        );
+        let last_key = app.local_preview_frame_key;
+        frame.sequence += 1;
+        frame.rgba.clear();
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            0
+        );
+        assert_eq!(app.local_preview_frame_key, last_key);
+        assert!(app.screen_texture.is_some());
+    }
+
+    #[test]
+    fn local_preview_invalid_rgba_only_stops_preview_and_caches_failure() {
+        let context = egui::Context::default();
+        let mut app = super::ClientUi::default();
+        app.screen_share_role = super::ScreenShareRole::Sending {
+            request_id: "test".to_owned(),
+        };
+        app.group_local_sharing = true;
+        let mut frame = local_preview_frame(1, 2, 2);
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            1
+        );
+        frame.sequence += 1;
+        frame.rgba.truncate(3);
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            0
+        );
+        assert!(app.screen_texture.is_none());
+        assert!(app.local_preview_frame_key.is_none());
+        assert!(app.screen_status.as_ref().unwrap().contains("prévia local"));
+        assert!(app.local_preview_failure.is_some());
+        assert!(matches!(
+            app.screen_share_role,
+            super::ScreenShareRole::Sending { .. }
+        ));
+        assert!(app.group_local_sharing);
+        // A retry would replace this status with the conversion error again.
+        app.screen_status = Some("Outro aviso de captura".to_owned());
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            0
+        );
+        assert_eq!(app.screen_status.as_deref(), Some("Outro aviso de captura"));
+        let valid = local_preview_frame(3, 2, 2);
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&valid)),
+            1
+        );
+        assert!(app.local_preview_failure.is_none());
+        assert_eq!(app.screen_status.as_deref(), Some("Outro aviso de captura"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_preview_reopens_static_nv12_without_another_capture_frame() {
+        let context = egui::Context::default();
+        let mut app = super::ClientUi::default();
+        let rgba = local_preview_frame(1, 2, 2);
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&rgba)),
+            1
+        );
+        assert_eq!(render_local_preview(&mut app, &context, false, None), 0);
+        let nv12 = local_preview_nv12_frame(1);
+        let image = super::local_preview_image(&nv12).unwrap().unwrap();
+        assert_eq!(image.size, [2, 2]);
+        assert_eq!(image.pixels, vec![egui::Color32::BLACK; 4]);
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&nv12)),
+            1
+        );
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&nv12)),
+            0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_preview_nv12_failure_retries_only_after_new_frame_or_reactivation() {
+        let context = egui::Context::default();
+        let mut app = super::ClientUi::default();
+        app.group_local_sharing = true;
+        let mut frame = local_preview_nv12_frame(1);
+        frame
+            .cpu_nv12
+            .as_mut()
+            .unwrap()
+            .clone_from(&std::sync::Arc::new(crate::screen_capture::CpuNv12Frame {
+                bytes: std::sync::Arc::new(vec![16]),
+                stride: 2,
+            }));
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            0
+        );
+        assert!(app.screen_status.is_some());
+        assert!(app.local_preview_frame_key.is_none());
+        app.screen_status = None;
+        for _ in 0..10 {
+            assert_eq!(
+                render_local_preview(&mut app, &context, true, Some(&frame)),
+                0
+            );
+        }
+        assert!(
+            app.screen_status.is_none(),
+            "unchanged failed frames must not retry conversion"
+        );
+        frame.sequence += 1;
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            0
+        );
+        assert!(
+            app.screen_status.is_some(),
+            "a new frame permits another attempt"
+        );
+        assert_eq!(render_local_preview(&mut app, &context, false, None), 0);
+        assert!(app.local_preview_failure.is_none());
+        assert!(app.screen_status.is_none());
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            0
+        );
+        assert!(
+            app.screen_status.is_some(),
+            "reopening also permits another attempt"
+        );
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&local_preview_nv12_frame(3))),
+            1
+        );
+        assert!(
+            app.screen_status.is_none(),
+            "success clears the preview's own error"
+        );
+        assert!(app.group_local_sharing);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_preview_rejects_odd_nv12_dimensions_without_panicking() {
+        let mut frame = local_preview_nv12_frame(1);
+        frame.width = 1;
+        assert!(
+            super::local_preview_image(&frame)
+                .unwrap_err()
+                .contains("dimensões pares")
+        );
+        frame.width = 2;
+        frame.height = 1;
+        assert!(
+            super::local_preview_image(&frame)
+                .unwrap_err()
+                .contains("dimensões pares")
+        );
+    }
+
+    #[test]
+    fn local_preview_lifecycle_reset_allows_a_new_capture_to_reuse_sequence() {
+        let context = egui::Context::default();
+        let frame = local_preview_frame(1, 2, 2);
+        let stop_actions: [fn(&mut super::ClientUi); 4] = [
+            |app| app.stop_screen_share(false),
+            super::ClientUi::stop_screen_capture,
+            super::ClientUi::leave_room,
+            |app| app.stop_group_media(false),
+        ];
+        for stop in stop_actions {
+            let mut app = super::ClientUi::default();
+            app.screen_share_role = super::ScreenShareRole::Sending {
+                request_id: "test".to_owned(),
+            };
+            assert_eq!(
+                render_local_preview(&mut app, &context, true, Some(&frame)),
+                1
+            );
+            stop(&mut app);
+            assert!(app.screen_texture.is_none());
+            assert!(app.local_preview_frame_key.is_none());
+            assert!(app.local_preview_failure.is_none());
+            assert_eq!(
+                render_local_preview(&mut app, &context, true, Some(&frame)),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn local_preview_missing_capture_clears_a_stale_texture() {
+        let context = egui::Context::default();
+        let mut app = super::ClientUi::default();
+        app.group_local_sharing = true;
+        app.show_local_preview = true;
+        let frame = local_preview_frame(1, 2, 2);
+        assert_eq!(
+            render_local_preview(&mut app, &context, true, Some(&frame)),
+            1
+        );
+        app.refresh_screen(&context);
+        assert!(app.screen_texture.is_none());
+        assert!(app.local_preview_frame_key.is_none());
     }
 
     #[test]

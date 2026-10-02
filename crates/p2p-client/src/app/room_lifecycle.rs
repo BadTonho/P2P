@@ -566,7 +566,7 @@ impl ClientUi {
             if let Some(mut capture) = self.screen_capture.take() {
                 let _ = capture.stop();
             }
-            self.screen_texture = None;
+            self.clear_local_preview();
         }
     }
 
@@ -760,7 +760,7 @@ impl ClientUi {
         if let Some(mut capture) = self.screen_capture.take() {
             let _ = capture.stop();
         }
-        self.screen_texture = None;
+        self.clear_local_preview();
         self.room_code = None;
         self.participants.clear();
         self.current_leader_id.clear();
