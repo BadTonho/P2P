@@ -10,8 +10,8 @@ use rtrb::Producer;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio;
 use windows::Win32::Media::Audio::{
-    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
     AudioSessionStateActive, IAudioCaptureClient, IAudioClient, IAudioSessionControl2,
     IAudioSessionManager2, IMMDeviceEnumerator, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
@@ -21,8 +21,8 @@ use windows::Win32::System::Com::StructuredStorage::{
     PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
 };
 use windows::Win32::System::Com::{
-    BLOB, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
-    CoUninitialize,
+    BLOB, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemAlloc,
+    CoTaskMemFree, CoUninitialize, IAgileObject,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -46,6 +46,8 @@ struct ActivationCompletionHandler {
     vtable: *const ActivationCompletionHandlerVtable,
     references: AtomicU32,
     sender: mpsc::SyncSender<AudioActivationResult>,
+    // Keep the COM-owned blob alive even if the caller times out before completion.
+    parameters: PROPVARIANT,
 }
 
 #[repr(C)]
@@ -70,7 +72,10 @@ unsafe extern "system" fn activation_query_interface(
         return HRESULT(0x80004003u32 as i32);
     }
     let iid = unsafe { &*iid };
-    if iid == &IUnknown::IID || iid == &Audio::IActivateAudioInterfaceCompletionHandler::IID {
+    if iid == &IUnknown::IID
+        || iid == &Audio::IActivateAudioInterfaceCompletionHandler::IID
+        || iid == &IAgileObject::IID
+    {
         unsafe {
             *output = this;
             activation_add_ref(this);
@@ -134,18 +139,6 @@ static ACTIVATION_COMPLETION_HANDLER_VTABLE: ActivationCompletionHandlerVtable =
         release: activation_release,
         activate_completed: activation_completed,
     };
-
-#[link(name = "Mmdevapi")]
-unsafe extern "system" {
-    #[link_name = "ActivateAudioInterfaceAsync"]
-    fn activate_audio_interface_async_raw(
-        device_interface_path: windows::core::PCWSTR,
-        riid: *const GUID,
-        activation_params: *const PROPVARIANT,
-        completion_handler: *mut core::ffi::c_void,
-        activation_operation: *mut *mut core::ffi::c_void,
-    ) -> HRESULT;
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AudioApplication {
@@ -429,6 +422,29 @@ enum SampleEncoding {
     Pcm,
 }
 
+fn process_loopback_pcm_format() -> Audio::WAVEFORMATEX {
+    let channels = OPUS_CHANNELS as u16;
+    let bits = 16;
+    let block_align = channels * bits / 8;
+    Audio::WAVEFORMATEX {
+        wFormatTag: 1, // WAVE_FORMAT_PCM
+        nChannels: channels,
+        nSamplesPerSec: OPUS_SAMPLE_RATE,
+        nAvgBytesPerSec: OPUS_SAMPLE_RATE * u32::from(block_align),
+        nBlockAlign: block_align,
+        wBitsPerSample: bits,
+        cbSize: 0,
+    }
+}
+
+struct MixFormatAllocation(*const Audio::WAVEFORMATEX);
+
+impl Drop for MixFormatAllocation {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(Some(self.0.cast())) };
+    }
+}
+
 unsafe fn initialize_capture_client(
     client: IAudioClient,
 ) -> Result<
@@ -442,9 +458,27 @@ unsafe fn initialize_capture_client(
     ),
     String,
 > {
-    let wave = unsafe { client.GetMixFormat() }.map_err(|error| {
-        format!("O Windows não forneceu o formato da captura seletiva: {error}")
-    })?;
+    // The virtual process-loopback client can return E_NOTIMPL for GetMixFormat.
+    // In that case request PCM explicitly, as in Microsoft's ApplicationLoopback
+    // sample, and let WASAPI convert the process mix to the requested format.
+    let requested_format = process_loopback_pcm_format();
+    let (wave, _mix_format_allocation, stream_flags) = match unsafe { client.GetMixFormat() } {
+        Ok(wave) => (
+            wave.cast_const(),
+            Some(MixFormatAllocation(wave)),
+            AUDCLNT_STREAMFLAGS_LOOPBACK,
+        ),
+        Err(error) if error.code() == HRESULT(0x80004001u32 as i32) => (
+            &requested_format as *const Audio::WAVEFORMATEX,
+            None,
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+        ),
+        Err(error) => {
+            return Err(format!(
+                "O Windows não forneceu o formato da captura seletiva: {error}"
+            ));
+        }
+    };
     if wave.is_null() {
         return Err(
             "O Windows não forneceu um formato de áudio válido para a exclusão.".to_owned(),
@@ -464,14 +498,12 @@ unsafe fn initialize_capture_client(
             } else if subformat == pcm_subformat_guid() {
                 SampleEncoding::Pcm
             } else {
-                unsafe { CoTaskMemFree(Some(wave.cast())) };
                 return Err(
                     "O formato de áudio do Windows não é compatível com a exclusão.".to_owned(),
                 );
             }
         }
         _ => {
-            unsafe { CoTaskMemFree(Some(wave.cast())) };
             return Err(
                 "O formato de áudio do Windows não é compatível com a exclusão.".to_owned(),
             );
@@ -481,7 +513,6 @@ unsafe fn initialize_capture_client(
     if !matches!(bits, 8 | 16 | 24 | 32)
         || (matches!(encoding, SampleEncoding::Float) && bits != 32)
     {
-        unsafe { CoTaskMemFree(Some(wave.cast())) };
         return Err(
             "A profundidade do áudio do Windows não é compatível com a exclusão.".to_owned(),
         );
@@ -495,41 +526,48 @@ unsafe fn initialize_capture_client(
         client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
+                stream_flags,
                 2_000_000,
                 0,
                 wave,
                 None,
             )
             .map_err(|error| {
-                CoTaskMemFree(Some(wave.cast()));
                 format!("O Windows não conseguiu configurar a captura seletiva: {error}")
             })?;
         let capture = client
             .GetService::<IAudioCaptureClient>()
             .map_err(|error| {
-                CoTaskMemFree(Some(wave.cast()));
                 format!("O Windows não disponibilizou os dados da captura seletiva: {error}")
             })?;
-        CoTaskMemFree(Some(wave.cast()));
         Ok((client, capture, rate, channels, block_align, sample_format))
     }
 }
 
-unsafe fn activate_process_audio_client(process_id: u32) -> Result<IAudioClient, String> {
+fn process_activation_parameters(process_id: u32) -> Result<PROPVARIANT, String> {
     let process_loopback = AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
         TargetProcessId: process_id,
         ProcessLoopbackMode: exclusion_target_mode(),
     };
-    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+    let params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: process_loopback,
         },
     };
+    // PROPVARIANT::drop calls PropVariantClear, which frees VT_BLOB through the COM
+    // task allocator. Pointing it at a stack local causes STATUS_HEAP_CORRUPTION.
+    let allocation = unsafe { CoTaskMemAlloc(size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>()) }
+        .cast::<AUDIOCLIENT_ACTIVATION_PARAMS>();
+    if allocation.is_null() {
+        return Err(
+            "Não foi possível alocar os parâmetros da captura seletiva de áudio.".to_owned(),
+        );
+    }
+    unsafe { allocation.write(params) };
     let blob = BLOB {
         cbSize: size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-        pBlobData: (&mut params as *mut AUDIOCLIENT_ACTIVATION_PARAMS).cast(),
+        pBlobData: allocation.cast(),
     };
     let mut property = PROPVARIANT::default();
     property.Anonymous = PROPVARIANT_0 {
@@ -541,38 +579,46 @@ unsafe fn activate_process_audio_client(process_id: u32) -> Result<IAudioClient,
             Anonymous: PROPVARIANT_0_0_0 { blob },
         }),
     };
+    Ok(property)
+}
 
+fn activation_completion_handler(
+    process_id: u32,
+) -> Result<
+    (
+        Audio::IActivateAudioInterfaceCompletionHandler,
+        mpsc::Receiver<AudioActivationResult>,
+    ),
+    String,
+> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let handler = Box::into_raw(Box::new(ActivationCompletionHandler {
         vtable: &ACTIVATION_COMPLETION_HANDLER_VTABLE,
         references: AtomicU32::new(1),
         sender,
+        parameters: process_activation_parameters(process_id)?,
     }));
-    let mut activation_operation = std::ptr::null_mut();
-    let activation_result = unsafe {
-        activate_audio_interface_async_raw(
+    // from_raw owns the initial COM reference and releases it on every exit path.
+    let handler =
+        unsafe { Audio::IActivateAudioInterfaceCompletionHandler::from_raw(handler.cast()) };
+    Ok((handler, receiver))
+}
+
+unsafe fn activate_process_audio_client(process_id: u32) -> Result<IAudioClient, String> {
+    let (handler, receiver) = activation_completion_handler(process_id)?;
+    let parameters =
+        unsafe { &(*handler.as_raw().cast::<ActivationCompletionHandler>()).parameters };
+    let _operation = unsafe {
+        Audio::ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
-            &property,
-            handler.cast(),
-            &mut activation_operation,
+            Some(parameters),
+            &handler,
         )
-    };
-    if activation_result.is_err() {
-        unsafe { activation_release(handler.cast()) };
-        return Err(format!(
-            "Windows rejected selective audio capture: {activation_result:?}"
-        ));
     }
-    if activation_operation.is_null() {
-        unsafe { activation_release(handler.cast()) };
-        return Err("Windows returned no selective audio activation operation.".to_owned());
-    }
-    let _operation =
-        unsafe { Audio::IActivateAudioInterfaceAsyncOperation::from_raw(activation_operation) };
-    let activation = receiver.recv_timeout(ACTIVATION_TIMEOUT);
-    unsafe { activation_release(handler.cast()) };
-    let activated = activation
+    .map_err(|error| format!("Windows rejected selective audio capture: {error}"))?;
+    let activated = receiver
+        .recv_timeout(ACTIVATION_TIMEOUT)
         .map_err(|_| "Windows timed out while opening selective audio capture.".to_owned())?
         .map_err(|error| format!("Windows could not open selective audio capture: {error}"))?;
     activated
@@ -809,6 +855,154 @@ mod tests {
         exclusion_target_mode, float_subformat_guid, initial_capture_route, normalize_path,
         paths_match, pcm_subformat_guid, should_switch_to_process_tree,
     };
+
+    #[test]
+    fn native_activation_cleanup_does_not_corrupt_the_process() {
+        use std::os::windows::process::CommandExt;
+
+        const CHILD_FLAG: &str = "P2P_TEST_PROCESS_LOOPBACK_ACTIVATION_CHILD";
+        const TEST_NAME: &str = "audio_capture::process_loopback::tests::native_activation_cleanup_does_not_corrupt_the_process";
+        if std::env::var_os(CHILD_FLAG).as_deref() == Some(std::ffi::OsStr::new("1")) {
+            super::run_com_task(|| {
+                // Activate and initialize the virtual client without starting it or reading audio.
+                // Both success and unavailable-API errors must release native resources safely.
+                for _ in 0..3 {
+                    match unsafe { super::activate_process_audio_client(std::process::id()) } {
+                        Ok(client) => {
+                            println!("Native process-loopback activation succeeded");
+                            match unsafe { super::initialize_capture_client(client) } {
+                                Ok(capture) => {
+                                    println!("Native process-loopback initialization succeeded");
+                                    drop(capture);
+                                }
+                                Err(error) => {
+                                    println!("Native initialization unavailable: {error}")
+                                }
+                            }
+                        }
+                        Err(error) => println!("Native activation unavailable: {error}"),
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+            return;
+        }
+
+        // A native heap-corruption exception cannot unwind. Isolate it so a regression
+        // becomes a failed test instead of terminating the entire workspace test suite.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_FLAG, "1")
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Native activation/cleanup terminated the process: {:?}\n{}\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[test]
+    fn activation_blob_owns_its_memory_and_can_be_copied_and_released_repeatedly() {
+        for process_id in 1..=32 {
+            let parameters = super::process_activation_parameters(process_id).unwrap();
+            let header = unsafe { &parameters.Anonymous.Anonymous };
+            assert_eq!(header.vt, super::VT_BLOB);
+            let blob = unsafe { header.Anonymous.blob };
+            assert_eq!(
+                blob.cbSize as usize,
+                std::mem::size_of::<super::AUDIOCLIENT_ACTIVATION_PARAMS>()
+            );
+
+            // PROPVARIANT uses the native copy/clear operations. A copy must own a
+            // separate blob and stay valid after the original has been released.
+            let copy = parameters.clone();
+            let copied_blob = unsafe { copy.Anonymous.Anonymous.Anonymous.blob };
+            assert_ne!(copied_blob.pBlobData, blob.pBlobData);
+            drop(parameters);
+
+            let actual = unsafe {
+                copied_blob
+                    .pBlobData
+                    .cast::<super::AUDIOCLIENT_ACTIVATION_PARAMS>()
+                    .read()
+            };
+            assert_eq!(
+                actual.ActivationType,
+                super::AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
+            );
+            let target = unsafe { actual.Anonymous.ProcessLoopbackParams };
+            assert_eq!(target.TargetProcessId, process_id);
+            assert_eq!(target.ProcessLoopbackMode, exclusion_target_mode());
+            drop(copy);
+        }
+    }
+
+    #[test]
+    fn virtual_capture_has_a_complete_pcm_format_when_mix_format_is_unavailable() {
+        let format = super::process_loopback_pcm_format();
+        assert_eq!(
+            (
+                format.wFormatTag,
+                format.nSamplesPerSec,
+                format.nChannels,
+                format.wBitsPerSample
+            ),
+            (1, 48_000, 2, 16)
+        );
+        assert_eq!(
+            (format.nBlockAlign, format.nAvgBytesPerSec, format.cbSize),
+            (4, 192_000, 0)
+        );
+        let sample_format = SampleFormat {
+            encoding: SampleEncoding::Pcm,
+            bits: format.wBitsPerSample,
+        };
+        let frame = [16_384i16.to_le_bytes(), (-16_384i16).to_le_bytes()].concat();
+        assert_eq!(
+            decode_stereo_frame(&frame, format.nChannels as usize, sample_format).unwrap(),
+            (0.5, -0.5)
+        );
+    }
+
+    #[test]
+    fn completion_handler_is_agile_and_handles_a_callback_after_the_caller_times_out() {
+        use windows::core::Interface;
+
+        let (handler, receiver) = super::activation_completion_handler(42).unwrap();
+        assert!(handler.cast::<super::IAudioClient>().is_err());
+        let windows_reference = handler.cast::<super::IAgileObject>().unwrap();
+        drop(handler);
+        drop(receiver); // The waiting caller timed out; Windows still owns a reference.
+
+        let completion = windows_reference
+            .cast::<super::Audio::IActivateAudioInterfaceCompletionHandler>()
+            .unwrap();
+        drop(windows_reference);
+        assert!(
+            unsafe { super::activation_completed(completion.as_raw(), std::ptr::null_mut()) }
+                .is_ok()
+        );
+        drop(completion);
+
+        let (handler, receiver) = super::activation_completion_handler(84).unwrap();
+        let windows_reference = handler.clone();
+        drop(handler);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(windows_reference);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
 
     #[test]
     fn chooses_full_audio_without_a_target_and_waits_for_a_closed_application() {
