@@ -17,7 +17,25 @@ if (-not $versionMatch.Success) {
 $version = $versionMatch.Groups[1].Value
 
 if (-not (Get-Command 'cl.exe' -ErrorAction SilentlyContinue)) {
-    throw 'O compilador MSVC não está no PATH. Abra o Developer PowerShell for Visual Studio 2022 e execute este script novamente.'
+    $msvcCandidates = @(
+        (Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\*\bin\Hostx64\x64" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName),
+        (Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\*\bin\Hostx64\x64" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName),
+        (Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\*\bin\Hostx64\x64" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName),
+        (Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC\*\bin\Hostx64\x64" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+    )
+    $foundMsvc = $msvcCandidates | Where-Object { $_ -and (Test-Path (Join-Path $_ 'cl.exe') -PathType Leaf) } | Select-Object -First 1
+    if ($foundMsvc) {
+        $env:PATH = "$foundMsvc;$env:PATH"
+    } else {
+        throw 'O compilador MSVC não está no PATH. Abra o Developer PowerShell for Visual Studio 2022 e execute este script novamente.'
+    }
+}
+
+if (-not $env:RC -and -not (Get-Command 'rc.exe' -ErrorAction SilentlyContinue)) {
+    $rcCandidate = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64\rc.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName | Select-Object -First 1
+    if ($rcCandidate) {
+        $env:RC = $rcCandidate
+    }
 }
 
 Push-Location $repoRoot
@@ -44,6 +62,7 @@ if ([string]::IsNullOrWhiteSpace($InnoCompiler)) {
         $candidates = @(
             (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
             (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
             (Join-Path $env:LOCALAPPDATA 'Programs\Antigravity IDE\resources\app\node_modules\innosetup\bin\ISCC.exe')
         )
         $InnoCompiler = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
