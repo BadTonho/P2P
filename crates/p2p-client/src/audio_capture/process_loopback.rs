@@ -11,11 +11,11 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio;
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
-    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
-    AudioSessionStateActive, IAudioCaptureClient, IAudioClient, IAudioSessionControl2,
-    IAudioSessionManager2, IMMDeviceEnumerator, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
-    VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, AUDIOCLIENT_ACTIVATION_PARAMS,
+    AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, AudioSessionStateActive, IAudioCaptureClient,
+    IAudioClient, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator,
+    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
 };
 use windows::Win32::System::Com::StructuredStorage::{
     PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
@@ -28,7 +28,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    CreateEventW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    WaitForSingleObject,
 };
 use windows::Win32::System::Variant::VT_BLOB;
 use windows::core::{GUID, HRESULT, IUnknown, Interface, PWSTR};
@@ -36,7 +37,6 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface, PWSTR};
 use super::system_audio::{CaptureDiagnostics, OPUS_CHANNELS, OPUS_SAMPLE_RATE};
 
 const MIN_PROCESS_LOOPBACK_BUILD: u32 = 20_348;
-const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(8);
 
 type AudioActivationResult = windows::core::Result<IUnknown>;
@@ -303,7 +303,15 @@ fn process_capture_loop(
 
     let setup = unsafe { activate_process_audio_client(process_id) }
         .and_then(|client| unsafe { initialize_capture_client(client) });
-    let (client, capture, input_rate, channels, block_align, sample_format) = match setup {
+    let InitializedCapture {
+        client,
+        capture,
+        rate: input_rate,
+        channels,
+        block_align,
+        sample_format,
+        event_guard,
+    } = match setup {
         Ok(setup) => setup,
         Err(error) => {
             let _ = started.send(Err(error.clone()));
@@ -323,117 +331,124 @@ fn process_capture_loop(
     let channels = channels.max(1);
 
     while !stop.load(Ordering::Relaxed) {
-        let packet_frames = match unsafe { capture.GetNextPacketSize() } {
-            Ok(frames) => frames,
-            Err(error) => {
-                let message = format!("Falha ao consultar os pacotes de áudio do Windows: {error}");
+        let _ = unsafe { WaitForSingleObject(event_guard.0, 20) };
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        loop {
+            let packet_frames = match unsafe { capture.GetNextPacketSize() } {
+                Ok(frames) => frames,
+                Err(error) => {
+                    let message =
+                        format!("Falha ao consultar os pacotes de áudio do Windows: {error}");
+                    diagnostics.set_fatal_error(None, message.clone());
+                    let _ = unsafe { client.Stop() };
+                    return Err(message);
+                }
+            };
+            if packet_frames == 0 {
+                break;
+            }
+
+            let mut data = std::ptr::null_mut();
+            let mut frames = 0u32;
+            let mut flags = 0u32;
+            if let Err(error) =
+                unsafe { capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None) }
+            {
+                let message = format!("Falha ao obter áudio do Windows: {error}");
                 diagnostics.set_fatal_error(None, message.clone());
                 let _ = unsafe { client.Stop() };
                 return Err(message);
             }
-        };
-        if packet_frames == 0 {
-            thread::sleep(PROCESS_POLL_INTERVAL);
-            continue;
-        }
 
-        let mut data = std::ptr::null_mut();
-        let mut frames = 0u32;
-        let mut flags = 0u32;
-        if let Err(error) =
-            unsafe { capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None) }
-        {
-            let message = format!("Falha ao obter áudio do Windows: {error}");
-            diagnostics.set_fatal_error(None, message.clone());
-            let _ = unsafe { client.Stop() };
-            return Err(message);
-        }
-
-        diagnostics.callbacks.fetch_add(1, Ordering::Relaxed);
-        diagnostics
-            .input_frames
-            .fetch_add(u64::from(frames), Ordering::Relaxed);
-        let mut non_silent = 0u64;
-        let mut captured = 0u64;
-        let mut dropped = 0u64;
-        if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 && !data.is_null() {
-            let samples =
-                unsafe { std::slice::from_raw_parts(data, frames as usize * block_align) };
-            for frame in samples.chunks_exact(block_align) {
-                let (left, right) = match decode_stereo_frame(frame, channels, sample_format) {
-                    Ok(samples) => samples,
-                    Err(error) => {
-                        let _ = unsafe { capture.ReleaseBuffer(frames) };
-                        if captured > 0 {
-                            diagnostics
-                                .captured_frames
-                                .fetch_add(captured, Ordering::Relaxed);
+            diagnostics.callbacks.fetch_add(1, Ordering::Relaxed);
+            diagnostics
+                .input_frames
+                .fetch_add(u64::from(frames), Ordering::Relaxed);
+            let mut non_silent = 0u64;
+            let mut captured = 0u64;
+            let mut dropped = 0u64;
+            if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 && !data.is_null() {
+                let samples =
+                    unsafe { std::slice::from_raw_parts(data, frames as usize * block_align) };
+                for frame in samples.chunks_exact(block_align) {
+                    let (left, right) = match decode_stereo_frame(frame, channels, sample_format) {
+                        Ok(samples) => samples,
+                        Err(error) => {
+                            let _ = unsafe { capture.ReleaseBuffer(frames) };
+                            if captured > 0 {
+                                diagnostics
+                                    .captured_frames
+                                    .fetch_add(captured, Ordering::Relaxed);
+                            }
+                            if dropped > 0 {
+                                diagnostics
+                                    .dropped_frames
+                                    .fetch_add(dropped, Ordering::Relaxed);
+                            }
+                            if non_silent > 0 {
+                                diagnostics
+                                    .non_silent_samples
+                                    .fetch_add(non_silent, Ordering::Relaxed);
+                            }
+                            diagnostics.set_fatal_error(None, error.clone());
+                            let _ = unsafe { client.Stop() };
+                            return Err(error);
                         }
-                        if dropped > 0 {
-                            diagnostics
-                                .dropped_frames
-                                .fetch_add(dropped, Ordering::Relaxed);
+                    };
+                    non_silent += u64::from(left.abs() > 0.001);
+                    non_silent += u64::from(right.abs() > 0.001);
+                    resample_phase += rate_ratio;
+                    while resample_phase >= 1.0 {
+                        if producer.slots() >= OPUS_CHANNELS {
+                            let _ = producer.push(left);
+                            let _ = producer.push(right);
+                            captured += 1;
+                        } else {
+                            dropped += 1;
                         }
-                        if non_silent > 0 {
-                            diagnostics
-                                .non_silent_samples
-                                .fetch_add(non_silent, Ordering::Relaxed);
-                        }
-                        diagnostics.set_fatal_error(None, error.clone());
-                        let _ = unsafe { client.Stop() };
-                        return Err(error);
+                        resample_phase -= 1.0;
                     }
-                };
-                non_silent += u64::from(left.abs() > 0.001);
-                non_silent += u64::from(right.abs() > 0.001);
-                resample_phase += rate_ratio;
-                while resample_phase >= 1.0 {
-                    if producer.slots() >= OPUS_CHANNELS {
-                        let _ = producer.push(left);
-                        let _ = producer.push(right);
-                        captured += 1;
-                    } else {
-                        dropped += 1;
+                }
+            } else {
+                // Silent packets still advance the resampler and deliver silence.
+                for _ in 0..frames {
+                    resample_phase += rate_ratio;
+                    while resample_phase >= 1.0 {
+                        if producer.slots() >= OPUS_CHANNELS {
+                            let _ = producer.push(0.0);
+                            let _ = producer.push(0.0);
+                            captured += 1;
+                        } else {
+                            dropped += 1;
+                        }
+                        resample_phase -= 1.0;
                     }
-                    resample_phase -= 1.0;
                 }
             }
-        } else {
-            // Silent packets still advance the resampler and deliver silence.
-            for _ in 0..frames {
-                resample_phase += rate_ratio;
-                while resample_phase >= 1.0 {
-                    if producer.slots() >= OPUS_CHANNELS {
-                        let _ = producer.push(0.0);
-                        let _ = producer.push(0.0);
-                        captured += 1;
-                    } else {
-                        dropped += 1;
-                    }
-                    resample_phase -= 1.0;
-                }
+            if captured > 0 {
+                diagnostics
+                    .captured_frames
+                    .fetch_add(captured, Ordering::Relaxed);
             }
-        }
-        if captured > 0 {
-            diagnostics
-                .captured_frames
-                .fetch_add(captured, Ordering::Relaxed);
-        }
-        if dropped > 0 {
-            diagnostics
-                .dropped_frames
-                .fetch_add(dropped, Ordering::Relaxed);
-        }
-        if non_silent > 0 {
-            diagnostics
-                .non_silent_samples
-                .fetch_add(non_silent, Ordering::Relaxed);
-        }
-        if let Err(error) = unsafe { capture.ReleaseBuffer(frames) } {
-            let message = format!("Falha ao liberar um pacote de áudio do Windows: {error}");
-            diagnostics.set_fatal_error(None, message.clone());
-            let _ = unsafe { client.Stop() };
-            return Err(message);
+            if dropped > 0 {
+                diagnostics
+                    .dropped_frames
+                    .fetch_add(dropped, Ordering::Relaxed);
+            }
+            if non_silent > 0 {
+                diagnostics
+                    .non_silent_samples
+                    .fetch_add(non_silent, Ordering::Relaxed);
+            }
+            if let Err(error) = unsafe { capture.ReleaseBuffer(frames) } {
+                let message = format!("Falha ao liberar um pacote de áudio do Windows: {error}");
+                diagnostics.set_fatal_error(None, message.clone());
+                let _ = unsafe { client.Stop() };
+                return Err(message);
+            }
         }
     }
 
@@ -476,19 +491,31 @@ impl Drop for MixFormatAllocation {
     }
 }
 
-unsafe fn initialize_capture_client(
+struct EventHandle(HANDLE);
+
+unsafe impl Send for EventHandle {}
+
+impl Drop for EventHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+struct InitializedCapture {
     client: IAudioClient,
-) -> Result<
-    (
-        IAudioClient,
-        IAudioCaptureClient,
-        u32,
-        usize,
-        usize,
-        SampleFormat,
-    ),
-    String,
-> {
+    capture: IAudioCaptureClient,
+    rate: u32,
+    channels: usize,
+    block_align: usize,
+    sample_format: SampleFormat,
+    event_guard: EventHandle,
+}
+
+unsafe fn initialize_capture_client(client: IAudioClient) -> Result<InitializedCapture, String> {
     // The virtual process-loopback client can return E_NOTIMPL for GetMixFormat.
     // In that case request PCM explicitly, as in Microsoft's ApplicationLoopback
     // sample, and let WASAPI convert the process mix to the requested format.
@@ -553,11 +580,16 @@ unsafe fn initialize_capture_client(
     let rate = format.nSamplesPerSec.max(1);
     let channels = usize::from(format.nChannels).max(1);
     let block_align = usize::from(format.nBlockAlign).max(1);
+
+    let event = unsafe { CreateEventW(None, false, false, None) }
+        .map_err(|error| format!("Não foi possível criar o evento de áudio do Windows: {error}"))?;
+    let event_guard = EventHandle(event);
+
     unsafe {
         client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
-                stream_flags,
+                stream_flags | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                 2_000_000,
                 0,
                 wave,
@@ -566,12 +598,23 @@ unsafe fn initialize_capture_client(
             .map_err(|error| {
                 format!("O Windows não conseguiu configurar a captura seletiva: {error}")
             })?;
+        client.SetEventHandle(event).map_err(|error| {
+            format!("O Windows não conseguiu associar o evento à captura seletiva: {error}")
+        })?;
         let capture = client
             .GetService::<IAudioCaptureClient>()
             .map_err(|error| {
                 format!("O Windows não disponibilizou os dados da captura seletiva: {error}")
             })?;
-        Ok((client, capture, rate, channels, block_align, sample_format))
+        Ok(InitializedCapture {
+            client,
+            capture,
+            rate,
+            channels,
+            block_align,
+            sample_format,
+            event_guard,
+        })
     }
 }
 

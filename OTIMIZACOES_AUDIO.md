@@ -14,18 +14,15 @@ Estas sugestões resultam da leitura do código atual. Ainda não foram implemen
 - Uma única operação atômica `fetch_add` por métrica é executada ao final do bloco (e também no caminho de erro/aborto), eliminando até 48.000 operações atômicas por segundo por captura.
 - Testado e validado automaticamente com a suíte completa de testes do workspace.
 
-## 2. Capturar por eventos do Windows
+## 2. Capturar por eventos do Windows — implementado
 
 **Arquivo:** `crates/p2p-client/src/audio_capture/process_loopback.rs`.
 
-A captura seletiva consulta o buffer e espera 5 ms quando não há pacotes. O WASAPI permite sinalizar quando há áudio disponível.
-
-- Avaliar `AUDCLNT_STREAMFLAGS_EVENTCALLBACK` e `IAudioClient::SetEventHandle`.
-- Aguardar os eventos de áudio e encerramento, sem depender de consultas periódicas para detectar novos dados.
-- Drenar os pacotes disponíveis ao receber o evento.
-- Preservar o comportamento com silêncio e garantir encerramento seguro, inclusive quando nenhum áudio chega.
-
-O [exemplo oficial da Microsoft](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/ApplicationLoopback/cpp/LoopbackCapture.cpp) usa captura por eventos no Process Loopback.
+- Implementada inicialização orientada a eventos usando `AUDCLNT_STREAMFLAGS_EVENTCALLBACK` e vinculação via `IAudioClient::SetEventHandle`.
+- O loop de captura substituiu o polling de 5 ms com `WaitForSingleObject` associado ao evento de buffer do WASAPI, com timeout de segurança e encerramento rápido.
+- Ao sinalizar o evento, todos os pacotes de áudio acumulados são drenados imediatamente em um loop interno, eliminando latência de entrega e consumo ocioso de CPU quando o processo está mudo.
+- O handle de evento do Windows é encapsulado em RAII (`EventHandle`) garantindo fechamento determinístico via `CloseHandle`.
+- Testado e validado automaticamente com a suíte de testes do workspace.
 
 ## 3. Separar a detecção do aplicativo do envio de áudio — implementado
 
