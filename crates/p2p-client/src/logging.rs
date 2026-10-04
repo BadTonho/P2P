@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::settings::LoggingLevel;
@@ -125,6 +127,7 @@ pub struct LoggingState {
     current_log_file: Option<PathBuf>,
     last_write_error: Option<Arc<Mutex<Option<String>>>>,
     sink: Option<Arc<Mutex<RollingSink>>>,
+    writer_sender: Option<mpsc::SyncSender<LogMessage>>,
     filter_reload: Option<FilterReloadHandle>,
     level: LoggingLevel,
     pub startup_message: Option<String>,
@@ -168,8 +171,15 @@ pub struct DiagnosticSnapshot {
 
 #[derive(Clone)]
 struct SharedLogWriter {
+    sender: Option<mpsc::SyncSender<LogMessage>>,
+    dropped_counter: Arc<AtomicU64>,
     sink: Arc<Mutex<RollingSink>>,
     last_error: Arc<Mutex<Option<String>>>,
+}
+
+enum LogMessage {
+    Line(Vec<u8>),
+    Flush(mpsc::SyncSender<()>),
 }
 
 struct RollingSink {
@@ -269,7 +279,22 @@ impl LoggingState {
     pub fn initialize(level: LoggingLevel) -> Self {
         let sink = Arc::new(Mutex::new(RollingSink::inactive()));
         let last_error = Arc::new(Mutex::new(None));
+        let (sender, receiver) = mpsc::sync_channel(4096);
+        let dropped_counter = Arc::new(AtomicU64::new(0));
+
+        let worker_sink = Arc::clone(&sink);
+        let worker_error = Arc::clone(&last_error);
+        let worker_dropped = Arc::clone(&dropped_counter);
+        std::thread::Builder::new()
+            .name("p2p-log-writer".to_owned())
+            .spawn(move || {
+                log_writer_worker(receiver, worker_sink, worker_error, worker_dropped);
+            })
+            .ok();
+
         let writer = SharedLogWriter {
+            sender: Some(sender.clone()),
+            dropped_counter,
             sink: Arc::clone(&sink),
             last_error: Arc::clone(&last_error),
         };
@@ -291,6 +316,7 @@ impl LoggingState {
             current_log_file: None,
             last_write_error: Some(last_error),
             sink: Some(sink),
+            writer_sender: Some(sender),
             filter_reload: Some(filter_reload),
             level,
             startup_message: None,
@@ -458,6 +484,7 @@ impl LoggingState {
         }
         output.push_str("\nDados excluídos: código da sala, tokens, payloads de sinalização e conteúdo de áudio/vídeo/tela.\n");
         if self.level != LoggingLevel::Disabled {
+            self.flush();
             output.push_str("\n========== LOG DESTA EXECUCAO ==========\n");
         }
 
@@ -487,6 +514,20 @@ impl LoggingState {
             fs::create_dir_all(parent)?;
         }
         fs::write(destination, output)
+    }
+
+    pub fn flush(&self) {
+        if let Some(writer_sender) = &self.writer_sender {
+            let (tx, rx) = mpsc::sync_channel(1);
+            if writer_sender.send(LogMessage::Flush(tx)).is_ok() {
+                let _ = rx.recv_timeout(std::time::Duration::from_millis(500));
+            }
+        } else if let Some(sink) = &self.sink {
+            let mut guard = sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = guard.flush_files();
+        }
     }
 
     pub fn log_directory(&self) -> Option<&Path> {
@@ -611,18 +652,28 @@ impl Write for LogLine {
 
 impl Drop for LogLine {
     fn drop(&mut self) {
-        let result = self
-            .writer
-            .sink
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .write_line(&self.bytes);
-        if let Err(error) = result {
-            *self
+        if self.bytes.is_empty() {
+            return;
+        }
+        if let Some(sender) = &self.writer.sender {
+            let line = std::mem::take(&mut self.bytes);
+            if let Err(mpsc::TrySendError::Full(_)) = sender.try_send(LogMessage::Line(line)) {
+                self.writer.dropped_counter.fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            let result = self
                 .writer
-                .last_error
+                .sink
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .write_line(&self.bytes);
+            if let Err(error) = result {
+                *self
+                    .writer
+                    .last_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
+            }
         }
     }
 }
@@ -718,6 +769,71 @@ impl RollingSink {
         }
         Ok(())
     }
+
+    fn flush_files(&mut self) -> io::Result<()> {
+        if let Some(file) = &mut self.file {
+            file.flush()?;
+        }
+        if let Some(error_file) = &mut self.error_file {
+            let _ = error_file.flush();
+        }
+        Ok(())
+    }
+}
+
+fn log_writer_worker(
+    receiver: mpsc::Receiver<LogMessage>,
+    sink: Arc<Mutex<RollingSink>>,
+    last_error: Arc<Mutex<Option<String>>>,
+    dropped_counter: Arc<AtomicU64>,
+) {
+    while let Ok(msg) = receiver.recv() {
+        match msg {
+            LogMessage::Line(bytes) => {
+                let dropped = dropped_counter.swap(0, Ordering::Relaxed);
+                let mut guard = sink
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if dropped > 0 {
+                    let notice = format!(
+                        "[AVISO: {dropped} mensagens de log foram descartadas devido a fila cheia]\n"
+                    );
+                    let _ = guard.write_line(notice.as_bytes());
+                }
+                let result = guard.write_line(&bytes);
+                if let Err(error) = result {
+                    *last_error
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(error.to_string());
+                }
+            }
+            LogMessage::Flush(ack) => {
+                let dropped = dropped_counter.swap(0, Ordering::Relaxed);
+                let mut guard = sink
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if dropped > 0 {
+                    let notice = format!(
+                        "[AVISO: {dropped} mensagens de log foram descartadas devido a fila cheia]\n"
+                    );
+                    let _ = guard.write_line(notice.as_bytes());
+                }
+                let _ = guard.flush_files();
+                let _ = ack.send(());
+            }
+        }
+    }
+    let mut guard = sink
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dropped = dropped_counter.swap(0, Ordering::Relaxed);
+    if dropped > 0 {
+        let notice =
+            format!("[AVISO: {dropped} mensagens de log foram descartadas devido a fila cheia]\n");
+        let _ = guard.write_line(notice.as_bytes());
+    }
+    let _ = guard.flush_files();
 }
 
 fn is_error_line(bytes: &[u8]) -> bool {
@@ -975,11 +1091,13 @@ fn prune_logs(directory: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiagnosticSnapshot, LOG_FILE_PREFIX, LoggingState, RollingSink, SharedLogWriter, date_key,
-        log_filter, open_log_file_if_enabled, prune_logs, safe_signaling_endpoint,
+        DiagnosticSnapshot, LOG_FILE_PREFIX, LogMessage, LoggingState, RollingSink,
+        SharedLogWriter, date_key, log_filter, log_writer_worker, open_log_file_if_enabled,
+        prune_logs, safe_signaling_endpoint,
     };
     use crate::settings::LoggingLevel;
     use std::fs;
+    use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
     use time::{Duration, OffsetDateTime};
     use tracing_subscriber::layer::SubscriberExt;
@@ -1085,6 +1203,8 @@ mod tests {
         let log_path = sink.lock().unwrap().path.clone().unwrap();
         let last_error = Arc::new(Mutex::new(None));
         let writer = SharedLogWriter {
+            sender: None,
+            dropped_counter: Arc::new(AtomicU64::new(0)),
             sink: Arc::clone(&sink),
             last_error: Arc::clone(&last_error),
         };
@@ -1250,5 +1370,44 @@ mod tests {
             super::safe_stun_endpoint("stun:user:secret@stun.example:3478?transport=udp"),
             "stun:stun.example:3478"
         );
+    }
+
+    #[test]
+    fn async_log_worker_processes_messages_and_flushes() {
+        let directory = std::env::temp_dir().join(format!(
+            "p2p-log-async-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let sink = Arc::new(Mutex::new(RollingSink::open(directory.clone()).unwrap()));
+        let last_error = Arc::new(Mutex::new(None));
+        let dropped_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(32);
+
+        let worker_sink = Arc::clone(&sink);
+        let worker_error = Arc::clone(&last_error);
+        let worker_dropped = Arc::clone(&dropped_counter);
+        let handle = std::thread::spawn(move || {
+            log_writer_worker(receiver, worker_sink, worker_error, worker_dropped);
+        });
+
+        sender
+            .send(LogMessage::Line(b"async line 1\n".to_vec()))
+            .unwrap();
+        sender
+            .send(LogMessage::Line(b"async line 2\n".to_vec()))
+            .unwrap();
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        sender.send(LogMessage::Flush(ack_tx)).unwrap();
+        ack_rx.recv().unwrap();
+
+        let log_path = sink.lock().unwrap().path.clone().unwrap();
+        let contents = fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("async line 1"));
+        assert!(contents.contains("async line 2"));
+
+        drop(sender);
+        handle.join().unwrap();
+        let _ = fs::remove_dir_all(directory);
     }
 }

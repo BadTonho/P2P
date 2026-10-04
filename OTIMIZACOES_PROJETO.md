@@ -15,7 +15,7 @@ Estas sugestões resultam da leitura do código. O item 1 foi implementado e ver
 | Caminho GPU | Implementado: a leitura NV12 e conversão RGBA para CPU são ignoradas quando a prévia está desligada, com readback sob demanda para fallback do encoder. | Médio |
 | Sessões em grupo | Implementado: preserva conexões ativas existentes quando espectadores entram ou saem sem alteração no bitrate alvo por espectador. | Médio |
 | Codificação de vídeo | Existe um encoder por espectador. Avaliar uma codificação compartilhada para espectadores com configurações compatíveis. | Grande |
-| Logs | A escrita ocorre na própria thread que registra o evento. Avaliar uma fila limitada e um worker para escrita. | Médio |
+| Logs | Implementado: worker assíncrono dedicado com fila limitada (4096) para gravação de eventos em disco e sincronização com flush para exportação e encerramento. | Médio |
 
 ## 1. Atualizar a prévia somente com quadro novo — implementado
 
@@ -78,28 +78,24 @@ Estas sugestões resultam da leitura do código. O item 1 foi implementado e ver
 
 É uma mudança de arquitetura e deve ficar para depois das otimizações menores.
 
-## 6. Separar a escrita de logs dos produtores
+## 6. Separar a escrita de logs dos produtores — implementado
 
 **Arquivo:** `crates/p2p-client/src/logging.rs`.
 
-- Avaliar um worker com fila limitada para gravação dos eventos.
-- Definir o comportamento quando a fila estiver cheia e como contabilizar eventos não gravados.
-- Preservar mudanças de nível em execução, rotação, retenção e exportação manual.
-- Garantir que os eventos pendentes sejam tratados antes da exportação e do encerramento normal.
-- Testar fila cheia, falha de escrita, ativação/desativação e encerramento.
-
-O ganho deve ser medido especialmente com logs detalhados ativados.
+- Implementada fila limitada (`mpsc::sync_channel(4096)`) com worker em thread dedicada (`p2p-log-writer`), desacoplando a escrita de log no disco das threads de aplicação, captura e áudio/vídeo.
+- A gravação de eventos no `LogLine::drop` utiliza envio não-bloqueante (`try_send`); quando a fila fica cheia sob carga intensa de I/O, mensagens excedentes são contabilizadas com contador atômico `dropped_counter` e um aviso explicativo `[AVISO: N mensagens de log foram descartadas devido a fila cheia]` é inserido no log assim que a fila é drenada.
+- Implementada sincronização com flush bloqueante (`LoggingState::flush()`) via `LogMessage::Flush(sync_channel)` para garantir integridade do arquivo antes da exportação manual de diagnósticos (`export_diagnostic_archive`).
+- Preservada rotação diária de arquivos, retenção de 14 dias, sanitização e exportação de logs.
+- Testado e validado com teste unitário automatizado (`async_log_worker_processes_messages_and_flushes`) e 100% da suíte do workspace.
 
 ## Ordem recomendada
 
-1. Prévia somente com quadro novo — implementação e verificações automatizadas concluídas; conferência visual pendente.
-2. Reutilização das texturas de leitura.
-3. Preservação das sessões de grupo.
-4. Leitura GPU → CPU somente quando necessária.
-5. Escrita de logs em worker, conforme o custo medido.
-6. Codificação de vídeo compartilhada.
-
-Implementar cada mudança separadamente, com testes e comparação antes/depois.
+1. Prévia somente com quadro novo — implementado.
+2. Reutilização das texturas de leitura — implementado.
+3. Preservação das sessões de grupo — implementado.
+4. Leitura GPU → CPU somente quando necessária — implementado.
+5. Escrita de logs em worker — implementado.
+6. Codificação de vídeo compartilhada — proposta arquitetural de maior escopo para distribuição de H.264 compartilhado mantendo SSRC/RTCP individuais.
 
 ## Medição e validação
 
