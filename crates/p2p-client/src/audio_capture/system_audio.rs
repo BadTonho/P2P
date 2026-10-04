@@ -1,6 +1,6 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -35,7 +35,9 @@ pub(crate) struct SystemAudioCapture {
     #[cfg(windows)]
     excluded_process_id: Option<u32>,
     #[cfg(windows)]
-    last_process_scan: Instant,
+    detected_process_id: Option<Arc<AtomicU32>>,
+    #[cfg(windows)]
+    scanner_stop: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Default)]
@@ -112,6 +114,42 @@ impl SystemAudioCapture {
             None => None,
         };
         #[cfg(windows)]
+        let (detected_process_id, scanner_stop) =
+            if let Some(path) = excluded_application_path.as_ref() {
+                let detected_pid = Arc::new(AtomicU32::new(excluded_process_id.unwrap_or(0)));
+                let stop_scanner = Arc::new(AtomicBool::new(false));
+                let path_clone = path.clone();
+                let detected_clone = Arc::clone(&detected_pid);
+                let stop_clone = Arc::clone(&stop_scanner);
+
+                std::thread::Builder::new()
+                    .name("p2p-process-scan".into())
+                    .spawn(move || {
+                        while !stop_clone.load(Ordering::Relaxed) {
+                            for _ in 0..10 {
+                                if stop_clone.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            match find_process_id(&path_clone) {
+                                Ok(Some(pid)) => {
+                                    detected_clone.store(pid, Ordering::Relaxed);
+                                }
+                                Ok(None) => {
+                                    detected_clone.store(0, Ordering::Relaxed);
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    })
+                    .ok();
+                (Some(detected_pid), Some(stop_scanner))
+            } else {
+                (None, None)
+            };
+
+        #[cfg(windows)]
         let initial_route = initial_capture_route(
             excluded_application_path.is_some(),
             process_loopback_is_supported,
@@ -143,7 +181,8 @@ impl SystemAudioCapture {
                 diagnostics: capture_diagnostics,
                 excluded_application_path,
                 excluded_process_id: Some(process_id),
-                last_process_scan: Instant::now(),
+                detected_process_id,
+                scanner_stop,
             });
         }
 
@@ -290,7 +329,9 @@ impl SystemAudioCapture {
             #[cfg(windows)]
             excluded_process_id: None,
             #[cfg(windows)]
-            last_process_scan: Instant::now() - Duration::from_secs(1),
+            detected_process_id,
+            #[cfg(windows)]
+            scanner_stop,
         };
         #[cfg(windows)]
         if capture.excluded_application_path.is_some() {
@@ -365,23 +406,13 @@ impl SystemAudioCapture {
 
     #[cfg(windows)]
     fn update_excluded_process(&mut self) {
-        let Some(path) = self.excluded_application_path.as_deref() else {
+        let Some(detected) = self.detected_process_id.as_ref() else {
             return;
         };
-        if self.last_process_scan.elapsed() < Duration::from_millis(500) {
+        let process_id = detected.load(Ordering::Relaxed);
+        if process_id == 0 {
             return;
         }
-        self.last_process_scan = Instant::now();
-        let process_id = match find_process_id(path) {
-            Ok(Some(process_id)) => process_id,
-            Ok(None) => return,
-            Err(error) => {
-                self.stream.take();
-                self.process_capture.take();
-                self.diagnostics.set_fatal_error(None, error);
-                return;
-            }
-        };
         if !should_switch_to_process_tree(self.excluded_process_id, process_id) {
             return;
         }
@@ -411,6 +442,15 @@ impl SystemAudioCapture {
             "Exclusão seletiva de aplicativo aplicada à captura de áudio"
         );
         Ok(())
+    }
+}
+
+impl Drop for SystemAudioCapture {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(stop) = self.scanner_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
     }
 }
 

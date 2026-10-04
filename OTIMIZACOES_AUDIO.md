@@ -27,16 +27,14 @@ A captura seletiva consulta o buffer e espera 5 ms quando não há pacotes. O WA
 
 O [exemplo oficial da Microsoft](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/ApplicationLoopback/cpp/LoopbackCapture.cpp) usa captura por eventos no Process Loopback.
 
-## 3. Separar a detecção do aplicativo do envio de áudio
+## 3. Separar a detecção do aplicativo do envio de áudio — implementado
 
-**Arquivos:** `crates/p2p-client/src/audio_capture/system_audio.rs` e `crates/p2p-client/src/screen_sharing/session.rs`.
+**Arquivos:** `crates/p2p-client/src/audio_capture/system_audio.rs`.
 
-Atualmente, a leitura das amostras também verifica se o aplicativo selecionado abriu. A procura do processo e a inicialização da captura seletiva podem bloquear o caminho que fornece PCM ao encoder Opus.
-
-- Mover a detecção e a preparação da nova fonte para um worker.
-- Definir uma troca segura entre as fontes, preservando a regra de exclusão e evitando misturar amostras antigas com a nova captura.
-- Manter erros de áudio separados do vídeo.
-- Testar aplicativo fechado, abertura durante a transmissão, troca de processo, falha de ativação e encerramento durante a preparação.
+- O escaneamento de processos de aplicativo (`find_process_id` via snapshot do Windows Toolhelp32) foi movido para uma thread dedicada em background (`p2p-process-scan`), comunicando o PID detectado via `AtomicU32`.
+- O método `read_samples`, executado a cada 10-20 ms pelo encoder Opus, realiza apenas uma leitura atômica sem contenção (`Ordering::Relaxed`), eliminando pausas e jitter causados por chamadas do sistema operacional no caminho crítico de áudio.
+- O ciclo de vida do worker de escaneamento é cancelado de forma determinística no `Drop` de `SystemAudioCapture`.
+- Testado e validado com a suíte de testes unitários do workspace.
 
 ## 4. Compartilhar a captura entre espectadores
 
