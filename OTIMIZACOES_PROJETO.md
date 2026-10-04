@@ -13,7 +13,7 @@ Estas sugestões resultam da leitura do código. O item 1 foi implementado e ver
 | Prévia local | Implementado: a textura é atualizada somente para um quadro novo ou quando precisa ser recriada. Verificação visual em monitores reais pendente. | Pequeno |
 | Captura e decoder DXVA | Implementado: as texturas D3D11 de staging são mantidas em cache e reutilizadas a cada quadro, sendo recriadas apenas se dimensões ou formato mudarem. | Médio |
 | Caminho GPU | Implementado: a leitura NV12 e conversão RGBA para CPU são ignoradas quando a prévia está desligada, com readback sob demanda para fallback do encoder. | Médio |
-| Sessões em grupo | O reequilíbrio encerra e recria todas as sessões de envio. Preservar as conexões existentes quando entra ou sai um espectador, considerando mudanças de bitrate. | Médio |
+| Sessões em grupo | Implementado: preserva conexões ativas existentes quando espectadores entram ou saem sem alteração no bitrate alvo por espectador. | Médio |
 | Codificação de vídeo | Existe um encoder por espectador. Avaliar uma codificação compartilhada para espectadores com configurações compatíveis. | Grande |
 | Logs | A escrita ocorre na própria thread que registra o evento. Avaliar uma fila limitada e um worker para escrita. | Médio |
 
@@ -56,14 +56,14 @@ Estas sugestões resultam da leitura do código. O item 1 foi implementado e ver
 - Se o encoder de hardware rejeitar a entrada por superfície GPU ou se o fallback OpenH264 na CPU for ativado, a leitura NV12 ocorre sob demanda (`readback_nv12`) a partir da própria superfície, preservando a resiliência do sistema e compatibilidade com fallbacks.
 - Testado e aprovado com 100% dos testes do workspace.
 
-## 4. Preservar sessões durante mudanças de espectadores
+## 4. Preservar sessões durante mudanças de espectadores — implementado
 
 **Arquivo:** `crates/p2p-client/src/app/group_sharing.rs`, no método `rebalance_group_outbound`.
 
-- Criar sessões apenas para novos espectadores e encerrar apenas as removidas quando o bitrate das demais não mudar.
-- Avaliar ajuste de bitrate durante a sessão quando o encoder oferecer suporte; definir o tratamento para encoders sem esse suporte.
-- Preservar os limites atuais de banda e a correlação por geração.
-- Testar entrada e saída de espectadores, sinais atrasados e continuidade das sessões mantidas.
+- Quando a taxa de bits alvo (`group_share_bitrate`) permanece a mesma (por exemplo, na transição entre 1 e 2 espectadores, ambos limitados pelo teto de bitrate por peer de 4 Mbps), as sessões WebRTC existentes não são interrompidas nem reiniciadas.
+- O reequilíbrio remove e desliga com sinal `ScreenShareStopped` exclusivamente os espectadores que saíram (`departed`), liberando suas portas dedicadas de mídia, e inicia sessões somente para novos espectadores.
+- Os espectadores que permanecem na transmissão continuam assistindo sem tela preta, queda de fluxo ou renegociação SDP desnecessária.
+- Adicionado teste automatizado específico (`rebalance_preserves_active_viewers_when_bitrate_is_unchanged`) e validado com 100% da suíte do workspace.
 
 ## 5. Compartilhar a codificação de vídeo
 

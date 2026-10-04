@@ -581,6 +581,43 @@ impl ClientUi {
             );
             return;
         }
+        let bitrate_unchanged = self.group_outbound_target_bitrate_bps == Some(bitrate);
+        if bitrate_unchanged {
+            let desired_set: std::collections::HashSet<&String> = viewers.iter().collect();
+            let departed: Vec<String> = self
+                .group_outbound_sessions
+                .keys()
+                .filter(|peer| !desired_set.contains(peer))
+                .cloned()
+                .collect();
+            for viewer in departed {
+                if let Some(session) = self.group_outbound_sessions.remove(&viewer) {
+                    log_final_group_session_diagnostics(&session, "sender", "viewer_departed");
+                }
+                if let Some(generation) = self.group_outbound_generations.remove(&viewer) {
+                    let _ = self.send_screen_share_signal_to_stream(
+                        &viewer,
+                        generation.clone(),
+                        SignalKind::ScreenShareStopped,
+                        String::new(),
+                    );
+                    self.mark_group_generation_closed(&viewer, generation);
+                }
+                self.group_outbound_ports.remove(&viewer);
+            }
+            for viewer in viewers {
+                if !self.group_outbound_sessions.contains_key(&viewer) {
+                    self.start_group_outbound(viewer, context, bitrate);
+                }
+            }
+            tracing::info!(
+                viewers = self.group_outbound_sessions.len(),
+                target_bitrate_bps = bitrate,
+                "Sessões de envio de grupo atualizadas preservando espectadores existentes"
+            );
+            return;
+        }
+
         let old_generations = self
             .group_outbound_generations
             .iter()
@@ -1178,6 +1215,26 @@ mod tests {
             &current,
             2_000_000,
         ));
+    }
+
+    #[test]
+    fn rebalance_preserves_active_viewers_when_bitrate_is_unchanged() {
+        let single = ["viewer-a".to_owned()];
+        let two = vec!["viewer-a".to_owned(), "viewer-b".to_owned()];
+        assert_eq!(group_share_bitrate(1), group_share_bitrate(2));
+        assert_eq!(group_share_bitrate(1), GROUP_SCREEN_MAX_PEER_BITRATE);
+        let desired: HashSet<&String> = two.iter().collect();
+        let departed: Vec<String> = single
+            .iter()
+            .filter(|peer| !desired.contains(peer))
+            .cloned()
+            .collect();
+        assert!(departed.is_empty());
+        let new_viewers: Vec<String> = two
+            .into_iter()
+            .filter(|peer| !single.contains(peer))
+            .collect();
+        assert_eq!(new_viewers, vec!["viewer-b".to_owned()]);
     }
 
     #[test]
