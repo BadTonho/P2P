@@ -487,6 +487,8 @@ where
                     .input_frames
                     .fetch_add((input.len() / channels) as u64, Ordering::Relaxed);
                 let mut non_silent_samples = 0_u64;
+                let mut captured_frames = 0_u64;
+                let mut dropped_frames = 0_u64;
                 for frame in input.chunks(channels) {
                     if frame.is_empty() {
                         continue;
@@ -504,16 +506,28 @@ where
                         if producer.slots() >= OPUS_CHANNELS {
                             let _ = producer.push(left.clamp(-1.0, 1.0));
                             let _ = producer.push(right.clamp(-1.0, 1.0));
-                            diagnostics.captured_frames.fetch_add(1, Ordering::Relaxed);
+                            captured_frames += 1;
                         } else {
-                            diagnostics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                            dropped_frames += 1;
                         }
                         resample_phase -= 1.0;
                     }
                 }
-                diagnostics
-                    .non_silent_samples
-                    .fetch_add(non_silent_samples, Ordering::Relaxed);
+                if captured_frames > 0 {
+                    diagnostics
+                        .captured_frames
+                        .fetch_add(captured_frames, Ordering::Relaxed);
+                }
+                if dropped_frames > 0 {
+                    diagnostics
+                        .dropped_frames
+                        .fetch_add(dropped_frames, Ordering::Relaxed);
+                }
+                if non_silent_samples > 0 {
+                    diagnostics
+                        .non_silent_samples
+                        .fetch_add(non_silent_samples, Ordering::Relaxed);
+                }
             },
             move |error| {
                 let kind = error.kind();

@@ -6,18 +6,13 @@ Reduzir o trabalho de captura e processamento de áudio, preservando a exclusão
 
 Estas sugestões resultam da leitura do código atual. Ainda não foram implementadas nem medidas; não representam uma promessa de ganho de FPS.
 
-## 1. Atualizar métricas por bloco
+## 1. Atualizar métricas por bloco — implementado
 
 **Arquivos:** `crates/p2p-client/src/audio_capture/process_loopback.rs` e `crates/p2p-client/src/audio_capture/system_audio.rs`.
 
-Hoje, os contadores de quadros capturados e descartados fazem operações atômicas a cada quadro PCM. Em 48 kHz, isso pode representar aproximadamente 48 mil atualizações por segundo, por captura.
-
-- Acumular os valores em variáveis locais durante o processamento do bloco.
-- Atualizar os contadores compartilhados uma vez por bloco.
-- Preservar os totais, inclusive nos caminhos de erro e de fila cheia.
-- Testar silêncio, áudio audível, descartes e equivalência dos contadores.
-
-É a primeira mudança recomendada por ter escopo pequeno e permitir comparação determinística.
+- Os contadores de quadros capturados (`captured_frames`), descartados (`dropped_frames`) e amostras não silenciosas (`non_silent_samples`) são acumulados em variáveis locais durante o processamento do bloco.
+- Uma única operação atômica `fetch_add` por métrica é executada ao final do bloco (e também no caminho de erro/aborto), eliminando até 48.000 operações atômicas por segundo por captura.
+- Testado e validado automaticamente com a suíte completa de testes do workspace.
 
 ## 2. Capturar por eventos do Windows
 

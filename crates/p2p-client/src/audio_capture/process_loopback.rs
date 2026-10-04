@@ -354,6 +354,8 @@ fn process_capture_loop(
             .input_frames
             .fetch_add(u64::from(frames), Ordering::Relaxed);
         let mut non_silent = 0u64;
+        let mut captured = 0u64;
+        let mut dropped = 0u64;
         if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 && !data.is_null() {
             let samples =
                 unsafe { std::slice::from_raw_parts(data, frames as usize * block_align) };
@@ -362,6 +364,21 @@ fn process_capture_loop(
                     Ok(samples) => samples,
                     Err(error) => {
                         let _ = unsafe { capture.ReleaseBuffer(frames) };
+                        if captured > 0 {
+                            diagnostics
+                                .captured_frames
+                                .fetch_add(captured, Ordering::Relaxed);
+                        }
+                        if dropped > 0 {
+                            diagnostics
+                                .dropped_frames
+                                .fetch_add(dropped, Ordering::Relaxed);
+                        }
+                        if non_silent > 0 {
+                            diagnostics
+                                .non_silent_samples
+                                .fetch_add(non_silent, Ordering::Relaxed);
+                        }
                         diagnostics.set_fatal_error(None, error.clone());
                         let _ = unsafe { client.Stop() };
                         return Err(error);
@@ -374,9 +391,9 @@ fn process_capture_loop(
                     if producer.slots() >= OPUS_CHANNELS {
                         let _ = producer.push(left);
                         let _ = producer.push(right);
-                        diagnostics.captured_frames.fetch_add(1, Ordering::Relaxed);
+                        captured += 1;
                     } else {
-                        diagnostics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                        dropped += 1;
                     }
                     resample_phase -= 1.0;
                 }
@@ -389,17 +406,29 @@ fn process_capture_loop(
                     if producer.slots() >= OPUS_CHANNELS {
                         let _ = producer.push(0.0);
                         let _ = producer.push(0.0);
-                        diagnostics.captured_frames.fetch_add(1, Ordering::Relaxed);
+                        captured += 1;
                     } else {
-                        diagnostics.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                        dropped += 1;
                     }
                     resample_phase -= 1.0;
                 }
             }
         }
-        diagnostics
-            .non_silent_samples
-            .fetch_add(non_silent, Ordering::Relaxed);
+        if captured > 0 {
+            diagnostics
+                .captured_frames
+                .fetch_add(captured, Ordering::Relaxed);
+        }
+        if dropped > 0 {
+            diagnostics
+                .dropped_frames
+                .fetch_add(dropped, Ordering::Relaxed);
+        }
+        if non_silent > 0 {
+            diagnostics
+                .non_silent_samples
+                .fetch_add(non_silent, Ordering::Relaxed);
+        }
         if let Err(error) = unsafe { capture.ReleaseBuffer(frames) } {
             let message = format!("Falha ao liberar um pacote de áudio do Windows: {error}");
             diagnostics.set_fatal_error(None, message.clone());
