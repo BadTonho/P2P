@@ -503,7 +503,7 @@ fn validate_encoder_frame(frame: &PreviewFrame) -> Result<(), String> {
         .ok_or_else(|| "O tamanho do quadro da tela é inválido.".to_owned())?;
     let rgba_is_valid = frame.rgba.len() == expected_len;
     #[cfg(windows)]
-    let cpu_encoder_input_available = frame.cpu_nv12.is_some();
+    let cpu_encoder_input_available = frame.cpu_nv12.is_some() || frame.gpu_nv12.is_some();
     #[cfg(not(windows))]
     let cpu_encoder_input_available = false;
     if !rgba_is_valid && !cpu_encoder_input_available {
@@ -593,6 +593,38 @@ mod tests {
         let mut decoder = Decoder::new().unwrap();
         let decoded = decoder.decode(&encoded).unwrap().unwrap();
         assert_eq!(decoded.dimensions(), (width as usize, height as usize));
+    }
+
+    #[test]
+    fn validate_encoder_frame_rejects_missing_inputs() {
+        let frame = PreviewFrame {
+            sequence: 1,
+            width: 320,
+            height: 240,
+            rgba: Vec::new(),
+            #[cfg(windows)]
+            gpu_nv12: None,
+            #[cfg(windows)]
+            cpu_nv12: None,
+        };
+        assert!(validate_encoder_frame(&frame).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_encoder_frame_accepts_cpu_nv12_without_rgba() {
+        let frame = PreviewFrame {
+            sequence: 1,
+            width: 320,
+            height: 240,
+            rgba: Vec::new(),
+            gpu_nv12: None,
+            cpu_nv12: Some(Arc::new(crate::screen_capture::CpuNv12Frame {
+                bytes: Arc::new(vec![0; 320 * 240 * 3 / 2]),
+                stride: 320,
+            })),
+        };
+        assert!(validate_encoder_frame(&frame).is_ok());
     }
 
     #[test]
