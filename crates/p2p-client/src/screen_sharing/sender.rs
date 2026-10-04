@@ -521,9 +521,19 @@ pub(super) fn encode_frame(encoder: &mut Encoder, frame: &PreviewFrame) -> Resul
     } else {
         #[cfg(windows)]
         {
-            let input = frame.cpu_nv12.as_deref().ok_or_else(|| {
-                "O quadro sem prévia não contém entrada NV12 para OpenH264.".to_owned()
-            })?;
+            let on_demand_nv12;
+            let input = if let Some(cpu_nv12) = frame.cpu_nv12.as_deref() {
+                cpu_nv12
+            } else if let Some(gpu_nv12) = frame.gpu_nv12.as_deref() {
+                let (bytes, stride) = gpu_nv12.readback_nv12()?;
+                on_demand_nv12 = crate::screen_capture::CpuNv12Frame {
+                    bytes: std::sync::Arc::new(bytes),
+                    stride,
+                };
+                &on_demand_nv12
+            } else {
+                return Err("O quadro sem prévia não contém entrada NV12 para OpenH264.".to_owned());
+            };
             Cow::Owned(mf_video::cpu_nv12_to_rgba(
                 input,
                 frame.width,

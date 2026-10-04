@@ -218,14 +218,38 @@ impl HardwareEncoder {
         self.drain_output()
     }
 
+    fn resolve_cpu_nv12<'a>(
+        frame: Option<&'a GpuNv12Surface>,
+        cpu_nv12: Option<&'a CpuNv12Frame>,
+        rgba: &[u8],
+        storage: &'a mut Option<CpuNv12Frame>,
+    ) -> Option<&'a CpuNv12Frame> {
+        if cpu_nv12.is_some() {
+            return cpu_nv12;
+        }
+        if let (true, Some((bytes, stride))) = (
+            rgba.is_empty(),
+            frame.and_then(|surface| surface.readback_nv12().ok()),
+        ) {
+            *storage = Some(CpuNv12Frame {
+                bytes: std::sync::Arc::new(bytes),
+                stride,
+            });
+            return storage.as_ref();
+        }
+        None
+    }
+
     pub fn encode_gpu_or_nv12_or_rgba(
         &mut self,
         frame: Option<&GpuNv12Surface>,
         cpu_nv12: Option<&CpuNv12Frame>,
         rgba: &[u8],
     ) -> Result<(Vec<u8>, bool, Option<String>), String> {
+        let mut storage = None;
         if !self.gpu_surface_input_enabled {
-            let result = match cpu_nv12 {
+            let effective_nv12 = Self::resolve_cpu_nv12(frame, cpu_nv12, rgba, &mut storage);
+            let result = match effective_nv12 {
                 Some(frame) => self.encode_nv12(frame),
                 None => self.encode_rgba(rgba),
             }?;
@@ -234,7 +258,8 @@ impl HardwareEncoder {
         let Some(frame) = frame else {
             if self.gpu_surface_input_enabled {
                 self.gpu_surface_input_enabled = false;
-                return self.encode_cpu_input(cpu_nv12, rgba).map(|bytes| {
+                let effective_nv12 = Self::resolve_cpu_nv12(None, cpu_nv12, rgba, &mut storage);
+                return self.encode_cpu_input(effective_nv12, rgba).map(|bytes| {
                     (
                         bytes,
                         false,
@@ -242,15 +267,18 @@ impl HardwareEncoder {
                     )
                 });
             }
+            let effective_nv12 = Self::resolve_cpu_nv12(None, cpu_nv12, rgba, &mut storage);
             return self
-                .encode_cpu_input(cpu_nv12, rgba)
+                .encode_cpu_input(effective_nv12, rgba)
                 .map(|bytes| (bytes, false, None));
         };
         match self.encode_gpu(frame) {
             Ok(bytes) => Ok((bytes, true, None)),
             Err(gpu_error) => {
                 self.gpu_surface_input_enabled = false;
-                match self.encode_cpu_input(cpu_nv12, rgba) {
+                let effective_nv12 =
+                    Self::resolve_cpu_nv12(Some(frame), cpu_nv12, rgba, &mut storage);
+                match self.encode_cpu_input(effective_nv12, rgba) {
                     Ok(bytes) => Ok((
                         bytes,
                         false,

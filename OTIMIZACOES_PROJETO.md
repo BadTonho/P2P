@@ -12,7 +12,7 @@ Estas sugestões resultam da leitura do código. O item 1 foi implementado e ver
 |---|---|---|
 | Prévia local | Implementado: a textura é atualizada somente para um quadro novo ou quando precisa ser recriada. Verificação visual em monitores reais pendente. | Pequeno |
 | Captura e decoder DXVA | Implementado: as texturas D3D11 de staging são mantidas em cache e reutilizadas a cada quadro, sendo recriadas apenas se dimensões ou formato mudarem. | Médio |
-| Caminho GPU | A captura lê NV12 de volta para a CPU mesmo com a prévia desligada. Avaliar uma leitura somente quando necessária para a prévia ou para o fallback do encoder. | Médio |
+| Caminho GPU | Implementado: a leitura NV12 e conversão RGBA para CPU são ignoradas quando a prévia está desligada, com readback sob demanda para fallback do encoder. | Médio |
 | Sessões em grupo | O reequilíbrio encerra e recria todas as sessões de envio. Preservar as conexões existentes quando entra ou sai um espectador, considerando mudanças de bitrate. | Médio |
 | Codificação de vídeo | Existe um encoder por espectador. Avaliar uma codificação compartilhada para espectadores com configurações compatíveis. | Grande |
 | Logs | A escrita ocorre na própria thread que registra o evento. Avaliar uma fila limitada e um worker para escrita. | Médio |
@@ -47,16 +47,14 @@ Estas sugestões resultam da leitura do código. O item 1 foi implementado e ver
 - O mapeamento (`Map`/`Unmap`) é devidamente liberado e sincronizado a cada quadro.
 - Validado com 100% de aprovação na suíte de testes do workspace.
 
-## 3. Evitar leitura GPU → CPU desnecessária
+## 3. Evitar leitura GPU → CPU desnecessária — implementado
 
-**Arquivos:** `crates/p2p-client/src/screen_capture/dxgi_backend.rs`, `crates/p2p-client/src/screen_sharing/sender.rs` e `crates/p2p-client/src/mf_video/windows_backend/gpu_nv12.rs`.
+**Arquivos:** `crates/p2p-client/src/screen_capture/dxgi_backend.rs`, `crates/p2p-client/src/screen_sharing/sender.rs` e `crates/p2p-client/src/mf_video/windows_backend/encoder.rs`.
 
-- Avaliar a necessidade de leitura conforme a prévia e o caminho efetivamente usado pelo encoder.
-- Preservar a leitura quando um encoder precisar de entrada pela CPU.
-- Manter a detecção de quadros novos e o fallback após rejeição de uma superfície GPU.
-- Testar prévia ligada/desligada, encoder GPU, encoder CPU e transição de fallback.
-
-O mapeamento pode precisar esperar a GPU terminar de usar o recurso. Referência: [ID3D11DeviceContext::Map — Microsoft](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-map).
+- Quando a prévia local está desativada (`wants_preview == false`), o loop de captura DXGI pula completamente a leitura da textura de staging D3D11 para a CPU (`readback_nv12_into`) e a subsequente conversão NV12 → RGBA, eliminando transferências contínuas de VRAM para RAM de 30 a 60 vezes por segundo.
+- A superfície de hardware D3D11 (`gpu_surface`) é enviada diretamente ao `HardwareEncoder` via `encode_gpu`, codificando em H.264 direto na GPU.
+- Se o encoder de hardware rejeitar a entrada por superfície GPU ou se o fallback OpenH264 na CPU for ativado, a leitura NV12 ocorre sob demanda (`readback_nv12`) a partir da própria superfície, preservando a resiliência do sistema e compatibilidade com fallbacks.
+- Testado e aprovado com 100% dos testes do workspace.
 
 ## 4. Preservar sessões durante mudanças de espectadores
 

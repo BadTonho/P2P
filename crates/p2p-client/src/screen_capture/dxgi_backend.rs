@@ -116,15 +116,27 @@ pub(super) fn capture_dxgi_monitor(
         let mut readback_nanos = 0;
         let mut resize_nanos = 0;
         let (preview_rgba, cpu_nv12) = if let Some(surface) = gpu_surface.as_ref() {
-            let started_at = Instant::now();
-            match surface.readback_nv12_into(&mut staging_texture) {
-                Ok((nv12, stride)) => {
-                    readback_nanos += started_at.elapsed().as_nanos() as u64;
-                    let cpu_nv12 = Some(Arc::new(CpuNv12Frame {
-                        bytes: Arc::new(nv12),
-                        stride,
-                    }));
-                    if wants_preview {
+            if !wants_preview {
+                gpu_preview_fallback_logged = false;
+                let mut reason = fallback_reason
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if reason
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("Prévia GPU:"))
+                {
+                    *reason = None;
+                }
+                (None, None)
+            } else {
+                let started_at = Instant::now();
+                match surface.readback_nv12_into(&mut staging_texture) {
+                    Ok((nv12, stride)) => {
+                        readback_nanos += started_at.elapsed().as_nanos() as u64;
+                        let cpu_nv12 = Some(Arc::new(CpuNv12Frame {
+                            bytes: Arc::new(nv12),
+                            stride,
+                        }));
                         let started_at = Instant::now();
                         match surface.to_rgba(
                             &cpu_nv12.as_ref().expect("NV12 frame was created").bytes,
@@ -160,32 +172,20 @@ pub(super) fn capture_dxgi_monitor(
                                 (None, cpu_nv12)
                             }
                         }
-                    } else {
-                        gpu_preview_fallback_logged = false;
-                        let mut reason = fallback_reason
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if reason
-                            .as_deref()
-                            .is_some_and(|value| value.starts_with("Prévia GPU:"))
-                        {
-                            *reason = None;
+                    }
+                    Err(error) => {
+                        readback_nanos += started_at.elapsed().as_nanos() as u64;
+                        if !gpu_preview_fallback_logged {
+                            tracing::warn!(error = %error, "Falha ao ler a superfície NV12 reduzida; usando cópia BGRA do DXGI");
+                            gpu_preview_fallback_logged = true;
                         }
-                        (None, cpu_nv12)
+                        *fallback_reason
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format!(
+                            "Prévia GPU: falha na leitura da imagem reduzida: {error}"
+                        ));
+                        (None, None)
                     }
-                }
-                Err(error) => {
-                    readback_nanos += started_at.elapsed().as_nanos() as u64;
-                    if !gpu_preview_fallback_logged {
-                        tracing::warn!(error = %error, "Falha ao ler a superfície NV12 reduzida; usando cópia BGRA do DXGI");
-                        gpu_preview_fallback_logged = true;
-                    }
-                    *fallback_reason
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format!(
-                        "Prévia GPU: falha na leitura da imagem reduzida: {error}"
-                    ));
-                    (None, None)
                 }
             }
         } else {
@@ -193,7 +193,7 @@ pub(super) fn capture_dxgi_monitor(
         };
         let rgba = match preview_rgba {
             Some(rgba) => rgba,
-            None if !wants_preview && cpu_nv12.is_some() => Vec::new(),
+            None if !wants_preview && (cpu_nv12.is_some() || gpu_surface.is_some()) => Vec::new(),
             None => {
                 let started_at = Instant::now();
                 let buffer = frame.buffer().map_err(|error| {
