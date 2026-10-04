@@ -1,15 +1,16 @@
 use super::super::{ClientUi, RoomMode, signaling_ws_url};
 use eframe::egui;
 
-const PROFILE_AVATAR_SIZE: f32 = 48.0;
-const PROFILE_NAME_INLINE_MIN_WIDTH: f32 = 280.0;
+const PROFILE_PILL_AVATAR_SIZE: f32 = 34.0;
+const PROFILE_WINDOW_AVATAR_SIZE: f32 = 64.0;
 const PRIMARY_ACTION_HEIGHT: f32 = 30.0;
 const PRIMARY_ACTION_WIDTH: f32 = 120.0;
 
 #[derive(Default)]
-struct ProfileCardActions {
+struct ProfileEditorActions {
     choose_avatar: bool,
     remove_avatar: bool,
+    close_window: bool,
 }
 
 fn show_room_mode_selector(
@@ -163,53 +164,140 @@ fn show_host_picker_and_manage<'a>(
     )
 }
 
-fn show_profile_card(
+fn show_profile_pill(
     ui: &mut egui::Ui,
-    display_name: &mut String,
+    display_name: &str,
     avatar: Option<&egui::TextureHandle>,
-    has_saved_avatar: bool,
-) -> (egui::Response, ProfileCardActions) {
-    let mut actions = ProfileCardActions::default();
-    let response = ui.group(|ui| {
-        ui.heading("Seu perfil");
+) -> egui::Response {
+    let name_display = if display_name.trim().is_empty() {
+        "Definir nome…".to_string()
+    } else {
+        display_name.trim().to_string()
+    };
+
+    let frame = egui::Frame::new()
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .fill(egui::Color32::from_rgb(26, 29, 36))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(44, 49, 62)));
+
+    let inner = frame.show(ui, |ui| {
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+
             if let Some(texture) = avatar {
                 ui.add(
                     egui::Image::new((
                         texture.id(),
-                        egui::vec2(PROFILE_AVATAR_SIZE, PROFILE_AVATAR_SIZE),
+                        egui::vec2(PROFILE_PILL_AVATAR_SIZE, PROFILE_PILL_AVATAR_SIZE),
                     ))
                     .fit_to_exact_size(egui::vec2(
-                        PROFILE_AVATAR_SIZE,
-                        PROFILE_AVATAR_SIZE,
-                    )),
+                        PROFILE_PILL_AVATAR_SIZE,
+                        PROFILE_PILL_AVATAR_SIZE,
+                    ))
+                    .corner_radius(egui::CornerRadius::same(4)),
                 );
+            } else {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(PROFILE_PILL_AVATAR_SIZE, PROFILE_PILL_AVATAR_SIZE),
+                    egui::Sense::hover(),
+                );
+                ui.painter().circle_filled(
+                    rect.center(),
+                    PROFILE_PILL_AVATAR_SIZE / 2.0,
+                    egui::Color32::from_rgb(45, 52, 68),
+                );
+                let initial = name_display
+                    .chars()
+                    .next()
+                    .unwrap_or('?')
+                    .to_uppercase()
+                    .to_string();
+                let text_color = egui::Color32::from_rgb(180, 195, 220);
+                let galley = ui.painter().layout_no_wrap(
+                    initial,
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    text_color,
+                );
+                let text_rect = egui::Rect::from_center_size(rect.center(), galley.size());
+                ui.painter().galley(text_rect.min, galley, text_color);
             }
 
             ui.vertical(|ui| {
-                if ui.available_width() >= PROFILE_NAME_INLINE_MIN_WIDTH {
-                    ui.horizontal(|ui| {
-                        ui.label("Nome na sala");
-                        ui.add(
-                            egui::TextEdit::singleline(display_name)
-                                .hint_text("Se ficar vazio, aparecerá Participante N")
-                                .char_limit(32)
-                                .desired_width(ui.available_width().min(360.0)),
-                        );
-                    });
-                } else {
-                    ui.label("Nome na sala (opcional)");
-                    ui.add(
-                        egui::TextEdit::singleline(display_name)
-                            .hint_text("Se ficar vazio, aparecerá Participante N")
-                            .char_limit(32)
-                            .desired_width(ui.available_width().min(360.0)),
-                    );
-                }
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.label(egui::RichText::new(&name_display).strong());
+                ui.label(
+                    egui::RichText::new("Editar perfil")
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(130, 140, 160)),
+                );
+            });
+        });
+    });
 
-                ui.horizontal_wrapped(|ui| {
+    ui.interact(inner.response.rect, inner.response.id, egui::Sense::click())
+        .on_hover_text("Clique para editar o perfil")
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn show_profile_window_contents(
+    ui: &mut egui::Ui,
+    display_name: &mut String,
+    avatar: Option<&egui::TextureHandle>,
+    has_saved_avatar: bool,
+    avatar_error: Option<&str>,
+) -> ProfileEditorActions {
+    let mut actions = ProfileEditorActions::default();
+
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+
+            if let Some(texture) = avatar {
+                ui.add(
+                    egui::Image::new((
+                        texture.id(),
+                        egui::vec2(PROFILE_WINDOW_AVATAR_SIZE, PROFILE_WINDOW_AVATAR_SIZE),
+                    ))
+                    .fit_to_exact_size(egui::vec2(
+                        PROFILE_WINDOW_AVATAR_SIZE,
+                        PROFILE_WINDOW_AVATAR_SIZE,
+                    ))
+                    .corner_radius(egui::CornerRadius::same(8)),
+                );
+            } else {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(PROFILE_WINDOW_AVATAR_SIZE, PROFILE_WINDOW_AVATAR_SIZE),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    rect,
+                    egui::CornerRadius::same(8),
+                    egui::Color32::from_rgb(38, 42, 54),
+                );
+                let initial = display_name
+                    .trim()
+                    .chars()
+                    .next()
+                    .unwrap_or('?')
+                    .to_uppercase()
+                    .to_string();
+                let text_color = egui::Color32::from_rgb(180, 195, 220);
+                let galley = ui.painter().layout_no_wrap(
+                    initial,
+                    egui::TextStyle::Heading.resolve(ui.style()),
+                    text_color,
+                );
+                let text_rect = egui::Rect::from_center_size(rect.center(), galley.size());
+                ui.painter().galley(text_rect.min, galley, text_color);
+            }
+
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new("Foto de perfil").strong());
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
                     if ui
-                        .small_button(if has_saved_avatar {
+                        .button(if has_saved_avatar {
                             "Alterar foto"
                         } else {
                             "Escolher foto"
@@ -218,16 +306,43 @@ fn show_profile_card(
                     {
                         actions.choose_avatar = true;
                     }
-                    if has_saved_avatar && ui.small_button("Remover foto").clicked() {
+                    if has_saved_avatar && ui.button("Remover foto").clicked() {
                         actions.remove_avatar = true;
                     }
                 });
+                ui.add_space(2.0);
+                ui.small("PNG ou JPEG (96x96).");
             });
         });
+
+        if let Some(error) = avatar_error {
+            ui.add_space(4.0);
+            ClientUi::show_notice(ui, "Foto do perfil:", error);
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        ui.label(egui::RichText::new("Nome na sala").strong());
+        ui.add(
+            egui::TextEdit::singleline(display_name)
+                .hint_text("Se ficar vazio, aparecerá Participante N")
+                .char_limit(32)
+                .desired_width(ui.available_width()),
+        );
+        ui.add_space(4.0);
         ui.small("O nome aparece em qualquer sala. A foto é compartilhada apenas em salas Rede local / Radmin.");
+
+        ui.add_space(12.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Concluir").clicked() {
+                actions.close_window = true;
+            }
+        });
     });
 
-    (response.response, actions)
+    actions
 }
 
 impl ClientUi {
@@ -235,9 +350,6 @@ impl ClientUi {
         if !self.addresses_loaded {
             self.refresh_host_addresses();
         }
-
-        self.show_profile_card(ui);
-        ui.add_space(4.0);
 
         show_room_mode_selector(
             ui,
@@ -299,24 +411,61 @@ impl ClientUi {
         });
     }
 
-    fn show_profile_card(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn show_home_bottom_bar(&mut self, ui: &mut egui::Ui) {
         let avatar = self.local_profile_avatar_texture(ui.ctx());
-        let has_saved_avatar = self.profile_avatar_jpeg.is_some();
-        let (_, actions) = show_profile_card(
-            ui,
-            &mut self.profile_display_name,
-            avatar.as_ref(),
-            has_saved_avatar,
-        );
+        let response = show_profile_pill(ui, &self.profile_display_name, avatar.as_ref());
+        if response.clicked() {
+            self.profile_window_open = true;
+        }
+    }
 
-        if actions.choose_avatar {
+    pub(super) fn show_profile_window(&mut self, context: &egui::Context) {
+        if !self.profile_window_open {
+            return;
+        }
+        let mut open = self.profile_window_open;
+        let mut choose_avatar = false;
+        let mut remove_avatar = false;
+        let mut close_window = false;
+        let has_saved_avatar = self.profile_avatar_jpeg.is_some();
+        let avatar = self.local_profile_avatar_texture(context);
+        let avatar_error = self.profile_avatar_error.clone();
+
+        egui::Window::new("Editar perfil")
+            .id(egui::Id::new("profile-editor-window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .show(context, |ui| {
+                Self::apply_monochrome_style(ui);
+                let actions = show_profile_window_contents(
+                    ui,
+                    &mut self.profile_display_name,
+                    avatar.as_ref(),
+                    has_saved_avatar,
+                    avatar_error.as_deref(),
+                );
+                if actions.choose_avatar {
+                    choose_avatar = true;
+                }
+                if actions.remove_avatar {
+                    remove_avatar = true;
+                }
+                if actions.close_window {
+                    close_window = true;
+                }
+            });
+
+        if close_window {
+            open = false;
+        }
+        self.profile_window_open = open;
+        if choose_avatar {
             self.choose_profile_avatar();
         }
-        if actions.remove_avatar {
+        if remove_avatar {
             self.remove_profile_avatar();
-        }
-        if let Some(error) = self.profile_avatar_error.clone() {
-            ClientUi::show_notice(ui, "Foto do perfil:", &error);
         }
     }
 
@@ -407,8 +556,8 @@ mod tests {
     use super::{
         PRIMARY_ACTION_HEIGHT, PRIMARY_ACTION_WIDTH, RoomMode, configure_action_button_visuals,
         join_action_enabled, primary_action_button, room_actions_enabled,
-        show_host_picker_and_manage, show_network_window, show_profile_card,
-        show_room_mode_selector,
+        show_host_picker_and_manage, show_network_window, show_profile_pill,
+        show_profile_window_contents, show_room_mode_selector,
     };
     use eframe::egui;
 
@@ -507,60 +656,121 @@ mod tests {
         layout.expect("home action cards should be laid out")
     }
 
-    fn render_profile_and_mode(width: f32) -> (egui::Rect, egui::Rect, RoomMode) {
+    #[test]
+    fn profile_pill_renders_and_responds_to_click() {
         let context = egui::Context::default();
-        let mut profile_rect = None;
-        let mut mode_rect = None;
+        let display_name = "Tonho".to_owned();
+        let mut pill_rect = None;
+
+        let mut first_frame = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 100.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let avatar = ui.ctx().load_texture(
+                    "profile-pill-test-avatar",
+                    egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                    egui::TextureOptions::default(),
+                );
+                let response = show_profile_pill(ui, &display_name, Some(&avatar));
+                pill_rect = Some(response.rect);
+            },
+        );
+        first_frame.textures_delta.clear();
+
+        let rect = pill_rect.expect("profile pill should be laid out");
+        assert!(rect.width() > 50.0);
+        assert!(rect.height() >= 34.0);
+
+        let click_pos = rect.center();
+        let mut clicked = false;
+        let mut second_frame = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 100.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(click_pos),
+                    egui::Event::PointerButton {
+                        pos: click_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos: click_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                let response = show_profile_pill(ui, &display_name, None);
+                clicked = response.clicked();
+            },
+        );
+        second_frame.textures_delta.clear();
+        assert!(clicked);
+    }
+
+    #[test]
+    fn profile_window_contents_render_and_handle_actions() {
+        let context = egui::Context::default();
         let mut display_name = "Tonho".to_owned();
-        let mut mode = RoomMode::Local;
-        let mut popup_open = false;
 
         let mut output = context.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(width, 480.0),
+                    egui::vec2(400.0, 400.0),
                 )),
                 ..Default::default()
             },
             |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let avatar = ui.ctx().load_texture(
-                        "profile-layout-test-avatar",
-                        egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
-                        egui::TextureOptions::default(),
-                    );
-                    let (profile, _) =
-                        show_profile_card(ui, &mut display_name, Some(&avatar), true);
-                    profile_rect = Some(profile.rect);
-                    ui.add_space(4.0);
-                    let (mode_row, _) = show_room_mode_selector(ui, &mut mode, &mut popup_open);
-                    mode_rect = Some(mode_row.rect);
-                });
+                let actions = show_profile_window_contents(
+                    ui,
+                    &mut display_name,
+                    None,
+                    true,
+                    Some("Aviso de teste"),
+                );
+                assert!(!actions.choose_avatar);
+                assert!(!actions.remove_avatar);
+                assert!(!actions.close_window);
             },
         );
         output.textures_delta.clear();
-
-        (
-            profile_rect.expect("profile card should be laid out"),
-            mode_rect.expect("room mode selector should be laid out"),
-            mode,
-        )
     }
 
     #[test]
-    fn profile_and_room_mode_fit_wide_and_narrow_layouts() {
-        let (wide_profile, wide_mode, wide_selection) = render_profile_and_mode(640.0);
-        let (narrow_profile, narrow_mode, narrow_selection) = render_profile_and_mode(340.0);
-
-        assert!(wide_profile.height() < narrow_profile.height());
-        assert!(wide_profile.height() < 120.0);
-        assert!(narrow_profile.right() <= 340.0);
-        assert!(narrow_mode.right() <= 340.0);
-        assert_eq!(wide_selection, RoomMode::Local);
-        assert_eq!(narrow_selection, RoomMode::Local);
-        assert!(wide_mode.min.y >= wide_profile.max.y);
-        assert!(narrow_mode.min.y >= narrow_profile.max.y);
+    fn room_mode_selector_fits_wide_and_narrow_layouts() {
+        for width in [640.0, 340.0] {
+            let context = egui::Context::default();
+            let mut mode = RoomMode::Local;
+            let mut open = false;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 100.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let (row, _) = show_room_mode_selector(ui, &mut mode, &mut open);
+                    assert!(row.rect.right() <= width);
+                },
+            );
+            output.textures_delta.clear();
+            assert_eq!(mode, RoomMode::Local);
+        }
     }
 
     #[test]

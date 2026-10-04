@@ -298,6 +298,7 @@ struct ClientUi {
     profile_avatar_jpeg: Option<Vec<u8>>,
     profile_avatar_texture: Option<egui::TextureHandle>,
     profile_avatar_error: Option<String>,
+    profile_window_open: bool,
     participant_avatar_textures: HashMap<String, (Option<String>, Option<egui::TextureHandle>)>,
     screen_capture: Option<ScreenCapture>,
     screen_picker: Option<PendingScreenCapture>,
@@ -772,6 +773,18 @@ impl ClientUi {
                     Self::apply_monochrome_style(ui);
                     ui::show_room_toolbar(self, ui);
                 });
+        } else if !self.settings_open {
+            egui::Panel::bottom("home-bottom-bar")
+                .frame(
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(17, 19, 24))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(32, 36, 45)))
+                        .inner_margin(egui::Margin::symmetric(12, 6)),
+                )
+                .show(ui, |ui| {
+                    Self::apply_monochrome_style(ui);
+                    ui::show_home_bottom_bar(self, ui);
+                });
         }
 
         let mut open_update_settings = false;
@@ -958,6 +971,8 @@ impl ClientUi {
         if open_logs_directory {
             self.open_logs_directory();
         }
+
+        ui::show_profile_window(self, &context);
 
         if self.preferences_snapshot() != preferences_before_frame {
             self.settings_dirty = true;

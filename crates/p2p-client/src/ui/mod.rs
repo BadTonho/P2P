@@ -30,6 +30,14 @@ pub(super) fn show_settings(app: &mut ClientUi, ui: &mut egui::Ui) {
     app.show_settings(ui);
 }
 
+pub(super) fn show_home_bottom_bar(app: &mut ClientUi, ui: &mut egui::Ui) {
+    app.show_home_bottom_bar(ui);
+}
+
+pub(super) fn show_profile_window(app: &mut ClientUi, context: &egui::Context) {
+    app.show_profile_window(context);
+}
+
 pub(super) fn show_diagnostics(
     app: &mut ClientUi,
     ui: &mut egui::Ui,
