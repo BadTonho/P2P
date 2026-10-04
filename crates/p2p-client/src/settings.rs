@@ -94,6 +94,12 @@ pub struct AppSettings {
     pub logging_level: LoggingLevel,
     #[serde(default)]
     pub log_performance_metrics: bool,
+    #[serde(default = "default_log_errors_file")]
+    pub log_errors_file: bool,
+}
+
+const fn default_log_errors_file() -> bool {
+    true
 }
 
 const fn default_remote_audio_volume_percent() -> u8 {
@@ -163,6 +169,7 @@ impl Default for AppSettings {
             remote_audio_default_volume_percent: default_remote_audio_volume_percent(),
             logging_level: LoggingLevel::default(),
             log_performance_metrics: false,
+            log_errors_file: default_log_errors_file(),
         }
     }
 }
@@ -652,5 +659,6 @@ mod tests {
         let settings: AppSettings =
             serde_json::from_str("{}").expect("empty json should deserialize with defaults");
         assert!(!settings.log_performance_metrics);
+        assert!(settings.log_errors_file);
     }
 }

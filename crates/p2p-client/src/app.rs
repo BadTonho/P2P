@@ -346,6 +346,7 @@ struct ClientUi {
     logging: LoggingState,
     logging_level: LoggingLevel,
     pub(super) log_performance_metrics: bool,
+    pub(super) log_errors_file: bool,
     last_screen_metrics_log_at: Option<Instant>,
     last_control_link_state: Option<(usize, usize)>,
     last_control_metrics_log_at: Option<Instant>,
@@ -536,6 +537,7 @@ impl ClientUi {
             remote_audio_default_volume_percent: self.remote_audio_default_volume_percent,
             logging_level: self.logging_level,
             log_performance_metrics: self.log_performance_metrics,
+            log_errors_file: self.log_errors_file,
             video_decoder_preference: self.video_decoder_preference,
             show_local_preview: self.show_local_preview,
             include_system_audio: self.include_system_audio,
@@ -561,6 +563,8 @@ impl ClientUi {
         self.remote_audio_default_volume_percent = preferences.remote_audio_default_volume_percent;
         self.logging_level = preferences.logging_level;
         self.log_performance_metrics = preferences.log_performance_metrics;
+        self.log_errors_file = preferences.log_errors_file;
+        self.logging.set_errors_enabled(self.log_errors_file);
         self.video_decoder_preference = preferences.video_decoder_preference;
         self.show_local_preview = preferences.show_local_preview;
         self.include_system_audio = preferences.include_system_audio;
@@ -2579,6 +2583,7 @@ pub(super) fn run() -> eframe::Result {
     let (preferences, settings_warning) = settings::load();
     app.apply_preferences(preferences);
     app.logging = LoggingState::initialize(app.logging_level);
+    app.logging.set_errors_enabled(app.log_errors_file);
     logging::install_panic_hook();
     app.updates.check();
     app.settings_error = settings_warning;

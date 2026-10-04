@@ -177,6 +177,7 @@ struct RollingSink {
     file: Option<File>,
     error_path: Option<PathBuf>,
     error_file: Option<File>,
+    errors_enabled: bool,
     stderr_fallback: bool,
     duplicate_packet_warnings: HashMap<Option<u32>, u64>,
     duplicate_packet_warning_order: VecDeque<Option<u32>>,
@@ -189,6 +190,7 @@ impl RollingSink {
             file: None,
             error_path: None,
             error_file: None,
+            errors_enabled: true,
             stderr_fallback: false,
             duplicate_packet_warnings: HashMap::new(),
             duplicate_packet_warning_order: VecDeque::new(),
@@ -315,6 +317,14 @@ impl LoggingState {
 
     pub fn set_level(&mut self, level: LoggingLevel) {
         self.set_level_with(level, open_log_directory);
+    }
+
+    pub fn set_errors_enabled(&mut self, enabled: bool) {
+        if let Some(sink) = &self.sink {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .errors_enabled = enabled;
+        }
     }
 
     fn set_level_with(
@@ -635,6 +645,7 @@ impl RollingSink {
             file: Some(file),
             error_path: Some(error_path),
             error_file: None,
+            errors_enabled: true,
             stderr_fallback: false,
             duplicate_packet_warnings: HashMap::new(),
             duplicate_packet_warning_order: VecDeque::new(),
@@ -687,7 +698,7 @@ impl RollingSink {
             stderr.flush()?;
         }
 
-        if is_error_line(bytes) {
+        if self.errors_enabled && is_error_line(bytes) {
             if self.error_file.is_none()
                 && let Some(error_path) = &self.error_path
             {

@@ -96,6 +96,17 @@ impl ClientUi {
             ui.small(
                 "Desmarcado por padrão para economizar espaço e evitar sobrecarga de I/O em disco.",
             );
+            ui.add_space(4.0);
+            if ui
+                .checkbox(
+                    &mut self.log_errors_file,
+                    "Gravar log dedicado de erros (p2p-errors.log)",
+                )
+                .changed()
+            {
+                self.logging.set_errors_enabled(self.log_errors_file);
+            }
+            ui.small("Ativado por padrão para facilitar o diagnóstico rápido de falhas.");
         });
     }
 
