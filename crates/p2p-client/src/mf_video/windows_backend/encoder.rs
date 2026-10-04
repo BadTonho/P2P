@@ -190,27 +190,26 @@ impl HardwareEncoder {
     pub fn encode_gpu(&mut self, frame: &GpuNv12Surface) -> Result<Vec<u8>, String> {
         if frame.width != self.width || frame.height != self.height {
             return Err(
-                "A superfÃ­cie NV12 da GPU nÃ£o corresponde Ã s dimensÃµes do codificador."
-                    .to_owned(),
+                "A superfície NV12 da GPU não corresponde às dimensões do codificador.".to_owned(),
             );
         }
         if self._device.is_none() {
             return Err(
-                "O codificador Media Foundation nÃ£o foi configurado para superfÃ­cies D3D11."
+                "O codificador Media Foundation não foi configurado para superfícies D3D11."
                     .to_owned(),
             );
         }
         let buffer =
             unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &frame.texture, 0, false) }
                 .map_err(|error| {
-                format!("O Media Foundation nÃ£o aceitou a superfÃ­cie D3D11 NV12: {error}")
+                format!("O Media Foundation não aceitou a superfície D3D11 NV12: {error}")
             })?;
         let sample = unsafe { MFCreateSample() }
-            .map_err(|error| format!("NÃ£o foi possÃ­vel criar amostra da GPU: {error}"))?;
+            .map_err(|error| format!("Não foi possível criar amostra da GPU: {error}"))?;
         unsafe {
             sample
                 .AddBuffer(&buffer)
-                .map_err(|error| format!("NÃ£o foi possÃ­vel anexar a superfÃ­cie D3D11: {error}"))?;
+                .map_err(|error| format!("Não foi possível anexar a superfície D3D11: {error}"))?;
         }
         self.transform.send_sample(&sample, self.next_time_hns)?;
         self.next_time_hns += HNS_PER_SECOND / i64::from(FRAME_RATE);

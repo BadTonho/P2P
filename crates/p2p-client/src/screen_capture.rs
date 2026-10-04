@@ -348,7 +348,7 @@ impl PickerThreadOwner {
 impl ScreenCapture {
     pub fn monitors() -> Result<Vec<MonitorOption>, String> {
         let monitors = Monitor::enumerate().map_err(|error| {
-            format!("NÃ£o foi possÃ­vel enumerar monitores para captura DXGI: {error}")
+            format!("Não foi possível enumerar monitores para captura DXGI: {error}")
         })?;
         let primary = Monitor::primary().ok();
         monitors
@@ -414,7 +414,7 @@ impl ScreenCapture {
                     worker_preview_enabled,
                 )
             })
-            .map_err(|error| format!("NÃ£o foi possÃ­vel iniciar a thread DXGI: {error}"))?;
+            .map_err(|error| format!("Não foi possível iniciar a thread DXGI: {error}"))?;
 
         tracing::info!(monitor_device_id = %device_id, "Captura DXGI do monitor iniciada");
         Ok(Self {

@@ -410,7 +410,7 @@ impl ClientUi {
             }
             Err(error) => {
                 self.available_monitors.clear();
-                tracing::warn!(error = %error, "NÃ£o foi possÃ­vel enumerar monitores DXGI");
+                tracing::warn!(error = %error, "Não foi possível enumerar monitores DXGI");
                 self.dxgi_capture_error = Some(error);
             }
         }

@@ -77,7 +77,7 @@ pub(super) fn capture_dxgi_monitor(
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 }
                 Err(error) => {
-                    tracing::warn!(error = %error, "ConversÃ£o DXGI para NV12 na GPU indisponÃ­vel; encoder usarÃ¡ o caminho atual por CPU");
+                    tracing::warn!(error = %error, "Conversão DXGI para NV12 na GPU indisponível; encoder usará o caminho atual por CPU");
                     gpu_processor = None;
                     gpu_fallback_logged = true;
                     *fallback_reason

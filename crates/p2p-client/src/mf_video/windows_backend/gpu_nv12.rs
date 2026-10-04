@@ -85,11 +85,11 @@ impl GpuNv12Processor {
         output_height: u32,
     ) -> Result<Self, String> {
         let video_device: ID3D11VideoDevice = device.cast().map_err(|error| {
-            format!("O dispositivo DXGI nÃ£o oferece conversÃ£o D3D11 de vÃ­deo: {error}")
+            format!("O dispositivo DXGI não oferece conversão D3D11 de vídeo: {error}")
         })?;
         let video_context: ID3D11VideoContext = context
             .cast()
-            .map_err(|error| format!("O contexto DXGI nÃ£o oferece ID3D11VideoContext: {error}"))?;
+            .map_err(|error| format!("O contexto DXGI não oferece ID3D11VideoContext: {error}"))?;
         let description = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
             InputFrameRate: DXGI_RATIONAL {
@@ -107,22 +107,22 @@ impl GpuNv12Processor {
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
         };
         let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&description) }
-            .map_err(|error| format!("NÃ£o foi possÃ­vel criar conversor D3D11: {error}"))?;
+            .map_err(|error| format!("Não foi possível criar conversor D3D11: {error}"))?;
         let input_support =
             unsafe { enumerator.CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM) }.map_err(
-                |error| format!("NÃ£o foi possÃ­vel consultar formato BGRA do monitor: {error}"),
+                |error| format!("Não foi possível consultar formato BGRA do monitor: {error}"),
             )?;
         if input_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 as u32 == 0 {
-            return Err("A GPU nÃ£o aceita BGRA como entrada do conversor de vÃ­deo.".to_owned());
+            return Err("A GPU não aceita BGRA como entrada do conversor de vídeo.".to_owned());
         }
         let output_support = unsafe { enumerator.CheckVideoProcessorFormat(DXGI_FORMAT_NV12) }
-            .map_err(|error| format!("NÃ£o foi possÃ­vel consultar saÃ­da NV12 da GPU: {error}"))?;
+            .map_err(|error| format!("Não foi possível consultar saída NV12 da GPU: {error}"))?;
         if output_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 == 0 {
-            return Err("A GPU nÃ£o aceita NV12 como saÃ­da do conversor de vÃ­deo.".to_owned());
+            return Err("A GPU não aceita NV12 como saída do conversor de vídeo.".to_owned());
         }
         let processor =
             unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }.map_err(|error| {
-                format!("NÃ£o foi possÃ­vel iniciar o conversor de vÃ­deo D3D11: {error}")
+                format!("Não foi possível iniciar o conversor de vídeo D3D11: {error}")
             })?;
         Ok(Self {
             device: device.clone(),
@@ -159,10 +159,10 @@ impl GpuNv12Processor {
             self.device
                 .CreateTexture2D(&texture_desc, None, Some(&mut texture))
                 .map_err(|error| {
-                    format!("NÃ£o foi possÃ­vel criar textura NV12 para o encoder: {error}")
+                    format!("Não foi possível criar textura NV12 para o encoder: {error}")
                 })?;
         }
-        let texture = texture.ok_or_else(|| "D3D11 nÃ£o retornou a textura NV12.".to_owned())?;
+        let texture = texture.ok_or_else(|| "D3D11 não retornou a textura NV12.".to_owned())?;
         let input_description = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
             ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
@@ -190,7 +190,7 @@ impl GpuNv12Processor {
                     Some(&mut input_view),
                 )
                 .map_err(|error| {
-                    format!("D3D11 nÃ£o criou a visualizaÃ§Ã£o do quadro DXGI: {error}")
+                    format!("D3D11 não criou a visualização do quadro DXGI: {error}")
                 })?;
             self.video_device
                 .CreateVideoProcessorOutputView(
@@ -199,7 +199,7 @@ impl GpuNv12Processor {
                     &output_description,
                     Some(&mut output_view),
                 )
-                .map_err(|error| format!("D3D11 nÃ£o criou a superfÃ­cie de saÃ­da NV12: {error}"))?;
+                .map_err(|error| format!("D3D11 não criou a superfície de saída NV12: {error}"))?;
             let source_rect = RECT {
                 left: 0,
                 top: 0,
@@ -238,11 +238,11 @@ impl GpuNv12Processor {
                     &self.processor,
                     output_view
                         .as_ref()
-                        .ok_or_else(|| "D3D11 nÃ£o retornou visualizaÃ§Ã£o de saÃ­da.".to_owned())?,
+                        .ok_or_else(|| "D3D11 não retornou visualização de saída.".to_owned())?,
                     0,
                     &[stream],
                 )
-                .map_err(|error| format!("A GPU nÃ£o converteu BGRA para NV12: {error}"))?;
+                .map_err(|error| format!("A GPU não converteu BGRA para NV12: {error}"))?;
         }
         Ok(GpuNv12Surface {
             device: self.device.clone(),
