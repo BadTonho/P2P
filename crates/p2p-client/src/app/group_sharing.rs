@@ -1024,9 +1024,10 @@ impl ClientUi {
             self.rebalance_group_outbound(context, None);
         }
 
-        if self
-            .last_group_metrics_log_at
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+        if self.log_performance_metrics
+            && self
+                .last_group_metrics_log_at
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
         {
             let interval_seconds = self
                 .last_group_metrics_log_at

@@ -34,6 +34,16 @@ impl ClientUi {
                     }
                 });
 
+                if let Some(error_path) = self.logging.errors_log_file() {
+                    ui.label("Log de erros (apenas erros):");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(error_path.display().to_string());
+                        if ui.small_button("Copiar caminho").clicked() {
+                            ui.ctx().copy_text(error_path.display().to_string());
+                        }
+                    });
+                }
+
                 if self.room_code.is_some() {
                     ui.separator();
                     self.show_screen_diagnostics(ui);

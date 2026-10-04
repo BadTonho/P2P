@@ -92,6 +92,8 @@ pub struct AppSettings {
     pub remote_audio_default_volume_percent: u8,
     #[serde(default)]
     pub logging_level: LoggingLevel,
+    #[serde(default)]
+    pub log_performance_metrics: bool,
 }
 
 const fn default_remote_audio_volume_percent() -> u8 {
@@ -160,6 +162,7 @@ impl Default for AppSettings {
             profile_display_name: String::new(),
             remote_audio_default_volume_percent: default_remote_audio_volume_percent(),
             logging_level: LoggingLevel::default(),
+            log_performance_metrics: false,
         }
     }
 }
@@ -642,5 +645,12 @@ mod tests {
         assert!(!serialized.contains("room_code"));
         assert!(!serialized.contains("turn_credentials"));
         assert!(!serialized.contains("password"));
+    }
+
+    #[test]
+    fn older_settings_default_log_performance_metrics_to_false() {
+        let settings: AppSettings =
+            serde_json::from_str("{}").expect("empty json should deserialize with defaults");
+        assert!(!settings.log_performance_metrics);
     }
 }

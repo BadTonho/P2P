@@ -88,6 +88,14 @@ impl ClientUi {
                 "Padrão: somente avisos e erros. Logs detalhados incluem informações e depuração.",
             );
             ui.small("Desativados não cria arquivos de sessão; logs antigos são preservados.");
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut self.log_performance_metrics,
+                "Registrar métricas periódicas de desempenho no log",
+            );
+            ui.small(
+                "Desmarcado por padrão para economizar espaço e evitar sobrecarga de I/O em disco.",
+            );
         });
     }
 

@@ -345,6 +345,7 @@ struct ClientUi {
     screen_share_metrics: ScreenShareMetrics,
     logging: LoggingState,
     logging_level: LoggingLevel,
+    pub(super) log_performance_metrics: bool,
     last_screen_metrics_log_at: Option<Instant>,
     last_control_link_state: Option<(usize, usize)>,
     last_control_metrics_log_at: Option<Instant>,
@@ -534,6 +535,7 @@ impl ClientUi {
             monitor_gain_db: self.monitor_gain_db,
             remote_audio_default_volume_percent: self.remote_audio_default_volume_percent,
             logging_level: self.logging_level,
+            log_performance_metrics: self.log_performance_metrics,
             video_decoder_preference: self.video_decoder_preference,
             show_local_preview: self.show_local_preview,
             include_system_audio: self.include_system_audio,
@@ -558,6 +560,7 @@ impl ClientUi {
         self.monitor_gain_db = preferences.monitor_gain_db;
         self.remote_audio_default_volume_percent = preferences.remote_audio_default_volume_percent;
         self.logging_level = preferences.logging_level;
+        self.log_performance_metrics = preferences.log_performance_metrics;
         self.video_decoder_preference = preferences.video_decoder_preference;
         self.show_local_preview = preferences.show_local_preview;
         self.include_system_audio = preferences.include_system_audio;
@@ -1033,9 +1036,10 @@ impl ClientUi {
         let rms = microphone.level();
         let level_dbfs = if rms > 0.0 { 20.0 * rms.log10() } else { -60.0 };
         let level_dbfs = level_dbfs.clamp(-60.0, 0.0);
-        if self
-            .last_audio_metrics_log_at
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+        if self.log_performance_metrics
+            && self
+                .last_audio_metrics_log_at
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
         {
             tracing::info!(
                 level_dbfs,
@@ -1732,9 +1736,10 @@ impl ClientUi {
         self.refresh_group_screen_shares(context);
         if let Some(session) = self.screen_share_session.as_ref() {
             self.screen_share_metrics = session.metrics();
-            let should_log_metrics = self
-                .last_screen_metrics_log_at
-                .is_none_or(|last| last.elapsed() >= Duration::from_secs(5));
+            let should_log_metrics = self.log_performance_metrics
+                && self
+                    .last_screen_metrics_log_at
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(5));
             if should_log_metrics {
                 let metrics = &self.screen_share_metrics;
                 let logged_at = Instant::now();

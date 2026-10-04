@@ -175,6 +175,8 @@ struct SharedLogWriter {
 struct RollingSink {
     path: Option<PathBuf>,
     file: Option<File>,
+    error_path: Option<PathBuf>,
+    error_file: Option<File>,
     stderr_fallback: bool,
     duplicate_packet_warnings: HashMap<Option<u32>, u64>,
     duplicate_packet_warning_order: VecDeque<Option<u32>>,
@@ -185,6 +187,8 @@ impl RollingSink {
         Self {
             path: None,
             file: None,
+            error_path: None,
+            error_file: None,
             stderr_fallback: false,
             duplicate_packet_warnings: HashMap::new(),
             duplicate_packet_warning_order: VecDeque::new(),
@@ -496,6 +500,12 @@ impl LoggingState {
         self.current_log_file.as_deref()
     }
 
+    pub fn errors_log_file(&self) -> Option<PathBuf> {
+        self.log_directory
+            .as_ref()
+            .map(|d| d.join("p2p-errors.log"))
+    }
+
     pub fn current_log_file_label(&self) -> String {
         self.current_log_file
             .as_ref()
@@ -619,9 +629,12 @@ impl RollingSink {
             .write(true)
             .create_new(true)
             .open(&path)?;
+        let error_path = directory.join("p2p-errors.log");
         Ok(Self {
             path: Some(path),
             file: Some(file),
+            error_path: Some(error_path),
+            error_file: None,
             stderr_fallback: false,
             duplicate_packet_warnings: HashMap::new(),
             duplicate_packet_warning_order: VecDeque::new(),
@@ -673,8 +686,32 @@ impl RollingSink {
             }
             stderr.flush()?;
         }
+
+        if is_error_line(bytes) {
+            if self.error_file.is_none()
+                && let Some(error_path) = &self.error_path
+            {
+                self.error_file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(error_path)
+                    .ok();
+            }
+            if let Some(error_file) = &mut self.error_file {
+                let _ = error_file.write_all(bytes);
+                if !bytes.ends_with(b"\n") {
+                    let _ = error_file.write_all(b"\n");
+                }
+                let _ = error_file.flush();
+            }
+        }
         Ok(())
     }
+}
+
+fn is_error_line(bytes: &[u8]) -> bool {
+    let line = String::from_utf8_lossy(bytes);
+    line.contains("ERROR") || line.contains("error:")
 }
 
 #[cfg(test)]
@@ -717,6 +754,19 @@ mod filter_tests {
             Some(177_936_076)
         );
         assert_eq!(duplicate_packet_ssrc("WARN packet duplicated"), None);
+    }
+
+    #[test]
+    fn detects_error_lines_properly() {
+        use super::is_error_line;
+        assert!(is_error_line(
+            b"2026-10-04T00:00:00Z ERROR connection failed"
+        ));
+        assert!(is_error_line(b"Failed with error: invalid packet"));
+        assert!(!is_error_line(
+            b"2026-10-04T00:00:00Z INFO connection success"
+        ));
+        assert!(!is_error_line(b"2026-10-04T00:00:00Z WARN packet delayed"));
     }
 
     #[test]
