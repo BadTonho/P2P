@@ -33,6 +33,10 @@ mod room_lifecycle;
 mod room_participants;
 #[path = "ui/mod.rs"]
 mod ui;
+#[path = "app/updates.rs"]
+mod updates;
+
+pub(crate) use updates::*;
 
 const TURN_CONFIG_SIGNAL_PREFIX: &str = "p2p-turn-room-config-v1:";
 const GROUP_SCREEN_MAX_AGGREGATE_BITRATE: u32 = 8_000_000;
@@ -108,65 +112,6 @@ fn settings_navigation_button(settings_open: bool) -> (&'static str, &'static st
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum UpdateShortcutAction {
-    Download,
-    OpenUpdates,
-    DisabledForRoom,
-}
-
-pub(super) fn update_shortcut_action(
-    status: &UpdateStatus,
-    room_active: bool,
-) -> Option<UpdateShortcutAction> {
-    let action = match status {
-        UpdateStatus::Available(_) => UpdateShortcutAction::Download,
-        UpdateStatus::Downloading { .. }
-        | UpdateStatus::CancellingDownload(_)
-        | UpdateStatus::Downloaded { .. } => UpdateShortcutAction::OpenUpdates,
-        UpdateStatus::Checking
-        | UpdateStatus::UpToDate
-        | UpdateStatus::PreparingToApply
-        | UpdateStatus::Applying
-        | UpdateStatus::Failed(_) => return None,
-    };
-
-    Some(if room_active {
-        UpdateShortcutAction::DisabledForRoom
-    } else {
-        action
-    })
-}
-
-pub(super) fn update_shortcut_tooltip(status: &UpdateStatus, room_active: bool) -> Option<String> {
-    let (version, description) = match status {
-        UpdateStatus::Available(manifest) => (&manifest.version, "Baixar atualização"),
-        UpdateStatus::Downloading { manifest, .. } => {
-            (&manifest.version, "Ver progresso do download")
-        }
-        UpdateStatus::CancellingDownload(manifest) => {
-            (&manifest.version, "Ver cancelamento do download")
-        }
-        UpdateStatus::Downloaded { manifest, .. } => (&manifest.version, "Ver atualização baixada"),
-        UpdateStatus::Checking
-        | UpdateStatus::UpToDate
-        | UpdateStatus::PreparingToApply
-        | UpdateStatus::Applying
-        | UpdateStatus::Failed(_) => return None,
-    };
-
-    Some(if room_active {
-        let verb = if matches!(status, UpdateStatus::Downloaded { .. }) {
-            "aplicar"
-        } else {
-            "baixar"
-        };
-        format!("Saia da sala para {verb} a atualização {version}")
-    } else {
-        format!("{description} {version}")
-    })
-}
-
 fn room_header_code_label(room_code: Option<&str>) -> Option<String> {
     room_code.map(|code| format!("Código: {code}"))
 }
@@ -206,26 +151,6 @@ enum SettingsCategory {
     Connection,
     Video,
     Updates,
-}
-
-#[derive(Clone, Default)]
-pub(super) enum UpdateStatus {
-    #[default]
-    Checking,
-    UpToDate,
-    Available(UpdateManifest),
-    Downloading {
-        manifest: UpdateManifest,
-        received: u64,
-    },
-    CancellingDownload(UpdateManifest),
-    Downloaded {
-        manifest: UpdateManifest,
-        path: std::path::PathBuf,
-    },
-    PreparingToApply,
-    Applying,
-    Failed(String),
 }
 
 #[derive(Default)]
@@ -418,83 +343,6 @@ impl ClientUi {
                 self.dxgi_capture_error = Some(error);
             }
         }
-    }
-
-    fn refresh_updates(&mut self, context: &egui::Context) {
-        if self.room_code.is_some()
-            && let UpdateStatus::Downloading { manifest, .. } = &self.update_status
-        {
-            let manifest = manifest.clone();
-            self.updates.cancel_download();
-            self.update_status = UpdateStatus::CancellingDownload(manifest);
-        }
-
-        while let Some(event) = self.updates.try_recv() {
-            match event {
-                UpdateEvent::CheckFinished(Ok(Some(manifest))) => {
-                    self.update_status = UpdateStatus::Available(manifest);
-                }
-                UpdateEvent::CheckFinished(Ok(None)) => {
-                    self.update_status = UpdateStatus::UpToDate;
-                }
-                UpdateEvent::CheckFinished(Err(error)) => {
-                    self.update_status = UpdateStatus::Failed(error);
-                }
-                UpdateEvent::DownloadProgress {
-                    version, received, ..
-                } => {
-                    if let UpdateStatus::Downloading {
-                        manifest,
-                        received: current,
-                    } = &mut self.update_status
-                        && manifest.version == version
-                    {
-                        *current = received;
-                    }
-                }
-                UpdateEvent::DownloadFinished { manifest, path } => {
-                    self.update_status = UpdateStatus::Downloaded { manifest, path };
-                }
-                UpdateEvent::DownloadCancelled { version } => {
-                    let manifest = match &self.update_status {
-                        UpdateStatus::Downloading { manifest, .. }
-                        | UpdateStatus::CancellingDownload(manifest)
-                            if manifest.version == version =>
-                        {
-                            Some(manifest.clone())
-                        }
-                        _ => None,
-                    };
-                    if let Some(manifest) = manifest {
-                        self.update_status = UpdateStatus::Available(manifest);
-                    }
-                }
-                UpdateEvent::DownloadFailed { version, error } => {
-                    self.update_status = UpdateStatus::Failed(format!(
-                        "Falha ao baixar a versão {version}: {error}"
-                    ));
-                }
-                UpdateEvent::ApplyStarted => {
-                    self.update_status = UpdateStatus::Applying;
-                    tracing::info!("Fechando o aplicativo para instalar a atualização");
-                    context.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                UpdateEvent::ApplyFailed(error) => {
-                    tracing::error!(error = %error, "Não foi possível preparar a atualização");
-                    self.update_status = UpdateStatus::Failed(error);
-                }
-            }
-        }
-    }
-
-    fn update_blocks_room_actions(&self) -> bool {
-        matches!(
-            &self.update_status,
-            UpdateStatus::Downloading { .. }
-                | UpdateStatus::CancellingDownload(_)
-                | UpdateStatus::PreparingToApply
-                | UpdateStatus::Applying
-        )
     }
 
     fn show_notice(ui: &mut egui::Ui, prefix: &str, message: &str) {
@@ -2676,24 +2524,13 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpdateShortcutAction, UpdateStatus, allocate_app_header_row, centered_header_rect,
-        copy_confirmation_visible, egui, is_public_ipv4_candidate, right_aligned_header_rect,
-        room_header_code_label, settings_navigation_button, signaling_ws_url,
-        update_shortcut_action, update_shortcut_tooltip, validate_new_host_profile,
+        allocate_app_header_row, centered_header_rect, copy_confirmation_visible, egui,
+        is_public_ipv4_candidate, right_aligned_header_rect, room_header_code_label,
+        settings_navigation_button, signaling_ws_url, validate_new_host_profile,
         validate_saved_host_profile,
     };
     use crate::settings::{MAX_SAVED_HOSTS, SavedHostProfile};
-    use crate::update::UpdateManifest;
     use std::net::Ipv4Addr;
-
-    fn update_manifest() -> UpdateManifest {
-        UpdateManifest {
-            version: "1.2.3".to_owned(),
-            download_url: "https://example.test/p2p-client.exe".to_owned(),
-            size_bytes: 10,
-            sha256: "a".repeat(64),
-        }
-    }
 
     fn local_preview_frame(
         sequence: u64,
@@ -3138,96 +2975,6 @@ mod tests {
         assert!((center_rect.center().x - header_rect.center().x).abs() < 0.1);
         assert!((settings_rect.right() - header_rect.right()).abs() < 0.1);
         assert!(following_content_rect.min.y - header_rect.max.y < 50.0);
-    }
-
-    #[test]
-    fn update_shortcut_is_hidden_when_no_actionable_update_exists() {
-        let statuses = [
-            UpdateStatus::Checking,
-            UpdateStatus::UpToDate,
-            UpdateStatus::PreparingToApply,
-            UpdateStatus::Applying,
-            UpdateStatus::Failed("network error".to_owned()),
-        ];
-
-        for status in statuses {
-            assert_eq!(update_shortcut_action(&status, false), None);
-            assert_eq!(update_shortcut_action(&status, true), None);
-            assert_eq!(update_shortcut_tooltip(&status, false), None);
-        }
-    }
-
-    #[test]
-    fn available_update_shortcut_downloads_only_outside_a_room() {
-        let status = UpdateStatus::Available(update_manifest());
-
-        assert_eq!(
-            update_shortcut_action(&status, false),
-            Some(UpdateShortcutAction::Download)
-        );
-        assert_eq!(
-            update_shortcut_action(&status, true),
-            Some(UpdateShortcutAction::DisabledForRoom)
-        );
-        assert!(
-            update_shortcut_tooltip(&status, false)
-                .unwrap()
-                .contains("1.2.3")
-        );
-        let room_tooltip = update_shortcut_tooltip(&status, true).unwrap();
-        assert!(room_tooltip.contains("Saia da sala"));
-        assert!(room_tooltip.contains("baixar"));
-        assert!(room_tooltip.contains("1.2.3"));
-    }
-
-    #[test]
-    fn update_shortcut_opens_update_settings_while_downloading_or_downloaded() {
-        let manifest = update_manifest();
-        let statuses = [
-            UpdateStatus::Downloading {
-                manifest: manifest.clone(),
-                received: 5,
-            },
-            UpdateStatus::CancellingDownload(manifest.clone()),
-            UpdateStatus::Downloaded {
-                manifest,
-                path: std::path::PathBuf::from("update.exe"),
-            },
-        ];
-
-        for status in statuses {
-            assert_eq!(
-                update_shortcut_action(&status, false),
-                Some(UpdateShortcutAction::OpenUpdates)
-            );
-            assert_eq!(
-                update_shortcut_action(&status, true),
-                Some(UpdateShortcutAction::DisabledForRoom)
-            );
-            assert!(
-                update_shortcut_tooltip(&status, false)
-                    .unwrap()
-                    .contains("1.2.3")
-            );
-        }
-    }
-
-    #[test]
-    fn downloaded_update_shortcut_does_not_apply_automatically() {
-        let status = UpdateStatus::Downloaded {
-            manifest: update_manifest(),
-            path: std::path::PathBuf::from("update.exe"),
-        };
-
-        assert_eq!(
-            update_shortcut_action(&status, false),
-            Some(UpdateShortcutAction::OpenUpdates)
-        );
-        assert!(
-            update_shortcut_tooltip(&status, true)
-                .unwrap()
-                .contains("aplicar")
-        );
     }
 
     #[test]
