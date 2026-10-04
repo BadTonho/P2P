@@ -68,7 +68,7 @@ impl HardwareDecoder {
         let mut decoded = None;
         for output_index in 0..8 {
             let wait = if output_index == 0 {
-                Duration::from_millis(8)
+                Duration::from_millis(25)
             } else {
                 Duration::from_millis(2)
             };
