@@ -505,25 +505,33 @@ impl ClientUi {
 
     fn apply_monochrome_style(ui: &mut egui::Ui) {
         let dark_mode = ui.visuals().dark_mode;
-        let (selection_fill, selection_stroke, foreground) = if dark_mode {
-            (
-                egui::Color32::from_gray(66),
-                egui::Color32::from_gray(210),
-                egui::Color32::from_gray(225),
-            )
-        } else {
-            (
-                egui::Color32::from_gray(220),
-                egui::Color32::from_gray(55),
-                egui::Color32::from_gray(45),
-            )
-        };
         let visuals = ui.visuals_mut();
-        visuals.selection.bg_fill = selection_fill;
-        visuals.selection.stroke = egui::Stroke::new(1.0, selection_stroke);
-        visuals.hyperlink_color = foreground;
-        visuals.warn_fg_color = foreground;
-        visuals.error_fg_color = foreground;
+        if dark_mode {
+            visuals.panel_fill = egui::Color32::from_rgb(18, 20, 24);
+            visuals.window_fill = egui::Color32::from_rgb(25, 27, 34);
+            visuals.extreme_bg_color = egui::Color32::from_rgb(13, 14, 17);
+            visuals.faint_bg_color = egui::Color32::from_rgb(28, 31, 38);
+            visuals.selection.bg_fill = egui::Color32::from_rgb(42, 54, 76);
+            visuals.selection.stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 130, 200));
+            visuals.hyperlink_color = egui::Color32::from_rgb(96, 165, 250);
+            visuals.warn_fg_color = egui::Color32::from_rgb(251, 191, 36);
+            visuals.error_fg_color = egui::Color32::from_rgb(248, 113, 113);
+        } else {
+            visuals.selection.bg_fill = egui::Color32::from_gray(220);
+            visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(55));
+            visuals.hyperlink_color = egui::Color32::from_rgb(29, 78, 216);
+            visuals.warn_fg_color = egui::Color32::from_rgb(180, 83, 9);
+            visuals.error_fg_color = egui::Color32::from_rgb(185, 28, 28);
+        }
+
+        visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
+        visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+        visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+        visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+        visuals.widgets.open.corner_radius = egui::CornerRadius::same(6);
+        visuals.window_corner_radius = egui::CornerRadius::same(8);
+        visuals.menu_corner_radius = egui::CornerRadius::same(6);
     }
 
     fn preferences_snapshot(&self) -> AppSettings {
@@ -754,7 +762,12 @@ impl ClientUi {
 
         if self.room_code.is_some() && !self.settings_open {
             egui::Panel::bottom("room-controls")
-                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)))
+                .frame(
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(20, 22, 27))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 42, 52)))
+                        .inner_margin(egui::Margin::symmetric(12, 8)),
+                )
                 .show(ui, |ui| {
                     Self::apply_monochrome_style(ui);
                     ui::show_room_toolbar(self, ui);

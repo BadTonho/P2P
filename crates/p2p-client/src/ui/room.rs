@@ -31,56 +31,63 @@ fn show_screen_audio_and_fullscreen_toolbar(
     let mut volume_change = None;
     let mut toggle_fullscreen = false;
 
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgba_premultiplied(20, 22, 28, 225))
+        .corner_radius(egui::CornerRadius::same(6))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 51, 64)))
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
 
-        let volume_icon = if current_volume == 0 {
-            "🔇"
-        } else if current_volume < 40 {
-            "🔉"
-        } else {
-            "🔊"
-        };
+                let volume_icon = if current_volume == 0 {
+                    "🔇"
+                } else if current_volume < 40 {
+                    "🔉"
+                } else {
+                    "🔊"
+                };
 
-        if ui
-            .button(volume_icon)
-            .on_hover_text(if current_volume == 0 {
-                "Ativar áudio da transmissão"
-            } else {
-                "Silenciar áudio da transmissão"
-            })
-            .clicked()
-        {
-            if current_volume > 0 {
-                volume_change = Some(0);
-            } else {
-                volume_change = Some(100);
-            }
-        }
+                if ui
+                    .button(volume_icon)
+                    .on_hover_text(if current_volume == 0 {
+                        "Ativar áudio da transmissão"
+                    } else {
+                        "Silenciar áudio da transmissão"
+                    })
+                    .clicked()
+                {
+                    if current_volume > 0 {
+                        volume_change = Some(0);
+                    } else {
+                        volume_change = Some(100);
+                    }
+                }
 
-        ui.label("Volume:");
-        let mut percent = f32::from(current_volume);
-        if ui
-            .add(
-                egui::Slider::new(&mut percent, 0.0..=100.0)
-                    .integer()
-                    .suffix("%"),
-            )
-            .changed()
-        {
-            volume_change = Some(percent.round().clamp(0.0, 100.0) as u8);
-        }
+                ui.label("Volume:");
+                let mut percent = f32::from(current_volume);
+                if ui
+                    .add(
+                        egui::Slider::new(&mut percent, 0.0..=100.0)
+                            .integer()
+                            .suffix("%"),
+                    )
+                    .changed()
+                {
+                    volume_change = Some(percent.round().clamp(0.0, 100.0) as u8);
+                }
 
-        ui.separator();
-        let fs_text = if is_fullscreen {
-            "🗗 Sair da tela cheia (F11)"
-        } else {
-            "⛶ Tela cheia (F11)"
-        };
-        if ui.button(fs_text).clicked() {
-            toggle_fullscreen = true;
-        }
-    });
+                ui.separator();
+                let fs_text = if is_fullscreen {
+                    "🗗 Sair da tela cheia (F11)"
+                } else {
+                    "⛶ Tela cheia (F11)"
+                };
+                if ui.button(fs_text).clicked() {
+                    toggle_fullscreen = true;
+                }
+            });
+        });
 
     (volume_change, toggle_fullscreen)
 }
