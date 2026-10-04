@@ -736,22 +736,37 @@ impl ClientUi {
             self.save_preferences();
         }
 
-        if self.allow_window_close {
-            return;
-        }
-
         if (self.hosting_locally && self.peer_connected)
             || self.outgoing_transfer.is_some()
             || self.incoming_transfer.is_some()
             || self.pending_signaling.is_some()
         {
-            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.close_after_transfer = true;
-            if self.hosting_locally && self.peer_connected && self.outgoing_transfer.is_none() {
-                self.request_leave(context);
+            if !self.allow_window_close {
+                context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_after_transfer = true;
+                if self.hosting_locally && self.peer_connected && self.outgoing_transfer.is_none() {
+                    self.request_leave(context);
+                }
+                return;
             }
         } else {
             self.allow_window_close = true;
+        }
+
+        if self.allow_window_close {
+            if let UpdateStatus::Downloaded { manifest, path } =
+                std::mem::replace(&mut self.update_status, UpdateStatus::Applying)
+            {
+                tracing::info!(
+                    version = %manifest.version,
+                    "Aplicando atualização baixada automaticamente ao fechar o aplicativo"
+                );
+                if let Err(error) = crate::update::stage_and_launch(path, manifest.version) {
+                    tracing::error!(error = %error, "Não foi possível iniciar o aplicador de atualização ao fechar");
+                }
+            } else if matches!(&self.update_status, UpdateStatus::Downloading { .. }) {
+                self.updates.cancel_download();
+            }
         }
     }
 

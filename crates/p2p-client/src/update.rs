@@ -21,7 +21,7 @@ mod release;
 #[cfg(test)]
 mod test_support;
 
-pub use apply::helper_arguments;
+pub use apply::{helper_arguments, stage_and_launch};
 
 const GITHUB_OWNER: &str = "BadTonho";
 const GITHUB_REPOSITORY: &str = "P2P";

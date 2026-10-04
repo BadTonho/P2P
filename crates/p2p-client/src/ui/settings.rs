@@ -152,16 +152,16 @@ impl ClientUi {
             }
             UpdateStatus::Downloaded { manifest, path } => {
                 ui.label(format!(
-                    "A versão {} foi baixada e validada.",
+                    "A versão {} foi baixada e validada. Ela será instalada automaticamente ao fechar o aplicativo.",
                     manifest.version
                 ));
                 if self.room_code.is_some() {
-                    ui.small("Saia da sala antes de reiniciar para aplicar a atualização.");
+                    ui.small("Saia da sala antes de reiniciar para aplicar a atualização agora.");
                 }
                 if ui
                     .add_enabled(
                         self.room_code.is_none(),
-                        egui::Button::new("Reiniciar para atualizar"),
+                        egui::Button::new("Reiniciar agora para atualizar"),
                     )
                     .clicked()
                 {

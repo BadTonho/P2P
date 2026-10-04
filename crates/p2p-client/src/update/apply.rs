@@ -2,10 +2,7 @@ use super::download::read_embedded_build_version;
 use super::release::parse_version;
 use super::*;
 
-pub(super) fn stage_and_launch(
-    downloaded: PathBuf,
-    expected_version: String,
-) -> Result<(), String> {
+pub fn stage_and_launch(downloaded: PathBuf, expected_version: String) -> Result<(), String> {
     if !downloaded.is_file() {
         return Err("O executável baixado não foi encontrado.".to_owned());
     }
@@ -328,5 +325,24 @@ mod tests {
         let path = helper_executable_path(12345);
         let filename = path.file_name().unwrap().to_string_lossy();
         assert_eq!(filename, "P2P-Voz-e-tela-update-helper-12345.exe");
+    }
+
+    #[test]
+    fn stage_and_launch_fails_for_non_existent_file() {
+        let missing = PathBuf::from("non-existent-update.exe");
+        let result = stage_and_launch(missing, "1.0.0".to_owned());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("não foi encontrado"));
+    }
+
+    #[test]
+    fn stage_and_launch_rejects_version_mismatch() {
+        let directory = test_directory();
+        let file = directory.join("downloaded.exe");
+        fs::write(&file, executable_stub("1.0.1")).unwrap();
+        let result = stage_and_launch(file, "1.0.2".to_owned());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("esperava a versao 1.0.2"));
+        let _ = fs::remove_dir_all(directory);
     }
 }
