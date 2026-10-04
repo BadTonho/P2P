@@ -1,4 +1,7 @@
-use super::super::{ClientUi, RoomMode, signaling_ws_url};
+use super::super::{
+    ClientUi, RoomMode, UpdateShortcutAction, UpdateStatus, signaling_ws_url,
+    update_shortcut_action, update_shortcut_tooltip,
+};
 use eframe::egui;
 
 const PROFILE_PILL_AVATAR_SIZE: f32 = 34.0;
@@ -411,11 +414,78 @@ impl ClientUi {
         });
     }
 
-    pub(super) fn show_home_bottom_bar(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn show_home_bottom_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        open_settings: &mut bool,
+        open_update_settings: &mut bool,
+    ) {
         let avatar = self.local_profile_avatar_texture(ui.ctx());
-        let response = show_profile_pill(ui, &self.profile_display_name, avatar.as_ref());
-        if response.clicked() {
-            self.profile_window_open = true;
+        let picker_open = self.screen_picker.is_some();
+        let update_status = self.update_status.clone();
+        let update_action = update_shortcut_action(&update_status, false);
+        let update_tooltip = update_shortcut_tooltip(&update_status, false)
+            .unwrap_or_else(|| "Atualização".to_owned());
+
+        let mut update_clicked = false;
+
+        ui.horizontal(|ui| {
+            let response = show_profile_pill(ui, &self.profile_display_name, avatar.as_ref());
+            if response.clicked() {
+                self.profile_window_open = true;
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let button_size = egui::vec2(30.0, 26.0);
+
+                let settings_response = ui
+                    .add_enabled(
+                        !picker_open,
+                        egui::Button::new(egui::RichText::new("⚙").size(18.0))
+                            .min_size(button_size),
+                    )
+                    .on_hover_text("Configurações");
+                if settings_response.clicked() {
+                    *open_settings = true;
+                }
+
+                if let Some(action) = update_action {
+                    let enabled = action != UpdateShortcutAction::DisabledForRoom && !picker_open;
+                    let response = ui
+                        .add_enabled(
+                            enabled,
+                            egui::Button::new(egui::RichText::new("↻").size(18.0))
+                                .min_size(button_size),
+                        )
+                        .on_hover_text(&update_tooltip);
+                    if response.clicked() {
+                        update_clicked = true;
+                    }
+                }
+            });
+        });
+
+        if update_clicked {
+            match update_action {
+                Some(UpdateShortcutAction::Download) => {
+                    if let UpdateStatus::Available(manifest) = &update_status {
+                        let manifest = manifest.clone();
+                        tracing::info!(
+                            version = %manifest.version,
+                            "Download de atualização iniciado pelo atalho na barra inferior"
+                        );
+                        self.updates.download(manifest.clone());
+                        self.update_status = UpdateStatus::Downloading {
+                            manifest,
+                            received: 0,
+                        };
+                    }
+                }
+                Some(UpdateShortcutAction::OpenUpdates) => {
+                    *open_update_settings = true;
+                }
+                Some(UpdateShortcutAction::DisabledForRoom) | None => {}
+            }
         }
     }
 
@@ -554,9 +624,9 @@ impl ClientUi {
 #[cfg(test)]
 mod tests {
     use super::{
-        PRIMARY_ACTION_HEIGHT, PRIMARY_ACTION_WIDTH, RoomMode, configure_action_button_visuals,
-        join_action_enabled, primary_action_button, room_actions_enabled,
-        show_host_picker_and_manage, show_network_window, show_profile_pill,
+        ClientUi, PRIMARY_ACTION_HEIGHT, PRIMARY_ACTION_WIDTH, RoomMode,
+        configure_action_button_visuals, join_action_enabled, primary_action_button,
+        room_actions_enabled, show_host_picker_and_manage, show_network_window, show_profile_pill,
         show_profile_window_contents, show_room_mode_selector,
     };
     use eframe::egui;
@@ -748,7 +818,29 @@ mod tests {
         );
         output.textures_delta.clear();
     }
+    #[test]
+    fn home_bottom_bar_renders_profile_and_right_aligned_buttons() {
+        let context = egui::Context::default();
+        let mut app = ClientUi::default();
+        let mut open_settings = false;
+        let mut open_update_settings = false;
 
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 60.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                app.show_home_bottom_bar(ui, &mut open_settings, &mut open_update_settings);
+            },
+        );
+        output.textures_delta.clear();
+        assert!(!open_settings);
+        assert!(!open_update_settings);
+    }
     #[test]
     fn room_mode_selector_fits_wide_and_narrow_layouts() {
         for width in [640.0, 340.0] {
