@@ -656,7 +656,7 @@ impl ClientUi {
         texture
     }
 
-    fn save_preferences(&mut self) {
+    pub(super) fn save_preferences(&mut self) {
         self.settings_dirty = true;
         self.settings_save_at = None;
         match settings::save(&self.preferences_snapshot()) {

@@ -26,7 +26,7 @@ pub(super) fn stage_and_launch(
         ));
     }
 
-    let helper = std::env::temp_dir().join("P2P-Voz-e-tela-update-helper.exe");
+    let helper = helper_executable_path(process_id);
     if let Err(error) = fs::copy(&target, &helper) {
         let _ = fs::remove_file(&staged);
         return Err(format!(
@@ -61,6 +61,10 @@ fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value: OsString = path.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
+}
+
+fn helper_executable_path(process_id: u32) -> PathBuf {
+    std::env::temp_dir().join(format!("P2P-Voz-e-tela-update-helper-{process_id}.exe"))
 }
 
 pub fn helper_arguments(args: &[OsString]) -> Option<i32> {
@@ -317,5 +321,12 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"old version");
         assert!(!directory.join("app.exe.backup").exists());
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn helper_executable_path_contains_process_id() {
+        let path = helper_executable_path(12345);
+        let filename = path.file_name().unwrap().to_string_lossy();
+        assert_eq!(filename, "P2P-Voz-e-tela-update-helper-12345.exe");
     }
 }

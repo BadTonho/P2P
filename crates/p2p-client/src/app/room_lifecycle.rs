@@ -729,7 +729,15 @@ impl ClientUi {
 
     pub(super) fn handle_window_close(&mut self, context: &egui::Context) {
         let close_requested = context.input(|input| input.viewport().close_requested());
-        if !close_requested || self.allow_window_close {
+        if !close_requested {
+            return;
+        }
+
+        if self.settings_dirty {
+            self.save_preferences();
+        }
+
+        if self.allow_window_close {
             return;
         }
 
