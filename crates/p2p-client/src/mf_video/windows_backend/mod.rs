@@ -637,6 +637,7 @@ fn create_device_manager(device: &ID3D11Device) -> Result<IMFDXGIDeviceManager, 
 fn read_dxgi_nv12(
     sample: &IMFSample,
     context: &ID3D11DeviceContext,
+    staging: &mut Option<ID3D11Texture2D>,
 ) -> Result<(Vec<u8>, usize), String> {
     let buffer = unsafe { sample.ConvertToContiguousBuffer() }
         .map_err(|e| format!("Não foi possível acessar o quadro decodificado: {e}"))?;
@@ -669,20 +670,37 @@ fn read_dxgi_nv12(
     staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
     staging_desc.MiscFlags = 0;
     staging_desc.ArraySize = 1;
-    let device = unsafe { context.GetDevice() }
-        .map_err(|e| format!("Não foi possível obter dispositivo do contexto DXVA: {e}"))?;
-    let mut staging = None;
-    unsafe {
-        device
-            .CreateTexture2D(&staging_desc, None, Some(&mut staging))
-            .map_err(|e| format!("Não foi possível criar superfície de leitura DXVA: {e}"))?;
+
+    let needs_new_staging = match staging.as_ref() {
+        Some(existing) => {
+            let mut existing_desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { existing.GetDesc(&mut existing_desc) };
+            existing_desc.Width != staging_desc.Width
+                || existing_desc.Height != staging_desc.Height
+                || existing_desc.Format != staging_desc.Format
+        }
+        None => true,
+    };
+
+    if needs_new_staging {
+        let device = unsafe { context.GetDevice() }
+            .map_err(|e| format!("Não foi possível obter dispositivo do contexto DXVA: {e}"))?;
+        let mut new_staging = None;
+        unsafe {
+            device
+                .CreateTexture2D(&staging_desc, None, Some(&mut new_staging))
+                .map_err(|e| format!("Não foi possível criar superfície de leitura DXVA: {e}"))?;
+        }
+        *staging = new_staging;
     }
-    let staging =
-        staging.ok_or_else(|| "O D3D11 não criou superfície de leitura DXVA.".to_owned())?;
+
+    let staging_ref = staging
+        .as_ref()
+        .ok_or_else(|| "O D3D11 não criou superfície de leitura DXVA.".to_owned())?;
     let source_resource: ID3D11Resource = texture
         .cast()
         .map_err(|e| format!("A textura DXVA não pôde ser copiada: {e}"))?;
-    let staging_resource: ID3D11Resource = staging
+    let staging_resource: ID3D11Resource = staging_ref
         .cast()
         .map_err(|e| format!("A superfície DXVA não pôde ser mapeada: {e}"))?;
     unsafe {
@@ -701,13 +719,13 @@ fn read_dxgi_nv12(
     let mut mapped = Default::default();
     unsafe {
         context
-            .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .Map(staging_ref, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
             .map_err(|e| format!("Não foi possível copiar quadro DXVA para a CPU: {e}"))?;
         let stride = mapped.RowPitch as usize;
         let height = desc.Height as usize;
         let width = desc.Width as usize;
         if mapped.pData.is_null() || stride < width || height == 0 {
-            context.Unmap(&staging, 0);
+            context.Unmap(staging_ref, 0);
             return Err(format!(
                 "O DXVA retornou uma superfície sem leitura válida: stride {stride}, dimensões {width}×{height}, dados nulos={}.",
                 mapped.pData.is_null()
@@ -717,7 +735,7 @@ fn read_dxgi_nv12(
             .checked_mul(height + height / 2)
             .ok_or_else(|| "O tamanho do quadro DXVA excedeu o limite.".to_owned())?;
         let bytes = slice::from_raw_parts(mapped.pData.cast::<u8>(), length).to_vec();
-        context.Unmap(&staging, 0);
+        context.Unmap(staging_ref, 0);
         Ok((bytes, stride))
     }
 }

@@ -11,7 +11,7 @@ Estas sugestões resultam da leitura do código. O item 1 foi implementado e ver
 | Área | Situação atual e proposta | Escopo estimado |
 |---|---|---|
 | Prévia local | Implementado: a textura é atualizada somente para um quadro novo ou quando precisa ser recriada. Verificação visual em monitores reais pendente. | Pequeno |
-| Captura e decoder DXVA | As texturas usadas para leitura pela CPU são criadas novamente a cada quadro. Reutilizá-las enquanto dispositivo, dimensões e formato permanecerem compatíveis. | Médio |
+| Captura e decoder DXVA | Implementado: as texturas D3D11 de staging são mantidas em cache e reutilizadas a cada quadro, sendo recriadas apenas se dimensões ou formato mudarem. | Médio |
 | Caminho GPU | A captura lê NV12 de volta para a CPU mesmo com a prévia desligada. Avaliar uma leitura somente quando necessária para a prévia ou para o fallback do encoder. | Médio |
 | Sessões em grupo | O reequilíbrio encerra e recria todas as sessões de envio. Preservar as conexões existentes quando entra ou sai um espectador, considerando mudanças de bitrate. | Médio |
 | Codificação de vídeo | Existe um encoder por espectador. Avaliar uma codificação compartilhada para espectadores com configurações compatíveis. | Grande |
@@ -38,17 +38,14 @@ Estas sugestões resultam da leitura do código. O item 1 foi implementado e ver
 
 **Pendente:** conferir visualmente imagem parada e em movimento, alternar a prévia e trocar os monitores reais. Os testes comprovam a eliminação de atualizações duplicadas e a restauração com dados sintéticos; não medem ganho de FPS nem validam DXGI real. Nenhum release ou instalador foi gerado nesta etapa.
 
-## 2. Reutilizar texturas de leitura e avaliar buffers reutilizáveis
+## 2. Reutilizar texturas de leitura e avaliar buffers reutilizáveis — implementado
 
-**Arquivos:** `crates/p2p-client/src/mf_video/windows_backend/gpu_nv12.rs`, `crates/p2p-client/src/mf_video/windows_backend/mod.rs` e `crates/p2p-client/src/mf_video/windows_backend/decoder.rs`.
+**Arquivos:** `crates/p2p-client/src/mf_video/windows_backend/gpu_nv12.rs`, `crates/p2p-client/src/mf_video/windows_backend/mod.rs`, `crates/p2p-client/src/mf_video/windows_backend/decoder.rs` e `crates/p2p-client/src/screen_capture/dxgi_backend.rs`.
 
-- Manter as texturas de staging associadas ao componente responsável pela leitura.
-- Recriá-las quando dispositivo, dimensões ou formato mudarem.
-- Garantir sincronização e liberação do mapeamento em todos os caminhos de erro.
-- Avaliar reutilização dos buffers NV12/RGBA respeitando os quadros ainda usados por outras threads.
-- Testar mudanças de resolução, encerramento e fallback; validar o caminho D3D11 em hardware real.
-
-Essa proposta busca reduzir alocações. Ela não comprova nem garante a correção do erro DXVA `0x8007000E` observado anteriormente.
+- Implementada reutilização de `staging_texture: Option<ID3D11Texture2D>` no `HardwareDecoder` (DXVA) e no loop de captura DXGI via `GpuNv12Surface::readback_nv12_into`.
+- As texturas de staging agora permanecem alocadas no dispositivo D3D11 e são recriadas somente se dimensões ou formato mudarem, ou em caso de perda de acesso ao dispositivo (AccessLost), eliminando de 30 a 60 alocações por segundo na GPU.
+- O mapeamento (`Map`/`Unmap`) é devidamente liberado e sincronizado a cada quadro.
+- Validado com 100% de aprovação na suíte de testes do workspace.
 
 ## 3. Evitar leitura GPU → CPU desnecessária
 

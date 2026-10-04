@@ -18,15 +18,17 @@ pub(super) fn capture_dxgi_monitor(
     let mut gpu_processor_attempted: Option<(u32, u32, u32, u32)> = None;
     let mut gpu_fallback_logged = false;
     let mut gpu_preview_fallback_logged = false;
+    let mut staging_texture = None;
 
     while !stop.load(Ordering::Relaxed) {
         let mut frame = match duplication.acquire_next_frame(100) {
             Ok(frame) => frame,
             Err(windows_capture::dxgi_duplication_api::Error::Timeout) => continue,
             Err(windows_capture::dxgi_duplication_api::Error::AccessLost) => {
-                tracing::warn!("DXGI perdeu acesso ao monitor; recriando a duplicaÃ§Ã£o");
+                tracing::warn!("DXGI perdeu acesso ao monitor; recriando a duplicação");
                 gpu_processor = None;
                 gpu_processor_attempted = None;
+                staging_texture = None;
                 *fallback_reason
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -115,7 +117,7 @@ pub(super) fn capture_dxgi_monitor(
         let mut resize_nanos = 0;
         let (preview_rgba, cpu_nv12) = if let Some(surface) = gpu_surface.as_ref() {
             let started_at = Instant::now();
-            match surface.readback_nv12() {
+            match surface.readback_nv12_into(&mut staging_texture) {
                 Ok((nv12, stride)) => {
                     readback_nanos += started_at.elapsed().as_nanos() as u64;
                     let cpu_nv12 = Some(Arc::new(CpuNv12Frame {

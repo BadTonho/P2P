@@ -13,7 +13,10 @@ impl GpuNv12Surface {
         &self.device
     }
 
-    pub fn readback_nv12(&self) -> Result<(Vec<u8>, usize), String> {
+    pub fn readback_nv12_into(
+        &self,
+        staging: &mut Option<ID3D11Texture2D>,
+    ) -> Result<(Vec<u8>, usize), String> {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { self.texture.GetDesc(&mut desc) };
         let mut staging_desc = desc;
@@ -21,21 +24,38 @@ impl GpuNv12Surface {
         staging_desc.BindFlags = 0;
         staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
         staging_desc.MiscFlags = 0;
-        let mut staging = None;
-        unsafe {
-            self.device
-                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
-                .map_err(|error| {
-                    format!("Não foi possível criar a cópia NV12 para a prévia: {error}")
-                })?;
+
+        let needs_new_staging = match staging.as_ref() {
+            Some(existing) => {
+                let mut existing_desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe { existing.GetDesc(&mut existing_desc) };
+                existing_desc.Width != staging_desc.Width
+                    || existing_desc.Height != staging_desc.Height
+                    || existing_desc.Format != staging_desc.Format
+            }
+            None => true,
+        };
+
+        if needs_new_staging {
+            let mut new_staging = None;
+            unsafe {
+                self.device
+                    .CreateTexture2D(&staging_desc, None, Some(&mut new_staging))
+                    .map_err(|error| {
+                        format!("Não foi possível criar a cópia NV12 para a prévia: {error}")
+                    })?;
+            }
+            *staging = new_staging;
         }
-        let staging =
-            staging.ok_or_else(|| "D3D11 não criou a cópia NV12 para a prévia.".to_owned())?;
+
+        let staging_ref = staging
+            .as_ref()
+            .ok_or_else(|| "D3D11 não criou a cópia NV12 para a prévia.".to_owned())?;
         let source: ID3D11Resource = self
             .texture
             .cast()
             .map_err(|error| format!("Não foi possível acessar a superfície NV12: {error}"))?;
-        let destination: ID3D11Resource = staging
+        let destination: ID3D11Resource = staging_ref
             .cast()
             .map_err(|error| format!("Não foi possível acessar a cópia NV12: {error}"))?;
         unsafe { self.context.CopyResource(&destination, &source) };
@@ -43,7 +63,7 @@ impl GpuNv12Surface {
         let mut mapped = Default::default();
         unsafe {
             self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .Map(staging_ref, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .map_err(|error| {
                     format!("Não foi possível ler a superfície NV12 reduzida: {error}")
                 })?;
@@ -52,9 +72,15 @@ impl GpuNv12Surface {
                 .checked_mul(self.height as usize + self.height as usize / 2)
                 .ok_or_else(|| "O tamanho da prévia NV12 excedeu o limite.".to_owned())?;
             let bytes = slice::from_raw_parts(mapped.pData.cast::<u8>(), length).to_vec();
-            self.context.Unmap(&staging, 0);
+            self.context.Unmap(staging_ref, 0);
             Ok((bytes, stride))
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn readback_nv12(&self) -> Result<(Vec<u8>, usize), String> {
+        let mut staging = None;
+        self.readback_nv12_into(&mut staging)
     }
 
     pub fn to_rgba(&self, nv12: &[u8], stride: usize) -> Result<Vec<u8>, String> {

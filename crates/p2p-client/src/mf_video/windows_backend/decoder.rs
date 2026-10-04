@@ -16,6 +16,7 @@ pub struct HardwareDecoder {
     height: u32,
     next_time_hns: i64,
     name: String,
+    staging_texture: Option<ID3D11Texture2D>,
 }
 
 impl HardwareDecoder {
@@ -53,6 +54,7 @@ impl HardwareDecoder {
             height,
             next_time_hns: 0,
             name,
+            staging_texture: None,
         })
     }
 
@@ -76,7 +78,7 @@ impl HardwareDecoder {
             else {
                 break;
             };
-            let (nv12, stride) = read_dxgi_nv12(&sample, &self.context)?;
+            let (nv12, stride) = read_dxgi_nv12(&sample, &self.context, &mut self.staging_texture)?;
             let rgba = nv12_to_rgba(&nv12, self.width as usize, self.height as usize, stride)?;
             decoded = Some(DecodedFrame {
                 width: self.width,
