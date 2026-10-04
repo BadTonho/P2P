@@ -103,18 +103,6 @@ impl Transform {
             );
         }
 
-        if let Some(manager) = decoder_device_manager {
-            unsafe {
-                transform
-                    .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
-                    .map_err(|e| {
-                        format!(
-                            "Não foi possível associar o dispositivo D3D11 ao decodificador: {e}"
-                        )
-                    })?;
-            }
-        }
-
         let async_transform =
             unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or_default() != 0;
         let events = if async_transform {
@@ -126,6 +114,16 @@ impl Transform {
         } else {
             None
         };
+
+        if let Some(manager) = decoder_device_manager {
+            unsafe {
+                transform
+                    .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
+                    .map_err(|e| {
+                        format!("Não foi possível associar o dispositivo D3D11 ao codec: {e}")
+                    })?;
+            }
+        }
 
         let input_type = make_video_type(input_subtype, width, height)?;
         let output_type = make_video_type(output_subtype, width, height)?;
