@@ -14,6 +14,10 @@ pub(super) fn show_room(app: &mut ClientUi, ui: &mut egui::Ui) {
     app.show_room(ui);
 }
 
+pub(super) fn show_fullscreen_video(app: &mut ClientUi, ui: &mut egui::Ui) {
+    app.show_fullscreen_video(ui);
+}
+
 pub(super) fn show_room_toolbar(app: &mut ClientUi, ui: &mut egui::Ui) {
     app.show_room_toolbar(ui);
 }

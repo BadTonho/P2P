@@ -772,6 +772,7 @@ impl ClientUi {
 
     pub(super) fn leave_room(&mut self) {
         tracing::info!("Saindo da sala e liberando recursos locais");
+        self.fullscreen_video = false;
         self.stop_microphone();
         self.stop_screen_share(true);
         self.turn_server = None;

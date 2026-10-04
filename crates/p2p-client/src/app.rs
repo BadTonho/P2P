@@ -235,6 +235,7 @@ struct ClientUi {
     code_copied_until: Option<Instant>,
     settings_open: bool,
     settings_category: SettingsCategory,
+    fullscreen_video: bool,
     server_url: String,
     public_server_url: String,
     saved_hosts: Vec<SavedHostProfile>,
@@ -672,9 +673,24 @@ impl ClientUi {
         }
     }
 
+    pub(super) fn set_fullscreen(&mut self, context: &egui::Context, enabled: bool) {
+        self.fullscreen_video = enabled;
+        context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(enabled));
+    }
+
+    pub(super) fn toggle_fullscreen(&mut self, context: &egui::Context) {
+        self.set_fullscreen(context, !self.fullscreen_video);
+    }
+
     fn show(&mut self, ui: &mut egui::Ui) {
         Self::apply_monochrome_style(ui);
         let context = ui.ctx().clone();
+        if context.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.toggle_fullscreen(&context);
+        }
+        if self.fullscreen_video && context.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.set_fullscreen(&context, false);
+        }
         let preferences_before_frame = self.preferences_snapshot();
         if self
             .code_copied_until
@@ -718,6 +734,16 @@ impl ClientUi {
         let mut open_settings = false;
         let mut close_settings = false;
         let mut export_logs = false;
+
+        if self.fullscreen_video && self.room_code.is_some() && !self.settings_open {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(egui::Color32::from_rgb(10, 10, 12)))
+                .show(ui, |ui| {
+                    Self::apply_monochrome_style(ui);
+                    ui::show_fullscreen_video(self, ui);
+                });
+            return;
+        }
 
         if self.room_code.is_some() && !self.settings_open {
             egui::Panel::bottom("room-controls")

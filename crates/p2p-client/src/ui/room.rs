@@ -23,6 +23,68 @@ fn remote_audio_volume_context_menu(response: egui::Response, current_percent: u
     changed_volume
 }
 
+fn show_screen_audio_and_fullscreen_toolbar(
+    ui: &mut egui::Ui,
+    current_volume: u8,
+    is_fullscreen: bool,
+) -> (Option<u8>, bool) {
+    let mut volume_change = None;
+    let mut toggle_fullscreen = false;
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+
+        let volume_icon = if current_volume == 0 {
+            "🔇"
+        } else if current_volume < 40 {
+            "🔉"
+        } else {
+            "🔊"
+        };
+
+        if ui
+            .button(volume_icon)
+            .on_hover_text(if current_volume == 0 {
+                "Ativar áudio da transmissão"
+            } else {
+                "Silenciar áudio da transmissão"
+            })
+            .clicked()
+        {
+            if current_volume > 0 {
+                volume_change = Some(0);
+            } else {
+                volume_change = Some(100);
+            }
+        }
+
+        ui.label("Volume:");
+        let mut percent = f32::from(current_volume);
+        if ui
+            .add(
+                egui::Slider::new(&mut percent, 0.0..=100.0)
+                    .integer()
+                    .suffix("%"),
+            )
+            .changed()
+        {
+            volume_change = Some(percent.round().clamp(0.0, 100.0) as u8);
+        }
+
+        ui.separator();
+        let fs_text = if is_fullscreen {
+            "🗗 Sair da tela cheia (F11)"
+        } else {
+            "⛶ Tela cheia (F11)"
+        };
+        if ui.button(fs_text).clicked() {
+            toggle_fullscreen = true;
+        }
+    });
+
+    (volume_change, toggle_fullscreen)
+}
+
 impl ClientUi {
     pub(super) fn show_room(&mut self, ui: &mut egui::Ui) {
         let mut participants = self.participants.clone();
@@ -141,15 +203,19 @@ impl ClientUi {
             } else {
                 match &self.screen_share_role {
                     ScreenShareRole::Receiving { .. } => {
-                        if let Some(texture) = &self.remote_screen_texture {
+                        if let Some(texture) = self.remote_screen_texture.clone() {
                             let available = stage.available_size();
                             let source = texture.size_vec2();
+                            let toolbar_height = 36.0;
+                            let available_video_height = (stage_height - toolbar_height).max(100.0);
                             let scale = (available.x / source.x)
-                                .min(available.y / source.y)
+                                .min(available_video_height / source.y)
                                 .min(1.0);
                             let image_size = source * scale.max(0.01);
                             stage.vertical_centered(|ui| {
-                                ui.add_space(((stage_height - image_size.y) * 0.5).max(0.0));
+                                ui.add_space(
+                                    ((available_video_height - image_size.y) * 0.5).max(0.0),
+                                );
                                 let response = ui.add(
                                     egui::Image::new((texture.id(), source))
                                         .fit_to_exact_size(image_size)
@@ -159,6 +225,19 @@ impl ClientUi {
                                     response,
                                     direct_remote_volume,
                                 );
+                                ui.add_space(6.0);
+                                let (bar_volume, toggle_fs) =
+                                    show_screen_audio_and_fullscreen_toolbar(
+                                        ui,
+                                        direct_remote_volume,
+                                        self.fullscreen_video,
+                                    );
+                                if bar_volume.is_some() {
+                                    direct_volume_change = bar_volume;
+                                }
+                                if toggle_fs {
+                                    self.toggle_fullscreen(ui.ctx());
+                                }
                             });
                         } else {
                             stage.vertical_centered(|ui| {
@@ -639,7 +718,7 @@ impl ClientUi {
     fn show_group_screen_stage(&mut self, ui: &mut egui::Ui, stage_height: f32) {
         let focused = self.focused_group_screen.clone();
         if let Some(id) = focused.as_deref() {
-            if let Some(texture) = self.group_remote_textures.get(id) {
+            if let Some(texture) = self.group_remote_textures.get(id).cloned() {
                 let current_volume = self
                     .group_inbound_sessions
                     .get(id)
@@ -648,17 +727,33 @@ impl ClientUi {
                 let mut volume_change = None;
                 let source = texture.size_vec2();
                 let available = ui.available_size();
+                let toolbar_height = 36.0;
+                let available_video_height = (stage_height - toolbar_height).max(100.0);
                 let scale = (available.x / source.x)
-                    .min(available.y / source.y)
+                    .min(available_video_height / source.y)
                     .min(1.0);
                 ui.vertical_centered(|ui| {
-                    ui.add_space(((stage_height - source.y * scale.max(0.01)) * 0.5).max(0.0));
+                    ui.add_space(
+                        ((available_video_height - source.y * scale.max(0.01)) * 0.5).max(0.0),
+                    );
                     let response = ui.add(
                         egui::Image::new((texture.id(), source))
                             .fit_to_exact_size(source * scale.max(0.01))
                             .sense(egui::Sense::click()),
                     );
                     volume_change = remote_audio_volume_context_menu(response, current_volume);
+                    ui.add_space(6.0);
+                    let (bar_volume, toggle_fs) = show_screen_audio_and_fullscreen_toolbar(
+                        ui,
+                        current_volume,
+                        self.fullscreen_video,
+                    );
+                    if bar_volume.is_some() {
+                        volume_change = bar_volume;
+                    }
+                    if toggle_fs {
+                        self.toggle_fullscreen(ui.ctx());
+                    }
                     if ui.button("Voltar à grade").clicked() {
                         self.focused_group_screen = None;
                     }
@@ -864,6 +959,67 @@ impl ClientUi {
                     }
                 });
             });
+        }
+    }
+
+    pub(super) fn show_fullscreen_video(&mut self, ui: &mut egui::Ui) {
+        let available = ui.available_size();
+        let toolbar_height = 42.0;
+        let available_video_height = (available.y - toolbar_height).max(100.0);
+
+        let (texture_opt, current_volume, is_group, group_id) =
+            if let Some(id) = self.focused_group_screen.clone() {
+                let tex = self.group_remote_textures.get(&id).cloned();
+                let vol = self
+                    .group_inbound_sessions
+                    .get(&id)
+                    .map(ScreenShareSession::remote_audio_volume_percent)
+                    .unwrap_or(self.remote_audio_default_volume_percent);
+                (tex, vol, true, Some(id))
+            } else if let Some(texture) = &self.remote_screen_texture {
+                let vol = self
+                    .screen_share_session
+                    .as_ref()
+                    .map(ScreenShareSession::remote_audio_volume_percent)
+                    .unwrap_or(self.remote_audio_default_volume_percent);
+                (Some(texture.clone()), vol, false, None)
+            } else {
+                self.set_fullscreen(ui.ctx(), false);
+                return;
+            };
+
+        if let Some(texture) = texture_opt {
+            let source = texture.size_vec2();
+            let scale = (available.x / source.x).min(available_video_height / source.y);
+            let image_size = source * scale.max(0.01);
+
+            ui.vertical_centered(|ui| {
+                ui.add_space(((available_video_height - image_size.y) * 0.5).max(0.0));
+                ui.add(egui::Image::new((texture.id(), source)).fit_to_exact_size(image_size));
+
+                ui.add_space(8.0);
+                let (new_vol, toggle_fs) =
+                    show_screen_audio_and_fullscreen_toolbar(ui, current_volume, true);
+                if let Some(vol) = new_vol {
+                    if let Some(ref gid) = group_id {
+                        if let Some(session) = self.group_inbound_sessions.get(gid) {
+                            session.set_remote_audio_volume_percent(vol);
+                        }
+                    } else if let Some(session) = &self.screen_share_session {
+                        session.set_remote_audio_volume_percent(vol);
+                    }
+                    self.remote_audio_default_volume_percent = vol;
+                }
+                if toggle_fs {
+                    self.set_fullscreen(ui.ctx(), false);
+                }
+                if is_group && ui.button("Voltar à grade").clicked() {
+                    self.focused_group_screen = None;
+                    self.set_fullscreen(ui.ctx(), false);
+                }
+            });
+        } else {
+            self.set_fullscreen(ui.ctx(), false);
         }
     }
 }
