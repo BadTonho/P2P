@@ -332,11 +332,10 @@ impl ClientUi {
 
                 if self.peer_connected && ui.button("Testar sinalização").clicked() {
                     self.diagnostic_status = Some("Enviando sinal de diagnóstico…".to_owned());
-                    if let Some(signaling) = &self.signaling {
-                        if let Err(error) = signaling.send_diagnostic() {
+                    if let Some(signaling) = &self.signaling
+                        && let Err(error) = signaling.send_diagnostic() {
                             self.diagnostic_status = Some(error);
                         }
-                    }
                 }
                 if let Some(status) = &self.diagnostic_status {
                     ui.small(status);
@@ -672,29 +671,28 @@ impl ClientUi {
                 }
                 return;
             }
-            if id == "__local" {
-                if let Some(texture) = self
+            if id == "__local"
+                && let Some(texture) = self
                     .screen_texture
                     .as_ref()
                     .filter(|_| self.show_local_preview)
-                {
-                    let source = texture.size_vec2();
-                    let available = ui.available_size();
-                    let scale = (available.x / source.x)
-                        .min(available.y / source.y)
-                        .min(1.0);
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(((stage_height - source.y * scale.max(0.01)) * 0.5).max(0.0));
-                        ui.add(
-                            egui::Image::new((texture.id(), source))
-                                .fit_to_exact_size(source * scale.max(0.01)),
-                        );
-                        if ui.button("Voltar à grade").clicked() {
-                            self.focused_group_screen = None;
-                        }
-                    });
-                    return;
-                }
+            {
+                let source = texture.size_vec2();
+                let available = ui.available_size();
+                let scale = (available.x / source.x)
+                    .min(available.y / source.y)
+                    .min(1.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(((stage_height - source.y * scale.max(0.01)) * 0.5).max(0.0));
+                    ui.add(
+                        egui::Image::new((texture.id(), source))
+                            .fit_to_exact_size(source * scale.max(0.01)),
+                    );
+                    if ui.button("Voltar à grade").clicked() {
+                        self.focused_group_screen = None;
+                    }
+                });
+                return;
             }
             self.focused_group_screen = None;
         }
@@ -813,13 +811,11 @@ impl ClientUi {
                 ui.label("A sala continua ativa neste computador enquanto o outro participante aceita e inicia o novo servidor.");
                 ui.horizontal(|ui| {
                     let can_cancel = self.outgoing_transfer.as_ref().is_some_and(|(_, token)| !token.is_empty());
-                    if ui.add_enabled(can_cancel, egui::Button::new("Cancelar transferência")).clicked() {
-                        if let (Some(signaling), Some((_, token))) = (&self.signaling, &self.outgoing_transfer) {
-                            if let Err(error) = signaling.cancel_host_transfer(token.clone()) {
+                    if ui.add_enabled(can_cancel, egui::Button::new("Cancelar transferência")).clicked()
+                        && let (Some(signaling), Some((_, token))) = (&self.signaling, &self.outgoing_transfer)
+                            && let Err(error) = signaling.cancel_host_transfer(token.clone()) {
                                 self.handoff_error = Some(error);
                             }
-                        }
-                    }
                     if ui.button("Encerrar sala").clicked() {
                         self.end_room_explicitly(context);
                     }

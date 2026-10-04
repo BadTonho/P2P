@@ -18,10 +18,10 @@ impl ClientUi {
                 ui.label("Log desta execução");
                 ui.horizontal_wrapped(|ui| {
                     ui.label(self.logging.current_log_file_label());
-                    if let Some(path) = self.logging.current_log_file() {
-                        if ui.small_button("Copiar caminho").clicked() {
-                            ui.ctx().copy_text(path.display().to_string());
-                        }
+                    if let Some(path) = self.logging.current_log_file()
+                        && ui.small_button("Copiar caminho").clicked()
+                    {
+                        ui.ctx().copy_text(path.display().to_string());
                     }
                     if ui
                         .add_enabled(

@@ -747,8 +747,10 @@ pub async fn serve(
     mut shutdown: oneshot::Receiver<()>,
     transfer_reservation: Option<TransferReservation>,
 ) -> io::Result<()> {
-    let mut registry = RoomRegistry::default();
-    registry.transfer_reservation = transfer_reservation;
+    let registry = RoomRegistry {
+        transfer_reservation,
+        ..Default::default()
+    };
     let rooms = Arc::new(Mutex::new(registry));
     let next_connection_id = Arc::new(AtomicU64::new(1));
     tracing::info!(local_address = ?listener.local_addr().ok(), "Servidor de sinalização pronto para aceitar conexões");

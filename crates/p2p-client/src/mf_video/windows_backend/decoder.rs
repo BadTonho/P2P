@@ -24,8 +24,8 @@ impl HardwareDecoder {
             || height < 2
             || width > 1280
             || height > 720
-            || width % 2 != 0
-            || height % 2 != 0
+            || !width.is_multiple_of(2)
+            || !height.is_multiple_of(2)
         {
             return Err(format!(
                 "Dimensões H.264 inválidas para DXVA: {width}×{height}."

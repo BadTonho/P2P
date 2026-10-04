@@ -91,55 +91,6 @@ pub(crate) trait AudioPlaybackFactory: Send + Sync {
     ) -> Result<Box<dyn AudioPlaybackSink>, String>;
 }
 
-#[cfg(test)]
-mod remote_volume_tests {
-    use super::{RemoteAudioVolume, scale_remote_audio_sample};
-
-    #[test]
-    fn remote_volume_scales_samples_at_zero_half_and_full() {
-        assert_eq!(
-            scale_remote_audio_sample(0.8, RemoteAudioVolume::new(0).gain()),
-            0.0
-        );
-        assert_eq!(
-            scale_remote_audio_sample(0.8, RemoteAudioVolume::new(50).gain()),
-            0.4
-        );
-        assert_eq!(
-            scale_remote_audio_sample(0.8, RemoteAudioVolume::new(100).gain()),
-            0.8
-        );
-    }
-
-    #[test]
-    fn remote_volume_changes_are_visible_to_playback_without_restarting() {
-        let volume = RemoteAudioVolume::new(100);
-        let playback_control = volume.clone();
-        assert_eq!(scale_remote_audio_sample(0.6, playback_control.gain()), 0.6);
-
-        volume.set_percent(50);
-        assert_eq!(scale_remote_audio_sample(0.6, playback_control.gain()), 0.3);
-
-        volume.set_percent(0);
-        assert_eq!(scale_remote_audio_sample(0.6, playback_control.gain()), 0.0);
-    }
-
-    #[test]
-    fn remote_volume_is_independent_per_session_and_inherits_default() {
-        let saved_default = 73;
-        let first_session = RemoteAudioVolume::new(saved_default);
-        let second_session = RemoteAudioVolume::new(saved_default);
-
-        first_session.set_percent(25);
-
-        assert_eq!(first_session.percent(), 25);
-        assert_eq!(second_session.percent(), saved_default);
-
-        let future_session = RemoteAudioVolume::new(saved_default);
-        assert_eq!(future_session.percent(), saved_default);
-    }
-}
-
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -523,13 +474,13 @@ impl MicrophoneTest {
             format_microphone_error(format!("O Windows não permitiu iniciar a captura: {error}"))
         })?;
 
-        if let Some(stream) = monitor_stream.as_ref() {
-            if let Err(error) = stream.play() {
-                monitor_start_error = Some(format!(
-                    "Não foi possível iniciar o retorno de áudio: {error}"
-                ));
-                monitor_stream = None;
-            }
+        if let Some(stream) = monitor_stream.as_ref()
+            && let Err(error) = stream.play()
+        {
+            monitor_start_error = Some(format!(
+                "Não foi possível iniciar o retorno de áudio: {error}"
+            ));
+            monitor_stream = None;
         }
 
         if monitor_stream.is_none() {
@@ -590,6 +541,7 @@ fn gain_db_to_amplitude(gain_db: f32) -> f32 {
     10.0_f32.powf(gain_db.clamp(0.0, 18.0) / 20.0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_input_stream<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
@@ -666,6 +618,7 @@ where
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_output_stream<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
@@ -831,4 +784,53 @@ fn format_microphone_error(cause: String) -> String {
     format!(
         "{cause} Se o microfone estiver bloqueado, abra Configurações > Privacidade e segurança > Microfone (no Windows 10, Privacidade > Microfone) e permita o acesso a aplicativos de área de trabalho."
     )
+}
+
+#[cfg(test)]
+mod remote_volume_tests {
+    use super::{RemoteAudioVolume, scale_remote_audio_sample};
+
+    #[test]
+    fn remote_volume_scales_samples_at_zero_half_and_full() {
+        assert_eq!(
+            scale_remote_audio_sample(0.8, RemoteAudioVolume::new(0).gain()),
+            0.0
+        );
+        assert_eq!(
+            scale_remote_audio_sample(0.8, RemoteAudioVolume::new(50).gain()),
+            0.4
+        );
+        assert_eq!(
+            scale_remote_audio_sample(0.8, RemoteAudioVolume::new(100).gain()),
+            0.8
+        );
+    }
+
+    #[test]
+    fn remote_volume_changes_are_visible_to_playback_without_restarting() {
+        let volume = RemoteAudioVolume::new(100);
+        let playback_control = volume.clone();
+        assert_eq!(scale_remote_audio_sample(0.6, playback_control.gain()), 0.6);
+
+        volume.set_percent(50);
+        assert_eq!(scale_remote_audio_sample(0.6, playback_control.gain()), 0.3);
+
+        volume.set_percent(0);
+        assert_eq!(scale_remote_audio_sample(0.6, playback_control.gain()), 0.0);
+    }
+
+    #[test]
+    fn remote_volume_is_independent_per_session_and_inherits_default() {
+        let saved_default = 73;
+        let first_session = RemoteAudioVolume::new(saved_default);
+        let second_session = RemoteAudioVolume::new(saved_default);
+
+        first_session.set_percent(25);
+
+        assert_eq!(first_session.percent(), 25);
+        assert_eq!(second_session.percent(), saved_default);
+
+        let future_session = RemoteAudioVolume::new(saved_default);
+        assert_eq!(future_session.percent(), saved_default);
+    }
 }

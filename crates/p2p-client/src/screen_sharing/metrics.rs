@@ -753,12 +753,9 @@ impl SharedMetrics {
         if contains_idr {
             flow.assembled_with_idr += 1;
         }
-        if contains_idr {
-            if let Some(started_at) = flow.resync_started_at {
-                let elapsed = started_at.elapsed().as_millis();
-                flow.last_idr_assembled_recovery_ms =
-                    Some(elapsed.min(u128::from(u64::MAX)) as u64);
-            }
+        if contains_idr && let Some(started_at) = flow.resync_started_at {
+            let elapsed = started_at.elapsed().as_millis();
+            flow.last_idr_assembled_recovery_ms = Some(elapsed.min(u128::from(u64::MAX)) as u64);
         }
         if !contains_idr && nals.iter().any(|nal_type| (1..=4).contains(nal_type)) {
             flow.assembled_delta_frames += 1;

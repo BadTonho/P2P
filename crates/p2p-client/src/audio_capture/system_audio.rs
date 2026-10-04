@@ -842,40 +842,7 @@ impl AudioPlaybackFactory for SystemAudioPlaybackFactory {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{RecoverableCaptureError, classify_capture_error};
-
-    #[test]
-    fn classifies_xrun_device_change_and_realtime_refusal_as_recoverable() {
-        assert_eq!(
-            classify_capture_error(cpal::ErrorKind::Xrun),
-            Some(RecoverableCaptureError::Xrun)
-        );
-        assert_eq!(
-            classify_capture_error(cpal::ErrorKind::DeviceChanged),
-            Some(RecoverableCaptureError::DeviceChanged)
-        );
-        assert_eq!(
-            classify_capture_error(cpal::ErrorKind::RealtimeDenied),
-            Some(RecoverableCaptureError::RealtimeDenied)
-        );
-    }
-
-    #[test]
-    fn treats_device_stream_and_backend_failures_as_fatal() {
-        assert_eq!(
-            classify_capture_error(cpal::ErrorKind::DeviceNotAvailable),
-            None
-        );
-        assert_eq!(
-            classify_capture_error(cpal::ErrorKind::StreamInvalidated),
-            None
-        );
-        assert_eq!(classify_capture_error(cpal::ErrorKind::BackendError), None);
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 fn build_playback_stream<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
@@ -955,4 +922,38 @@ where
             None,
         )
         .map_err(|error| format!("Não foi possível abrir a saída para áudio remoto: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RecoverableCaptureError, classify_capture_error};
+
+    #[test]
+    fn classifies_xrun_device_change_and_realtime_refusal_as_recoverable() {
+        assert_eq!(
+            classify_capture_error(cpal::ErrorKind::Xrun),
+            Some(RecoverableCaptureError::Xrun)
+        );
+        assert_eq!(
+            classify_capture_error(cpal::ErrorKind::DeviceChanged),
+            Some(RecoverableCaptureError::DeviceChanged)
+        );
+        assert_eq!(
+            classify_capture_error(cpal::ErrorKind::RealtimeDenied),
+            Some(RecoverableCaptureError::RealtimeDenied)
+        );
+    }
+
+    #[test]
+    fn treats_device_stream_and_backend_failures_as_fatal() {
+        assert_eq!(
+            classify_capture_error(cpal::ErrorKind::DeviceNotAvailable),
+            None
+        );
+        assert_eq!(
+            classify_capture_error(cpal::ErrorKind::StreamInvalidated),
+            None
+        );
+        assert_eq!(classify_capture_error(cpal::ErrorKind::BackendError), None);
+    }
 }

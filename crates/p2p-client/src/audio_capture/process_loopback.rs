@@ -215,8 +215,10 @@ pub(crate) fn find_process_id(executable_path: &str) -> Result<Option<u32>, Stri
 }
 
 pub(crate) fn process_loopback_supported() -> Result<bool, String> {
-    let mut version = RtlOsVersionInfo::default();
-    version.dwOSVersionInfoSize = size_of::<RtlOsVersionInfo>() as u32;
+    let mut version = RtlOsVersionInfo {
+        dwOSVersionInfoSize: size_of::<RtlOsVersionInfo>() as u32,
+        ..Default::default()
+    };
     // RtlGetVersion reports the real build number regardless of the app manifest.
     let status = unsafe { RtlGetVersion(&mut version) };
     if status < 0 {

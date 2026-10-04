@@ -38,12 +38,12 @@ fn format_section(section: &MediaSection) -> String {
                 .map(String::as_str)
                 .unwrap_or("desconhecido");
             let mut description = format!("{codec}(pt={payload_type}");
-            if codec.starts_with("H264/") {
-                if let Some(parameters) = section.fmtp.get(payload_type) {
-                    for key in ["packetization-mode", "profile-level-id"] {
-                        if let Some(value) = parameters.get(key) {
-                            description.push_str(&format!(";{key}={value}"));
-                        }
+            if codec.starts_with("H264/")
+                && let Some(parameters) = section.fmtp.get(payload_type)
+            {
+                for key in ["packetization-mode", "profile-level-id"] {
+                    if let Some(value) = parameters.get(key) {
+                        description.push_str(&format!(";{key}={value}"));
                     }
                 }
             }

@@ -14,6 +14,7 @@ pub struct HardwareEncoder {
 }
 
 impl HardwareEncoder {
+    #[allow(dead_code)]
     pub fn new(width: u32, height: u32) -> Result<Self, String> {
         Self::new_with_bitrate(width, height, BITRATE)
     }
@@ -44,6 +45,7 @@ impl HardwareEncoder {
         })
     }
 
+    #[allow(dead_code)]
     pub fn new_gpu(width: u32, height: u32, device: &ID3D11Device) -> Result<Self, String> {
         Self::new_gpu_with_bitrate(width, height, device, BITRATE)
     }
@@ -148,7 +150,7 @@ impl HardwareEncoder {
     pub fn encode_nv12(&mut self, frame: &CpuNv12Frame) -> Result<Vec<u8>, String> {
         let width = self.width as usize;
         let height = self.height as usize;
-        if self.width % 2 != 0 || self.height % 2 != 0 || frame.stride < width {
+        if !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) || frame.stride < width {
             return Err("O quadro NV12 da captura tem dimensões ou stride inválidos.".to_owned());
         }
         let required = frame

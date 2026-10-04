@@ -77,7 +77,7 @@ fn local_preview_image(frame: &PreviewFrame) -> Result<Option<egui::ColorImage>,
     } else {
         #[cfg(windows)]
         {
-            if width % 2 != 0 || height % 2 != 0 {
+            if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
                 return Err("O quadro NV12 da prévia precisa de dimensões pares.".to_owned());
             }
             let nv12 = frame.cpu_nv12.as_ref().expect("NV12 availability checked");
@@ -417,12 +417,12 @@ impl ClientUi {
     }
 
     fn refresh_updates(&mut self, context: &egui::Context) {
-        if self.room_code.is_some() {
-            if let UpdateStatus::Downloading { manifest, .. } = &self.update_status {
-                let manifest = manifest.clone();
-                self.updates.cancel_download();
-                self.update_status = UpdateStatus::CancellingDownload(manifest);
-            }
+        if self.room_code.is_some()
+            && let UpdateStatus::Downloading { manifest, .. } = &self.update_status
+        {
+            let manifest = manifest.clone();
+            self.updates.cancel_download();
+            self.update_status = UpdateStatus::CancellingDownload(manifest);
         }
 
         while let Some(event) = self.updates.try_recv() {
@@ -443,10 +443,9 @@ impl ClientUi {
                         manifest,
                         received: current,
                     } = &mut self.update_status
+                        && manifest.version == version
                     {
-                        if manifest.version == version {
-                            *current = received;
-                        }
+                        *current = received;
                     }
                 }
                 UpdateEvent::DownloadFinished { manifest, path } => {
@@ -525,25 +524,26 @@ impl ClientUi {
     }
 
     fn preferences_snapshot(&self) -> AppSettings {
-        let mut settings = AppSettings::default();
-        settings.server_url = self.server_url.clone();
-        settings.public_server_url = Some(self.public_server_url.clone());
-        settings.saved_hosts = self.saved_hosts.clone();
-        settings.selected_host_index = self.selected_host_index;
-        settings.stun_server_url = self.stun_server_url.clone();
-        settings.monitor_gain_db = self.monitor_gain_db;
-        settings.remote_audio_default_volume_percent = self.remote_audio_default_volume_percent;
-        settings.logging_level = self.logging_level;
-        settings.video_decoder_preference = self.video_decoder_preference;
-        settings.show_local_preview = self.show_local_preview;
-        settings.include_system_audio = self.include_system_audio;
-        settings.excluded_audio_application_path = self.excluded_audio_application_path.clone();
-        settings.profile_display_name = self.profile_display_name.clone();
-        settings.create_room_mode = self.create_room_mode;
-        settings.use_turn_on_create = self.use_turn_on_create;
-        settings.may_host = self.may_host;
-        settings.control_ipv4 = self.preferred_control_ipv4;
-        settings
+        AppSettings {
+            server_url: self.server_url.clone(),
+            public_server_url: Some(self.public_server_url.clone()),
+            saved_hosts: self.saved_hosts.clone(),
+            selected_host_index: self.selected_host_index,
+            stun_server_url: self.stun_server_url.clone(),
+            monitor_gain_db: self.monitor_gain_db,
+            remote_audio_default_volume_percent: self.remote_audio_default_volume_percent,
+            logging_level: self.logging_level,
+            video_decoder_preference: self.video_decoder_preference,
+            show_local_preview: self.show_local_preview,
+            include_system_audio: self.include_system_audio,
+            excluded_audio_application_path: self.excluded_audio_application_path.clone(),
+            profile_display_name: self.profile_display_name.clone(),
+            create_room_mode: self.create_room_mode,
+            use_turn_on_create: self.use_turn_on_create,
+            may_host: self.may_host,
+            control_ipv4: self.preferred_control_ipv4,
+            ..Default::default()
+        }
     }
 
     fn apply_preferences(&mut self, preferences: AppSettings) {
@@ -634,10 +634,10 @@ impl ClientUi {
         participant: &ParticipantInfo,
     ) -> Option<egui::TextureHandle> {
         let encoded = participant.avatar_jpeg_base64.clone();
-        if let Some((cached, texture)) = self.participant_avatar_textures.get(&participant.id) {
-            if *cached == encoded {
-                return texture.clone();
-            }
+        if let Some((cached, texture)) = self.participant_avatar_textures.get(&participant.id)
+            && *cached == encoded
+        {
+            return texture.clone();
         }
 
         let texture = encoded
@@ -828,12 +828,10 @@ impl ClientUi {
                     update_clicked = response.clicked();
                 }
 
-                if code_clicked {
-                    if let Some(code) = room_code {
-                        ui.ctx().copy_text(code);
-                        self.code_copied_until = Some(Instant::now() + Duration::from_secs(2));
-                        ui.ctx().request_repaint_after(Duration::from_secs(2));
-                    }
+                if code_clicked && let Some(code) = room_code {
+                    ui.ctx().copy_text(code);
+                    self.code_copied_until = Some(Instant::now() + Duration::from_secs(2));
+                    ui.ctx().request_repaint_after(Duration::from_secs(2));
                 }
                 if settings_clicked {
                     if settings_open {
@@ -919,15 +917,15 @@ impl ClientUi {
             self.settings_dirty = true;
             self.settings_save_at = Some(Instant::now() + Duration::from_millis(400));
         }
-        if self.settings_dirty {
-            if let Some(save_at) = self.settings_save_at {
-                let now = Instant::now();
-                if now >= save_at {
-                    self.save_preferences();
-                    context.request_repaint();
-                } else {
-                    context.request_repaint_after(save_at - now);
-                }
+        if self.settings_dirty
+            && let Some(save_at) = self.settings_save_at
+        {
+            let now = Instant::now();
+            if now >= save_at {
+                self.save_preferences();
+                context.request_repaint();
+            } else {
+                context.request_repaint_after(save_at - now);
             }
         }
     }
@@ -1232,11 +1230,11 @@ impl ClientUi {
         {
             return;
         }
-        if self.room_mode == RoomMode::InternetTest {
-            if let Err(error) = screen_sharing::validate_stun_uri(&self.stun_server_url) {
-                self.screen_share_status = Some(error);
-                return;
-            }
+        if self.room_mode == RoomMode::InternetTest
+            && let Err(error) = screen_sharing::validate_stun_uri(&self.stun_server_url)
+        {
+            self.screen_share_status = Some(error);
+            return;
         }
         self.screen_share_metrics = ScreenShareMetrics::default();
         let nonce = SystemTime::now()
@@ -1596,11 +1594,11 @@ impl ClientUi {
                         payload,
                         context,
                     );
-                } else if let Some(session) = &self.screen_share_session {
-                    if let Err(error) = session.handle_signal(kind, payload) {
-                        self.stop_screen_share(true);
-                        self.screen_share_status = Some(error);
-                    }
+                } else if let Some(session) = &self.screen_share_session
+                    && let Err(error) = session.handle_signal(kind, payload)
+                {
+                    self.stop_screen_share(true);
+                    self.screen_share_status = Some(error);
                 }
             }
             SignalKind::Diagnostic => {}
@@ -1831,7 +1829,7 @@ impl ClientUi {
                     pli_sent_interval = performance.pli_requests_sent,
                     pli_received_interval = performance.pli_requests_received,
                     h264_pipeline_interval = %crate::screen_sharing::h264_pipeline_interval_label(&performance),
-                    rtp_recovery_stats = %crate::screen_sharing::rtp_recovery_interval_label(&metrics, &performance),
+                    rtp_recovery_stats = %crate::screen_sharing::rtp_recovery_interval_label(metrics, &performance),
                     pli_queue_overflow = metrics.pli_queue_overflow,
                     rtc_rtp_out_packets = metrics.outbound_rtp_packets,
                     rtc_rtp_out_bytes = metrics.outbound_rtp_bytes,
@@ -1947,30 +1945,30 @@ impl ClientUi {
             .screen_share_session
             .as_ref()
             .and_then(ScreenShareSession::latest_remote_frame);
-        if let Some(frame) = remote_frame {
-            if self.remote_screen_sequence != frame.sequence {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba,
-                );
-                if let Some(texture) = self.remote_screen_texture.as_mut() {
-                    texture.set(image, egui::TextureOptions::LINEAR);
-                } else {
-                    self.remote_screen_texture = Some(context.load_texture(
-                        "remote-screen",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ));
-                }
-                if let Some(session) = self.screen_share_session.as_ref() {
-                    session.record_ui_texture_update();
-                }
-                if self.remote_screen_sequence == 0 {
-                    self.screen_share_status =
-                        Some("Primeiro quadro da tela recebido e decodificado.".to_owned());
-                }
-                self.remote_screen_sequence = frame.sequence;
+        if let Some(frame) = remote_frame
+            && self.remote_screen_sequence != frame.sequence
+        {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.rgba,
+            );
+            if let Some(texture) = self.remote_screen_texture.as_mut() {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                self.remote_screen_texture = Some(context.load_texture(
+                    "remote-screen",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
             }
+            if let Some(session) = self.screen_share_session.as_ref() {
+                session.record_ui_texture_update();
+            }
+            if self.remote_screen_sequence == 0 {
+                self.screen_share_status =
+                    Some("Primeiro quadro da tela recebido e decodificado.".to_owned());
+            }
+            self.remote_screen_sequence = frame.sequence;
         }
     }
 
@@ -1996,10 +1994,8 @@ impl ClientUi {
                 "Encerrando sessão de compartilhamento de tela; identificador omitido"
             );
         }
-        if announce {
-            if let Some(request_id) = request_id {
-                let _ = self.send_screen_share_signal(SignalKind::ScreenShareStopped, request_id);
-            }
+        if announce && let Some(request_id) = request_id {
+            let _ = self.send_screen_share_signal(SignalKind::ScreenShareStopped, request_id);
         }
         if let Some(session) = self.screen_share_session.take() {
             let metrics = session.metrics();
@@ -2336,7 +2332,7 @@ impl ClientUi {
                 metrics.ui_texture_updates,
                 metrics.pli_queue_overflow,
                 metrics.decode_errors,
-                format!(
+                format_args!(
                     "janela adaptativa RTP={} ms/{} amostras; {}",
                     metrics.rtp_reorder_window_ms,
                     metrics.rtp_reorder_samples,

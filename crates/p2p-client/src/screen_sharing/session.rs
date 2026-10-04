@@ -202,6 +202,7 @@ pub struct ScreenShareSession {
     worker: Option<JoinHandle<()>>,
 }
 
+#[allow(dead_code)]
 impl ScreenShareSession {
     pub fn new(
         context: egui::Context,
@@ -267,11 +268,11 @@ impl ScreenShareSession {
         decoder_preference: VideoDecoderPreference,
         remote_audio_volume_percent: u8,
     ) -> Result<Self, String> {
-        if let Some(server) = stun_server.as_deref() {
-            if let Err(error) = validate_stun_uri(server) {
-                tracing::error!(reason = %error, "URI STUN recusada antes de iniciar WebRTC");
-                return Err(error);
-            }
+        if let Some(server) = stun_server.as_deref()
+            && let Err(error) = validate_stun_uri(server)
+        {
+            tracing::error!(reason = %error, "URI STUN recusada antes de iniciar WebRTC");
+            return Err(error);
         }
         Self::with_udp_address_and_audio_volume(
             context,
@@ -829,6 +830,7 @@ impl PeerConnectionEventHandler for PeerEvents {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: std_mpsc::Sender<ScreenShareEvent>,
@@ -1397,10 +1399,10 @@ fn adapter_name_for_ip(address: &str) -> String {
                 })
                 .collect()
         });
-        return adapters
+        adapters
             .get(&ip)
             .cloned()
-            .unwrap_or_else(|| "adaptador não identificado".to_owned());
+            .unwrap_or_else(|| "adaptador não identificado".to_owned())
     }
     #[cfg(not(windows))]
     {
@@ -1409,6 +1411,7 @@ fn adapter_name_for_ip(address: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_peer(
     events: &std_mpsc::Sender<ScreenShareEvent>,
     context: egui::Context,
@@ -1436,7 +1439,6 @@ async fn create_peer(
             }],
         },
         payload_type: VIDEO_PAYLOAD_TYPE,
-        ..Default::default()
     };
     let mut media_engine = MediaEngine::default();
     media_engine
@@ -1451,7 +1453,6 @@ async fn create_peer(
             rtcp_feedback: vec![],
         },
         payload_type: AUDIO_PAYLOAD_TYPE,
-        ..Default::default()
     };
     media_engine
         .register_codec(opus_codec, RtpCodecKind::Audio)
@@ -1509,7 +1510,6 @@ async fn create_peer(
             urls: vec![credentials.url.clone()],
             username: credentials.username.clone(),
             credential: credentials.credential.clone(),
-            ..Default::default()
         };
         turn_server
             .urls()
@@ -1543,6 +1543,7 @@ async fn create_peer(
     Ok(Arc::new(connection))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_sender(
     source: LatestFrame,
     events: &std_mpsc::Sender<ScreenShareEvent>,
@@ -2118,6 +2119,7 @@ async fn send_system_audio(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_receiver(
     payload: String,
     events: &std_mpsc::Sender<ScreenShareEvent>,

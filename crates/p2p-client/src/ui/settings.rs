@@ -480,11 +480,10 @@ impl ClientUi {
                         .step_by(1.0),
                 )
                 .changed();
-            if gain_changed {
-                if let Some(microphone) = &self.microphone {
+            if gain_changed
+                && let Some(microphone) = &self.microphone {
                     microphone.set_monitor_gain_db(self.monitor_gain_db);
                 }
-            }
             ui.small("O ganho altera apenas o som ouvido. Valores altos podem distorcer.");
 
             if let Some(error) = &self.microphone_error {

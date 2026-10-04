@@ -46,10 +46,10 @@ pub(super) fn register_srtp_track_context(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !registry.sessions_by_ssrc.contains_key(&ssrc) {
         registry.ssrc_order.push_back(ssrc);
-        if registry.ssrc_order.len() > MAX_TRACK_SSRCS {
-            if let Some(oldest) = registry.ssrc_order.pop_front() {
-                registry.sessions_by_ssrc.remove(&oldest);
-            }
+        if registry.ssrc_order.len() > MAX_TRACK_SSRCS
+            && let Some(oldest) = registry.ssrc_order.pop_front()
+        {
+            registry.sessions_by_ssrc.remove(&oldest);
         }
     }
     registry.sessions_by_ssrc.entry(ssrc).or_default().insert(
@@ -231,10 +231,10 @@ fn increment_duplicate_warning_count(
 ) -> u64 {
     if !counts.contains_key(&ssrc) {
         order.push_back(ssrc);
-        if order.len() > 64 {
-            if let Some(oldest) = order.pop_front() {
-                counts.remove(&oldest);
-            }
+        if order.len() > 64
+            && let Some(oldest) = order.pop_front()
+        {
+            counts.remove(&oldest);
         }
     }
     let count = counts.entry(ssrc).or_default();
@@ -327,13 +327,13 @@ impl LoggingState {
         if level != LoggingLevel::Disabled && self.current_log_file.is_none() {
             self.activate_log_file_with(open_log_directory);
         }
-        if let Some(filter_reload) = &self.filter_reload {
-            if let Err(error) = filter_reload.reload(log_filter(level)) {
-                self.startup_message = Some(format!(
-                    "N\u{00e3}o foi poss\u{00ed}vel alterar o n\u{00ed}vel dos logs: {error}"
-                ));
-                return;
-            }
+        if let Some(filter_reload) = &self.filter_reload
+            && let Err(error) = filter_reload.reload(log_filter(level))
+        {
+            self.startup_message = Some(format!(
+                "N\u{00e3}o foi poss\u{00ed}vel alterar o n\u{00ed}vel dos logs: {error}"
+            ));
+            return;
         }
         self.level = level;
     }

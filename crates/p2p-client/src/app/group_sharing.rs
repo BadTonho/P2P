@@ -9,8 +9,7 @@ const MAX_PENDING_GROUP_ICE_PAYLOAD_BYTES: usize = 4_096;
 
 fn group_share_bitrate(viewer_count: usize) -> u32 {
     (GROUP_SCREEN_MAX_AGGREGATE_BITRATE / viewer_count.max(1) as u32)
-        .min(GROUP_SCREEN_MAX_PEER_BITRATE)
-        .max(250_000)
+        .clamp(250_000, GROUP_SCREEN_MAX_PEER_BITRATE)
 }
 
 fn group_screen_share_compatible(room_mode: RoomMode, participants: &[ParticipantInfo]) -> bool {
@@ -306,15 +305,14 @@ impl ClientUi {
             .remove(&(peer_id.to_owned(), generation.clone()));
         self.closed_group_generations
             .insert((peer_id.to_owned(), generation), Instant::now());
-        if self.closed_group_generations.len() > 128 {
-            if let Some(oldest) = self
+        if self.closed_group_generations.len() > 128
+            && let Some(oldest) = self
                 .closed_group_generations
                 .iter()
                 .min_by_key(|(_, closed_at)| **closed_at)
                 .map(|(key, _)| key.clone())
-            {
-                self.closed_group_generations.remove(&oldest);
-            }
+        {
+            self.closed_group_generations.remove(&oldest);
         }
     }
 
@@ -344,34 +342,30 @@ impl ClientUi {
         }
         if !self.pending_group_ice.contains_key(&key)
             && self.pending_group_ice.len() >= MAX_PENDING_GROUP_ICE_SESSIONS
-        {
-            if let Some(oldest) = self
+            && let Some(oldest) = self
                 .pending_group_ice
                 .iter()
                 .min_by_key(|(_, candidates)| candidates.front().map(|item| item.queued_at))
                 .map(|(key, _)| key.clone())
-            {
-                self.pending_group_ice.remove(&oldest);
-            }
+        {
+            self.pending_group_ice.remove(&oldest);
         }
         let total = self
             .pending_group_ice
             .values()
             .map(VecDeque::len)
             .sum::<usize>();
-        if total >= MAX_PENDING_GROUP_ICE_TOTAL {
-            if let Some(oldest) = self
+        if total >= MAX_PENDING_GROUP_ICE_TOTAL
+            && let Some(oldest) = self
                 .pending_group_ice
                 .iter()
                 .min_by_key(|(_, candidates)| candidates.front().map(|item| item.queued_at))
                 .map(|(key, _)| key.clone())
-            {
-                if let Some(candidates) = self.pending_group_ice.get_mut(&oldest) {
-                    candidates.pop_front();
-                    if candidates.is_empty() {
-                        self.pending_group_ice.remove(&oldest);
-                    }
-                }
+            && let Some(candidates) = self.pending_group_ice.get_mut(&oldest)
+        {
+            candidates.pop_front();
+            if candidates.is_empty() {
+                self.pending_group_ice.remove(&oldest);
             }
         }
         let candidates = self.pending_group_ice.entry(key).or_default();
@@ -557,10 +551,10 @@ impl ClientUi {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        if let Some(viewer) = additional_viewer {
-            if !viewers.contains(&viewer) {
-                viewers.push(viewer);
-            }
+        if let Some(viewer) = additional_viewer
+            && !viewers.contains(&viewer)
+        {
+            viewers.push(viewer);
         }
         viewers.sort();
         if viewers.is_empty() {

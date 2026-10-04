@@ -669,10 +669,10 @@ async fn stop_local_server(
     if let Some(shutdown) = shutdown {
         let _ = shutdown.send(());
     }
-    if let Some(task) = task {
-        if timeout(Duration::from_secs(2), task).await.is_err() {
-            // The runtime also cancels this task when the worker exits.
-        }
+    if let Some(task) = task
+        && timeout(Duration::from_secs(2), task).await.is_err()
+    {
+        // The runtime also cancels this task when the worker exits.
     }
 }
 

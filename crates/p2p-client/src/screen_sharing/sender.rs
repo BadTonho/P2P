@@ -297,7 +297,9 @@ pub(super) fn encode_latest_frames(
                             format!("Media Foundation H.264 de hardware indisponível: {error}");
                         tracing::warn!(fallback_reason = %reason, "Usando codificador H.264 OpenH264 na CPU");
                         metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
-                        encoder = Some(ActiveH264Encoder::OpenH264(openh264_encoder(bitrate_bps)?));
+                        encoder = Some(ActiveH264Encoder::OpenH264(Box::new(openh264_encoder(
+                            bitrate_bps,
+                        )?)));
                     }
                 }
             }
@@ -305,7 +307,9 @@ pub(super) fn encode_latest_frames(
             {
                 let reason = "Media Foundation está disponível apenas no Windows.".to_owned();
                 metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
-                encoder = Some(ActiveH264Encoder::OpenH264(openh264_encoder(bitrate_bps)?));
+                encoder = Some(ActiveH264Encoder::OpenH264(Box::new(openh264_encoder(
+                    bitrate_bps,
+                )?)));
             }
         }
 
@@ -403,14 +407,14 @@ pub(super) fn encode_latest_frames(
             metrics.record_encode_duration(encode_started_at.elapsed());
             let encoded = encoded_result?;
             forward_encoded_access_unit(&encoded, &samples, &metrics, &mut forwarding_gate)?;
-            encoder = Some(ActiveH264Encoder::OpenH264(cpu));
+            encoder = Some(ActiveH264Encoder::OpenH264(Box::new(cpu)));
         }
     }
     Ok(())
 }
 
 enum ActiveH264Encoder {
-    OpenH264(Encoder),
+    OpenH264(Box<Encoder>),
     #[cfg(windows)]
     MediaFoundation(mf_video::HardwareEncoder),
 }
@@ -486,8 +490,8 @@ fn validate_encoder_frame(frame: &PreviewFrame) -> Result<(), String> {
         || frame.height < 2
         || frame.width > 1280
         || frame.height > 720
-        || frame.width % 2 != 0
-        || frame.height % 2 != 0
+        || !frame.width.is_multiple_of(2)
+        || !frame.height.is_multiple_of(2)
     {
         return Err(
             "O quadro excede o limite 1280×720 ou não tem dimensões H.264 válidas.".to_owned(),

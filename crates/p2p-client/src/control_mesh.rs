@@ -236,12 +236,11 @@ impl PeerStats {
             .probes
             .iter_mut()
             .find(|probe| probe.sequence == sequence)
+            && probe.rtt_ms.is_none()
         {
-            if probe.rtt_ms.is_none() {
-                probe.rtt_ms = Some(now.duration_since(probe.sent_at).as_secs_f32() * 1000.0);
-                probe.finalized = true;
-                self.consecutive_losses = 0;
-            }
+            probe.rtt_ms = Some(now.duration_since(probe.sent_at).as_secs_f32() * 1000.0);
+            probe.finalized = true;
+            self.consecutive_losses = 0;
         }
     }
 
@@ -913,16 +912,16 @@ async fn tick_mesh(state: &SharedState, events: &std_mpsc::Sender<ControlEvent>)
         for (_, sender) in &links {
             let _ = sender.send(status.clone());
         }
-        if unstable && leader_id == state.local.id {
-            if state
+        if unstable
+            && leader_id == state.local.id
+            && state
                 .last_unstable_notice
                 .is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(10))
-            {
-                state.last_unstable_notice = Some(now);
-                let _ = events.send(ControlEvent::HostUnstable {
-                    loss_percent: own_metrics.loss_percent,
-                });
-            }
+        {
+            state.last_unstable_notice = Some(now);
+            let _ = events.send(ControlEvent::HostUnstable {
+                loss_percent: own_metrics.loss_percent,
+            });
         }
         (
             senders,
@@ -958,18 +957,18 @@ async fn tick_mesh(state: &SharedState, events: &std_mpsc::Sender<ControlEvent>)
         )
     });
     if let Some((candidate_epoch, deadline, candidate)) = active_election {
-        if now >= deadline {
-            if let Some(candidate) = candidate {
-                broadcast(
-                    state,
-                    ControlMessage::CandidateFailed {
-                        participant_id: candidate.clone(),
-                        epoch: candidate_epoch,
-                    },
-                )
-                .await;
-                fail_current_candidate(state, events, candidate_epoch).await;
-            }
+        if now >= deadline
+            && let Some(candidate) = candidate
+        {
+            broadcast(
+                state,
+                ControlMessage::CandidateFailed {
+                    participant_id: candidate.clone(),
+                    epoch: candidate_epoch,
+                },
+            )
+            .await;
+            fail_current_candidate(state, events, candidate_epoch).await;
         }
     } else if !leader_id.is_empty() {
         if links_missing {
@@ -1463,21 +1462,23 @@ mod tests {
     fn test_state(local: ParticipantInfo, has_successor: bool) -> MeshState {
         let now = Instant::now();
         let host = participant("host", 1, false);
-        let mut stats = PeerStats::default();
-        stats.probes = VecDeque::from([
-            Probe {
-                sequence: 1,
-                sent_at: now,
-                rtt_ms: Some(50.0),
-                finalized: true,
-            },
-            Probe {
-                sequence: 2,
-                sent_at: now,
-                rtt_ms: Some(100.0),
-                finalized: true,
-            },
-        ]);
+        let stats = PeerStats {
+            probes: VecDeque::from([
+                Probe {
+                    sequence: 1,
+                    sent_at: now,
+                    rtt_ms: Some(50.0),
+                    finalized: true,
+                },
+                Probe {
+                    sequence: 2,
+                    sent_at: now,
+                    rtt_ms: Some(100.0),
+                    finalized: true,
+                },
+            ]),
+            ..Default::default()
+        };
         let (link_tx, _link_rx) = mpsc::unbounded_channel();
         let mut roster = vec![host.clone(), local.clone()];
         let mut remote_status = HashMap::new();

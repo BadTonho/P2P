@@ -215,10 +215,10 @@ impl ClientUi {
                 SignalingEvent::Error(error) | SignalingEvent::ServerError(error) => {
                     tracing::error!(error = %error, "Erro recebido durante conexão ou transferência de sala");
                     if let Some(epoch) = self.pending_election_epoch.take() {
-                        if !self.pending_election_reconnect {
-                            if let Some(mesh) = &self.control_mesh {
-                                mesh.candidate_failed(epoch);
-                            }
+                        if !self.pending_election_reconnect
+                            && let Some(mesh) = &self.control_mesh
+                        {
+                            mesh.candidate_failed(epoch);
                         }
                         self.pending_signaling = None;
                         self.pending_election_reconnect = false;
@@ -240,10 +240,10 @@ impl ClientUi {
                 SignalingEvent::Disconnected => {
                     tracing::warn!("Conexão pendente de sala foi desconectada");
                     if let Some(epoch) = self.pending_election_epoch.take() {
-                        if !self.pending_election_reconnect {
-                            if let Some(mesh) = &self.control_mesh {
-                                mesh.candidate_failed(epoch);
-                            }
+                        if !self.pending_election_reconnect
+                            && let Some(mesh) = &self.control_mesh
+                        {
+                            mesh.candidate_failed(epoch);
                         }
                         self.pending_signaling = None;
                         self.pending_election_reconnect = false;
@@ -546,12 +546,11 @@ impl ClientUi {
             }
         }
 
-        if acknowledge_diagnostic {
-            if let Some(signaling) = &self.signaling {
-                if let Err(error) = signaling.acknowledge_diagnostic() {
-                    self.diagnostic_status = Some(error);
-                }
-            }
+        if acknowledge_diagnostic
+            && let Some(signaling) = &self.signaling
+            && let Err(error) = signaling.acknowledge_diagnostic()
+        {
+            self.diagnostic_status = Some(error);
         }
 
         if disconnect {

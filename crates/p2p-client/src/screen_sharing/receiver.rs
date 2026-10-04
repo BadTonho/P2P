@@ -402,16 +402,16 @@ impl H264AccessUnitAssembler {
         }
         let now = Instant::now();
         let mut evicted = None;
-        if !self.frames.contains_key(&timestamp) && self.frames.len() >= MAX_PENDING_RTP_FRAMES {
-            if let Some(oldest_timestamp) = self
+        if !self.frames.contains_key(&timestamp)
+            && self.frames.len() >= MAX_PENDING_RTP_FRAMES
+            && let Some(oldest_timestamp) = self
                 .frames
                 .iter()
                 .min_by_key(|(_, frame)| frame.first_received)
                 .map(|(timestamp, _)| *timestamp)
-            {
-                self.frames.remove(&oldest_timestamp);
-                evicted = Some("limite de quadros RTP pendentes excedido".to_owned());
-            }
+        {
+            self.frames.remove(&oldest_timestamp);
+            evicted = Some("limite de quadros RTP pendentes excedido".to_owned());
         }
 
         let frame = self
@@ -1412,11 +1412,10 @@ impl PeerEvents {
                                             let complete_chain = cached_gop.replay_chain();
                                             let can_continue_from_cache = complete_chain.is_some();
                                             let mut replay = complete_chain.unwrap_or_default();
-                                            if replay.is_empty() {
-                                                if let Some(idr) = cached_idr.as_deref() {
+                                            if replay.is_empty()
+                                                && let Some(idr) = cached_idr.as_deref() {
                                                     replay.push(idr);
                                                 }
-                                            }
 
                                             let decoded_before_replay = worker_metrics
                                                 .decoded_frames
