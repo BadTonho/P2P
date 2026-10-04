@@ -4,7 +4,7 @@
 
 Reduzir o trabalho de captura e processamento de áudio, preservando a exclusão de aplicativos, os diagnósticos e o isolamento das sessões.
 
-Estas sugestões resultam da leitura do código atual. Ainda não foram implementadas nem medidas; não representam uma promessa de ganho de FPS.
+Os itens 1, 2 e 3 foram implementados e validados automaticamente na suíte de testes do workspace. O item 4 permanece documentado como proposta arquitetural de maior porte para distribuição de áudio multi-peer.
 
 ## 1. Atualizar métricas por bloco — implementado
 
@@ -47,14 +47,12 @@ Cada conexão de envio em grupo prepara sua própria captura e seu próprio enco
 
 É a mudança de maior escopo e deve ficar para depois das otimizações menores.
 
-## Ordem recomendada
+## Ordem recomendada e status
 
-1. Métricas por bloco.
-2. Detecção e preparação da exclusão em worker.
-3. Captura por eventos.
-4. Captura e codificação compartilhadas entre espectadores.
-
-Implementar e validar cada mudança separadamente para identificar ganhos e regressões.
+1. Métricas por bloco — implementado.
+2. Detecção e preparação da exclusão em worker — implementado.
+3. Captura por eventos — implementado.
+4. Captura e codificação compartilhadas entre espectadores — proposta para arquitetura futura.
 
 ## Medição e validação
 

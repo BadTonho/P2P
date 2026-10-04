@@ -4,7 +4,7 @@
 
 Reduzir trabalho repetido na interface, captura e processamento de vídeo, além de evitar interrupções desnecessárias das sessões em grupo.
 
-Estas sugestões resultam da leitura do código. O item 1 foi implementado e verificado automaticamente; os demais continuam como propostas. Ainda não há medição de ganho de CPU ou FPS, e estas oportunidades não demonstram a causa do FPS baixo. As sugestões específicas de áudio estão em [OTIMIZACOES_AUDIO.md](OTIMIZACOES_AUDIO.md).
+Estas sugestões resultam da leitura do código e de análises de telemetria real. Os itens 1, 2, 3, 4 e 6 foram implementados e validados automaticamente na suíte de testes do workspace, incluindo correções para desbloqueio do encoder assíncrono D3D11 (NVENC) e calibração de tempo de entrega DXVA. O item 5 permanece documentado como proposta arquitetural de maior porte. As sugestões específicas de áudio estão em [OTIMIZACOES_AUDIO.md](OTIMIZACOES_AUDIO.md).
 
 ## Oportunidades identificadas
 
