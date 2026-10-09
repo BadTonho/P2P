@@ -1,17 +1,19 @@
 use std::collections::HashMap;
 use std::io;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
-use tokio_tungstenite::{WebSocketStream, accept_async};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{WebSocketStream, accept_async_with_config};
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_AVATAR_BYTES: usize = 16 * 1024;
@@ -19,6 +21,18 @@ const MAX_AVATAR_BASE64_BYTES: usize = MAX_AVATAR_BYTES.div_ceil(3) * 4;
 const MAX_DISPLAY_NAME_CHARS: usize = 32;
 const HOST_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ROOM_PARTICIPANTS: usize = 8;
+/// Room codes are 48 random bits (12 hexadecimal digits). Clients accept codes of any length.
+const ROOM_CODE_LENGTH: usize = 12;
+const ROOM_NOT_FOUND_MESSAGE: &str = "A sala nao existe ou ja foi encerrada.";
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_QUEUED_OUTBOUND_MESSAGES: usize = 2048;
+const MAX_TOTAL_CONNECTIONS: usize = 512;
+const MAX_CONNECTIONS_PER_IP: usize = 16;
+const FAILED_JOIN_WINDOW: Duration = Duration::from_secs(60);
+const MAX_FAILED_JOINS_PER_WINDOW: usize = 10;
+const TOO_MANY_JOIN_ATTEMPTS_MESSAGE: &str =
+    "Muitas tentativas de entrada com codigos invalidos. Aguarde um minuto e tente novamente.";
 
 type ConnectionId = u64;
 type Outgoing = mpsc::UnboundedSender<OutboundMessage>;
@@ -51,6 +65,9 @@ struct RoomRegistry {
     connection_rooms: HashMap<ConnectionId, String>,
     participant_info: HashMap<ConnectionId, ParticipantInfo>,
     transfer_reservation: Option<TransferReservation>,
+    total_connections: usize,
+    connections_per_ip: HashMap<IpAddr, usize>,
+    failed_joins: HashMap<IpAddr, Vec<Instant>>,
 }
 
 #[derive(Default)]
@@ -63,6 +80,61 @@ struct Room {
 }
 
 impl RoomRegistry {
+    fn admit_connection(&mut self, ip: Option<IpAddr>) -> Result<(), &'static str> {
+        if self.total_connections >= MAX_TOTAL_CONNECTIONS {
+            return Err("limite global de conexoes atingido");
+        }
+        if let Some(ip) = ip {
+            let count = self.connections_per_ip.entry(ip).or_insert(0);
+            if *count >= MAX_CONNECTIONS_PER_IP {
+                return Err("limite de conexoes por endereco atingido");
+            }
+            *count += 1;
+        }
+        self.total_connections += 1;
+        Ok(())
+    }
+
+    fn release_connection(&mut self, ip: Option<IpAddr>) {
+        self.total_connections = self.total_connections.saturating_sub(1);
+        if let Some(ip) = ip
+            && let Some(count) = self.connections_per_ip.get_mut(&ip)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.connections_per_ip.remove(&ip);
+            }
+        }
+    }
+
+    fn join_attempts_blocked(&mut self, ip: Option<IpAddr>, now: Instant) -> bool {
+        let Some(ip) = ip else {
+            return false;
+        };
+        let Some(failures) = self.failed_joins.get_mut(&ip) else {
+            return false;
+        };
+        failures.retain(|at| now.duration_since(*at) < FAILED_JOIN_WINDOW);
+        if failures.is_empty() {
+            self.failed_joins.remove(&ip);
+            return false;
+        }
+        failures.len() >= MAX_FAILED_JOINS_PER_WINDOW
+    }
+
+    fn record_failed_join(&mut self, ip: Option<IpAddr>, now: Instant) {
+        let Some(ip) = ip else {
+            return;
+        };
+        if self.failed_joins.len() > 1024 {
+            self.failed_joins.retain(|_, failures| {
+                failures.retain(|at| now.duration_since(*at) < FAILED_JOIN_WINDOW);
+                !failures.is_empty()
+            });
+        }
+        self.failed_joins.entry(ip).or_default().push(now);
+    }
+
     fn create_room(
         &mut self,
         connection_id: ConnectionId,
@@ -82,7 +154,11 @@ impl RoomRegistry {
         }
 
         let code = loop {
-            let candidate = format!("{:08X}", rand::random::<u32>());
+            let candidate = format!(
+                "{:0width$X}",
+                rand::random::<u64>() & ((1_u64 << (ROOM_CODE_LENGTH * 4)) - 1),
+                width = ROOM_CODE_LENGTH
+            );
             if !self.rooms.contains_key(&candidate) {
                 break candidate;
             }
@@ -124,7 +200,7 @@ impl RoomRegistry {
         }
 
         let Some(room) = self.rooms.get_mut(code) else {
-            return Err("A sala nao existe ou ja foi encerrada.".to_owned());
+            return Err(ROOM_NOT_FOUND_MESSAGE.to_owned());
         };
         let capacity = match room.room_mode {
             RoomMode::Local => MAX_ROOM_PARTICIPANTS,
@@ -191,7 +267,7 @@ impl RoomRegistry {
         participant: ParticipantInfo,
     ) -> Result<(), String> {
         let Some(room) = self.rooms.get(code) else {
-            return Err("A sala nao existe ou ja foi encerrada.".to_owned());
+            return Err(ROOM_NOT_FOUND_MESSAGE.to_owned());
         };
         let is_known_member = room.members.iter().any(|known| known.id == participant.id);
         let is_already_connected = room.participants.iter().any(|(other_id, _)| {
@@ -778,32 +854,68 @@ pub async fn serve(
     Ok(())
 }
 
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_MESSAGE_BYTES))
+}
+
 async fn handle_connection(stream: TcpStream, connection_id: ConnectionId, rooms: SharedRooms) {
-    let websocket = match accept_async(stream).await {
-        Ok(websocket) => websocket,
-        Err(error) => {
-            tracing::warn!(connection_id, error = %error, "Falha no handshake WebSocket recebido");
-            return;
+    let peer_ip = stream.peer_addr().ok().map(|address| address.ip());
+    if let Err(reason) = rooms.lock().await.admit_connection(peer_ip) {
+        tracing::warn!(
+            connection_id,
+            reason,
+            "Conexão recusada pelo limite do servidor"
+        );
+        return;
+    }
+    let handshake = timeout(
+        HANDSHAKE_TIMEOUT,
+        accept_async_with_config(stream, Some(websocket_config())),
+    )
+    .await;
+    match handshake {
+        Ok(Ok(websocket)) => {
+            serve_websocket(websocket, connection_id, peer_ip, Arc::clone(&rooms)).await;
         }
-    };
-    serve_websocket(websocket, connection_id, rooms).await;
+        Ok(Err(error)) => {
+            tracing::warn!(connection_id, error = %error, "Falha no handshake WebSocket recebido");
+        }
+        Err(_) => {
+            tracing::warn!(connection_id, "Handshake WebSocket excedeu o tempo limite");
+        }
+    }
+    rooms.lock().await.release_connection(peer_ip);
 }
 
 async fn serve_websocket(
     websocket: WebSocketStream<TcpStream>,
     connection_id: ConnectionId,
+    peer_ip: Option<IpAddr>,
     rooms: SharedRooms,
 ) {
     let (websocket_sender, mut websocket_receiver) = websocket.split();
     let (outgoing, outgoing_messages) = mpsc::unbounded_channel::<OutboundMessage>();
 
-    let writer = tokio::spawn(write_outgoing_messages(
+    let mut writer = tokio::spawn(write_outgoing_messages(
         websocket_sender,
         outgoing_messages,
         connection_id,
     ));
+    let mut writer_finished = false;
 
-    while let Some(frame) = websocket_receiver.next().await {
+    loop {
+        let frame = tokio::select! {
+            frame = websocket_receiver.next() => frame,
+            _ = &mut writer => {
+                writer_finished = true;
+                break;
+            }
+        };
+        let Some(frame) = frame else {
+            break;
+        };
         let frame = match frame {
             Ok(frame) => frame,
             Err(error) => {
@@ -825,7 +937,8 @@ async fn serve_websocket(
                 }
                 match serde_json::from_str::<ClientMessage>(text.as_str()) {
                     Ok(message) => {
-                        handle_client_message(connection_id, message, &outgoing, &rooms).await;
+                        handle_client_message(connection_id, peer_ip, message, &outgoing, &rooms)
+                            .await;
                     }
                     Err(error) => {
                         tracing::warn!(connection_id, error = %error, "Mensagem JSON inválida recebida; conteúdo omitido");
@@ -857,7 +970,9 @@ async fn serve_websocket(
         tracing::info!(connection_id, "Cliente removido da sala ao fechar conexão");
     }
     drop(outgoing);
-    let _ = writer.await;
+    if !writer_finished {
+        let _ = writer.await;
+    }
 }
 
 async fn write_outgoing_messages<S>(
@@ -886,16 +1001,33 @@ async fn write_outgoing_messages<S>(
             OutboundMessage::Control(message) => message,
             OutboundMessage::CloseAcknowledgement(message) => message,
         };
-        if let Err(error) = websocket_sender.send(message).await {
-            tracing::warn!(connection_id, error = %error, "Falha ao enviar resposta pelo WebSocket");
+        if outgoing_messages.len() > MAX_QUEUED_OUTBOUND_MESSAGES {
+            tracing::warn!(
+                connection_id,
+                queued = outgoing_messages.len(),
+                "Cliente lento removido: fila de saída excedeu o limite"
+            );
             break;
+        }
+        match timeout(WRITE_TIMEOUT, websocket_sender.send(message)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(connection_id, error = %error, "Falha ao enviar resposta pelo WebSocket");
+                break;
+            }
+            Err(_) => {
+                tracing::warn!(connection_id, "Envio pelo WebSocket excedeu o tempo limite");
+                break;
+            }
         }
         if is_close {
             if !is_acknowledgement {
                 // The read half queues a CloseAcknowledgement when the peer
                 // answers. Its frame is already on the socket, so do not echo
                 // a second close frame.
-                while let Some(response) = outgoing_messages.recv().await {
+                while let Ok(Some(response)) =
+                    timeout(WRITE_TIMEOUT, outgoing_messages.recv()).await
+                {
                     if matches!(response, OutboundMessage::CloseAcknowledgement(_)) {
                         break;
                     }
@@ -913,10 +1045,26 @@ async fn write_outgoing_messages<S>(
 
 async fn handle_client_message(
     connection_id: ConnectionId,
+    peer_ip: Option<IpAddr>,
     message: ClientMessage,
     outgoing: &Outgoing,
     rooms: &SharedRooms,
 ) {
+    if matches!(
+        message,
+        ClientMessage::JoinRoom { .. } | ClientMessage::JoinRoomIdentified { .. }
+    ) && rooms
+        .lock()
+        .await
+        .join_attempts_blocked(peer_ip, Instant::now())
+    {
+        tracing::warn!(
+            connection_id,
+            "Entrada recusada: muitas tentativas com códigos inválidos"
+        );
+        send_error(outgoing, TOO_MANY_JOIN_ATTEMPTS_MESSAGE);
+        return;
+    }
     let operation = match &message {
         ClientMessage::CreateRoom => "create_room",
         ClientMessage::CreateRoomIdentified { .. } => "create_room_identified",
@@ -1028,6 +1176,12 @@ async fn handle_client_message(
     };
 
     if let Err(message) = result {
+        if message == ROOM_NOT_FOUND_MESSAGE && operation.starts_with("join_room") {
+            rooms
+                .lock()
+                .await
+                .record_failed_join(peer_ip, Instant::now());
+        }
         tracing::warn!(connection_id, operation, reason = %message, "Operação do protocolo recusada");
         send_error(outgoing, &message);
     } else if operation != "signal" {
@@ -1063,11 +1217,14 @@ mod tests {
     use tokio_tungstenite::{WebSocketStream, connect_async};
 
     use super::{
-        OutboundMessage, RoomRegistry, TransferReservation, handle_connection,
-        is_small_baseline_jpeg, sanitize_avatar, sanitize_display_name, serve,
-        write_outgoing_messages,
+        FAILED_JOIN_WINDOW, MAX_CONNECTIONS_PER_IP, MAX_FAILED_JOINS_PER_WINDOW, MAX_MESSAGE_BYTES,
+        MAX_TOTAL_CONNECTIONS, OutboundMessage, ROOM_CODE_LENGTH, RoomRegistry,
+        TransferReservation, handle_connection, is_small_baseline_jpeg, sanitize_avatar,
+        sanitize_display_name, serve, write_outgoing_messages,
     };
     use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage, SignalKind};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Instant;
 
     fn small_jpeg_base64() -> String {
         // Minimal SOF0 header used to exercise the server's bounded metadata parser.
@@ -1166,7 +1323,11 @@ mod tests {
         let (first_tx, mut first_rx) = mpsc::unbounded_channel();
 
         let code = registry.create_room(1, first_tx).unwrap();
-        assert_eq!(code.len(), 8);
+        assert_eq!(code.len(), ROOM_CODE_LENGTH);
+        assert!(
+            code.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_lowercase())
+        );
         assert_eq!(
             server_message(&mut first_rx),
             ServerMessage::RoomCreated { code: code.clone() }
@@ -1943,6 +2104,125 @@ mod tests {
             ServerMessage::PeerLeft
         );
         second.close(None).await.unwrap();
+        accept_task.abort();
+    }
+
+    fn ip(last: u8) -> Option<IpAddr> {
+        Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, last)))
+    }
+
+    #[test]
+    fn connection_admission_enforces_per_address_and_global_limits() {
+        let mut registry = RoomRegistry::default();
+        for _ in 0..MAX_CONNECTIONS_PER_IP {
+            registry.admit_connection(ip(1)).unwrap();
+        }
+        assert!(registry.admit_connection(ip(1)).is_err());
+        // Outro endereço continua sendo aceito.
+        registry.admit_connection(ip(2)).unwrap();
+
+        registry.release_connection(ip(1));
+        registry.admit_connection(ip(1)).unwrap();
+
+        let mut registry = RoomRegistry::default();
+        for index in 0..MAX_TOTAL_CONNECTIONS {
+            let octets = [10, (index / 250) as u8, (index % 250) as u8, 1];
+            registry
+                .admit_connection(Some(IpAddr::V4(Ipv4Addr::from(octets))))
+                .unwrap();
+        }
+        assert!(registry.admit_connection(ip(9)).is_err());
+        registry.release_connection(ip(9));
+        assert_eq!(registry.total_connections, MAX_TOTAL_CONNECTIONS - 1);
+    }
+
+    #[test]
+    fn repeated_invalid_join_attempts_are_blocked_until_the_window_expires() {
+        let mut registry = RoomRegistry::default();
+        let start = Instant::now();
+        for _ in 0..MAX_FAILED_JOINS_PER_WINDOW {
+            assert!(!registry.join_attempts_blocked(ip(1), start));
+            registry.record_failed_join(ip(1), start);
+        }
+        assert!(registry.join_attempts_blocked(ip(1), start));
+        assert!(!registry.join_attempts_blocked(ip(2), start));
+        assert!(!registry.join_attempts_blocked(ip(1), start + FAILED_JOIN_WINDOW));
+        assert!(registry.failed_joins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn websocket_blocks_room_code_guessing_and_rejects_oversized_messages() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let rooms = Arc::new(Mutex::new(RoomRegistry::default()));
+        let next_id = Arc::new(AtomicU64::new(1));
+        let accept_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let connection_id = next_id.fetch_add(1, Ordering::Relaxed);
+                let rooms = Arc::clone(&rooms);
+                tokio::spawn(async move {
+                    handle_connection(stream, connection_id, rooms).await;
+                });
+            }
+        });
+        let url = format!("ws://{address}");
+
+        let (mut guesser, _) = connect_async(&url).await.unwrap();
+        for _ in 0..MAX_FAILED_JOINS_PER_WINDOW {
+            send_client_message(
+                &mut guesser,
+                ClientMessage::JoinRoom {
+                    code: "AAAAAAAAAAAA".to_owned(),
+                },
+            )
+            .await;
+            assert!(matches!(
+                receive_server_message(&mut guesser).await,
+                ServerMessage::Error { message } if message.contains("nao existe")
+            ));
+        }
+        send_client_message(
+            &mut guesser,
+            ClientMessage::JoinRoom {
+                code: "BBBBBBBBBBBB".to_owned(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_server_message(&mut guesser).await,
+            ServerMessage::Error { message } if message.contains("Muitas tentativas")
+        ));
+        // Criar uma sala continua permitido; apenas as tentativas de entrada são limitadas.
+        send_client_message(&mut guesser, ClientMessage::CreateRoom).await;
+        assert!(matches!(
+            receive_server_message(&mut guesser).await,
+            ServerMessage::RoomCreated { code } if code.len() == ROOM_CODE_LENGTH
+        ));
+        let _ = guesser.close(None).await;
+
+        let (mut oversized, _) = connect_async(&url).await.unwrap();
+        oversized
+            .send(WebSocketMessage::Text(
+                "x".repeat(MAX_MESSAGE_BYTES + 1).into(),
+            ))
+            .await
+            .unwrap();
+        let ended = timeout(Duration::from_secs(5), async {
+            loop {
+                match oversized.next().await {
+                    None | Some(Err(_)) | Some(Ok(WebSocketMessage::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "o servidor deve encerrar a conexão com mensagem grande demais"
+        );
         accept_task.abort();
     }
 }
