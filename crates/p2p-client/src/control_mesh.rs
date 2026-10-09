@@ -16,14 +16,15 @@ const CONTROL_LISTEN_ADDRESS: &str = "0.0.0.0:9001";
 const PROBE_PERIOD: Duration = Duration::from_secs(1);
 const PROBE_WINDOW: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const HOST_TIMEOUT: Duration = Duration::from_secs(5);
-const CONTROL_LINK_STARTUP_GRACE: Duration = Duration::from_secs(15);
+const HOST_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTROL_LINK_STARTUP_GRACE: Duration = Duration::from_secs(20);
 const EMPTY_ELECTION_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(10);
-const UNSTABLE_LOSS_PERCENT: f32 = 20.0;
-const HEALTHY_LOSS_PERCENT: f32 = 5.0;
-const HEALTHY_REENTRY_TIME: Duration = Duration::from_secs(30);
+const UNSTABLE_LOSS_PERCENT: f32 = 45.0;
+const HEALTHY_LOSS_PERCENT: f32 = 15.0;
+const HEALTHY_REENTRY_TIME: Duration = Duration::from_secs(10);
 const MIN_HEALTH_SAMPLES: usize = 5;
+const MAX_CONSECUTIVE_LOSSES: u32 = 8;
 
 #[derive(Clone, Debug)]
 pub struct QueueEntry {
@@ -925,10 +926,10 @@ async fn tick_mesh(state: &SharedState, events: &std_mpsc::Sender<ControlEvent>)
             && recovering
             && !state.local.control_address.is_empty()
             && own_metrics.loss_percent < UNSTABLE_LOSS_PERCENT
-            && own_metrics.consecutive_losses < 5;
+            && own_metrics.consecutive_losses < MAX_CONSECUTIVE_LOSSES;
         let unstable = (own_metrics.samples >= MIN_HEALTH_SAMPLES
             && own_metrics.loss_percent >= UNSTABLE_LOSS_PERCENT)
-            || own_metrics.consecutive_losses >= 5;
+            || own_metrics.consecutive_losses >= MAX_CONSECUTIVE_LOSSES;
         let links_missing = state.leader_id != state.local.id
             && state.leader_control_seen
             && now.duration_since(state.leader_last_seen) >= HOST_TIMEOUT;
@@ -940,7 +941,7 @@ async fn tick_mesh(state: &SharedState, events: &std_mpsc::Sender<ControlEvent>)
                     now.duration_since(*seen) < HOST_TIMEOUT
                         && ((metrics.samples >= MIN_HEALTH_SAMPLES
                             && metrics.loss_percent >= UNSTABLE_LOSS_PERCENT)
-                            || metrics.consecutive_losses >= 5)
+                            || metrics.consecutive_losses >= MAX_CONSECUTIVE_LOSSES)
                 });
         let leader_id = state.leader_id.clone();
         let local_host_unstable = leader_id == state.local.id && unstable;
@@ -959,16 +960,24 @@ async fn tick_mesh(state: &SharedState, events: &std_mpsc::Sender<ControlEvent>)
                         .get(&participant.id)
                         .filter(|(_, _, seen)| now.duration_since(*seen) < HOST_TIMEOUT)
                         .map(|(metrics, eligible, _)| (*metrics, participant.may_host && *eligible))
-                        .unwrap_or((
-                            Metrics {
-                                loss_percent: 0.0,
-                                jitter_ms: 0.0,
-                                latency_ms: 0.0,
-                                samples: 0,
-                                consecutive_losses: 0,
-                            },
-                            false,
-                        ))
+                        .unwrap_or_else(|| {
+                            let is_recently_joined =
+                                state.known_since.get(&participant.id).is_some_and(|since| {
+                                    now.duration_since(*since) < CONTROL_LINK_STARTUP_GRACE
+                                });
+                            (
+                                Metrics {
+                                    loss_percent: 0.0,
+                                    jitter_ms: 0.0,
+                                    latency_ms: 0.0,
+                                    samples: 0,
+                                    consecutive_losses: 0,
+                                },
+                                participant.may_host
+                                    && !participant.control_address.is_empty()
+                                    && is_recently_joined,
+                            )
+                        })
                 };
                 QueueEntry {
                     participant,
@@ -1099,22 +1108,30 @@ fn own_worst_metrics(state: &mut MeshState, now: Instant) -> Metrics {
                 .map(|mut stats| stats.metrics(now))
         })
         .collect::<Vec<_>>();
-    for participant in state.roster.iter().filter(|participant| {
-        participant.id != state.local.id
-            && !(ignore_timed_out_leader && participant.id == state.leader_id)
-    }) {
-        if !state.links.contains_key(&participant.id)
-            && control_link_timeout_elapsed(state, &participant.id, now)
-        {
+
+    // Se o nó não possui nenhum link ativo na malha, avaliamos se todos os outros
+    // participantes conhecidos já estouraram o prazo de conexão.
+    if metrics.is_empty() {
+        let has_other_participants = state.roster.iter().any(|participant| {
+            participant.id != state.local.id
+                && !(ignore_timed_out_leader && participant.id == state.leader_id)
+        });
+        let any_timeout_elapsed = state.roster.iter().any(|participant| {
+            participant.id != state.local.id
+                && !(ignore_timed_out_leader && participant.id == state.leader_id)
+                && control_link_timeout_elapsed(state, &participant.id, now)
+        });
+        if has_other_participants && any_timeout_elapsed {
             metrics.push(Metrics {
                 loss_percent: 100.0,
                 jitter_ms: 0.0,
                 latency_ms: 0.0,
                 samples: MIN_HEALTH_SAMPLES,
-                consecutive_losses: 5,
+                consecutive_losses: MAX_CONSECUTIVE_LOSSES,
             });
         }
     }
+
     metrics.sort_by(|left, right| compare_metrics(right, left));
     metrics.into_iter().next().unwrap_or(Metrics {
         loss_percent: 0.0,
@@ -1140,10 +1157,21 @@ fn control_link_timeout_elapsed(state: &MeshState, participant_id: &str, now: In
     }
 }
 
+fn entry_priority_tier(entry: &QueueEntry) -> u8 {
+    if entry.eligible {
+        0
+    } else if entry.participant.may_host && !entry.participant.control_address.is_empty() {
+        1
+    } else if !entry.participant.control_address.is_empty() {
+        2
+    } else {
+        3
+    }
+}
+
 fn compare_queue_entries(left: &QueueEntry, right: &QueueEntry) -> std::cmp::Ordering {
-    right
-        .eligible
-        .cmp(&left.eligible)
+    entry_priority_tier(left)
+        .cmp(&entry_priority_tier(right))
         .then_with(|| left.loss_percent.total_cmp(&right.loss_percent))
         .then_with(|| left.jitter_ms.total_cmp(&right.jitter_ms))
         .then_with(|| left.latency_ms.total_cmp(&right.latency_ms))
@@ -1184,11 +1212,14 @@ async fn initiate_election(
         let local_eligible = state.local.may_host
             && !state.local.control_address.is_empty()
             && own.loss_percent < UNSTABLE_LOSS_PERCENT
-            && own.consecutive_losses < 5;
+            && own.consecutive_losses < MAX_CONSECUTIVE_LOSSES;
         let mut queue = state
             .roster
             .iter()
-            .filter(|participant| participant.id != state.leader_id)
+            .filter(|participant| {
+                participant.id != state.leader_id
+                    && departing_id.as_deref() != Some(participant.id.as_str())
+            })
             .map(|participant| {
                 let (metrics, eligible) = if participant.id == state.local.id {
                     (own, local_eligible)
@@ -1200,19 +1231,24 @@ async fn initiate_election(
                         .map(|(metrics, eligible, _)| (*metrics, *eligible));
                     match recent_status {
                         Some((metrics, eligible)) => (metrics, participant.may_host && eligible),
-                        None => (
-                            Metrics {
-                                // A newly joined participant may not have sent its first health
-                                // status yet. Keep it as a fallback candidate; its attempt to
-                                // open the signaling server will either succeed or time out.
-                                loss_percent: 100.0,
-                                jitter_ms: 0.0,
-                                latency_ms: 0.0,
-                                samples: 0,
-                                consecutive_losses: 0,
-                            },
-                            participant.may_host && !participant.control_address.is_empty(),
-                        ),
+                        None => {
+                            let is_recently_joined =
+                                state.known_since.get(&participant.id).is_some_and(|since| {
+                                    now.duration_since(*since) < CONTROL_LINK_STARTUP_GRACE
+                                });
+                            (
+                                Metrics {
+                                    loss_percent: 0.0,
+                                    jitter_ms: 0.0,
+                                    latency_ms: 0.0,
+                                    samples: 0,
+                                    consecutive_losses: 0,
+                                },
+                                participant.may_host
+                                    && !participant.control_address.is_empty()
+                                    && is_recently_joined,
+                            )
+                        }
                     }
                 };
                 QueueEntry {
@@ -1223,13 +1259,33 @@ async fn initiate_election(
                     eligible,
                 }
             })
-            .filter(|entry| entry.eligible)
             .collect::<Vec<_>>();
         queue.sort_by(compare_queue_entries);
-        let candidates = queue
-            .into_iter()
-            .map(|entry| entry.participant.id)
+
+        let eligible_candidates = queue
+            .iter()
+            .filter(|entry| entry.eligible)
+            .map(|entry| entry.participant.id.clone())
             .collect::<Vec<_>>();
+
+        let candidates = if !eligible_candidates.is_empty() {
+            eligible_candidates
+        } else if end_if_no_candidate {
+            let fallback_candidates = queue
+                .iter()
+                .map(|entry| entry.participant.id.clone())
+                .collect::<Vec<_>>();
+            if !fallback_candidates.is_empty() {
+                tracing::warn!(
+                    fallback_count = fallback_candidates.len(),
+                    "Nenhum participante estritamente elegível; selecionando o menos pior para manter a sala aberta"
+                );
+            }
+            fallback_candidates
+        } else {
+            Vec::new()
+        };
+
         if !candidates.is_empty() {
             state.empty_election_retry = None;
         }
@@ -1276,7 +1332,7 @@ async fn initiate_election(
         if end_if_no_candidate {
             tracing::error!(
                 epoch,
-                "Sala encerrada porque não há candidato elegível para hospedagem"
+                "Sala encerrada porque não há participantes restantes para assumir a hospedagem"
             );
             broadcast(state, ControlMessage::EndRoom { epoch }).await;
             let _ = events.send(ControlEvent::RoomEnded);
@@ -1506,7 +1562,7 @@ mod tests {
         CONTROL_LINK_STARTUP_GRACE, ControlEvent, ControlMesh, EMPTY_ELECTION_RETRY_INTERVAL,
         Election, HOST_TIMEOUT, MeshState, Metrics, PeerLink, PeerStats, Probe, QueueEntry,
         compare_queue_entries, control_link_timeout_elapsed, fail_current_candidate,
-        initiate_election, own_worst_metrics,
+        initiate_election, own_worst_metrics, parse_ip_from_address,
     };
     use signaling_protocol::ParticipantInfo;
     use std::collections::{HashMap, HashSet, VecDeque};
@@ -1780,7 +1836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_candidate_keeps_an_unstable_but_online_host_and_ends_after_host_exit() {
+    async fn no_candidate_keeps_an_unstable_but_online_host_and_elects_least_bad_after_host_exit() {
         let local = participant("local", 2, false);
         let state = Arc::new(Mutex::new(test_state(local.clone(), false)));
         let (event_tx, event_rx) = std::sync::mpsc::channel();
@@ -1788,12 +1844,72 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
         assert!(state.lock().await.election.is_none());
 
+        // Quando o anfitrião sai e não há ninguém estritamente elegível, o participante
+        // menos pior é eleito para evitar o fechamento da sala.
         let state = Arc::new(Mutex::new(test_state(local, false)));
         initiate_election(&state, &event_tx, true, true, Some("host".to_owned())).await;
         assert!(matches!(
             event_rx.try_recv().unwrap(),
-            ControlEvent::RoomEnded
+            ControlEvent::BecomeHost { code, .. } if code == "SAMECODE"
         ));
+    }
+
+    #[tokio::test]
+    async fn least_bad_candidate_is_chosen_by_metrics_tier_when_nobody_is_eligible() {
+        let now = Instant::now();
+        let local = participant("local", 2, false);
+        let mut mesh_state = test_state(local, false);
+        // Cria dois participantes remotos inelegíveis (may_host = false):
+        // p1 tem perda moderada (30%), p2 tem perda severa (70%).
+        let p1 = participant("candidate_moderate", 3, false);
+        let p2 = participant("candidate_bad", 4, false);
+        mesh_state.roster.push(p1.clone());
+        mesh_state.roster.push(p2.clone());
+        mesh_state.remote_status.insert(
+            p1.id.clone(),
+            (
+                Metrics {
+                    loss_percent: 30.0,
+                    jitter_ms: 5.0,
+                    latency_ms: 20.0,
+                    samples: 10,
+                    consecutive_losses: 2,
+                },
+                false, // inelegível
+                now,
+            ),
+        );
+        mesh_state.remote_status.insert(
+            p2.id.clone(),
+            (
+                Metrics {
+                    loss_percent: 70.0,
+                    jitter_ms: 15.0,
+                    latency_ms: 100.0,
+                    samples: 10,
+                    consecutive_losses: 6,
+                },
+                false, // inelegível
+                now,
+            ),
+        );
+
+        let state = Arc::new(Mutex::new(mesh_state));
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+
+        // Host sai da sala
+        initiate_election(&state, &event_tx, true, true, Some("host".to_owned())).await;
+
+        let locked = state.lock().await;
+        let election = locked.election.as_ref().expect("deve ter iniciado eleição");
+        // O candidato com 30% de perda (menos pior) deve vir antes do de 70%
+        let p1_pos = election.candidates.iter().position(|id| id == &p1.id);
+        let p2_pos = election.candidates.iter().position(|id| id == &p2.id);
+        assert!(p1_pos.is_some() && p2_pos.is_some());
+        assert!(
+            p1_pos.unwrap() < p2_pos.unwrap(),
+            "o menos pior (30% perda) deve ter prioridade sobre o pior (70% perda)"
+        );
     }
 
     #[tokio::test]
@@ -1825,18 +1941,32 @@ mod tests {
         initiate_election(&state, &event_tx, false, false, None).await;
         assert!(state.lock().await.epoch > before_safety_retry);
 
-        let ending_state = Arc::new(Mutex::new(test_state(
-            participant("ending", 2, false),
-            false,
-        )));
+        // Se o anfitrião sair e não houver mais nenhum participante restante na sala, a sala encerra.
+        let mut empty_state = test_state(participant("host_only", 1, false), false);
+        empty_state.roster.retain(|p| p.id == "host");
+        let ending_state = Arc::new(Mutex::new(empty_state));
         let (ending_events_tx, ending_events_rx) = std::sync::mpsc::channel();
-        initiate_election(&ending_state, &ending_events_tx, false, true, None).await;
+        initiate_election(
+            &ending_state,
+            &ending_events_tx,
+            false,
+            true,
+            Some("host".to_owned()),
+        )
+        .await;
         assert!(matches!(
             ending_events_rx.try_recv().unwrap(),
             ControlEvent::RoomEnded
         ));
         let ended_epoch = ending_state.lock().await.epoch;
-        initiate_election(&ending_state, &ending_events_tx, false, true, None).await;
+        initiate_election(
+            &ending_state,
+            &ending_events_tx,
+            false,
+            true,
+            Some("host".to_owned()),
+        )
+        .await;
         assert_eq!(ending_state.lock().await.epoch, ended_epoch);
         assert!(ending_events_rx.try_recv().is_err());
     }
