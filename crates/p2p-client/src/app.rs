@@ -2055,6 +2055,7 @@ pub(super) fn run() -> eframe::Result {
     if let Some(exit_code) = update::helper_arguments(&arguments) {
         std::process::exit(exit_code);
     }
+    update::cleanup_stale_helpers();
     let mut app = ClientUi::default();
     app.microphone_level_dbfs = -60.0;
     let (preferences, settings_warning) = settings::load();

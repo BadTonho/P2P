@@ -1,11 +1,36 @@
 use super::*;
 
+pub(super) fn is_allowed_github_host(host: Option<&str>) -> bool {
+    match host {
+        Some(h) => {
+            h == "github.com"
+                || h.ends_with(".github.com")
+                || h == "githubusercontent.com"
+                || h.ends_with(".githubusercontent.com")
+        }
+        None => false,
+    }
+}
+
 pub(super) fn new_http_client() -> Result<Client, String> {
     Client::builder()
         .user_agent(concat!("P2P-Voz-e-tela/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(600))
-        .redirect(Policy::limited(10))
+        .redirect(Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                attempt.error("Muitos redirecionamentos durante a consulta.")
+            } else {
+                let next_url = attempt.url();
+                if next_url.scheme() != "https" {
+                    attempt.error("O redirecionamento tentou utilizar uma conexão insegura.")
+                } else if !is_allowed_github_host(next_url.host_str()) {
+                    attempt.error("O redirecionamento apontou para um domínio não autorizado.")
+                } else {
+                    attempt.follow()
+                }
+            }
+        }))
         .build()
         .map_err(|_| "Não foi possível preparar a conexão HTTPS.".to_owned())
 }
@@ -148,6 +173,11 @@ pub(super) fn validate_response(
     if response.url().scheme() != "https" {
         return Err(
             "O redirecionamento do servidor de atualizações deixou de usar HTTPS.".to_owned(),
+        );
+    }
+    if !is_allowed_github_host(response.url().host_str()) {
+        return Err(
+            "O servidor de atualizações redirecionou para um domínio não autorizado.".to_owned(),
         );
     }
     if response

@@ -136,6 +136,43 @@ impl Drop for RemoveOnDrop {
     }
 }
 
+pub(super) fn validate_pe_signature(path: &Path) -> Result<(), String> {
+    use std::io::Seek;
+    let mut file = File::open(path)
+        .map_err(|error| format!("Não foi possível conferir o executável baixado: {error}"))?;
+    let mut dos_header = [0_u8; 64];
+    if file.read_exact(&mut dos_header).is_err() || &dos_header[0..2] != b"MZ" {
+        return Err(
+            "O arquivo baixado não parece ser um executável Windows (cabeçalho MZ ausente)."
+                .to_owned(),
+        );
+    }
+    let pe_offset = u32::from_le_bytes([
+        dos_header[0x3c],
+        dos_header[0x3d],
+        dos_header[0x3e],
+        dos_header[0x3f],
+    ]) as u64;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("Não foi possível ler metadados do executável: {error}"))?
+        .len();
+    if pe_offset < 64 || pe_offset.saturating_add(4) > file_len {
+        return Err(
+            "O cabeçalho PE do executável baixado está fora dos limites do arquivo.".to_owned(),
+        );
+    }
+    file.seek(io::SeekFrom::Start(pe_offset))
+        .map_err(|error| format!("Não foi possível localizar o cabeçalho PE: {error}"))?;
+    let mut pe_signature = [0_u8; 4];
+    if file.read_exact(&mut pe_signature).is_err() || &pe_signature != b"PE\0\0" {
+        return Err(
+            "O arquivo baixado não possui uma assinatura PE válida (PE\\0\\0 ausente).".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn validate_downloaded_file(
     path: &Path,
     manifest: &UpdateManifest,
@@ -151,12 +188,7 @@ pub(super) fn validate_downloaded_file(
     if !actual_hash.eq_ignore_ascii_case(&manifest.sha256) {
         return Err("O SHA-256 baixado não corresponde ao valor informado pelo GitHub.".to_owned());
     }
-    let mut file = File::open(path)
-        .map_err(|error| format!("Não foi possível conferir o executável baixado: {error}"))?;
-    let mut signature = [0_u8; 2];
-    if file.read_exact(&mut signature).is_err() || signature != *b"MZ" {
-        return Err("O arquivo baixado não parece ser um executável Windows.".to_owned());
-    }
+    validate_pe_signature(path)?;
     let actual_version = read_embedded_build_version(path)?;
     if actual_version != manifest.version {
         return Err(format!(
@@ -284,6 +316,40 @@ mod tests {
 
         fs::write(&path, b"MZ without marker").unwrap();
         assert!(read_embedded_build_version(&path).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn pe_signature_verification_rejects_corrupted_headers() {
+        let directory = test_directory();
+        let path = directory.join("corrupt_pe.exe");
+
+        // Missing MZ
+        fs::write(&path, b"NOT_MZ_HEADER").unwrap();
+        assert!(validate_pe_signature(&path).is_err());
+
+        // Has MZ but invalid PE offset out of bounds
+        let mut bad_offset = vec![0_u8; 64];
+        bad_offset[0] = b'M';
+        bad_offset[1] = b'Z';
+        bad_offset[0x3c] = 200;
+        fs::write(&path, &bad_offset).unwrap();
+        assert!(validate_pe_signature(&path).is_err());
+
+        // Has MZ and PE offset, but missing PE\0\0 signature
+        let mut bad_sig = vec![0_u8; 68];
+        bad_sig[0] = b'M';
+        bad_sig[1] = b'Z';
+        bad_sig[0x3c] = 64;
+        bad_sig[64..68].copy_from_slice(b"FAIL");
+        fs::write(&path, &bad_sig).unwrap();
+        assert!(validate_pe_signature(&path).is_err());
+
+        // Valid PE header
+        let valid = executable_stub("1.0.0");
+        fs::write(&path, &valid).unwrap();
+        assert!(validate_pe_signature(&path).is_ok());
+
         let _ = fs::remove_dir_all(directory);
     }
 }

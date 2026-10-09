@@ -30,11 +30,13 @@ pub(super) fn manifest() -> UpdateManifest {
 }
 
 pub(super) fn executable_stub(version: &str) -> Vec<u8> {
-    [
-        b"MZfake executable".as_slice(),
-        BUILD_VERSION_MARKER_PREFIX,
-        version.as_bytes(),
-        b"\0",
-    ]
-    .concat()
+    let mut bytes = vec![0_u8; 64];
+    bytes[0] = b'M';
+    bytes[1] = b'Z';
+    bytes[0x3c] = 64;
+    bytes.extend_from_slice(b"PE\0\0");
+    bytes.extend_from_slice(BUILD_VERSION_MARKER_PREFIX);
+    bytes.extend_from_slice(version.as_bytes());
+    bytes.push(0);
+    bytes
 }

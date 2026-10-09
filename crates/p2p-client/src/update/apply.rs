@@ -23,6 +23,7 @@ pub fn stage_and_launch(downloaded: PathBuf, expected_version: String) -> Result
         ));
     }
 
+    cleanup_stale_helpers();
     let helper = helper_executable_path(process_id);
     if let Err(error) = fs::copy(&target, &helper) {
         let _ = fs::remove_file(&staged);
@@ -52,6 +53,23 @@ pub fn stage_and_launch(downloaded: PathBuf, expected_version: String) -> Result
     }
     tracing::info!("Aplicador de atualização iniciado; aguardando fechamento do aplicativo");
     Ok(())
+}
+
+pub fn cleanup_stale_helpers() {
+    let temp = std::env::temp_dir();
+    let Ok(entries) = fs::read_dir(temp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("P2P-Voz-e-tela-update-helper-") && name.ends_with(".exe") {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+    }
 }
 
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -100,10 +118,11 @@ fn run_helper(args: &[OsString]) -> i32 {
             "Não foi possível aguardar o fechamento do aplicativo: {error}"
         ));
         let _ = launch_target(&target);
+        schedule_reboot_deletion_for_current_exe();
         return 1;
     }
 
-    match replace_and_restart(&target, &staged, &expected_version) {
+    let exit_code = match replace_and_restart(&target, &staged, &expected_version) {
         Ok(()) => {
             let _ = fs::remove_file(downloaded);
             0
@@ -114,8 +133,37 @@ fn run_helper(args: &[OsString]) -> i32 {
             let _ = launch_target(&target);
             1
         }
+    };
+    schedule_reboot_deletion_for_current_exe();
+    exit_code
+}
+
+#[cfg(windows)]
+fn schedule_reboot_deletion_for_current_exe() {
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_DELAY_UNTIL_REBOOT: u32 = 0x0000_0004;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing_file: *const u16, new_file: *const u16, flags: u32) -> i32;
+    }
+    if let Ok(current_exe) = std::env::current_exe() {
+        let current_wide: Vec<u16> = current_exe
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        unsafe {
+            MoveFileExW(
+                current_wide.as_ptr(),
+                std::ptr::null(),
+                MOVEFILE_DELAY_UNTIL_REBOOT,
+            );
+        }
     }
 }
+
+#[cfg(not(windows))]
+fn schedule_reboot_deletion_for_current_exe() {}
 
 #[cfg(windows)]
 fn wait_for_process(process_id: u32) -> io::Result<()> {
@@ -344,5 +392,15 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("esperava a versao 1.0.2"));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cleanup_stale_helpers_removes_old_helper_files() {
+        let temp = std::env::temp_dir();
+        let dummy_helper = temp.join("P2P-Voz-e-tela-update-helper-999999.exe");
+        fs::write(&dummy_helper, b"dummy").unwrap();
+        assert!(dummy_helper.exists());
+        cleanup_stale_helpers();
+        assert!(!dummy_helper.exists());
     }
 }
