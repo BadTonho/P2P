@@ -471,15 +471,24 @@ async fn run_mesh(
     }
 }
 
+fn parse_ip_from_address(addr: &str) -> Option<std::net::IpAddr> {
+    let trimmed = addr.trim();
+    if let Ok(socket) = trimmed.parse::<std::net::SocketAddr>() {
+        return Some(socket.ip());
+    }
+    trimmed.parse::<std::net::IpAddr>().ok()
+}
+
 async fn accept_peer(
     stream: TcpStream,
     state: SharedState,
     events: std_mpsc::Sender<ControlEvent>,
 ) -> Result<(), String> {
+    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
     let websocket = accept_async(stream)
         .await
         .map_err(|error| error.to_string())?;
-    attach_socket(websocket, state, events).await
+    attach_socket(websocket, state, events, peer_ip).await
 }
 
 async fn connect_peer(
@@ -492,7 +501,7 @@ async fn connect_peer(
     match timeout(Duration::from_secs(3), connect_async(url)).await {
         Ok(Ok((websocket, _))) => {
             tracing::info!(peer_address = %address, "Conexão direta de controle estabelecida");
-            if let Err(error) = attach_socket(websocket, state.clone(), events).await {
+            if let Err(error) = attach_socket(websocket, state.clone(), events, None).await {
                 tracing::warn!(peer_address = %address, error = %error, "Falha ao completar handshake de controle");
             }
         }
@@ -529,6 +538,7 @@ async fn attach_socket<S>(
     mut websocket: WebSocketStream<S>,
     state: SharedState,
     events: std_mpsc::Sender<ControlEvent>,
+    peer_ip: Option<std::net::IpAddr>,
 ) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -581,6 +591,21 @@ where
     };
     if remote.id == local.id {
         return Err("tentativa de conexão com o próprio aplicativo".to_owned());
+    }
+    if let (Some(incoming_ip), Some(expected_ip)) =
+        (peer_ip, parse_ip_from_address(&remote.control_address))
+    {
+        if !incoming_ip.is_loopback() && incoming_ip != expected_ip {
+            tracing::warn!(
+                expected = %expected_ip,
+                actual = %incoming_ip,
+                remote_id = %remote.id,
+                "Conexão de controle rejeitada: IP de conexão inconsistente com o roster"
+            );
+            return Err(
+                "endereço de controle inconsistente com o endereço IP de conexão".to_owned(),
+            );
+        }
     }
 
     let (mut writer, mut reader) = websocket.split();
@@ -656,16 +681,52 @@ where
                     ControlMessage::HostLeaving { participant_id, epoch } => {
                         let is_current_leader = {
                             let state = state.lock().await;
-                            epoch >= state.epoch && participant_id == state.leader_id
+                            epoch >= state.epoch
+                                && participant_id == state.leader_id
+                                && remote.id == participant_id
                         };
                         if is_current_leader {
                             initiate_election(&state, &events, false, true, Some(participant_id)).await;
+                        } else {
+                            tracing::warn!(
+                                remote_id = %remote.id,
+                                participant_id = %participant_id,
+                                "HostLeaving descartado de participante não autorizado"
+                            );
                         }
                     }
                     ControlMessage::ElectionStart { epoch, candidates, departing_id } => {
-                        apply_election(&state, &events, epoch, candidates, departing_id).await;
+                        let is_valid = {
+                            let state = state.lock().await;
+                            if candidates.is_empty() {
+                                false
+                            } else {
+                                let known_ids: HashSet<&str> = state.roster.iter().map(|p| p.id.as_str()).collect();
+                                candidates.iter().all(|c| known_ids.contains(c.as_str()))
+                            }
+                        };
+                        if is_valid {
+                            apply_election(&state, &events, epoch, candidates, departing_id).await;
+                        } else {
+                            tracing::warn!(
+                                remote_id = %remote.id,
+                                "ElectionStart descartado: lista de candidatos inválida ou com participantes desconhecidos"
+                            );
+                        }
                     }
                     ControlMessage::CandidateFailed { participant_id, epoch } => {
+                        let authorized = {
+                            let state = state.lock().await;
+                            remote.id == participant_id || remote.id == state.leader_id
+                        };
+                        if !authorized {
+                            tracing::warn!(
+                                remote_id = %remote.id,
+                                participant_id = %participant_id,
+                                "CandidateFailed descartado: participante não autorizado a desqualificar o candidato"
+                            );
+                            continue;
+                        }
                         let should_advance = state.lock().await.election.as_ref()
                             .is_some_and(|election| election.epoch == epoch && election.candidates.get(election.index) == Some(&participant_id));
                         if should_advance {
@@ -673,6 +734,30 @@ where
                         }
                     }
                     ControlMessage::LeaderElected { participant_id, address, epoch, order } => {
+                        if address.trim().is_empty() || address.len() > 256 {
+                            tracing::warn!(
+                                remote_id = %remote.id,
+                                "LeaderElected descartado: endereço inválido ou excessivo"
+                            );
+                            continue;
+                        }
+                        let authorized = {
+                            let state = state.lock().await;
+                            remote.id == participant_id
+                                || remote.id == state.leader_id
+                                || state.election.as_ref().is_some_and(|election| {
+                                    election.epoch == epoch
+                                        && election.candidates.get(election.index) == Some(&participant_id)
+                                })
+                        };
+                        if !authorized {
+                            tracing::warn!(
+                                remote_id = %remote.id,
+                                participant_id = %participant_id,
+                                "LeaderElected descartado de participante sem autoridade para anunciar a liderança"
+                            );
+                            continue;
+                        }
                         let mut state = state.lock().await;
                         if let Some(current) = state.roster.iter().find(|participant| participant.id == participant_id) {
                             let was_local_leader = state.leader_id == state.local.id;
@@ -703,19 +788,28 @@ where
                     ControlMessage::EndRoom { epoch } => {
                         let should_end = {
                             let mut state = state.lock().await;
-                            let election_still_has_candidates = state
-                                .election
-                                .as_ref()
-                                .is_some_and(|election| {
-                                    election.epoch >= epoch
-                                        && election.candidates.get(election.index).is_some()
-                                });
-                            if epoch < state.epoch || election_still_has_candidates {
+                            if remote.id != state.leader_id {
+                                tracing::warn!(
+                                    remote_id = %remote.id,
+                                    leader_id = %state.leader_id,
+                                    "EndRoom descartado de participante que não é o anfitrião"
+                                );
                                 false
                             } else {
-                                state.epoch = epoch;
-                                state.election = None;
-                                true
+                                let election_still_has_candidates = state
+                                    .election
+                                    .as_ref()
+                                    .is_some_and(|election| {
+                                        election.epoch >= epoch
+                                            && election.candidates.get(election.index).is_some()
+                                    });
+                                if epoch < state.epoch || election_still_has_candidates {
+                                    false
+                                } else {
+                                    state.epoch = epoch;
+                                    state.election = None;
+                                    true
+                                }
                             }
                         };
                         if should_end {
@@ -1847,5 +1941,23 @@ mod tests {
         assert!(receive_until(&host_mesh.events, Duration::from_secs(5), |event| {
             matches!(event, ControlEvent::LeaderChanged { participant_id, .. } if participant_id == "guest")
         }).is_some());
+    }
+
+    #[test]
+    fn parses_ip_from_various_address_formats() {
+        assert_eq!(
+            parse_ip_from_address("192.168.1.100:9001"),
+            Some("192.168.1.100".parse().unwrap())
+        );
+        assert_eq!(
+            parse_ip_from_address("10.0.0.1"),
+            Some("10.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            parse_ip_from_address("[::1]:8080"),
+            Some("::1".parse().unwrap())
+        );
+        assert_eq!(parse_ip_from_address("invalid-host"), None);
+        assert_eq!(parse_ip_from_address(""), None);
     }
 }
