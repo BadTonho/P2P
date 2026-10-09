@@ -18,7 +18,7 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -39,6 +39,9 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Lint with clippy
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
 
       - name: Test workspace
         run: cargo test --workspace --locked

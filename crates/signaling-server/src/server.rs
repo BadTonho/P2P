@@ -721,6 +721,15 @@ impl RoomRegistry {
             for (_, peer) in &room.participants {
                 let _ = peer.send(OutboundMessage::Protocol(ServerMessage::PeerLeft));
             }
+            if room.leader_connection_id == connection_id
+                && let Some((next_leader_id, _)) = room.participants.iter().min_by_key(|(id, _)| {
+                    self.participant_info
+                        .get(id)
+                        .map_or(u8::MAX, |info| info.order)
+                })
+            {
+                room.leader_connection_id = *next_leader_id;
+            }
             remove_room = room.participants.is_empty();
         }
         if remove_room {
@@ -1529,6 +1538,67 @@ mod tests {
             [1, 2]
         );
         assert!(!participants[1].may_host);
+    }
+
+    #[test]
+    fn leader_departure_promotes_next_participant_as_leader() {
+        let mut registry = RoomRegistry::default();
+        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+        let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
+        let code = registry.create_room(1, host_tx).unwrap();
+        let _ = server_message(&mut host_rx);
+        registry
+            .identify_participant(
+                1,
+                ParticipantInfo {
+                    id: "host-id".to_owned(),
+                    display_name: "Host".to_owned(),
+                    order: 0,
+                    may_host: true,
+                    control_address: "192.168.1.2:9001".to_owned(),
+                    avatar_jpeg_base64: None,
+                    supports_group_screen_share: false,
+                    supports_group_session_ids: false,
+                },
+            )
+            .unwrap();
+        let _ = server_message(&mut host_rx);
+
+        registry.join_room(2, &code, guest_tx).unwrap();
+        let _ = server_message(&mut guest_rx);
+        let _ = server_message(&mut host_rx);
+        registry
+            .identify_participant(
+                2,
+                ParticipantInfo {
+                    id: "guest-id".to_owned(),
+                    display_name: "Guest".to_owned(),
+                    order: 0,
+                    may_host: false,
+                    control_address: "192.168.1.3:9001".to_owned(),
+                    avatar_jpeg_base64: None,
+                    supports_group_screen_share: false,
+                    supports_group_session_ids: false,
+                },
+            )
+            .unwrap();
+        let _ = server_message(&mut host_rx);
+        let _ = server_message(&mut guest_rx);
+
+        registry.leave_room(1);
+
+        let _ = server_message(&mut guest_rx); // PeerLeft
+        let ServerMessage::RoomRoster {
+            leader_id,
+            participants,
+            ..
+        } = server_message(&mut guest_rx)
+        else {
+            panic!("esperado RoomRoster apos saida do host");
+        };
+        assert_eq!(leader_id, "guest-id");
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].id, "guest-id");
     }
 
     #[test]
