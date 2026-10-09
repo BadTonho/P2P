@@ -203,13 +203,44 @@ fn settings_path() -> Result<PathBuf, String> {
     Ok(data_directory()?.join(SETTINGS_FILE))
 }
 
+fn backup_corrupted_settings(path: &Path) {
+    let backup_path = path.with_extension("json.bak");
+    let _ = fs::copy(path, backup_path);
+}
+
 fn load_from(path: &Path) -> (AppSettings, Option<String>) {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return (AppSettings::default(), None);
         }
         Err(error) => {
+            return (
+                AppSettings::default(),
+                Some(format!(
+                    "Não foi possível consultar as preferências em '{}': {error}. Os valores padrão foram carregados.",
+                    path.display()
+                )),
+            );
+        }
+    };
+
+    if metadata.len() > MAX_SETTINGS_BYTES {
+        backup_corrupted_settings(path);
+        return (
+            AppSettings::default(),
+            Some(format!(
+                "O arquivo de preferências é maior que o limite permitido ({} bytes). Um backup foi preservado em '{}.bak' e os valores padrão foram carregados.",
+                metadata.len(),
+                path.display()
+            )),
+        );
+    }
+
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            backup_corrupted_settings(path);
             return (
                 AppSettings::default(),
                 Some(format!(
@@ -220,29 +251,29 @@ fn load_from(path: &Path) -> (AppSettings, Option<String>) {
         }
     };
 
-    if bytes.len() as u64 > MAX_SETTINGS_BYTES {
-        return (
-            AppSettings::default(),
-            Some("O arquivo de preferências é maior que o limite permitido. Os valores padrão foram carregados.".to_owned()),
-        );
-    }
-
     let mut settings: AppSettings = match serde_json::from_slice(&bytes) {
         Ok(settings) => settings,
         Err(error) => {
+            backup_corrupted_settings(path);
             return (
                 AppSettings::default(),
                 Some(format!(
-                    "O arquivo de preferências está inválido ({error}). Os valores padrão foram carregados."
+                    "O arquivo de preferências está inválido ({error}). Um backup foi salvo em '{}.bak' e os valores padrão foram carregados.",
+                    path.display()
                 )),
             );
         }
     };
 
     if settings.schema_version != SETTINGS_SCHEMA_VERSION {
+        backup_corrupted_settings(path);
         return (
             AppSettings::default(),
-            Some("O arquivo de preferências usa uma versão incompatível. Os valores padrão foram carregados.".to_owned()),
+            Some(format!(
+                "O arquivo de preferências usa uma versão incompatível (versão {}). Um backup foi salvo em '{}.bak' e os valores padrão foram carregados.",
+                settings.schema_version,
+                path.display()
+            )),
         );
     }
 
@@ -414,6 +445,26 @@ mod tests {
         let (loaded, warning) = load_from(&path);
         assert_eq!(loaded, AppSettings::default());
         assert!(warning.is_some());
+        let backup = path.with_extension("json.bak");
+        assert!(backup.exists(), "backup file must be created");
+        assert_eq!(fs::read(&backup).unwrap(), b"not json");
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn incompatible_schema_version_creates_backup_and_uses_defaults() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).expect("test directory should be created");
+        let path = directory.join(SETTINGS_FILE);
+        let future_settings = r#"{"schema_version": 999, "server_url": "test"}"#;
+        fs::write(&path, future_settings.as_bytes()).expect("settings should be written");
+
+        let (loaded, warning) = load_from(&path);
+        assert_eq!(loaded, AppSettings::default());
+        assert!(warning.unwrap().contains("versão incompatível"));
+        let backup = path.with_extension("json.bak");
+        assert!(backup.exists(), "backup file must be created");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), future_settings);
         fs::remove_dir_all(directory).expect("test directory should be removed");
     }
 
