@@ -1465,9 +1465,16 @@ impl ClientUi {
     }
 
     fn send_turn_room_config(&self) {
+        if !self.hosting_locally {
+            return;
+        }
         let Some(config) = &self.turn_room_config else {
             return;
         };
+        if !config.is_valid() {
+            tracing::warn!("Configuração de mídia local inválida; envio de sinal ignorado");
+            return;
+        }
         let payload = match serde_json::to_string(config) {
             Ok(payload) => format!("{TURN_CONFIG_SIGNAL_PREFIX}{payload}"),
             Err(error) => {

@@ -22,9 +22,31 @@ pub struct TurnCredentials {
     pub credential: String,
 }
 
+impl TurnCredentials {
+    pub fn is_valid(&self) -> bool {
+        self.url.starts_with("turn:")
+            && self.url.contains("?transport=udp")
+            && !self.url.chars().any(char::is_whitespace)
+            && !self.url.contains('@')
+            && self.url.len() <= 256
+            && !self.username.is_empty()
+            && self.username.len() <= 128
+            && !self.username.chars().any(char::is_whitespace)
+            && !self.credential.is_empty()
+            && self.credential.len() <= 128
+            && !self.credential.chars().any(char::is_whitespace)
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct TurnRoomConfig {
     pub turn: Option<TurnCredentials>,
+}
+
+impl TurnRoomConfig {
+    pub fn is_valid(&self) -> bool {
+        self.turn.as_ref().map_or(true, TurnCredentials::is_valid)
+    }
 }
 
 pub struct TurnRelayServer {
@@ -322,5 +344,40 @@ mod tests {
             }
         };
         assert!(error.contains(&format!("UDP {port}")));
+    }
+
+    #[test]
+    fn turn_credentials_validation_rejects_malformed_urls_and_whitespaces() {
+        let valid = super::TurnCredentials {
+            url: "turn:203.0.113.1:3478?transport=udp".to_owned(),
+            username: "valid_user".to_owned(),
+            credential: "valid_secret_123".to_owned(),
+        };
+        assert!(valid.is_valid());
+
+        let mut invalid_url = valid.clone();
+        invalid_url.url = "http://malicious.site:3478".to_owned();
+        assert!(!invalid_url.is_valid());
+
+        let mut with_whitespace = valid.clone();
+        with_whitespace.username = "user name".to_owned();
+        assert!(!with_whitespace.is_valid());
+
+        let mut with_at = valid.clone();
+        with_at.url = "turn:user@203.0.113.1:3478?transport=udp".to_owned();
+        assert!(!with_at.is_valid());
+
+        let empty_config = super::TurnRoomConfig { turn: None };
+        assert!(empty_config.is_valid());
+
+        let valid_config = super::TurnRoomConfig {
+            turn: Some(valid.clone()),
+        };
+        assert!(valid_config.is_valid());
+
+        let invalid_config = super::TurnRoomConfig {
+            turn: Some(invalid_url),
+        };
+        assert!(!invalid_config.is_valid());
     }
 }

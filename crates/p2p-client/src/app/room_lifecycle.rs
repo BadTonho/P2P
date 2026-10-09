@@ -414,14 +414,24 @@ impl ClientUi {
                     }
                 }
                 SignalingEvent::Signal {
-                    from_participant_id: _,
+                    from_participant_id,
                     stream_id: _,
                     kind: SignalKind::Diagnostic,
                     payload,
                 } => {
                     if let Some(serialized) = payload.strip_prefix(TURN_CONFIG_SIGNAL_PREFIX) {
+                        if !self.current_leader_id.is_empty()
+                            && from_participant_id.as_deref() != Some(&self.current_leader_id)
+                        {
+                            tracing::warn!(
+                                from = ?from_participant_id,
+                                leader = %self.current_leader_id,
+                                "Configuração TURN descartada: remetente não é o anfitrião da sala"
+                            );
+                            continue;
+                        }
                         match serde_json::from_str::<TurnRoomConfig>(serialized) {
-                            Ok(config) => {
+                            Ok(config) if config.is_valid() => {
                                 let turn_enabled = config.turn.is_some();
                                 self.turn_room_config = Some(config);
                                 self.turn_config_received = true;
@@ -437,6 +447,15 @@ impl ClientUi {
                                     "Configuração recebida; esta sala usa somente conexão direta."
                                         .to_owned()
                                 });
+                            }
+                            Ok(_) => {
+                                tracing::warn!(
+                                    "Configuração ICE descartada: credenciais inválidas ou malformadas"
+                                );
+                                self.connection_error = Some(
+                                    "O anfitrião enviou uma configuração de mídia inválida."
+                                        .to_owned(),
+                                );
                             }
                             Err(error) => {
                                 tracing::error!(error = %error, "Configuração ICE da sala inválida");
