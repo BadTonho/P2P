@@ -163,7 +163,22 @@ impl Drop for TurnRelayServer {
             let _ = shutdown.send(());
         }
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            let (done_tx, done_rx) = std_mpsc::channel();
+            let joiner = thread::Builder::new()
+                .name("p2p-turn-relay-joiner".to_owned())
+                .spawn(move || {
+                    let _ = worker.join();
+                    let _ = done_tx.send(());
+                });
+
+            if let Ok(joiner_thread) = joiner {
+                if done_rx.recv_timeout(Duration::from_millis(1500)).is_err() {
+                    tracing::warn!(
+                        "O desligamento do servidor TURN excedeu 1.5s; prosseguindo para não congelar a aplicação"
+                    );
+                }
+                drop(joiner_thread);
+            }
         }
     }
 }
