@@ -79,6 +79,14 @@ struct Room {
     room_mode: RoomMode,
 }
 
+pub fn is_valid_room_code(code: &str) -> bool {
+    let trimmed = code.trim();
+    (4..=32).contains(&trimmed.len())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 impl RoomRegistry {
     fn admit_connection(&mut self, ip: Option<IpAddr>) -> Result<(), &'static str> {
         if self.total_connections >= MAX_TOTAL_CONNECTIONS {
@@ -140,7 +148,7 @@ impl RoomRegistry {
         connection_id: ConnectionId,
         sender: Outgoing,
     ) -> Result<String, String> {
-        self.create_room_with_mode(connection_id, sender, RoomMode::Local)
+        self.create_room_with_mode(connection_id, sender, RoomMode::Local, None)
     }
 
     fn create_room_with_mode(
@@ -148,19 +156,34 @@ impl RoomRegistry {
         connection_id: ConnectionId,
         sender: Outgoing,
         room_mode: RoomMode,
+        requested_code: Option<String>,
     ) -> Result<String, String> {
         if self.connection_rooms.contains_key(&connection_id) {
             return Err("Este cliente ja esta em uma sala.".to_owned());
         }
 
-        let code = loop {
-            let candidate = format!(
-                "{:0width$X}",
-                rand::random::<u64>() & ((1_u64 << (ROOM_CODE_LENGTH * 4)) - 1),
-                width = ROOM_CODE_LENGTH
-            );
-            if !self.rooms.contains_key(&candidate) {
-                break candidate;
+        let code = if let Some(code) = requested_code {
+            let sanitized = code.trim().to_ascii_uppercase();
+            if !is_valid_room_code(&sanitized) {
+                return Err(
+                    "O código de sala fornecido é inválido. Utilize de 4 a 32 caracteres alfanuméricos."
+                        .to_owned(),
+                );
+            }
+            if self.rooms.contains_key(&sanitized) {
+                return Err("Este código de sala já está em uso.".to_owned());
+            }
+            sanitized
+        } else {
+            loop {
+                let candidate = format!(
+                    "{:0width$X}",
+                    rand::random::<u64>() & ((1_u64 << (ROOM_CODE_LENGTH * 4)) - 1),
+                    width = ROOM_CODE_LENGTH
+                );
+                if !self.rooms.contains_key(&candidate) {
+                    break candidate;
+                }
             }
         };
 
@@ -254,8 +277,9 @@ impl RoomRegistry {
         sender: Outgoing,
         participant: ParticipantInfo,
         room_mode: RoomMode,
+        fixed_code: Option<String>,
     ) -> Result<(), String> {
-        self.create_room_with_mode(connection_id, sender, room_mode)?;
+        self.create_room_with_mode(connection_id, sender, room_mode, fixed_code)?;
         self.identify_participant(connection_id, participant)
     }
 
@@ -1120,11 +1144,13 @@ async fn handle_client_message(
         ClientMessage::CreateRoomIdentified {
             participant,
             room_mode,
+            fixed_code,
         } => rooms.lock().await.create_room_identified(
             connection_id,
             outgoing.clone(),
             participant,
             room_mode,
+            fixed_code,
         ),
         ClientMessage::JoinRoom { code } => {
             rooms
@@ -1248,8 +1274,8 @@ mod tests {
     use super::{
         FAILED_JOIN_WINDOW, MAX_CONNECTIONS_PER_IP, MAX_FAILED_JOINS_PER_WINDOW, MAX_MESSAGE_BYTES,
         MAX_TOTAL_CONNECTIONS, OutboundMessage, ROOM_CODE_LENGTH, RoomRegistry,
-        TransferReservation, handle_connection, is_small_baseline_jpeg, sanitize_avatar,
-        sanitize_display_name, serve, write_outgoing_messages,
+        TransferReservation, default_participant, handle_connection, is_small_baseline_jpeg,
+        is_valid_room_code, sanitize_avatar, sanitize_display_name, serve, write_outgoing_messages,
     };
     use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage, SignalKind};
     use std::net::{IpAddr, Ipv4Addr};
@@ -1386,7 +1412,7 @@ mod tests {
         let (host_tx, mut host_rx) = mpsc::unbounded_channel();
         let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
         let code = registry
-            .create_room_with_mode(1, host_tx, RoomMode::InternetTest)
+            .create_room_with_mode(1, host_tx, RoomMode::InternetTest, None)
             .unwrap();
         let _ = server_message(&mut host_rx); // RoomCreated
         registry
@@ -2373,6 +2399,90 @@ mod tests {
             ended.is_ok(),
             "o servidor deve encerrar a conexão com mensagem grande demais"
         );
+        accept_task.abort();
+    }
+
+    #[test]
+    fn test_is_valid_room_code() {
+        assert!(is_valid_room_code("ABCD"));
+        assert!(is_valid_room_code("MINHA-SALA-01"));
+        assert!(is_valid_room_code("ROOM_123_TEST"));
+        assert!(is_valid_room_code("12345678901234567890123456789012")); // 32 chars
+        // Inválidos
+        assert!(!is_valid_room_code("ABC")); // menos de 4 chars
+        assert!(!is_valid_room_code("123456789012345678901234567890123")); // 33 chars
+        assert!(!is_valid_room_code("SALA COM ESPACO"));
+        assert!(!is_valid_room_code("SALA@!#"));
+    }
+
+    #[tokio::test]
+    async fn websocket_creates_and_joins_fixed_room_and_rejects_duplicates() {
+        let (url, stop, accept_task) = start_test_server(None).await;
+        let (mut host, _) = connect_async(&url).await.unwrap();
+
+        // Criação com código fixo
+        send_client_message(
+            &mut host,
+            ClientMessage::CreateRoomIdentified {
+                participant: default_participant(1, 1),
+                room_mode: RoomMode::Local,
+                fixed_code: Some("MINHA-SALA-FIXA".to_owned()),
+            },
+        )
+        .await;
+
+        let created = receive_server_message(&mut host).await;
+        assert_eq!(
+            created,
+            ServerMessage::RoomCreated {
+                code: "MINHA-SALA-FIXA".to_owned()
+            }
+        );
+        let initial_roster = receive_server_message(&mut host).await;
+        assert!(matches!(initial_roster, ServerMessage::RoomRoster { .. }));
+
+        // Tentativa de outro host criar com o mesmo código deve falhar
+        let (mut duplicate_host, _) = connect_async(&url).await.unwrap();
+        send_client_message(
+            &mut duplicate_host,
+            ClientMessage::CreateRoomIdentified {
+                participant: default_participant(2, 1),
+                room_mode: RoomMode::Local,
+                fixed_code: Some("MINHA-SALA-FIXA".to_owned()),
+            },
+        )
+        .await;
+        let duplicate_response = receive_server_message(&mut duplicate_host).await;
+        assert!(matches!(
+            duplicate_response,
+            ServerMessage::Error { message } if message.contains("já está em uso")
+        ));
+        let _ = duplicate_host.close(None).await;
+
+        // Convidado entra com sucesso na sala fixa
+        let (mut guest, _) = connect_async(&url).await.unwrap();
+        send_client_message(
+            &mut guest,
+            ClientMessage::JoinRoomIdentified {
+                code: "MINHA-SALA-FIXA".to_owned(),
+                participant: default_participant(3, 2),
+            },
+        )
+        .await;
+        assert_eq!(
+            receive_server_message(&mut guest).await,
+            ServerMessage::RoomJoined {
+                code: "MINHA-SALA-FIXA".to_owned()
+            }
+        );
+        assert_eq!(
+            receive_server_message(&mut host).await,
+            ServerMessage::PeerJoined
+        );
+
+        let _ = guest.close(None).await;
+        let _ = host.close(None).await;
+        let _ = stop.send(());
         accept_task.abort();
     }
 }

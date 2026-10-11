@@ -11,6 +11,8 @@ pub enum ClientMessage {
         participant: ParticipantInfo,
         #[serde(default)]
         room_mode: RoomMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fixed_code: Option<String>,
     },
     JoinRoomIdentified {
         code: String,
