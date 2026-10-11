@@ -1,7 +1,9 @@
 mod diagnostics;
 mod home;
-mod room;
+pub mod room;
 mod settings;
+
+pub use room::{ScreenShareModalTab, ShareSourceSelection};
 
 use super::ClientUi;
 use eframe::egui;
@@ -50,4 +52,8 @@ pub(super) fn show_diagnostics(
     export_logs: &mut bool,
 ) {
     app.show_diagnostics(ui, open_logs_directory, export_logs);
+}
+
+pub(super) fn show_screen_share_modal(app: &mut ClientUi, context: &egui::Context) {
+    app.show_screen_share_modal(context);
 }

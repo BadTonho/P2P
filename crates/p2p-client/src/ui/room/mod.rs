@@ -1,6 +1,9 @@
 mod handoff;
+pub mod share_modal;
 mod stage;
 mod toolbar;
+
+pub use share_modal::{ScreenShareModalTab, ShareSourceSelection};
 
 use super::super::{ClientUi, RoomMode, ScreenShareRole, signaling_ws_url};
 use crate::screen_capture::ScreenCapture;

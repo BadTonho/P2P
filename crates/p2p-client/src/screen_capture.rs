@@ -18,6 +18,7 @@ use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     GraphicsCaptureItemType, MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
+use windows_capture::window::Window;
 
 mod dxgi_backend;
 mod wgc_backend;
@@ -26,6 +27,15 @@ const MAX_FRAME_WIDTH: u32 = 1280;
 const MAX_FRAME_HEIGHT: u32 = 720;
 const MIN_CAPTURE_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
 const CAPTURE_PACING_JITTER_TOLERANCE: Duration = Duration::from_micros(250);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowOption {
+    pub id: isize,
+    pub title: String,
+    pub process_name: String,
+    pub width: u32,
+    pub height: u32,
+}
 
 #[derive(Clone, Debug)]
 pub struct MonitorOption {
@@ -37,6 +47,7 @@ pub struct MonitorOption {
 }
 
 impl MonitorOption {
+    #[allow(dead_code)]
     pub fn label(&self, ordinal: usize) -> String {
         let device_label = self
             .device_id
@@ -424,6 +435,116 @@ impl ScreenCapture {
                 stop,
                 thread: Some(thread),
             }),
+            latest_frame,
+            performance,
+            fallback_reason,
+            source_closed,
+            picker_owner: None,
+        })
+    }
+
+    pub fn windows() -> Result<Vec<WindowOption>, String> {
+        let current_pid = std::process::id();
+        let windows = Window::enumerate()
+            .map_err(|error| format!("Não foi possível listar as janelas abertas: {error}"))?;
+        let mut options = Vec::new();
+        for window in windows {
+            if !window.is_valid() {
+                continue;
+            }
+            if let Ok(pid) = window.process_id()
+                && pid == current_pid
+            {
+                continue;
+            }
+            let title = match window.title() {
+                Ok(t) if !t.trim().is_empty() => t.trim().to_owned(),
+                _ => continue,
+            };
+            if title == "Program Manager" || title == "Windows Input Experience" {
+                continue;
+            }
+            let width = window.width().unwrap_or(0);
+            let height = window.height().unwrap_or(0);
+            if width <= 100 || height <= 100 {
+                continue;
+            }
+            let process_name = window
+                .process_name()
+                .unwrap_or_else(|_| "aplicativo".to_owned());
+            options.push(WindowOption {
+                id: window.as_raw_hwnd() as isize,
+                title,
+                process_name,
+                width: width as u32,
+                height: height as u32,
+            });
+        }
+        options.sort_by(|a, b| {
+            a.process_name
+                .to_lowercase()
+                .cmp(&b.process_name.to_lowercase())
+                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+        });
+        Ok(options)
+    }
+
+    pub fn start_window_id(
+        window_id: isize,
+        context: egui::Context,
+        preview_enabled: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        let window = Window::from_raw_hwnd(window_id as *mut std::ffi::c_void);
+        Self::start_window(window, context, preview_enabled)
+    }
+
+    pub fn start_window(
+        window: Window,
+        context: egui::Context,
+        preview_enabled: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        if !window.is_valid() {
+            return Err("A janela selecionada não é mais válida ou foi fechada.".to_owned());
+        }
+        let width = window.width().map_err(|error| error.to_string())?;
+        let height = window.height().map_err(|error| error.to_string())?;
+        if width <= 0 || height <= 0 {
+            return Err(
+                "A janela selecionada possui dimensões inválidas ou está minimizada.".to_owned(),
+            );
+        }
+        let latest_frame = LatestFrame::default();
+        let performance = Arc::new(CapturePerformanceCounters::default());
+        let fallback_reason = Arc::new(Mutex::new(None));
+        let source_closed = Arc::new(AtomicBool::new(false));
+        let settings = Settings::new(
+            window,
+            CursorCaptureSettings::Default,
+            DrawBorderSettings::Default,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Rgba8,
+            HandlerFlags {
+                _size: (width, height),
+                context,
+                latest_frame: latest_frame.clone(),
+                performance: Arc::clone(&performance),
+                source_closed: Arc::clone(&source_closed),
+                preview_enabled,
+            },
+        );
+        let control =
+            wgc_backend::ScreenFrameHandler::start_free_threaded(settings).map_err(|error| {
+                tracing::error!(error = %error, "Windows Graphics Capture não iniciou para janela");
+                format!("O Windows não iniciou a captura da janela: {error}")
+            })?;
+        tracing::info!(width, height, "Captura local da janela iniciada");
+
+        Ok(Self {
+            backend_name: "Windows Graphics Capture (Janela)",
+            control: Some(control),
+            dxgi_worker: None,
             latest_frame,
             performance,
             fallback_reason,

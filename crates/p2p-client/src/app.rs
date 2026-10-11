@@ -13,7 +13,9 @@ use crate::logging::{
     DiagnosticSnapshot, LoggingState, safe_signaling_endpoint, safe_stun_endpoint,
 };
 use crate::profile;
-use crate::screen_capture::{MonitorOption, PendingScreenCapture, PreviewFrame, ScreenCapture};
+use crate::screen_capture::{
+    MonitorOption, PendingScreenCapture, PreviewFrame, ScreenCapture, WindowOption,
+};
 use crate::screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
 use crate::settings::{AppSettings, LoggingLevel, SavedHostProfile, VideoDecoderPreference};
 use crate::signaling_client::{SignalingClient, SignalingEvent};
@@ -40,6 +42,7 @@ mod ui;
 mod updates;
 
 pub(crate) use hosts::*;
+pub(crate) use ui::{ScreenShareModalTab, ShareSourceSelection};
 pub(crate) use updates::*;
 
 const TURN_CONFIG_SIGNAL_PREFIX: &str = "p2p-turn-room-config-v1:";
@@ -238,8 +241,16 @@ struct ClientUi {
     screen_picker: Option<PendingScreenCapture>,
     available_monitors: Vec<MonitorOption>,
     monitors_loaded: bool,
-    monitor_menu_open: bool,
     dxgi_capture_error: Option<String>,
+    pub(crate) screen_share_modal_open: bool,
+    pub(crate) screen_share_modal_tab: ScreenShareModalTab,
+    pub(crate) selected_share_source: Option<ShareSourceSelection>,
+    pub(crate) available_windows: Vec<WindowOption>,
+    pub(crate) windows_loaded: bool,
+    pub(crate) windows_loading: bool,
+    pub(crate) windows_rx: Option<std::sync::mpsc::Receiver<Result<Vec<WindowOption>, String>>>,
+    pub(crate) window_search_query: String,
+    pub(crate) auto_start_share_after_picker: bool,
     screen_texture: Option<egui::TextureHandle>,
     local_preview_frame_key: Option<LocalPreviewFrameKey>,
     local_preview_failure: Option<(LocalPreviewFrameKey, String)>,
@@ -863,6 +874,7 @@ impl ClientUi {
         }
 
         ui::show_profile_window(self, &context);
+        ui::show_screen_share_modal(self, &context);
 
         if self.preferences_snapshot() != preferences_before_frame {
             self.settings_dirty = true;
@@ -909,6 +921,116 @@ impl ClientUi {
         self.settings_category = category;
     }
 
+    pub(crate) fn open_screen_share_modal(&mut self) {
+        self.screen_share_modal_open = true;
+        self.refresh_monitors(true);
+        self.refresh_windows();
+        if self.selected_share_source.is_none()
+            && let Some(first) = self.available_monitors.first()
+        {
+            self.selected_share_source =
+                Some(ShareSourceSelection::Monitor(first.device_id.clone()));
+        }
+    }
+
+    pub(crate) fn refresh_windows(&mut self) {
+        if self.windows_loading {
+            return;
+        }
+        self.windows_loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.windows_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("window-enumerator".to_owned())
+            .spawn(move || {
+                let result = ScreenCapture::windows();
+                let _ = tx.send(result);
+            })
+            .ok();
+    }
+
+    pub(crate) fn poll_windows_refresh(&mut self) {
+        if let Some(rx) = &self.windows_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.windows_loading = false;
+                    self.windows_loaded = true;
+                    self.windows_rx = None;
+                    match result {
+                        Ok(windows) => {
+                            self.available_windows = windows;
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "Falha ao consultar janelas abertas");
+                            self.available_windows.clear();
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.windows_loading = false;
+                    self.windows_rx = None;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn start_selected_share(&mut self, context: &egui::Context) {
+        let Some(source) = self.selected_share_source.clone() else {
+            return;
+        };
+        self.dxgi_capture_error = None;
+        self.screen_status = None;
+
+        let capture_result = match source {
+            ShareSourceSelection::Monitor(device_id) => {
+                tracing::info!(monitor_device_id = %device_id, "Iniciando captura de monitor pelo modal unificado");
+                ScreenCapture::start_monitor(
+                    &device_id,
+                    context.clone(),
+                    Arc::clone(&self.capture_preview_enabled),
+                )
+            }
+            ShareSourceSelection::Window(window_id) => {
+                tracing::info!(
+                    window_id,
+                    "Iniciando captura de janela pelo modal unificado"
+                );
+                ScreenCapture::start_window_id(
+                    window_id,
+                    context.clone(),
+                    Arc::clone(&self.capture_preview_enabled),
+                )
+            }
+        };
+
+        match capture_result {
+            Ok(capture) => {
+                self.clear_local_preview();
+                let is_window = capture.backend_name().contains("Janela");
+                self.screen_capture = Some(capture);
+                self.screen_status = Some(if is_window {
+                    "Captura de janela ativa (Windows Graphics Capture).".to_owned()
+                } else {
+                    "Captura de tela ativa (DXGI Desktop Duplication).".to_owned()
+                });
+                self.screen_share_modal_open = false;
+
+                if self.group_sharing_compatible() {
+                    self.set_group_share(true);
+                } else {
+                    self.request_screen_share(context);
+                }
+                context.request_repaint();
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "Falha ao iniciar captura pelo modal de compartilhamento");
+                self.screen_status = Some(format!("Falha ao iniciar captura: {error}"));
+                self.dxgi_capture_error = Some(error);
+            }
+        }
+    }
+
     fn select_screen(&mut self, _context: &egui::Context) {
         tracing::info!("Usuário abriu o seletor de tela ou janela do Windows");
         self.screen_status = None;
@@ -949,12 +1071,22 @@ impl ClientUi {
                     self.screen_capture = Some(capture);
                     self.screen_status =
                         Some("A prévia atualiza enquanto a captura estiver ativa.".to_owned());
+                    if self.auto_start_share_after_picker {
+                        self.auto_start_share_after_picker = false;
+                        if self.group_sharing_compatible() {
+                            self.set_group_share(true);
+                        } else {
+                            self.request_screen_share(context);
+                        }
+                    }
                 }
                 Ok(None) => {
+                    self.auto_start_share_after_picker = false;
                     self.screen_status =
                         Some("Seleção cancelada; a captura permaneceu desligada.".to_owned());
                 }
                 Err(error) => {
+                    self.auto_start_share_after_picker = false;
                     tracing::error!(error = %error, "Falha ao iniciar captura de tela após seleção");
                     self.screen_status = Some(format!(
                         "Não foi possível iniciar a captura da tela: {error}"

@@ -453,7 +453,7 @@ impl ClientUi {
         ui.heading("Áudio");
         ui.group(|ui| {
             ui.heading("Som da tela compartilhada");
-            ui.label("Na barra da sala, marque ‘Incluir som do computador’ antes de compartilhar para transmitir o áudio reproduzido no Windows.");
+            ui.label("Ao compartilhar a tela, marque ‘Compartilhar áudio do computador’ na janela para transmitir o áudio reproduzido no Windows.");
             ui.small("A opção fica desligada por padrão. Ela captura o áudio do computador, não o microfone; a faixa Opus segue diretamente aos participantes que assistem à tela.");
             ui.separator();
 
