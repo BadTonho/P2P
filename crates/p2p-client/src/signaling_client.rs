@@ -31,6 +31,7 @@ fn default_participant() -> ParticipantInfo {
         avatar_jpeg_base64: None,
         supports_group_screen_share: false,
         supports_group_session_ids: false,
+        public_key: None,
     }
 }
 

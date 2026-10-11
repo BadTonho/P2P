@@ -330,6 +330,13 @@ impl RoomRegistry {
         participant.display_name =
             sanitize_display_name(&participant.display_name, participant.order);
         participant.avatar_jpeg_base64 = sanitize_avatar(participant.avatar_jpeg_base64);
+        participant.public_key = sanitize_public_key(participant.public_key);
+        if let Some(known) = room.members.iter().find(|known| known.id == participant.id)
+            && known.public_key.is_some()
+            && known.public_key != participant.public_key
+        {
+            return Err("Essa identidade ja foi registrada na sala com outra chave.".to_owned());
+        }
         if internet_test {
             participant.may_host = false;
             participant.control_address.clear();
@@ -757,6 +764,18 @@ fn sanitize_display_name(name: &str, order: u8) -> String {
     }
 }
 
+/// Aceita apenas chaves Ed25519 de exatamente 32 bytes em base64 padrão.
+fn sanitize_public_key(encoded: Option<String>) -> Option<String> {
+    let encoded = encoded?;
+    if encoded.len() != 44 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .ok()?;
+    (bytes.len() == 32).then_some(encoded)
+}
+
 fn sanitize_avatar(encoded: Option<String>) -> Option<String> {
     let encoded = encoded?;
     if encoded.len() > MAX_AVATAR_BASE64_BYTES {
@@ -824,6 +843,7 @@ fn default_participant(connection_id: ConnectionId, order: u8) -> ParticipantInf
         avatar_jpeg_base64: None,
         supports_group_screen_share: false,
         supports_group_session_ids: false,
+        public_key: None,
     }
 }
 
@@ -1381,6 +1401,7 @@ mod tests {
                     avatar_jpeg_base64: Some(small_jpeg_base64()),
                     supports_group_screen_share: false,
                     supports_group_session_ids: false,
+                    public_key: None,
                 },
             )
             .unwrap();
@@ -1412,6 +1433,7 @@ mod tests {
                     avatar_jpeg_base64: Some(small_jpeg_base64()),
                     supports_group_screen_share: false,
                     supports_group_session_ids: false,
+                    public_key: None,
                 },
             )
             .unwrap();
@@ -1470,6 +1492,7 @@ mod tests {
                     avatar_jpeg_base64: Some(small_jpeg_base64()),
                     supports_group_screen_share: false,
                     supports_group_session_ids: false,
+                    public_key: None,
                 },
             )
             .unwrap();
@@ -1505,6 +1528,7 @@ mod tests {
                     avatar_jpeg_base64: Some(small_jpeg_base64()),
                     supports_group_screen_share: false,
                     supports_group_session_ids: false,
+                    public_key: None,
                 },
             )
             .unwrap();
@@ -1559,6 +1583,7 @@ mod tests {
                     avatar_jpeg_base64: None,
                     supports_group_screen_share: false,
                     supports_group_session_ids: false,
+                    public_key: None,
                 },
             )
             .unwrap();
@@ -1579,6 +1604,7 @@ mod tests {
                     avatar_jpeg_base64: None,
                     supports_group_screen_share: false,
                     supports_group_session_ids: false,
+                    public_key: None,
                 },
             )
             .unwrap();
@@ -1616,6 +1642,55 @@ mod tests {
     }
 
     #[test]
+    fn public_keys_are_validated_and_bound_to_the_participant_id() {
+        use super::sanitize_public_key;
+        let key_a = format!("{}=", "A".repeat(43));
+        let key_b = format!("{}=", "Q".repeat(43));
+        assert_eq!(
+            sanitize_public_key(Some(key_a.clone())),
+            Some(key_a.clone())
+        );
+        assert!(sanitize_public_key(Some("curta".to_owned())).is_none());
+        assert!(sanitize_public_key(Some("!".repeat(44))).is_none());
+        assert!(sanitize_public_key(None).is_none());
+
+        let participant = |key: Option<String>| ParticipantInfo {
+            id: "ghost-id".to_owned(),
+            display_name: "Fantasma".to_owned(),
+            order: 2,
+            may_host: false,
+            control_address: "192.168.1.9:9001".to_owned(),
+            avatar_jpeg_base64: None,
+            supports_group_screen_share: false,
+            supports_group_session_ids: false,
+            public_key: key,
+        };
+        let mut registry = RoomRegistry::default();
+        let (host_tx, _host_rx) = mpsc::unbounded_channel();
+        let (guest_tx, _guest_rx) = mpsc::unbounded_channel();
+        let code = registry.create_room(1, host_tx).unwrap();
+        registry
+            .rooms
+            .get_mut(&code)
+            .unwrap()
+            .members
+            .push(participant(Some(key_a.clone())));
+        registry.join_room(2, &code, guest_tx).unwrap();
+
+        let wrong_key = registry
+            .identify_participant(2, participant(Some(key_b)))
+            .unwrap_err();
+        assert!(wrong_key.contains("outra chave"));
+        let missing_key = registry
+            .identify_participant(2, participant(None))
+            .unwrap_err();
+        assert!(missing_key.contains("outra chave"));
+        registry
+            .identify_participant(2, participant(Some(key_a)))
+            .unwrap();
+    }
+
+    #[test]
     fn election_adoption_preserves_roster_and_allows_existing_members_to_rejoin() {
         let original_members = vec![
             ParticipantInfo {
@@ -1627,6 +1702,7 @@ mod tests {
                 avatar_jpeg_base64: None,
                 supports_group_screen_share: false,
                 supports_group_session_ids: false,
+                public_key: None,
             },
             ParticipantInfo {
                 id: "candidate-id".to_owned(),
@@ -1637,6 +1713,7 @@ mod tests {
                 avatar_jpeg_base64: None,
                 supports_group_screen_share: false,
                 supports_group_session_ids: false,
+                public_key: None,
             },
             ParticipantInfo {
                 id: "guest-id".to_owned(),
@@ -1647,6 +1724,7 @@ mod tests {
                 avatar_jpeg_base64: None,
                 supports_group_screen_share: false,
                 supports_group_session_ids: false,
+                public_key: None,
             },
         ];
         let mut registry = RoomRegistry {
@@ -1679,6 +1757,7 @@ mod tests {
                     avatar_jpeg_base64: None,
                     supports_group_screen_share: false,
                     supports_group_session_ids: false,
+                    public_key: None,
                 },
             )
             .unwrap();
@@ -1714,6 +1793,7 @@ mod tests {
                     avatar_jpeg_base64: None,
                     supports_group_screen_share: false,
                     supports_group_session_ids: false,
+                    public_key: None,
                 },
             )
             .unwrap();

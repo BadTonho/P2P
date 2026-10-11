@@ -38,6 +38,7 @@ impl ClientUi {
             },
             supports_group_screen_share: self.room_mode == RoomMode::Local,
             supports_group_session_ids: self.room_mode == RoomMode::Local,
+            public_key: None,
         }
     }
 

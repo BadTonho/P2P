@@ -122,6 +122,10 @@ pub struct ParticipantInfo {
     /// Missing on older clients, which must keep using the legacy two-person flow.
     #[serde(default)]
     pub supports_group_session_ids: bool,
+    /// Chave pública Ed25519 (32 bytes em base64) usada para autenticar a malha
+    /// de controle. Ausente em clientes antigos.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 /// Mensagens da conexão direta entre os clientes. Não transporta mídia.
@@ -131,6 +135,13 @@ pub enum ControlMessage {
     Hello {
         room_code: String,
         participant: ParticipantInfo,
+        /// Desafio aleatório (hex) que o outro lado deve assinar em `Auth`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nonce: Option<String>,
+    },
+    /// Assinatura Ed25519 (base64) do desafio recebido no `Hello` do par.
+    Auth {
+        signature: String,
     },
     Ping {
         sequence: u64,

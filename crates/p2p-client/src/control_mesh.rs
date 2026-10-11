@@ -553,6 +553,7 @@ where
         ControlMessage::Hello {
             room_code: room_code.clone(),
             participant: local.clone(),
+            nonce: None,
         },
     )
     .await?;
@@ -568,6 +569,7 @@ where
             ControlMessage::Hello {
                 room_code: peer_room,
                 participant,
+                ..
             } if peer_room == room_code => participant,
             ControlMessage::Hello { .. } => {
                 return Err("o participante informou outra sala".to_owned());
@@ -817,7 +819,7 @@ where
                             let _ = events.send(ControlEvent::RoomEnded);
                         }
                     }
-                    ControlMessage::Hello { .. } => {}
+                    ControlMessage::Hello { .. } | ControlMessage::Auth { .. } => {}
                 }
                 if let Some((leader_id, address, epoch, order)) = should_broadcast_canonical {
                     broadcast(&state, ControlMessage::LeaderElected {
@@ -1581,6 +1583,7 @@ mod tests {
             avatar_jpeg_base64: None,
             supports_group_screen_share: false,
             supports_group_session_ids: false,
+            public_key: None,
         }
     }
 
@@ -1693,6 +1696,7 @@ mod tests {
                 avatar_jpeg_base64: None,
                 supports_group_screen_share: false,
                 supports_group_session_ids: false,
+                public_key: None,
             },
             loss_percent: loss,
             jitter_ms: jitter,
