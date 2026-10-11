@@ -261,6 +261,8 @@ struct ClientUi {
     available_audio_applications: Vec<AudioApplication>,
     audio_applications_error: Option<String>,
     audio_applications_loaded: bool,
+    audio_applications_rx: Option<std::sync::mpsc::Receiver<Result<Vec<AudioApplication>, String>>>,
+    audio_applications_loading: bool,
     group_available_shares: HashSet<String>,
     group_watched_shares: HashSet<String>,
     group_outbound_sessions: HashMap<String, ScreenShareSession>,
@@ -880,17 +882,11 @@ impl ClientUi {
     }
 
     fn open_settings(&mut self) {
-        if self.room_code.is_some() && self.screen_capture.is_some() {
-            self.stop_screen_capture();
-        }
         self.settings_category = SettingsCategory::Audio;
         self.settings_open = true;
     }
 
     fn open_connection_settings(&mut self) {
-        if self.room_code.is_some() && self.screen_capture.is_some() {
-            self.stop_screen_capture();
-        }
         if self.settings_category == SettingsCategory::Audio {
             self.stop_microphone();
         }

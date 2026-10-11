@@ -446,8 +446,9 @@ impl ClientUi {
     }
 
     fn show_audio_settings(&mut self, ui: &mut egui::Ui) {
-        if !self.audio_applications_loaded {
-            self.refresh_audio_applications();
+        self.poll_audio_applications_query();
+        if !self.audio_applications_loaded && !self.audio_applications_loading {
+            self.refresh_audio_applications(ui.ctx().clone());
         }
         ui.heading("Áudio");
         ui.group(|ui| {
@@ -472,7 +473,12 @@ impl ClientUi {
             ui.separator();
             ui.label("Não compartilhar o áudio de aplicativos específicos:");
 
-            if self.available_audio_applications.is_empty() {
+            if self.audio_applications_loading && self.available_audio_applications.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Consultando aplicativos com áudio em execução…");
+                });
+            } else if self.available_audio_applications.is_empty() {
                 ui.small("Nenhum outro aplicativo reproduzindo áudio detectado no momento.");
             } else {
                 let mut toggled = None;
@@ -544,8 +550,19 @@ impl ClientUi {
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Atualizar lista de aplicativos").clicked() {
-                    self.refresh_audio_applications();
+                let refresh_label = if self.audio_applications_loading {
+                    "Consultando…"
+                } else {
+                    "Atualizar lista de aplicativos"
+                };
+                if ui
+                    .add_enabled(
+                        !self.audio_applications_loading,
+                        egui::Button::new(refresh_label),
+                    )
+                    .clicked()
+                {
+                    self.refresh_audio_applications(ui.ctx().clone());
                 }
                 if !self.excluded_audio_applications.is_empty()
                     && ui.button("Limpar exclusões").clicked()
@@ -629,18 +646,47 @@ impl ClientUi {
         });
     }
 
-    fn refresh_audio_applications(&mut self) {
-        match available_audio_applications() {
-            Ok(applications) => {
-                self.available_audio_applications = applications;
-                self.audio_applications_error = None;
-            }
-            Err(error) => {
-                self.available_audio_applications.clear();
-                self.audio_applications_error = Some(error);
+    fn poll_audio_applications_query(&mut self) {
+        if let Some(rx) = &self.audio_applications_rx {
+            match rx.try_recv() {
+                Ok(Ok(applications)) => {
+                    self.available_audio_applications = applications;
+                    self.audio_applications_error = None;
+                    self.audio_applications_loaded = true;
+                    self.audio_applications_loading = false;
+                    self.audio_applications_rx = None;
+                }
+                Ok(Err(error)) => {
+                    self.available_audio_applications.clear();
+                    self.audio_applications_error = Some(error);
+                    self.audio_applications_loaded = true;
+                    self.audio_applications_loading = false;
+                    self.audio_applications_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.audio_applications_loading = false;
+                    self.audio_applications_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
-        self.audio_applications_loaded = true;
+    }
+
+    fn refresh_audio_applications(&mut self, context: egui::Context) {
+        if self.audio_applications_loading {
+            return;
+        }
+        self.audio_applications_loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.audio_applications_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("p2p-audio-apps-query".to_owned())
+            .spawn(move || {
+                let result = available_audio_applications();
+                let _ = tx.send(result);
+                context.request_repaint();
+            })
+            .ok();
     }
 
     fn show_video_settings(&mut self, ui: &mut egui::Ui) {

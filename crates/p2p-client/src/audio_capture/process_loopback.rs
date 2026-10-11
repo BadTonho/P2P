@@ -986,7 +986,7 @@ fn process_image_path(process_id: u32) -> Option<String> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id).ok()?;
         let _process = HandleGuard(process);
-        let mut buffer = vec![0u16; 32_768];
+        let mut buffer = [0u16; 1024];
         let mut length = buffer.len() as u32;
         QueryFullProcessImageNameW(
             process,
@@ -995,8 +995,7 @@ fn process_image_path(process_id: u32) -> Option<String> {
             &mut length,
         )
         .ok()?;
-        buffer.truncate(length as usize);
-        String::from_utf16(&buffer).ok()
+        String::from_utf16(&buffer[..length as usize]).ok()
     }
 }
 
@@ -1013,10 +1012,17 @@ impl Drop for HandleGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        InitialCaptureRoute, SampleEncoding, SampleFormat, decode_stereo_frame,
-        exclusion_target_mode, float_subformat_guid, inclusion_target_mode, initial_capture_route,
-        normalize_path, paths_match, pcm_subformat_guid, should_switch_to_process_tree,
+        InitialCaptureRoute, SampleEncoding, SampleFormat, available_audio_applications,
+        decode_stereo_frame, exclusion_target_mode, float_subformat_guid, inclusion_target_mode,
+        initial_capture_route, normalize_path, paths_match, pcm_subformat_guid,
+        should_switch_to_process_tree,
     };
+
+    #[test]
+    fn available_audio_applications_runs_without_panicking() {
+        let result = available_audio_applications();
+        assert!(result.is_ok() || result.is_err());
+    }
 
     #[test]
     fn native_activation_cleanup_does_not_corrupt_the_process() {
