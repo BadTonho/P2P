@@ -29,6 +29,7 @@ mod audio;
 mod group_sharing;
 #[path = "app/hosts.rs"]
 mod hosts;
+pub(crate) use hosts::{generate_random_room_code, is_valid_room_code, sanitize_room_code};
 #[path = "app/room_lifecycle.rs"]
 mod room_lifecycle;
 #[path = "app/room_participants.rs"]
@@ -170,7 +171,11 @@ struct ClientUi {
     selected_host_index: Option<usize>,
     new_host_name: String,
     new_host_address: String,
+    new_host_room_code: String,
     saved_host_error: Option<String>,
+    use_fixed_room: bool,
+    fixed_room_code: String,
+    last_manual_join_code: Option<String>,
     stun_server_url: String,
     create_room_mode: RoomMode,
     use_turn_on_create: bool,
@@ -395,6 +400,13 @@ impl ClientUi {
             use_turn_on_create: self.use_turn_on_create,
             may_host: self.may_host,
             control_ipv4: self.preferred_control_ipv4,
+            use_fixed_room: self.use_fixed_room,
+            fixed_room_code: if self.fixed_room_code.trim().is_empty() {
+                None
+            } else {
+                Some(self.fixed_room_code.clone())
+            },
+            last_manual_join_code: self.last_manual_join_code.clone(),
             ..Default::default()
         }
     }
@@ -424,6 +436,17 @@ impl ClientUi {
         self.use_turn_on_create = preferences.use_turn_on_create;
         self.may_host = preferences.may_host;
         self.preferred_control_ipv4 = preferences.control_ipv4;
+        self.use_fixed_room = preferences.use_fixed_room;
+        self.fixed_room_code = preferences.fixed_room_code.unwrap_or_default();
+        self.last_manual_join_code = preferences.last_manual_join_code;
+        self.join_code = if let Some(index) = self.selected_host_index {
+            self.saved_hosts
+                .get(index)
+                .and_then(|p| p.room_code.clone())
+                .unwrap_or_default()
+        } else {
+            self.last_manual_join_code.clone().unwrap_or_default()
+        };
     }
 
     pub(super) fn choose_profile_avatar(&mut self) {

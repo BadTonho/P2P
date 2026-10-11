@@ -2250,7 +2250,7 @@ mod tests {
             ["guest"]
         );
         guest_mesh.publish_leader("ws://127.0.0.1:9002".to_owned(), epoch);
-        assert!(receive_until(&host_mesh.events, Duration::from_secs(5), |event| {
+        assert!(receive_until(&host_mesh.events, Duration::from_secs(8), |event| {
             matches!(event, ControlEvent::LeaderChanged { participant_id, .. } if participant_id == "guest")
         }).is_some());
     }

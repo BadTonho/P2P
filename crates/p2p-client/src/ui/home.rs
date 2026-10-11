@@ -1,7 +1,9 @@
 use super::super::{
-    ClientUi, RoomMode, UpdateShortcutAction, UpdateStatus, signaling_ws_url,
-    update_shortcut_action, update_shortcut_tooltip,
+    ClientUi, RoomMode, UpdateShortcutAction, UpdateStatus, generate_random_room_code,
+    is_valid_room_code, sanitize_room_code, signaling_ws_url, update_shortcut_action,
+    update_shortcut_tooltip,
 };
+use crate::settings::{MAX_SAVED_HOSTS, SavedHostProfile};
 use eframe::egui;
 
 const PROFILE_PILL_AVATAR_SIZE: f32 = 34.0;
@@ -543,8 +545,45 @@ impl ClientUi {
         ui.group(|ui| {
             ui.heading("Criar sala");
             ui.label("Hospede neste computador e compartilhe o código com seu amigo.");
-            let enabled = room_actions_enabled(self.connecting, self.update_blocks_room_actions());
-            let response = primary_action_button(ui, "Criar sala", PRIMARY_ACTION_WIDTH, enabled);
+            ui.add_space(4.0);
+            let checkbox_resp =
+                ui.checkbox(&mut self.use_fixed_room, "Sala fixa (código permanente)");
+            if checkbox_resp.changed()
+                && self.use_fixed_room
+                && self.fixed_room_code.trim().is_empty()
+            {
+                self.fixed_room_code = generate_random_room_code();
+            }
+            if self.use_fixed_room {
+                if self.fixed_room_code.trim().is_empty() {
+                    self.fixed_room_code = generate_random_room_code();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Código fixo:");
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.fixed_room_code)
+                            .hint_text("Código da sala fixa")
+                            .desired_width(160.0),
+                    );
+                    if edit.changed() {
+                        self.fixed_room_code = sanitize_room_code(&self.fixed_room_code);
+                    }
+                    if ui.small_button("Gerar novo").clicked() {
+                        self.fixed_room_code = generate_random_room_code();
+                    }
+                });
+                ui.small("O código será sempre o mesmo ao criar a sala.");
+            }
+            ui.add_space(4.0);
+            let valid_fixed = !self.use_fixed_room || is_valid_room_code(&self.fixed_room_code);
+            let enabled = room_actions_enabled(self.connecting, self.update_blocks_room_actions())
+                && valid_fixed;
+            let button_text = if self.use_fixed_room {
+                "Criar sala fixa"
+            } else {
+                "Criar sala"
+            };
+            let response = primary_action_button(ui, button_text, PRIMARY_ACTION_WIDTH, enabled);
             if response.clicked() {
                 self.start_hosting();
             }
@@ -560,6 +599,7 @@ impl ClientUi {
                 .and_then(|index| self.saved_hosts.get(index))
                 .map(|profile| profile.name.as_str())
                 .unwrap_or("Endereço manual");
+            let old_host_index = self.selected_host_index;
             let (_, manage_response) = show_host_picker_and_manage(
                 ui,
                 selected_label,
@@ -570,6 +610,9 @@ impl ClientUi {
                     .map(|(index, profile)| (index, profile.name.as_str())),
             );
             manage_hosts = manage_response.clicked();
+            if self.selected_host_index != old_host_index {
+                self.select_host(self.selected_host_index);
+            }
             if let Some(index) = self.selected_host_index {
                 if let Some(profile) = self.saved_hosts.get(index) {
                     ui.small(format!("Endereço: {}", profile.address));
@@ -578,23 +621,44 @@ impl ClientUi {
                     }
                 }
             } else {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.server_url)
-                        .hint_text("IP ou nome DDNS do anfitrião")
-                        .desired_width(ui.available_width().min(420.0)),
-                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.server_url)
+                            .hint_text("IP ou nome DDNS do anfitrião")
+                            .desired_width(ui.available_width().min(300.0)),
+                    );
+                    if !self.server_url.trim().is_empty()
+                        && self.saved_hosts.len() < MAX_SAVED_HOSTS
+                        && ui.small_button("+ Salvar anfitrião").clicked()
+                    {
+                        let room_code = if self.join_code.trim().is_empty() {
+                            None
+                        } else {
+                            Some(sanitize_room_code(&self.join_code))
+                        };
+                        self.saved_hosts.push(SavedHostProfile {
+                            name: format!("Anfitrião {}", self.saved_hosts.len() + 1),
+                            address: self.server_url.trim().to_owned(),
+                            room_code,
+                        });
+                        self.selected_host_index = Some(self.saved_hosts.len() - 1);
+                    }
+                });
             }
             ui.label("Digite o código da sala:");
             ui.horizontal_wrapped(|ui| {
                 let field_width =
                     (ui.available_width() - PRIMARY_ACTION_WIDTH - ui.spacing().item_spacing.x)
                         .max(80.0);
-                ui.add_sized(
+                let code_edit = ui.add_sized(
                     egui::vec2(field_width, PRIMARY_ACTION_HEIGHT),
                     egui::TextEdit::singleline(&mut self.join_code)
                         .hint_text("Código da sala")
                         .desired_width(field_width),
                 );
+                if code_edit.changed() {
+                    self.set_join_code(&self.join_code.clone());
+                }
 
                 let address = self.join_address();
                 let valid_address = signaling_ws_url(address).is_ok();

@@ -88,7 +88,18 @@ impl ClientUi {
         self.hosting_locally = false;
 
         let participant = self.local_participant_info();
-        match SignalingClient::start_host_with_participant(participant, self.room_mode) {
+        let fixed_code = if self.use_fixed_room {
+            let sanitized = sanitize_room_code(&self.fixed_room_code);
+            if is_valid_room_code(&sanitized) {
+                Some(sanitized)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match SignalingClient::start_host_with_participant(participant, self.room_mode, fixed_code)
+        {
             Ok(client) => self.signaling = Some(client),
             Err(error) => {
                 tracing::error!(error = %error, "Falha ao iniciar sala hospedada localmente");
@@ -813,7 +824,14 @@ impl ClientUi {
         self.pending_election_reconnect = false;
         self.leave_after_handoff = false;
         self.ending_room_explicitly = false;
-        self.join_code.clear();
+        self.join_code = if let Some(index) = self.selected_host_index {
+            self.saved_hosts
+                .get(index)
+                .and_then(|p| p.room_code.clone())
+                .unwrap_or_default()
+        } else {
+            self.last_manual_join_code.clone().unwrap_or_default()
+        };
         self.code_copied_until = None;
         self.microphone_error = None;
         self.screen_status = None;

@@ -4,6 +4,7 @@ use super::{
     room_actions_enabled, show_host_picker_and_manage, show_network_window, show_profile_pill,
     show_profile_window_contents, show_room_mode_selector,
 };
+use crate::settings::SavedHostProfile;
 use eframe::egui;
 
 struct HomeActionLayout {
@@ -444,4 +445,78 @@ fn configure_network_button_opens_the_floating_window() {
     );
     fourth_frame.textures_delta.clear();
     assert!(!shown);
+}
+
+#[test]
+fn fixed_room_card_controls_and_validation() {
+    let context = egui::Context::default();
+    let mut ui_state = ClientUi::default();
+    ui_state.use_fixed_room = true;
+    ui_state.fixed_room_code.clear();
+
+    let mut frame = context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 480.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            ui_state.show_create_room_card(ui);
+        },
+    );
+    frame.textures_delta.clear();
+
+    // Quando vazia, deve ter gerado um código aleatório de 12 caracteres automaticamente
+    assert_eq!(ui_state.fixed_room_code.len(), 12);
+    assert!(crate::app::is_valid_room_code(&ui_state.fixed_room_code));
+}
+
+#[test]
+fn join_room_card_swaps_and_persists_codes_per_host_and_manual() {
+    let mut ui_state = ClientUi::default();
+    ui_state.last_manual_join_code = Some("MANUAL123".to_owned());
+    ui_state.saved_hosts = vec![
+        SavedHostProfile {
+            name: "Amigo 1".to_owned(),
+            address: "192.168.1.10".to_owned(),
+            room_code: Some("SALA1".to_owned()),
+        },
+        SavedHostProfile {
+            name: "Amigo 2".to_owned(),
+            address: "192.168.1.20".to_owned(),
+            room_code: None,
+        },
+    ];
+
+    // Começa em manual
+    ui_state.select_host(None);
+    assert_eq!(ui_state.join_code, "MANUAL123");
+
+    // Seleciona Amigo 1
+    ui_state.select_host(Some(0));
+    assert_eq!(ui_state.join_code, "SALA1");
+
+    // Altera o código do Amigo 1
+    ui_state.set_join_code("SALA1-NOVA");
+    assert_eq!(
+        ui_state.saved_hosts[0].room_code.as_deref(),
+        Some("SALA1-NOVA")
+    );
+
+    // Seleciona Amigo 2 (que não tem código salvo)
+    ui_state.select_host(Some(1));
+    assert_eq!(ui_state.join_code, "");
+
+    // Volta para manual
+    ui_state.select_host(None);
+    assert_eq!(ui_state.join_code, "MANUAL123");
+
+    // Altera código manual
+    ui_state.set_join_code("NOVO-MANUAL");
+    assert_eq!(
+        ui_state.last_manual_join_code.as_deref(),
+        Some("NOVO-MANUAL")
+    );
 }

@@ -12,6 +12,38 @@ pub(crate) struct HostAddress {
 }
 
 impl ClientUi {
+    pub(crate) fn select_host(&mut self, index: Option<usize>) {
+        self.selected_host_index = index;
+        self.join_code = if let Some(index) = self.selected_host_index {
+            self.saved_hosts
+                .get(index)
+                .and_then(|p| p.room_code.clone())
+                .unwrap_or_default()
+        } else {
+            self.last_manual_join_code.clone().unwrap_or_default()
+        };
+    }
+
+    pub(crate) fn set_join_code(&mut self, code: &str) {
+        let sanitized = sanitize_room_code(code);
+        self.join_code = sanitized.clone();
+        if let Some(index) = self.selected_host_index {
+            if let Some(profile) = self.saved_hosts.get_mut(index) {
+                profile.room_code = if sanitized.is_empty() {
+                    None
+                } else {
+                    Some(sanitized)
+                };
+            }
+        } else {
+            self.last_manual_join_code = if sanitized.is_empty() {
+                None
+            } else {
+                Some(sanitized)
+            };
+        }
+    }
+
     pub(crate) fn join_address(&self) -> &str {
         self.selected_host_index
             .and_then(|index| self.saved_hosts.get(index))
@@ -246,11 +278,39 @@ pub(crate) fn signaling_ws_url(input: &str) -> Result<String, String> {
     Ok(format!("{scheme}://{host}:9000"))
 }
 
+pub(crate) fn sanitize_room_code(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+pub(crate) fn is_valid_room_code(input: &str) -> bool {
+    let trimmed = input.trim();
+    (4..=32).contains(&trimmed.len())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+pub(crate) fn generate_random_room_code() -> String {
+    format!("{:012X}", rand::random::<u64>() & ((1_u64 << (12 * 4)) - 1))
+}
+
 pub(crate) fn validate_saved_host_profile(profile: &SavedHostProfile) -> Result<(), String> {
     validate_host_name(&profile.name)?;
     let address = profile.address.trim();
     if address.len() > 512 {
         return Err("O endereço excede 512 caracteres.".to_owned());
+    }
+    if let Some(code) = &profile.room_code {
+        let trimmed = code.trim();
+        if !trimmed.is_empty() && !is_valid_room_code(trimmed) {
+            return Err(
+                "O código da sala deve ter entre 4 e 32 caracteres alfanuméricos.".to_owned(),
+            );
+        }
     }
     signaling_ws_url(address).map(|_| ())
 }
@@ -269,6 +329,7 @@ pub(crate) fn validate_new_host_profile(
     validate_saved_host_profile(&SavedHostProfile {
         name: name.trim().to_owned(),
         address: address.trim().to_owned(),
+        room_code: None,
     })
 }
 
@@ -375,8 +436,25 @@ mod tests {
             validate_saved_host_profile(&SavedHostProfile {
                 name: "Friend".to_owned(),
                 address: "ws://friend.example.net:9000".to_owned(),
+                room_code: None,
             })
             .is_ok()
+        );
+        assert!(
+            validate_saved_host_profile(&SavedHostProfile {
+                name: "Friend".to_owned(),
+                address: "ws://friend.example.net:9000".to_owned(),
+                room_code: Some("VALID-CODE".to_owned()),
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_saved_host_profile(&SavedHostProfile {
+                name: "Friend".to_owned(),
+                address: "ws://friend.example.net:9000".to_owned(),
+                room_code: Some("BAD CODE WITH SPACES".to_owned()),
+            })
+            .is_err()
         );
     }
 
@@ -388,6 +466,7 @@ mod tests {
         ui.saved_hosts = vec![SavedHostProfile {
             name: "Friend".to_owned(),
             address: "friend.example.net".to_owned(),
+            room_code: None,
         }];
         ui.selected_host_index = Some(0);
 

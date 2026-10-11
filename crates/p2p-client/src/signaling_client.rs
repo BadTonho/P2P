@@ -101,12 +101,14 @@ impl SignalingClient {
     pub fn start_host_with_participant(
         participant: ParticipantInfo,
         room_mode: RoomMode,
+        fixed_code: Option<String>,
     ) -> Result<Self, String> {
         Self::start_worker(
             LOCAL_CLIENT_URL.to_owned(),
             ClientMessage::CreateRoomIdentified {
                 participant: participant.clone(),
                 room_mode,
+                fixed_code,
             },
             Some(None),
             LOCAL_SERVER_ADDRESS.to_owned(),
