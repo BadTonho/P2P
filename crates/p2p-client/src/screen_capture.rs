@@ -683,11 +683,23 @@ impl ScreenCapture {
     }
 }
 
+/// Tempo máximo que a interface espera a thread de captura DXGI encerrar.
+const DXGI_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+
 fn join_dxgi_worker(worker: &mut DxgiCaptureWorker) -> Result<(), String> {
     worker.stop.store(true, Ordering::Relaxed);
     let Some(thread) = worker.thread.take() else {
         return Ok(());
     };
+    let deadline = Instant::now() + DXGI_JOIN_TIMEOUT;
+    while !thread.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !thread.is_finished() {
+        // Não bloqueia a interface se o driver gráfico travar a thread de captura.
+        tracing::warn!("A captura DXGI não encerrou em 3 s; liberando a interface sem aguardar");
+        return Err("A captura DXGI demorou para encerrar e continua em segundo plano.".to_owned());
+    }
     thread
         .join()
         .map_err(|_| "A thread de captura DXGI foi encerrada inesperadamente.".to_owned())?

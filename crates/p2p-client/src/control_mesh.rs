@@ -15,6 +15,11 @@ use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::{WebSocketStream, accept_async, connect_async};
 
 const CONTROL_LISTEN_ADDRESS: &str = "0.0.0.0:9001";
+const MESH_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+const LISTENER_BIND_ATTEMPTS: u32 = 15;
+const LISTENER_BIND_RETRY_DELAY: Duration = Duration::from_millis(200);
+const ROSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+const ROSTER_WAIT_POLL: Duration = Duration::from_millis(100);
 const PROBE_PERIOD: Duration = Duration::from_secs(1);
 const PROBE_WINDOW: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -83,7 +88,7 @@ enum Command {
 pub struct ControlMesh {
     commands: mpsc::UnboundedSender<Command>,
     events: std_mpsc::Receiver<ControlEvent>,
-    _worker: JoinHandle<()>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl ControlMesh {
@@ -144,7 +149,7 @@ impl ControlMesh {
         Ok(Self {
             commands: command_tx,
             events: event_rx,
-            _worker: worker,
+            worker: Some(worker),
         })
     }
 
@@ -187,6 +192,19 @@ impl ControlMesh {
 impl Drop for ControlMesh {
     fn drop(&mut self) {
         let _ = self.commands.send(Command::Stop);
+        // Espera (com limite) a thread encerrar para que a porta 9001 seja liberada antes
+        // de uma nova malha tentar abrir o listener (evita o erro 10048).
+        if let Some(worker) = self.worker.take() {
+            let deadline = Instant::now() + MESH_SHUTDOWN_WAIT;
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                tracing::warn!("A malha de controle não encerrou a tempo; seguindo sem aguardar");
+            }
+        }
     }
 }
 
@@ -350,7 +368,7 @@ async fn run_mesh(
     events: std_mpsc::Sender<ControlEvent>,
 ) {
     tracing::info!(listen_address = %listen_address, "Iniciando malha direta de controle");
-    let listener = match TcpListener::bind(listen_address).await {
+    let listener = match bind_listener_with_retry(&listen_address).await {
         Ok(listener) => listener,
         Err(error) => {
             tracing::error!(error = %error, "Falha ao abrir o listener TCP da malha de controle");
@@ -482,6 +500,58 @@ async fn run_mesh(
             }
         }
     }
+}
+
+/// Tenta abrir o listener algumas vezes: logo após sair de uma sala o socket anterior pode
+/// levar alguns instantes para ser liberado pelo sistema.
+async fn bind_listener_with_retry(listen_address: &str) -> std::io::Result<TcpListener> {
+    let mut attempt = 1;
+    loop {
+        match TcpListener::bind(listen_address).await {
+            Ok(listener) => return Ok(listener),
+            Err(error)
+                if attempt < LISTENER_BIND_ATTEMPTS
+                    && error.kind() == std::io::ErrorKind::AddrInUse =>
+            {
+                tracing::debug!(
+                    attempt,
+                    "Porta de controle ainda em uso; tentando novamente"
+                );
+                attempt += 1;
+                tokio::time::sleep(LISTENER_BIND_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Procura o participante no roster, aguardando um curto período: a conexão TCP direta pode
+/// chegar milissegundos antes de a lista de participantes chegar pela sinalização.
+async fn find_roster_participant(state: &SharedState, id: &str) -> Option<ParticipantInfo> {
+    let deadline = Instant::now() + ROSTER_WAIT_TIMEOUT;
+    loop {
+        {
+            let state = state.lock().await;
+            if let Some(found) = state.roster.iter().find(|participant| participant.id == id) {
+                return Some(found.clone());
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(ROSTER_WAIT_POLL).await;
+    }
+}
+
+/// Devolve `(esperado, recebido)` quando o IP da conexão recebida difere do IP anunciado no
+/// roster. Loopback e endereços não interpretáveis nunca contam como divergência.
+fn ip_mismatch(
+    peer_ip: Option<std::net::IpAddr>,
+    control_address: &str,
+) -> Option<(std::net::IpAddr, std::net::IpAddr)> {
+    let incoming_ip = peer_ip?;
+    let expected_ip = parse_ip_from_address(control_address)?;
+    (!incoming_ip.is_loopback() && incoming_ip != expected_ip).then_some((expected_ip, incoming_ip))
 }
 
 fn parse_ip_from_address(addr: &str) -> Option<std::net::IpAddr> {
@@ -626,30 +696,36 @@ where
         may_host = claimed_remote.may_host,
         "Participante identificado na malha de controle"
     );
-    let remote = {
-        let state = state.lock().await;
-        state
-            .roster
-            .iter()
-            .find(|participant| participant.id == claimed_remote.id)
-            .cloned()
-            .ok_or_else(|| "o participante não pertence à lista desta sala".to_owned())?
-    };
+    let remote = find_roster_participant(&state, &claimed_remote.id)
+        .await
+        .ok_or_else(|| "o participante não pertence à lista desta sala".to_owned())?;
     if remote.id == local.id {
         return Err("tentativa de conexão com o próprio aplicativo".to_owned());
     }
-    if let (Some(incoming_ip), Some(expected_ip)) =
-        (peer_ip, parse_ip_from_address(&remote.control_address))
-        && !incoming_ip.is_loopback()
-        && incoming_ip != expected_ip
-    {
-        tracing::warn!(
-            expected = %expected_ip,
-            actual = %incoming_ip,
-            remote_id = %remote.id,
-            "Conexão de controle rejeitada: IP de conexão inconsistente com o roster"
-        );
-        return Err("endereço de controle inconsistente com o endereço IP de conexão".to_owned());
+    // Com chave pública publicada no roster e identidade local, o desafio Ed25519 abaixo
+    // comprova o par; o IP pode legitimamente diferir (ex.: Radmin VPN anunciado, mas o
+    // Windows roteia pela rede local/Wi-Fi), então a checagem de IP só vale sem chave.
+    let authenticated_by_key =
+        identity.is_some() && local_nonce.is_some() && remote.public_key.is_some();
+    if let Some((expected_ip, incoming_ip)) = ip_mismatch(peer_ip, &remote.control_address) {
+        if authenticated_by_key {
+            tracing::debug!(
+                expected = %expected_ip,
+                actual = %incoming_ip,
+                remote_id = %remote.id,
+                "IP de conexão difere do roster; par será validado pela assinatura"
+            );
+        } else {
+            tracing::warn!(
+                expected = %expected_ip,
+                actual = %incoming_ip,
+                remote_id = %remote.id,
+                "Conexão de controle rejeitada: IP de conexão inconsistente com o roster"
+            );
+            return Err(
+                "endereço de controle inconsistente com o endereço IP de conexão".to_owned(),
+            );
+        }
     }
 
     if let (Some(identity), Some(local_nonce)) = (&identity, &local_nonce) {
@@ -1638,7 +1714,7 @@ mod tests {
         CONTROL_LINK_STARTUP_GRACE, ControlEvent, ControlMesh, EMPTY_ELECTION_RETRY_INTERVAL,
         Election, HOST_TIMEOUT, MeshState, Metrics, PeerLink, PeerStats, Probe, QueueEntry,
         compare_queue_entries, control_link_timeout_elapsed, fail_current_candidate,
-        initiate_election, own_worst_metrics, parse_ip_from_address,
+        initiate_election, ip_mismatch, own_worst_metrics, parse_ip_from_address,
     };
     use crate::mesh_identity::MeshIdentity;
     use signaling_protocol::ParticipantInfo;
@@ -2271,5 +2347,97 @@ mod tests {
         );
         assert_eq!(parse_ip_from_address("invalid-host"), None);
         assert_eq!(parse_ip_from_address(""), None);
+    }
+
+    #[test]
+    fn ip_mismatch_reports_radmin_versus_lan_but_ignores_loopback_and_unknowns() {
+        let radmin_roster = "26.47.216.51:9001";
+        let lan_peer = Some("192.168.1.201".parse().unwrap());
+        assert_eq!(
+            ip_mismatch(lan_peer, radmin_roster),
+            Some((
+                "26.47.216.51".parse().unwrap(),
+                "192.168.1.201".parse().unwrap()
+            ))
+        );
+        assert_eq!(
+            ip_mismatch(Some("26.47.216.51".parse().unwrap()), radmin_roster),
+            None
+        );
+        assert_eq!(
+            ip_mismatch(Some("127.0.0.1".parse().unwrap()), radmin_roster),
+            None
+        );
+        assert_eq!(ip_mismatch(None, radmin_roster), None);
+        assert_eq!(ip_mismatch(lan_peer, "ddns.exemplo.com:9001"), None);
+    }
+
+    #[test]
+    fn roster_lookup_waits_for_a_participant_that_arrives_slightly_late() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let state = Arc::new(Mutex::new(test_state(participant("local", 3, true), false)));
+            let late_state = state.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                late_state
+                    .lock()
+                    .await
+                    .roster
+                    .push(participant("late", 4, true));
+            });
+            let found = super::find_roster_participant(&state, "late").await;
+            assert_eq!(found.map(|found| found.id), Some("late".to_owned()));
+            assert!(
+                super::find_roster_participant(&state, "ghost")
+                    .await
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn dropping_a_mesh_releases_its_port_for_the_next_room() {
+        let _lock = mesh_lock();
+        let address = free_local_address();
+        let local = participant("host", 1, false);
+        let first = ControlMesh::start_on(
+            local.clone(),
+            "SAMECODE".to_owned(),
+            local.id.clone(),
+            "ws://127.0.0.1:9000".to_owned(),
+            address.clone(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            receive_until(&first.events, Duration::from_secs(3), |event| matches!(
+                event,
+                ControlEvent::Ready
+            ))
+            .is_some()
+        );
+        drop(first);
+
+        let second = ControlMesh::start_on(
+            local.clone(),
+            "OTHERCODE".to_owned(),
+            local.id.clone(),
+            "ws://127.0.0.1:9000".to_owned(),
+            address,
+            None,
+        )
+        .unwrap();
+        assert!(
+            receive_until(&second.events, Duration::from_secs(3), |event| matches!(
+                event,
+                ControlEvent::Ready
+            ))
+            .is_some(),
+            "a nova malha deve abrir a mesma porta logo após a anterior ser descartada"
+        );
     }
 }

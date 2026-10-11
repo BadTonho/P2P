@@ -423,6 +423,9 @@ impl ScreenShareSession {
                     worker_audio_playback_factory,
                     worker_remote_audio_volume,
                 ));
+                // Soltar o runtime esperaria sem limite as tarefas bloqueantes (codificador);
+                // limita a espera para não travar a interface ao parar o compartilhamento.
+                runtime.shutdown_timeout(Duration::from_secs(2));
             })
             .map_err(|error| format!("Não foi possível iniciar a sessão de tela: {error}"))?;
 

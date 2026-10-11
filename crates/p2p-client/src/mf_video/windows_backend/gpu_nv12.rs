@@ -110,6 +110,15 @@ impl GpuNv12Processor {
         output_width: u32,
         output_height: u32,
     ) -> Result<Self, String> {
+        // O dispositivo é usado pela thread de captura, pela leitura da prévia e pelo
+        // codificador Media Foundation; o contexto imediato precisa ser protegido.
+        if let Ok(multithread) =
+            device.cast::<windows::Win32::Graphics::Direct3D11::ID3D11Multithread>()
+        {
+            unsafe {
+                let _ = multithread.SetMultithreadProtected(true);
+            }
+        }
         let video_device: ID3D11VideoDevice = device.cast().map_err(|error| {
             format!("O dispositivo DXGI não oferece conversão D3D11 de vídeo: {error}")
         })?;
