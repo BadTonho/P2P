@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -7,8 +8,8 @@ use rtrb::{Consumer, Producer, RingBuffer};
 
 #[cfg(windows)]
 use super::process_loopback::{
-    InitialCaptureRoute, ProcessLoopbackCapture, find_process_id, initial_capture_route,
-    process_loopback_supported, should_switch_to_process_tree,
+    ProcessLoopbackCapture, active_audio_sessions, exclusion_target_mode, inclusion_target_mode,
+    paths_match, process_loopback_supported,
 };
 use super::{
     AudioPlaybackFactory, AudioPlaybackSink, AudioSampleSource, RemoteAudioVolume,
@@ -22,20 +23,40 @@ pub(super) const CAPTURE_QUEUE_MILLIS: usize = 250;
 const PLAYBACK_QUEUE_MILLIS: usize = 250;
 const PLAYBACK_PRIME_MILLIS: usize = 40;
 
-pub(crate) struct SystemAudioCapture {
-    stream: Option<cpal::Stream>,
-    #[cfg(windows)]
-    process_capture: Option<ProcessLoopbackCapture>,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AudioExclusionConfig {
+    pub(crate) exclude_self_audio: bool,
+    pub(crate) excluded_applications: Vec<String>,
+}
+
+impl AudioExclusionConfig {
+    pub(crate) fn new(exclude_self_audio: bool, excluded_applications: Vec<String>) -> Self {
+        Self {
+            exclude_self_audio,
+            excluded_applications,
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ActiveLoopbackStream {
+    process_id: u32,
+    _capture: ProcessLoopbackCapture,
     consumer: Consumer<f32>,
+}
+
+pub(crate) struct SystemAudioCapture {
+    _stream: Option<cpal::Stream>,
+    #[cfg(windows)]
+    _process_capture: Option<ProcessLoopbackCapture>,
+    consumer: Option<Consumer<f32>>,
+    #[cfg(windows)]
+    multi_streams: Vec<ActiveLoopbackStream>,
+    #[cfg(windows)]
+    desired_pids_receiver: Option<mpsc::Receiver<Vec<u32>>>,
     input_rate: u32,
     input_channels: usize,
     diagnostics: Arc<CaptureDiagnostics>,
-    #[cfg(windows)]
-    excluded_application_path: Option<String>,
-    #[cfg(windows)]
-    excluded_process_id: Option<u32>,
-    #[cfg(windows)]
-    detected_process_id: Option<Arc<AtomicU32>>,
     #[cfg(windows)]
     scanner_stop: Option<Arc<AtomicBool>>,
 }
@@ -82,48 +103,81 @@ fn classify_capture_error(kind: cpal::ErrorKind) -> Option<RecoverableCaptureErr
 }
 
 impl SystemAudioCapture {
-    pub(crate) fn start(
-        session_id: u64,
-        excluded_application_path: Option<String>,
-    ) -> Result<Self, String> {
+    pub(crate) fn start(session_id: u64, config: AudioExclusionConfig) -> Result<Self, String> {
         #[cfg(not(windows))]
-        if excluded_application_path.is_some() {
+        if config.exclude_self_audio || !config.excluded_applications.is_empty() {
             return Err("A exclusão de aplicativos no áudio está disponível somente no Windows compatível. O vídeo continuará, mas o áudio não será enviado.".to_owned());
         }
-        #[cfg(windows)]
-        let process_loopback_is_supported = if excluded_application_path.is_some() {
-            process_loopback_supported()?
-        } else {
-            true
-        };
-        #[cfg(windows)]
-        if matches!(
-            initial_capture_route(
-                excluded_application_path.is_some(),
-                process_loopback_is_supported,
-                None
-            ),
-            InitialCaptureRoute::BlockUnsupported
-        ) {
-            return Err("A exclusão de aplicativos do áudio exige Windows build 20348 ou posterior. O vídeo continuará, mas o áudio não será enviado.".to_owned());
-        }
+
         let capture_diagnostics = Arc::new(CaptureDiagnostics::default());
+
         #[cfg(windows)]
-        let excluded_process_id = match excluded_application_path.as_deref() {
-            Some(path) => find_process_id(path)?,
-            None => None,
-        };
-        #[cfg(windows)]
-        let (detected_process_id, scanner_stop) =
-            if let Some(path) = excluded_application_path.as_ref() {
-                let detected_pid = Arc::new(AtomicU32::new(excluded_process_id.unwrap_or(0)));
+        {
+            let loopback_supported = process_loopback_supported().unwrap_or(false);
+
+            // Case 1: Multiple external applications excluded (or external app + self exclusion)
+            if !config.excluded_applications.is_empty() {
+                if !loopback_supported {
+                    return Err("A exclusão de aplicativos do áudio exige Windows build 20348 ou posterior. O vídeo continuará, mas o áudio não será enviado.".to_owned());
+                }
+
+                let (desired_tx, desired_rx) = mpsc::channel();
                 let stop_scanner = Arc::new(AtomicBool::new(false));
-                let path_clone = path.clone();
-                let detected_clone = Arc::clone(&detected_pid);
                 let stop_clone = Arc::clone(&stop_scanner);
+                let my_pid = std::process::id();
+
+                let filter_pids = {
+                    let config_clone = config.clone();
+                    move |sessions: Vec<(u32, String)>| -> Vec<u32> {
+                        sessions
+                            .into_iter()
+                            .filter(|(pid, path)| {
+                                if config_clone.exclude_self_audio && *pid == my_pid {
+                                    return false;
+                                }
+                                if config_clone
+                                    .excluded_applications
+                                    .iter()
+                                    .any(|excluded| paths_match(excluded, path))
+                                {
+                                    return false;
+                                }
+                                true
+                            })
+                            .map(|(pid, _)| pid)
+                            .collect()
+                    }
+                };
+
+                let initial_sessions = active_audio_sessions().unwrap_or_default();
+                let initial_pids = filter_pids(initial_sessions);
+                let _ = desired_tx.send(initial_pids);
+
+                let filter_for_thread = {
+                    let config_clone = config.clone();
+                    move |sessions: Vec<(u32, String)>| -> Vec<u32> {
+                        sessions
+                            .into_iter()
+                            .filter(|(pid, path)| {
+                                if config_clone.exclude_self_audio && *pid == my_pid {
+                                    return false;
+                                }
+                                if config_clone
+                                    .excluded_applications
+                                    .iter()
+                                    .any(|excluded| paths_match(excluded, path))
+                                {
+                                    return false;
+                                }
+                                true
+                            })
+                            .map(|(pid, _)| pid)
+                            .collect()
+                    }
+                };
 
                 std::thread::Builder::new()
-                    .name("p2p-process-scan".into())
+                    .name("p2p-audio-scan".into())
                     .spawn(move || {
                         while !stop_clone.load(Ordering::Relaxed) {
                             for _ in 0..10 {
@@ -132,60 +186,79 @@ impl SystemAudioCapture {
                                 }
                                 std::thread::sleep(Duration::from_millis(50));
                             }
-                            match find_process_id(&path_clone) {
-                                Ok(Some(pid)) => {
-                                    detected_clone.store(pid, Ordering::Relaxed);
+                            if let Ok(sessions) = active_audio_sessions() {
+                                let pids = filter_for_thread(sessions);
+                                if desired_tx.send(pids).is_err() {
+                                    break;
                                 }
-                                Ok(None) => {
-                                    detected_clone.store(0, Ordering::Relaxed);
-                                }
-                                Err(_) => {}
                             }
                         }
                     })
                     .ok();
-                (Some(detected_pid), Some(stop_scanner))
-            } else {
-                (None, None)
-            };
 
-        #[cfg(windows)]
-        let initial_route = initial_capture_route(
-            excluded_application_path.is_some(),
-            process_loopback_is_supported,
-            excluded_process_id,
-        );
+                let mut capture = Self {
+                    _stream: None,
+                    _process_capture: None,
+                    consumer: None,
+                    multi_streams: Vec::new(),
+                    desired_pids_receiver: Some(desired_rx),
+                    input_rate: OPUS_SAMPLE_RATE,
+                    input_channels: OPUS_CHANNELS,
+                    diagnostics: capture_diagnostics,
+                    scanner_stop: Some(stop_scanner),
+                };
+                capture.update_multi_streams();
+                tracing::info!(
+                    screen_share_session = session_id,
+                    audio_capture = "WASAPI multi-session inclusion loopback",
+                    excluded_apps_count = config.excluded_applications.len(),
+                    exclude_self = config.exclude_self_audio,
+                    "Captura seletiva de áudio com múltiplas exclusões iniciada"
+                );
+                return Ok(capture);
+            }
 
-        #[cfg(windows)]
-        if let InitialCaptureRoute::ExcludeProcessTree(process_id) = initial_route {
-            let queue_capacity =
-                (OPUS_SAMPLE_RATE as usize * OPUS_CHANNELS * CAPTURE_QUEUE_MILLIS / 1000).max(2);
-            let (producer, consumer) = RingBuffer::<f32>::new(queue_capacity);
-            let process_capture = ProcessLoopbackCapture::start(
-                process_id,
-                producer,
-                Arc::clone(&capture_diagnostics),
-            )?;
-            tracing::info!(
-                screen_share_session = session_id,
-                audio_capture = "WASAPI process loopback",
-                excluded_process_tree = true,
-                "Captura seletiva de áudio iniciada"
-            );
-            return Ok(Self {
-                stream: None,
-                process_capture: Some(process_capture),
-                consumer,
-                input_rate: OPUS_SAMPLE_RATE,
-                input_channels: OPUS_CHANNELS,
-                diagnostics: capture_diagnostics,
-                excluded_application_path,
-                excluded_process_id: Some(process_id),
-                detected_process_id,
-                scanner_stop,
-            });
+            // Case 2: Only self-audio exclusion (default mode)
+            if config.exclude_self_audio {
+                if loopback_supported {
+                    let queue_capacity =
+                        (OPUS_SAMPLE_RATE as usize * OPUS_CHANNELS * CAPTURE_QUEUE_MILLIS / 1000)
+                            .max(2);
+                    let (producer, consumer) = RingBuffer::<f32>::new(queue_capacity);
+                    let my_pid = std::process::id();
+                    let process_capture = ProcessLoopbackCapture::start_with_mode(
+                        my_pid,
+                        exclusion_target_mode(),
+                        producer,
+                        Arc::clone(&capture_diagnostics),
+                    )?;
+                    tracing::info!(
+                        screen_share_session = session_id,
+                        audio_capture = "WASAPI process loopback",
+                        excluded_self_process = my_pid,
+                        "Captura do áudio do computador iniciada com exclusão nativa do aplicativo (sem eco)"
+                    );
+                    return Ok(Self {
+                        _stream: None,
+                        _process_capture: Some(process_capture),
+                        consumer: Some(consumer),
+                        multi_streams: Vec::new(),
+                        desired_pids_receiver: None,
+                        input_rate: OPUS_SAMPLE_RATE,
+                        input_channels: OPUS_CHANNELS,
+                        diagnostics: capture_diagnostics,
+                        scanner_stop: None,
+                    });
+                } else {
+                    tracing::warn!(
+                        screen_share_session = session_id,
+                        "Windows build não suporta exclusão de áudio por processo; usando captura completa padrão"
+                    );
+                }
+            }
         }
 
+        // Case 3 (or fallback): standard full desktop loopback via CPAL
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| {
             "O Windows não disponibilizou uma saída de áudio padrão para capturar o som do computador.".to_owned()
@@ -316,48 +389,74 @@ impl SystemAudioCapture {
             "Captura do áudio reproduzido pelo computador iniciada"
         );
 
-        let capture = Self {
-            stream: Some(stream),
+        Ok(Self {
+            _stream: Some(stream),
             #[cfg(windows)]
-            process_capture: None,
-            consumer,
+            _process_capture: None,
+            consumer: Some(consumer),
+            #[cfg(windows)]
+            multi_streams: Vec::new(),
+            #[cfg(windows)]
+            desired_pids_receiver: None,
             input_rate,
             input_channels,
             diagnostics: capture_diagnostics,
             #[cfg(windows)]
-            excluded_application_path,
-            #[cfg(windows)]
-            excluded_process_id: None,
-            #[cfg(windows)]
-            detected_process_id,
-            #[cfg(windows)]
-            scanner_stop,
-        };
-        #[cfg(windows)]
-        if capture.excluded_application_path.is_some() {
-            tracing::info!(
-                screen_share_session = session_id,
-                audio_capture = "WASAPI loopback via CPAL; selected process not running",
-                "A captura completa do áudio será usada até o aplicativo selecionado iniciar"
-            );
-        }
-        Ok(capture)
+            scanner_stop: None,
+        })
     }
 
     pub(crate) fn read_samples(&mut self, output: &mut [f32]) -> usize {
-        #[cfg(windows)]
-        self.update_excluded_process();
-        let mut read = 0;
-        while read < output.len() {
-            match self.consumer.pop() {
-                Ok(sample) => {
-                    output[read] = sample;
-                    read += 1;
+        if let Some(consumer) = self.consumer.as_mut() {
+            let mut read = 0;
+            while read < output.len() {
+                match consumer.pop() {
+                    Ok(sample) => {
+                        output[read] = sample;
+                        read += 1;
+                    }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
+            return read;
         }
-        read
+
+        #[cfg(windows)]
+        {
+            self.update_multi_streams();
+            if self.multi_streams.is_empty() {
+                return 0;
+            }
+            let max_available = self
+                .multi_streams
+                .iter()
+                .map(|s| s.consumer.slots())
+                .max()
+                .unwrap_or(0)
+                .min(output.len());
+
+            if max_available == 0 {
+                return 0;
+            }
+
+            output[..max_available].fill(0.0);
+            for stream in &mut self.multi_streams {
+                let available = stream.consumer.slots().min(max_available);
+                for slot in output[..available].iter_mut() {
+                    if let Ok(sample) = stream.consumer.pop() {
+                        *slot += sample;
+                    }
+                }
+            }
+
+            for sample in &mut output[..max_available] {
+                *sample = sample.clamp(-1.0, 1.0);
+            }
+
+            max_available
+        }
+        #[cfg(not(windows))]
+        0
     }
 
     pub(crate) fn captured_frames(&self) -> u64 {
@@ -405,43 +504,53 @@ impl SystemAudioCapture {
     }
 
     #[cfg(windows)]
-    fn update_excluded_process(&mut self) {
-        let Some(detected) = self.detected_process_id.as_ref() else {
+    fn update_multi_streams(&mut self) {
+        let Some(rx) = self.desired_pids_receiver.as_ref() else {
             return;
         };
-        let process_id = detected.load(Ordering::Relaxed);
-        if process_id == 0 {
-            return;
+        let mut latest_desired = None;
+        while let Ok(pids) = rx.try_recv() {
+            latest_desired = Some(pids);
         }
-        if !should_switch_to_process_tree(self.excluded_process_id, process_id) {
-            return;
-        }
-        if let Err(error) = self.switch_to_excluded_process(process_id) {
-            self.stream.take();
-            self.process_capture.take();
-            self.diagnostics.set_fatal_error(None, error);
-        }
-    }
+        if let Some(desired_pids) = latest_desired {
+            self.multi_streams
+                .retain(|s| desired_pids.contains(&s.process_id));
 
-    #[cfg(windows)]
-    fn switch_to_excluded_process(&mut self, process_id: u32) -> Result<(), String> {
-        let queue_capacity =
-            (OPUS_SAMPLE_RATE as usize * OPUS_CHANNELS * CAPTURE_QUEUE_MILLIS / 1000).max(2);
-        let (producer, consumer) = RingBuffer::<f32>::new(queue_capacity);
-        let process_capture =
-            ProcessLoopbackCapture::start(process_id, producer, Arc::clone(&self.diagnostics))?;
-        self.stream.take();
-        self.process_capture = Some(process_capture);
-        self.consumer = consumer;
-        self.input_rate = OPUS_SAMPLE_RATE;
-        self.input_channels = OPUS_CHANNELS;
-        self.excluded_process_id = Some(process_id);
-        tracing::info!(
-            audio_capture = "WASAPI process loopback",
-            excluded_process_tree = true,
-            "Exclusão seletiva de aplicativo aplicada à captura de áudio"
-        );
-        Ok(())
+            for &pid in &desired_pids {
+                if !self.multi_streams.iter().any(|s| s.process_id == pid) {
+                    let queue_capacity =
+                        (OPUS_SAMPLE_RATE as usize * OPUS_CHANNELS * CAPTURE_QUEUE_MILLIS / 1000)
+                            .max(2);
+                    let (producer, consumer) = RingBuffer::<f32>::new(queue_capacity);
+                    match ProcessLoopbackCapture::start_with_mode(
+                        pid,
+                        inclusion_target_mode(),
+                        producer,
+                        Arc::clone(&self.diagnostics),
+                    ) {
+                        Ok(capture) => {
+                            tracing::info!(
+                                process_id = pid,
+                                audio_capture = "WASAPI process loopback inclusion",
+                                "Iniciada captura de áudio para aplicativo permitido"
+                            );
+                            self.multi_streams.push(ActiveLoopbackStream {
+                                process_id: pid,
+                                _capture: capture,
+                                consumer,
+                            });
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                process_id = pid,
+                                error = %error,
+                                "Não foi possível abrir captura seletiva para aplicativo permitido"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1009,5 +1118,21 @@ mod tests {
             None
         );
         assert_eq!(classify_capture_error(cpal::ErrorKind::BackendError), None);
+    }
+
+    #[test]
+    fn audio_exclusion_config_behavior() {
+        use super::AudioExclusionConfig;
+
+        let default_config = AudioExclusionConfig::default();
+        assert!(!default_config.exclude_self_audio);
+        assert!(default_config.excluded_applications.is_empty());
+
+        let custom_config = AudioExclusionConfig::new(
+            true,
+            vec!["C:\\Games\\Game.exe".into(), "C:\\Apps\\Music.exe".into()],
+        );
+        assert!(custom_config.exclude_self_audio);
+        assert_eq!(custom_config.excluded_applications.len(), 2);
     }
 }

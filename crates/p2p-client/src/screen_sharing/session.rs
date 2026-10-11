@@ -179,7 +179,7 @@ enum Command {
         source: LatestFrame,
         bitrate_bps: u32,
         include_system_audio: bool,
-        audio_exclusion_path: Option<String>,
+        audio_exclusion_config: AudioExclusionConfig,
         audio_source_override: Option<Box<dyn AudioSampleSource>>,
     },
     Signal {
@@ -461,13 +461,13 @@ impl ScreenShareSession {
         &self,
         source: LatestFrame,
         include_system_audio: bool,
-        audio_exclusion_path: Option<String>,
+        audio_exclusion_config: AudioExclusionConfig,
     ) -> Result<(), String> {
         self.start_sending_with_options_and_exclusion(
             source,
             MAX_PEER_MEDIA_BITRATE,
             include_system_audio,
-            audio_exclusion_path,
+            audio_exclusion_config,
         )
     }
 
@@ -481,7 +481,7 @@ impl ScreenShareSession {
             source,
             bitrate_bps,
             include_system_audio,
-            None,
+            AudioExclusionConfig::default(),
         )
     }
 
@@ -490,14 +490,14 @@ impl ScreenShareSession {
         source: LatestFrame,
         bitrate_bps: u32,
         include_system_audio: bool,
-        audio_exclusion_path: Option<String>,
+        audio_exclusion_config: AudioExclusionConfig,
     ) -> Result<(), String> {
         self.commands
             .send(Command::StartSending {
                 source,
                 bitrate_bps: bitrate_bps.clamp(250_000, MAX_PEER_MEDIA_BITRATE),
                 include_system_audio,
-                audio_exclusion_path,
+                audio_exclusion_config,
                 audio_source_override: None,
             })
             .map_err(|_| "A sessão WebRTC foi encerrada.".to_owned())
@@ -514,7 +514,7 @@ impl ScreenShareSession {
                 source,
                 bitrate_bps: MAX_PEER_MEDIA_BITRATE,
                 include_system_audio: false,
-                audio_exclusion_path: None,
+                audio_exclusion_config: AudioExclusionConfig::default(),
                 audio_source_override: Some(audio_source),
             })
             .map_err(|_| "A sessão WebRTC foi encerrada.".to_owned())
@@ -1002,7 +1002,7 @@ async fn run_session(
             command = commands.recv() => {
                 let Some(command) = command else { break };
         match command {
-            Command::StartSending { source, bitrate_bps, include_system_audio, audio_exclusion_path, audio_source_override } => {
+            Command::StartSending { source, bitrate_bps, include_system_audio, audio_exclusion_config, audio_source_override } => {
                 if active_peer.is_some() {
                     let _ = events.send(ScreenShareEvent::Error(
                         "Já existe uma sessão de compartilhamento ativa.".to_owned(),
@@ -1023,7 +1023,7 @@ async fn run_session(
                     decoder_preference,
                     bitrate_bps,
                     include_system_audio,
-                    audio_exclusion_path,
+                    audio_exclusion_config,
                     audio_source_override,
                     Arc::clone(&audio_playback_factory),
                     remote_audio_volume.clone(),
@@ -1558,7 +1558,7 @@ async fn create_sender(
     decoder_preference: VideoDecoderPreference,
     bitrate_bps: u32,
     include_system_audio: bool,
-    audio_exclusion_path: Option<String>,
+    audio_exclusion_config: AudioExclusionConfig,
     audio_source_override: Option<Box<dyn AudioSampleSource>>,
     audio_playback_factory: Arc<dyn AudioPlaybackFactory>,
     remote_audio_volume: RemoteAudioVolume,
@@ -1571,7 +1571,7 @@ async fn create_sender(
                 Some(capture) => capture,
                 None => Box::new(SystemAudioCapture::start(
                     metrics.session_id,
-                    audio_exclusion_path,
+                    audio_exclusion_config,
                 )?),
             };
             let (input_rate_hz, input_channels) = capture.input_format();

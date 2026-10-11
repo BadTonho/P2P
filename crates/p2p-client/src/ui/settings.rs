@@ -453,61 +453,114 @@ impl ClientUi {
         ui.group(|ui| {
             ui.heading("Som da tela compartilhada");
             ui.label("Na barra da sala, marque ‘Incluir som do computador’ antes de compartilhar para transmitir o áudio reproduzido no Windows.");
-            ui.small("A opção fica desligada por padrão. Ela captura a saída padrão do computador, não o microfone; a faixa Opus segue diretamente aos participantes que assistem à tela.");
+            ui.small("A opção fica desligada por padrão. Ela captura o áudio do computador, não o microfone; a faixa Opus segue diretamente aos participantes que assistem à tela.");
             ui.separator();
-            ui.label("Não compartilhar o áudio de:");
-            let mut selected_path = self
-                .excluded_audio_application_path
-                .clone()
-                .unwrap_or_default();
-            let selected_label = if selected_path.is_empty() {
-                "Nenhum".to_owned()
-            } else {
-                self.available_audio_applications
-                    .iter()
-                    .find(|app| app.executable_path.eq_ignore_ascii_case(&selected_path))
-                    .map(|app| app.display_name.clone())
-                    .unwrap_or_else(|| {
-                        std::path::Path::new(&selected_path)
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("Aplicativo salvo")
-                            .to_owned()
-                    })
-            };
-            egui::ComboBox::from_id_salt("excluded-audio-application")
-                .selected_text(selected_label)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut selected_path, String::new(), "Nenhum");
-                    for app in &self.available_audio_applications {
-                        ui.selectable_value(
-                            &mut selected_path,
-                            app.executable_path.clone(),
-                            &app.display_name,
-                        );
-                    }
-                });
-            if selected_path.is_empty() {
-                if self.excluded_audio_application_path.take().is_some() {
-                    self.save_preferences();
-                }
-            } else if self.excluded_audio_application_path.as_deref() != Some(selected_path.as_str()) {
-                self.excluded_audio_application_path = Some(selected_path);
+
+            let mut exclude_self = self.exclude_self_audio;
+            if ui
+                .checkbox(
+                    &mut exclude_self,
+                    "Ignorar áudio do próprio aplicativo (evita eco ao transmitir e assistir)",
+                )
+                .changed()
+            {
+                self.exclude_self_audio = exclude_self;
                 self.save_preferences();
             }
+            ui.small("Ativado por padrão para impedir retorno de áudio em loop quando você e outros participantes transmitem e assistem simultaneamente.");
+
+            ui.separator();
+            ui.label("Não compartilhar o áudio de aplicativos específicos:");
+
+            if self.available_audio_applications.is_empty() {
+                ui.small("Nenhum outro aplicativo reproduzindo áudio detectado no momento.");
+            } else {
+                let mut toggled = None;
+                for app in &self.available_audio_applications {
+                    let is_excluded = self
+                        .excluded_audio_applications
+                        .iter()
+                        .any(|p| p.eq_ignore_ascii_case(&app.executable_path));
+                    let mut checked = is_excluded;
+                    if ui.checkbox(&mut checked, &app.display_name).changed() {
+                        toggled = Some((app.executable_path.clone(), checked));
+                    }
+                }
+                if let Some((path, checked)) = toggled {
+                    if checked {
+                        if !self
+                            .excluded_audio_applications
+                            .iter()
+                            .any(|p| p.eq_ignore_ascii_case(&path))
+                        {
+                            self.excluded_audio_applications.push(path);
+                        }
+                    } else {
+                        self.excluded_audio_applications
+                            .retain(|p| !p.eq_ignore_ascii_case(&path));
+                    }
+                    self.excluded_audio_application_path =
+                        self.excluded_audio_applications.first().cloned();
+                    self.save_preferences();
+                }
+            }
+
+            let not_running: Vec<String> = self
+                .excluded_audio_applications
+                .iter()
+                .filter(|saved| {
+                    !self
+                        .available_audio_applications
+                        .iter()
+                        .any(|app| app.executable_path.eq_ignore_ascii_case(saved))
+                })
+                .cloned()
+                .collect();
+
+            if !not_running.is_empty() {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Aplicativos selecionados que não estão em execução:").italics());
+                let mut remove_path = None;
+                for path in &not_running {
+                    ui.horizontal(|ui| {
+                        let name = std::path::Path::new(path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(path);
+                        ui.label(format!("• {name}"));
+                        if ui.small_button("Remover").clicked() {
+                            remove_path = Some(path.clone());
+                        }
+                    });
+                }
+                if let Some(removed) = remove_path {
+                    self.excluded_audio_applications
+                        .retain(|p| !p.eq_ignore_ascii_case(&removed));
+                    self.excluded_audio_application_path =
+                        self.excluded_audio_applications.first().cloned();
+                    self.save_preferences();
+                }
+            }
+
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Atualizar lista").clicked() {
+                if ui.button("Atualizar lista de aplicativos").clicked() {
                     self.refresh_audio_applications();
                 }
-                if self.available_audio_applications.is_empty() {
-                    ui.small("Abra um aplicativo que esteja reproduzindo áudio e atualize a lista.");
+                if !self.excluded_audio_applications.is_empty()
+                    && ui.button("Limpar exclusões").clicked()
+                {
+                    self.excluded_audio_applications.clear();
+                    self.excluded_audio_application_path = None;
+                    self.save_preferences();
                 }
             });
+
             if let Some(error) = &self.audio_applications_error {
                 Self::show_notice(ui, "Lista de aplicativos:", error);
             }
-            ui.small("O app selecionado e os processos filhos dele serão ignorados. A escolha é salva neste computador.");
-            ui.small("Se ele estiver fechado ao iniciar o áudio, o som completo será compartilhado até o app abrir. A exclusão exige Windows build 20348 ou posterior; sem suporte, o vídeo continua e o áudio não é enviado.");
+            ui.small("Os aplicativos marcados serão ignorados durante o compartilhamento. A escolha é salva neste computador.");
+            ui.small("A exclusão exige Windows build 20348 ou posterior; sem suporte, o vídeo continua e o áudio completo é enviado.");
             ui.small("Falhas de captura, codificação, envio, recepção e reprodução ficam registradas por sessão nos logs. Uma falha de áudio não encerra a transmissão de vídeo.");
         });
         ui.add_space(8.0);

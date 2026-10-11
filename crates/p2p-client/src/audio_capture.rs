@@ -8,8 +8,8 @@ mod system_audio;
 #[cfg(windows)]
 pub(crate) use process_loopback::{AudioApplication, available_audio_applications};
 pub(crate) use system_audio::{
-    OPUS_CHANNELS, OPUS_FRAME_SAMPLES_PER_CHANNEL, OPUS_SAMPLE_RATE, SystemAudioCapture,
-    SystemAudioPlaybackFactory,
+    AudioExclusionConfig, OPUS_CHANNELS, OPUS_FRAME_SAMPLES_PER_CHANNEL, OPUS_SAMPLE_RATE,
+    SystemAudioCapture, SystemAudioPlaybackFactory,
 };
 
 #[cfg(not(windows))]

@@ -161,8 +161,18 @@ impl Drop for ProcessLoopbackCapture {
 }
 
 impl ProcessLoopbackCapture {
+    #[allow(dead_code)]
     pub(crate) fn start(
         process_id: u32,
+        producer: Producer<f32>,
+        diagnostics: Arc<CaptureDiagnostics>,
+    ) -> Result<Self, String> {
+        Self::start_with_mode(process_id, exclusion_target_mode(), producer, diagnostics)
+    }
+
+    pub(crate) fn start_with_mode(
+        process_id: u32,
+        mode: windows::Win32::Media::Audio::PROCESS_LOOPBACK_MODE,
         producer: Producer<f32>,
         diagnostics: Arc<CaptureDiagnostics>,
     ) -> Result<Self, String> {
@@ -176,7 +186,14 @@ impl ProcessLoopbackCapture {
         let worker = thread::Builder::new()
             .name("p2p-process-audio-capture".to_owned())
             .spawn(move || {
-                let result = process_capture_loop(process_id, producer, diagnostics, worker_stop, &started_tx);
+                let result = process_capture_loop(
+                    process_id,
+                    mode,
+                    producer,
+                    diagnostics,
+                    worker_stop,
+                    &started_tx,
+                );
                 if let Err(error) = result {
                     // The callback does not carry user or process details.
                     tracing::error!(stage = "process_loopback", error = %error, "Captura seletiva de áudio parou");
@@ -210,6 +227,11 @@ pub(crate) fn available_audio_applications() -> Result<Vec<AudioApplication>, St
     run_com_task(enumerate_audio_applications)
 }
 
+pub(crate) fn active_audio_sessions() -> Result<Vec<(u32, String)>, String> {
+    run_com_task(enumerate_active_sessions)
+}
+
+#[allow(dead_code)]
 pub(crate) fn find_process_id(executable_path: &str) -> Result<Option<u32>, String> {
     find_process_id_by_path(executable_path)
 }
@@ -230,6 +252,7 @@ pub(crate) fn process_loopback_supported() -> Result<bool, String> {
     Ok(version.dwBuildNumber >= MIN_PROCESS_LOOPBACK_BUILD)
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InitialCaptureRoute {
     FullSystemAudio,
@@ -237,6 +260,7 @@ pub(super) enum InitialCaptureRoute {
     BlockUnsupported,
 }
 
+#[allow(dead_code)]
 pub(super) fn initial_capture_route(
     exclusion_configured: bool,
     supported: bool,
@@ -253,6 +277,7 @@ pub(super) fn initial_capture_route(
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn should_switch_to_process_tree(
     current_process_id: Option<u32>,
     found_process_id: u32,
@@ -260,8 +285,12 @@ pub(super) fn should_switch_to_process_tree(
     current_process_id != Some(found_process_id)
 }
 
-fn exclusion_target_mode() -> windows::Win32::Media::Audio::PROCESS_LOOPBACK_MODE {
+pub(crate) fn exclusion_target_mode() -> windows::Win32::Media::Audio::PROCESS_LOOPBACK_MODE {
     PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
+}
+
+pub(crate) fn inclusion_target_mode() -> windows::Win32::Media::Audio::PROCESS_LOOPBACK_MODE {
+    windows::Win32::Media::Audio::PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
 }
 
 #[repr(C)]
@@ -288,6 +317,7 @@ unsafe extern "system" {
 
 fn process_capture_loop(
     process_id: u32,
+    mode: windows::Win32::Media::Audio::PROCESS_LOOPBACK_MODE,
     mut producer: Producer<f32>,
     diagnostics: Arc<CaptureDiagnostics>,
     stop: Arc<AtomicBool>,
@@ -301,7 +331,7 @@ fn process_capture_loop(
     }
     let _com = ComApartment;
 
-    let setup = unsafe { activate_process_audio_client(process_id) }
+    let setup = unsafe { activate_process_audio_client(process_id, mode) }
         .and_then(|client| unsafe { initialize_capture_client(client) });
     let InitializedCapture {
         client,
@@ -618,10 +648,13 @@ unsafe fn initialize_capture_client(client: IAudioClient) -> Result<InitializedC
     }
 }
 
-fn process_activation_parameters(process_id: u32) -> Result<PROPVARIANT, String> {
+fn process_activation_parameters(
+    process_id: u32,
+    mode: windows::Win32::Media::Audio::PROCESS_LOOPBACK_MODE,
+) -> Result<PROPVARIANT, String> {
     let process_loopback = AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
         TargetProcessId: process_id,
-        ProcessLoopbackMode: exclusion_target_mode(),
+        ProcessLoopbackMode: mode,
     };
     let params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
@@ -658,6 +691,7 @@ fn process_activation_parameters(process_id: u32) -> Result<PROPVARIANT, String>
 
 fn activation_completion_handler(
     process_id: u32,
+    mode: windows::Win32::Media::Audio::PROCESS_LOOPBACK_MODE,
 ) -> Result<
     (
         Audio::IActivateAudioInterfaceCompletionHandler,
@@ -670,7 +704,7 @@ fn activation_completion_handler(
         vtable: &ACTIVATION_COMPLETION_HANDLER_VTABLE,
         references: AtomicU32::new(1),
         sender,
-        parameters: process_activation_parameters(process_id)?,
+        parameters: process_activation_parameters(process_id, mode)?,
     }));
     // from_raw owns the initial COM reference and releases it on every exit path.
     let handler =
@@ -678,8 +712,11 @@ fn activation_completion_handler(
     Ok((handler, receiver))
 }
 
-unsafe fn activate_process_audio_client(process_id: u32) -> Result<IAudioClient, String> {
-    let (handler, receiver) = activation_completion_handler(process_id)?;
+unsafe fn activate_process_audio_client(
+    process_id: u32,
+    mode: windows::Win32::Media::Audio::PROCESS_LOOPBACK_MODE,
+) -> Result<IAudioClient, String> {
+    let (handler, receiver) = activation_completion_handler(process_id, mode)?;
     let parameters =
         unsafe { &(*handler.as_raw().cast::<ActivationCompletionHandler>()).parameters };
     let _operation = unsafe {
@@ -814,6 +851,9 @@ fn enumerate_audio_applications() -> Result<Vec<AudioApplication>, String> {
                 Ok(process_id) if process_id > 0 => process_id,
                 _ => continue,
             };
+            if process_id == std::process::id() {
+                continue;
+            }
             let Some(path) = process_image_path(process_id) else {
                 continue;
             };
@@ -842,6 +882,54 @@ fn enumerate_audio_applications() -> Result<Vec<AudioApplication>, String> {
     }
 }
 
+fn enumerate_active_sessions() -> Result<Vec<(u32, String)>, String> {
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&Audio::MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|error| {
+                format!("Não foi possível consultar os dispositivos de áudio: {error}")
+            })?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(Audio::eRender, Audio::eMultimedia)
+            .map_err(|error| format!("Não foi possível consultar a saída de áudio: {error}"))?;
+        let manager: IAudioSessionManager2 =
+            device.Activate(CLSCTX_ALL, None).map_err(|error| {
+                format!("Não foi possível listar aplicativos com sessão de áudio: {error}")
+            })?;
+        let sessions = manager.GetSessionEnumerator().map_err(|error| {
+            format!("Não foi possível listar aplicativos com sessão de áudio: {error}")
+        })?;
+        let count = sessions
+            .GetCount()
+            .map_err(|error| format!("Não foi possível contar as sessões de áudio: {error}"))?;
+        let mut result = Vec::new();
+        for index in 0..count {
+            let control = match sessions.GetSession(index) {
+                Ok(control) => control,
+                Err(_) => continue,
+            };
+            let control: IAudioSessionControl2 = match control.cast() {
+                Ok(control) => control,
+                Err(_) => continue,
+            };
+            if control.GetState().ok() != Some(AudioSessionStateActive) {
+                continue;
+            }
+            let process_id = match control.GetProcessId() {
+                Ok(process_id) if process_id > 0 => process_id,
+                _ => continue,
+            };
+            let Some(path) = process_image_path(process_id) else {
+                continue;
+            };
+            if !result.iter().any(|(pid, _)| *pid == process_id) {
+                result.push((process_id, path));
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[allow(dead_code)]
 fn find_process_id_by_path(executable_path: &str) -> Result<Option<u32>, String> {
     let expected_name = Path::new(executable_path)
         .file_name()
@@ -890,7 +978,7 @@ fn normalize_path(path: &str) -> PathBuf {
         .into()
 }
 
-fn paths_match(left: &str, right: &str) -> bool {
+pub(crate) fn paths_match(left: &str, right: &str) -> bool {
     normalize_path(left) == normalize_path(right)
 }
 
@@ -926,8 +1014,8 @@ impl Drop for HandleGuard {
 mod tests {
     use super::{
         InitialCaptureRoute, SampleEncoding, SampleFormat, decode_stereo_frame,
-        exclusion_target_mode, float_subformat_guid, initial_capture_route, normalize_path,
-        paths_match, pcm_subformat_guid, should_switch_to_process_tree,
+        exclusion_target_mode, float_subformat_guid, inclusion_target_mode, initial_capture_route,
+        normalize_path, paths_match, pcm_subformat_guid, should_switch_to_process_tree,
     };
 
     #[test]
@@ -941,7 +1029,12 @@ mod tests {
                 // Activate and initialize the virtual client without starting it or reading audio.
                 // Both success and unavailable-API errors must release native resources safely.
                 for _ in 0..3 {
-                    match unsafe { super::activate_process_audio_client(std::process::id()) } {
+                    match unsafe {
+                        super::activate_process_audio_client(
+                            std::process::id(),
+                            exclusion_target_mode(),
+                        )
+                    } {
                         Ok(client) => {
                             println!("Native process-loopback activation succeeded");
                             match unsafe { super::initialize_capture_client(client) } {
@@ -984,7 +1077,8 @@ mod tests {
     #[test]
     fn activation_blob_owns_its_memory_and_can_be_copied_and_released_repeatedly() {
         for process_id in 1..=32 {
-            let parameters = super::process_activation_parameters(process_id).unwrap();
+            let parameters =
+                super::process_activation_parameters(process_id, exclusion_target_mode()).unwrap();
             let header = unsafe { &parameters.Anonymous.Anonymous };
             assert_eq!(header.vt, super::VT_BLOB);
             let blob = unsafe { header.Anonymous.blob };
@@ -1048,7 +1142,8 @@ mod tests {
     fn completion_handler_is_agile_and_handles_a_callback_after_the_caller_times_out() {
         use windows::core::Interface;
 
-        let (handler, receiver) = super::activation_completion_handler(42).unwrap();
+        let (handler, receiver) =
+            super::activation_completion_handler(42, exclusion_target_mode()).unwrap();
         assert!(handler.cast::<super::IAudioClient>().is_err());
         let windows_reference = handler.cast::<super::IAgileObject>().unwrap();
         drop(handler);
@@ -1064,7 +1159,8 @@ mod tests {
         );
         drop(completion);
 
-        let (handler, receiver) = super::activation_completion_handler(84).unwrap();
+        let (handler, receiver) =
+            super::activation_completion_handler(84, exclusion_target_mode()).unwrap();
         let windows_reference = handler.clone();
         drop(handler);
         assert!(matches!(
@@ -1105,6 +1201,7 @@ mod tests {
             InitialCaptureRoute::BlockUnsupported
         );
         assert_eq!(exclusion_target_mode().0, 1);
+        assert_eq!(inclusion_target_mode().0, 0);
     }
 
     #[test]

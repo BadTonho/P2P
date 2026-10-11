@@ -324,12 +324,11 @@ fn load_from(path: &Path) -> (AppSettings, Option<String>) {
         migration_warnings.push("A seleção de anfitrião inválida foi limpa.");
     }
 
-    if settings.excluded_audio_applications.is_empty() {
-        if let Some(path) = settings.excluded_audio_application_path.as_ref() {
-            if !path.trim().is_empty() {
-                settings.excluded_audio_applications.push(path.clone());
-            }
-        }
+    if settings.excluded_audio_applications.is_empty()
+        && let Some(path) = settings.excluded_audio_application_path.as_ref()
+        && !path.trim().is_empty()
+    {
+        settings.excluded_audio_applications.push(path.clone());
     } else if settings.excluded_audio_application_path.is_none() {
         settings.excluded_audio_application_path =
             settings.excluded_audio_applications.first().cloned();

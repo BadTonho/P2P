@@ -7,7 +7,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::audio_capture::{AudioApplication, MicrophoneTest};
+use crate::audio_capture::{AudioApplication, AudioExclusionConfig, MicrophoneTest};
 use crate::control_mesh::{ControlEvent, ControlMesh, QueueEntry};
 use crate::logging::{
     DiagnosticSnapshot, LoggingState, safe_signaling_endpoint, safe_stun_endpoint,
@@ -255,6 +255,8 @@ struct ClientUi {
     remote_screen_sequence: u64,
     group_local_sharing: bool,
     include_system_audio: bool,
+    exclude_self_audio: bool,
+    excluded_audio_applications: Vec<String>,
     excluded_audio_application_path: Option<String>,
     available_audio_applications: Vec<AudioApplication>,
     audio_applications_error: Option<String>,
@@ -394,6 +396,8 @@ impl ClientUi {
             video_decoder_preference: self.video_decoder_preference,
             show_local_preview: self.show_local_preview,
             include_system_audio: self.include_system_audio,
+            exclude_self_audio: self.exclude_self_audio,
+            excluded_audio_applications: self.excluded_audio_applications.clone(),
             excluded_audio_application_path: self.excluded_audio_application_path.clone(),
             profile_display_name: self.profile_display_name.clone(),
             create_room_mode: self.create_room_mode,
@@ -428,6 +432,8 @@ impl ClientUi {
         self.video_decoder_preference = preferences.video_decoder_preference;
         self.show_local_preview = preferences.show_local_preview;
         self.include_system_audio = preferences.include_system_audio;
+        self.exclude_self_audio = preferences.exclude_self_audio;
+        self.excluded_audio_applications = preferences.excluded_audio_applications;
         self.excluded_audio_application_path = preferences.excluded_audio_application_path;
         self.profile_display_name = preferences.profile_display_name;
         self.capture_preview_enabled
@@ -447,6 +453,13 @@ impl ClientUi {
         } else {
             self.last_manual_join_code.clone().unwrap_or_default()
         };
+    }
+
+    pub(crate) fn audio_exclusion_config(&self) -> AudioExclusionConfig {
+        AudioExclusionConfig::new(
+            self.exclude_self_audio,
+            self.excluded_audio_applications.clone(),
+        )
     }
 
     pub(super) fn choose_profile_avatar(&mut self) {
@@ -1353,7 +1366,7 @@ impl ClientUi {
                         if let Err(error) = session.start_sending_with_audio_exclusion(
                             source,
                             self.include_system_audio,
-                            self.excluded_audio_application_path.clone(),
+                            self.audio_exclusion_config(),
                         ) {
                             session.stop();
                             self.screen_share_role = ScreenShareRole::Idle;

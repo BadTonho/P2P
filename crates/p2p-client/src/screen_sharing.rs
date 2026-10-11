@@ -54,8 +54,9 @@ use webrtc::peer_connection::{
 use webrtc::runtime::TokioRuntime;
 
 use crate::audio_capture::{
-    AudioPlaybackFactory, AudioSampleSource, OPUS_CHANNELS, OPUS_FRAME_SAMPLES_PER_CHANNEL,
-    OPUS_SAMPLE_RATE, RemoteAudioVolume, SystemAudioCapture, SystemAudioPlaybackFactory,
+    AudioExclusionConfig, AudioPlaybackFactory, AudioSampleSource, OPUS_CHANNELS,
+    OPUS_FRAME_SAMPLES_PER_CHANNEL, OPUS_SAMPLE_RATE, RemoteAudioVolume, SystemAudioCapture,
+    SystemAudioPlaybackFactory,
 };
 use crate::logging::safe_stun_endpoint;
 use crate::mf_video;

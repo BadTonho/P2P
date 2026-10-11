@@ -527,7 +527,7 @@ impl ClientUi {
                     source,
                     bitrate,
                     self.include_system_audio,
-                    self.excluded_audio_application_path.clone(),
+                    self.audio_exclusion_config(),
                 ) {
                     self.screen_share_status = Some(error);
                 } else {
