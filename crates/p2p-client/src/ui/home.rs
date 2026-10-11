@@ -373,7 +373,7 @@ impl ClientUi {
                 Self::show_notice(
                     ui,
                     "Atenção:",
-                    "A sinalização usa ws:// sem criptografia ou autenticação. As credenciais TURN também passam por esse canal. Use apenas em testes controlados com pessoas conhecidas.",
+                    "A sinalização ws:// não criptografa os dados e credenciais TURN. Utilize wss:// para trânsito cifrado com TLS, ou mantenha ws:// apenas em testes controlados com pessoas conhecidas.",
                 );
                 ui.collapsing("Endereço e portas", |ui| {
                     ui.label("Configure o IPv4 público ou nome DDNS e a URI STUN em Configurações > Conexão.");

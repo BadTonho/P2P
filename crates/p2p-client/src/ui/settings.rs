@@ -411,7 +411,7 @@ impl ClientUi {
             ui.label("O endereço de convite é o IPv4 público ou DDNS deste computador; o app não detecta o IP público.");
             ui.label("Para hospedar na Internet, encaminhe TCP 9000 e libere a porta no firewall. TURN também requer UDP 3478 e UDP 50000–50100; CGNAT pode impedir conexões de entrada.");
             ui.label("TURN é configurado pelo anfitrião. Não é necessário manter um notebook separado ligado.");
-            ui.label("ws:// não criptografa a sinalização nem autentica os participantes. Use apenas testes controlados com pessoas conhecidas.");
+            ui.label("ws:// não criptografa a sinalização. Utilize wss:// para criptografia com TLS; em ws://, use apenas testes controlados com pessoas conhecidas.");
             ui.label("Perfis, endereço manual e endereço de convite ficam salvos nas preferências locais deste aplicativo.");
         });
     }

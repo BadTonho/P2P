@@ -353,10 +353,10 @@ async fn run_client(
         )));
     }
 
-    if !server_url.starts_with("ws://") {
+    if !server_url.starts_with("ws://") && !server_url.starts_with("wss://") {
         tracing::error!("Endereço de sinalização rejeitado: esquema inválido");
         let _ = events.send(SignalingEvent::Error(
-            "Informe o servidor no formato ws://IP-DO-ANFITRIAO:9000.".to_owned(),
+            "Informe o servidor no formato ws://... ou wss://...".to_owned(),
         ));
         stop_local_server(server_shutdown, server_task).await;
         return;

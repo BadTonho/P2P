@@ -614,7 +614,11 @@ pub fn safe_stun_endpoint(input: &str) -> String {
 
 pub fn safe_signaling_endpoint(input: &str) -> String {
     let input = input.trim();
-    let Some(rest) = input.strip_prefix("ws://") else {
+    let (scheme, rest) = if let Some(rest) = input.strip_prefix("wss://") {
+        ("wss", rest)
+    } else if let Some(rest) = input.strip_prefix("ws://") {
+        ("ws", rest)
+    } else {
         return "(endereço inválido)".to_owned();
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
@@ -624,7 +628,7 @@ pub fn safe_signaling_endpoint(input: &str) -> String {
     if authority.is_empty() {
         "(endereço inválido)".to_owned()
     } else {
-        format!("ws://{authority}")
+        format!("{scheme}://{authority}")
     }
 }
 
@@ -1252,6 +1256,12 @@ mod tests {
         assert_eq!(
             safe_signaling_endpoint("ws://user:secret@192.168.1.25:9000/ROOM-CODE?token=secret"),
             "ws://192.168.1.25:9000"
+        );
+        assert_eq!(
+            safe_signaling_endpoint(
+                "wss://user:secret@my-room.example.com:9000/ROOM-CODE?token=secret"
+            ),
+            "wss://my-room.example.com:9000"
         );
     }
 

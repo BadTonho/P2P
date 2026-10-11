@@ -195,12 +195,14 @@ pub(crate) fn signaling_ws_url(input: &str) -> Result<String, String> {
     if value.is_empty() {
         return Err("O endereço do anfitrião está vazio.".to_owned());
     }
-    let address = if let Some(address) = value.strip_prefix("ws://") {
-        address
+    let (scheme, address) = if let Some(address) = value.strip_prefix("wss://") {
+        ("wss", address)
+    } else if let Some(address) = value.strip_prefix("ws://") {
+        ("ws", address)
     } else if value.contains("://") {
-        return Err("Use ws://; wss:// ainda não está disponível nesta etapa.".to_owned());
+        return Err("Use ws:// ou wss:// para o servidor de sinalização.".to_owned());
     } else {
-        value
+        ("ws", value)
     };
 
     let address = address.trim_end_matches('/');
@@ -241,7 +243,7 @@ pub(crate) fn signaling_ws_url(input: &str) -> Result<String, String> {
         }
     }
 
-    Ok(format!("ws://{host}:9000"))
+    Ok(format!("{scheme}://{host}:9000"))
 }
 
 pub(crate) fn validate_saved_host_profile(profile: &SavedHostProfile) -> Result<(), String> {
@@ -343,11 +345,20 @@ mod tests {
             signaling_ws_url("ws://my-room.ddns.net:9000").unwrap(),
             "ws://my-room.ddns.net:9000"
         );
+        assert_eq!(
+            signaling_ws_url("wss://my-room.ddns.net:9000").unwrap(),
+            "wss://my-room.ddns.net:9000"
+        );
+        assert_eq!(
+            signaling_ws_url("wss://my-room.ddns.net").unwrap(),
+            "wss://my-room.ddns.net:9000"
+        );
     }
 
     #[test]
-    fn signaling_address_rejects_tls_ipv6_wrong_port_and_paths() {
-        assert!(signaling_ws_url("wss://my-room.ddns.net").is_err());
+    fn signaling_address_rejects_unsupported_schemes_ipv6_wrong_port_and_paths() {
+        assert!(signaling_ws_url("http://my-room.ddns.net").is_err());
+        assert!(signaling_ws_url("https://my-room.ddns.net").is_err());
         assert!(signaling_ws_url("2001:db8::1").is_err());
         assert!(signaling_ws_url("192.0.2.10:9001").is_err());
         assert!(signaling_ws_url("192.0.2.10/room").is_err());

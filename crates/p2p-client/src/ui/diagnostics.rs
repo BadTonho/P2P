@@ -83,7 +83,7 @@ impl ClientUi {
             } else {
                 ui.label("Aguardando a configuração de rede enviada pelo anfitrião.");
             }
-            ui.label("Teste controlado: ws:// não criptografa a sinalização ou as credenciais temporárias do TURN.");
+            ui.label("Em ws:// a sinalização trafega sem cifragem. Para conexões protegidas em trânsito, utilize wss://.");
         } else {
             ui.label(
                 "Rede local/Radmin: libere TCP 9001 e UDP 9002–9009 no firewall dos participantes.",

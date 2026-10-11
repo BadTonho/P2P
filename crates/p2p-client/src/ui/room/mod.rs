@@ -31,7 +31,7 @@ impl ClientUi {
             Self::show_notice(
                 ui,
                 "Teste controlado:",
-                "A sinalização usa ws:// sem criptografia ou autenticação. Use apenas com pessoas conhecidas.",
+                "Conexões ws:// não possuem criptografia em trânsito. Use apenas com pessoas conhecidas ou configure wss:// com TLS.",
             );
         }
         if let Some(error) = &self.connection_error {
