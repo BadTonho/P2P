@@ -89,8 +89,6 @@ impl TurnRelayServer {
                 "Não foi possível iniciar o TURN em UDP {turn_port}: a porta está ocupada ou indisponível ({error})."
             )
         })?;
-        drop(probe);
-
         let config = build_config(
             external_ipv4,
             turn_port,
@@ -99,6 +97,9 @@ impl TurnRelayServer {
             username,
             credential,
         )?;
+        // O probe só é liberado depois da configuração pronta para reduzir ao mínimo a
+        // janela entre a checagem e o bind real feito pelo turn-server.
+        drop(probe);
         let (shutdown, shutdown_rx) = oneshot::channel();
         let (failure_tx, failures) = std_mpsc::channel();
         let worker = thread::Builder::new()
@@ -147,6 +148,12 @@ impl TurnRelayServer {
             match UdpSocket::bind(listen) {
                 Ok(socket) => drop(socket),
                 Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    // Se outro processo ganhou a corrida pela porta, o bind do turn-server
+                    // falha e o erro chega pelo canal; revalida antes de considerar pronto.
+                    thread::sleep(Duration::from_millis(150));
+                    if let Some(error) = server.try_failure() {
+                        return Err(error);
+                    }
                     ready = true;
                     break;
                 }

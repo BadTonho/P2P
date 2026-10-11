@@ -16,3 +16,9 @@ edition = "2024"
 version = "1.2.4"
 license = "GPL-3.0-or-later"
 rust-version = "1.95"
+
+# O CMake do audiopus_sys escolhe Debug/Release pelo opt-level. Em Debug, o Opus
+# referencia o CRT de debug (__imp__CrtDbgReportW), que não é linkado pelo Rust
+# e quebra o build dos testes. Compilar essa dependência otimizada evita isso.
+[profile.dev.package.audiopus_sys]
+opt-level = 3
