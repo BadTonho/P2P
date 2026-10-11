@@ -3,10 +3,10 @@
 ## Atualizações pelo GitHub Releases
 
 - O atualizador consulta o último GitHub Release público em `https://api.github.com/repos/BadTonho/P2P/releases/latest`. Não adicione tokens, chaves de API ou credenciais ao executável.
-- Cada release estável precisa ter uma tag numérica `vMAJOR.MINOR.PATCH` e exatamente um asset chamado `p2p-client.exe`. A versão da tag deve corresponder à versão do workspace no `Cargo.toml` da raiz.
+- Cada release estável precisa ter uma tag numérica `vMAJOR.MINOR.PATCH`, o asset `P2P-Voz-e-tela-Setup.exe` (instalador para atualização e novas instalações) e o asset `p2p-client.exe` (para execução portátil). A versão da tag deve corresponder à versão do workspace no `Cargo.toml` da raiz.
 - O app usa a tag, o tamanho, o SHA-256 (`digest`) e o link do asset retornados pela API pública do GitHub. Não é necessário criar nem publicar um manifesto separado.
-- Cada release também pode incluir `P2P-Voz-e-tela-Setup.exe`; preserve o asset `p2p-client.exe` com esse nome exato para o atualizador.
-- Preserve o download iniciado pelo usuário, a validação HTTPS/tamanho/SHA-256/assinatura PE e o aplicador com backup e rollback. Não registre dados privados ou tokens.
+- O atualizador prioriza `P2P-Voz-e-tela-Setup.exe` executando a instalação silenciosa para atualizar arquivos, registro e atalhos, mantendo fallback para `p2p-client.exe` quando o instalador não estiver presente.
+- Preserve o download iniciado pelo usuário, a validação HTTPS/tamanho/SHA-256/assinatura PE e a aplicação de atualização. Não registre dados privados ou tokens.
 - Preserve as preferências locais em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json` durante atualizações. Não salve códigos de sala nem credenciais temporárias.
 - Mantenha `ATUALIZACOES.md` alinhado à implementação e ao processo de publicação.
 - A primeira versão pública será 1.0.0 com o atualizador do GitHub. Não reintroduza dependência do Google Drive nem instruções de migração do Drive sem pedido explícito.

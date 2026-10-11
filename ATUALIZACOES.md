@@ -10,17 +10,17 @@ O app consulta o último [GitHub Release público](https://github.com/BadTonho/P
 4. Crie e publique no GitHub um release estável com uma tag correspondente, como `v1.0.1`.
 5. Anexe ao release `target\release\p2p-client.exe` com o nome exato `p2p-client.exe` e `target\installer\P2P-Voz-e-tela-Setup.exe` com o nome exato `P2P-Voz-e-tela-Setup.exe`.
 
-O app encontra atualizações pelo asset `p2p-client.exe`; o instalador é um asset adicional para instalações novas. Repita o processo para cada versão: mude a versão, compile os dois arquivos e publique um novo release. A API do GitHub fornece a tag, o tamanho, o SHA-256 e o link do executável. O atualizador considera releases estáveis publicados, não rascunhos ou pré-lançamentos.
+O app encontra atualizações prioritariamente pelo instalador `P2P-Voz-e-tela-Setup.exe` (executando a instalação silenciosa para atualizar arquivos, registro e atalhos), com fallback automático para `p2p-client.exe` caso o release contenha apenas o executável. Repita o processo para cada versão: mude a versão, compile os dois arquivos e publique um novo release. A API do GitHub fornece a tag, o tamanho, o SHA-256 e o link do asset. O atualizador considera releases estáveis publicados, não rascunhos ou pré-lançamentos.
 
 ## Instalação, preferências e remoção
 
-O instalador é por usuário, não exige administrador e instala em `%LOCALAPPDATA%\Programs\P2P-Voz-e-tela`. Ele cria um atalho no menu Iniciar. O atualizador integrado substitui o executável nessa pasta; as preferências ficam separadas em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json` e sobrevivem às atualizações.
+O instalador é por usuário, não exige administrador e instala em `%LOCALAPPDATA%\Programs\P2P-Voz-e-tela`. Ele cria um atalho no menu Iniciar. O atualizador integrado executa o instalador em modo silencioso (`/SILENT /CLOSEAPPLICATIONS`); as preferências ficam separadas em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json` e sobrevivem às atualizações.
 
 Ao desinstalar, o instalador remove o arquivo de preferências e a foto opcional do perfil (`profile-avatar.jpg`). O aplicativo não grava códigos de sala nem credenciais temporárias nesse arquivo. Os logs ficam na pasta `logs` e não são apagados junto com as preferências.
 
 ## Validação e segurança
 
-O app baixa o executável por HTTPS e confere o tamanho, o SHA-256 informado pela API do GitHub, a assinatura PE (`MZ`) e um marcador de versão embutido no build. O marcador deve corresponder à tag do release; o aplicador confere novamente a versão depois da substituição e restaura a cópia anterior se ela não corresponder ou se o novo app não iniciar. Essas verificações detectam arquivos incompatíveis ou corrompidos, mas não autenticam quem publicou o arquivo.
+O app baixa o instalador ou executável por HTTPS e confere o tamanho, o SHA-256 informado pela API do GitHub e a assinatura PE (`MZ`). Para o executável portátil direto, também confere o marcador de versão embutido no build. Essas verificações detectam arquivos incompatíveis ou corrompidos, mas não autenticam quem publicou o arquivo.
 
 Não há assinatura digital. O SHA-256 detecta corrupção durante o download, mas não prova a identidade do publicador se o repositório ou a conta do GitHub forem comprometidos. Um repositório e seus releases públicos podem ser vistos e baixados por qualquer pessoa.
 

@@ -63,7 +63,12 @@ fn download_update_file(
 
     let directory = update_directory()?;
     let part_path = directory.join(format!("p2p-update-{}.part", manifest.version));
-    let output_path = directory.join(format!("p2p-update-{}.exe", manifest.version));
+    let output_filename = if manifest.is_installer() {
+        format!("P2P-Voz-e-tela-Setup-{}.exe", manifest.version)
+    } else {
+        format!("p2p-update-{}.exe", manifest.version)
+    };
+    let output_path = directory.join(output_filename);
     let _ = fs::remove_file(&part_path);
     let _cleanup = RemoveOnDrop(part_path.clone());
     let mut file = File::create(&part_path).map_err(|error| {
@@ -189,12 +194,14 @@ pub(super) fn validate_downloaded_file(
         return Err("O SHA-256 baixado não corresponde ao valor informado pelo GitHub.".to_owned());
     }
     validate_pe_signature(path)?;
-    let actual_version = read_embedded_build_version(path)?;
-    if actual_version != manifest.version {
-        return Err(format!(
-            "O release anuncia a versao {}, mas o executavel baixado identifica-se como {}. O arquivo nao sera aplicado.",
-            manifest.version, actual_version
-        ));
+    if !manifest.is_installer() {
+        let actual_version = read_embedded_build_version(path)?;
+        if actual_version != manifest.version {
+            return Err(format!(
+                "O release anuncia a versao {}, mas o executavel baixado identifica-se como {}. O arquivo nao sera aplicado.",
+                manifest.version, actual_version
+            ));
+        }
     }
     Ok(())
 }
@@ -260,7 +267,9 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::update::test_support::{executable_stub, manifest, test_directory};
+    use crate::update::test_support::{
+        executable_stub, manifest, portable_manifest, test_directory,
+    };
     use sha2::{Digest, Sha256};
     use std::fs;
 
@@ -270,7 +279,7 @@ mod tests {
         let path = directory.join("download.exe");
         let bytes = executable_stub("1.0.1");
         fs::write(&path, &bytes).unwrap();
-        let mut value = manifest();
+        let mut value = portable_manifest();
         value.size_bytes = bytes.len() as u64;
         value.sha256 = format!("{:x}", Sha256::digest(&bytes));
 
@@ -296,6 +305,32 @@ mod tests {
         value.sha256 = format!("{:x}", Sha256::digest(&no_marker));
         assert!(
             validate_downloaded_file(&path, &value, no_marker.len() as u64, &value.sha256).is_err()
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn installer_payload_is_validated_by_size_hash_and_pe_signature() {
+        let directory = test_directory();
+        let path = directory.join("P2P-Voz-e-tela-Setup.exe");
+        let mut pe_stub = vec![0_u8; 64];
+        pe_stub[0] = b'M';
+        pe_stub[1] = b'Z';
+        pe_stub[0x3c] = 64;
+        pe_stub.extend_from_slice(b"PE\0\0");
+        pe_stub.extend_from_slice(b"inno setup stub binary");
+        fs::write(&path, &pe_stub).unwrap();
+
+        let mut value = manifest();
+        value.size_bytes = pe_stub.len() as u64;
+        value.sha256 = format!("{:x}", Sha256::digest(&pe_stub));
+
+        assert!(
+            validate_downloaded_file(&path, &value, pe_stub.len() as u64, &value.sha256).is_ok()
+        );
+        assert!(validate_downloaded_file(&path, &value, 1, &value.sha256).is_err());
+        assert!(
+            validate_downloaded_file(&path, &value, pe_stub.len() as u64, &"0".repeat(64)).is_err()
         );
         let _ = fs::remove_dir_all(directory);
     }

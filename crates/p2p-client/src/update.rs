@@ -27,7 +27,8 @@ const GITHUB_OWNER: &str = "BadTonho";
 const GITHUB_REPOSITORY: &str = "P2P";
 const GITHUB_RELEASE_API_URL: &str = "https://api.github.com/repos/BadTonho/P2P/releases/latest";
 const GITHUB_RELEASES_PAGE_URL: &str = "https://github.com/BadTonho/P2P/releases/latest";
-const RELEASE_ASSET_NAME: &str = "p2p-client.exe";
+pub const INSTALLER_ASSET_NAME: &str = "P2P-Voz-e-tela-Setup.exe";
+pub const PORTABLE_ASSET_NAME: &str = "p2p-client.exe";
 const RELEASE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const UPDATE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const UPDATE_DIRECTORY: &str = "P2P-Voz-e-tela\\updates";
@@ -54,6 +55,15 @@ pub struct UpdateManifest {
     pub download_url: String,
     pub size_bytes: u64,
     pub sha256: String,
+    pub asset_name: String,
+}
+
+impl UpdateManifest {
+    pub fn is_installer(&self) -> bool {
+        self.asset_name == INSTALLER_ASSET_NAME
+            || self.asset_name.ends_with("-Setup.exe")
+            || self.download_url.ends_with("-Setup.exe")
+    }
 }
 
 #[derive(Debug)]

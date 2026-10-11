@@ -2,9 +2,42 @@ use super::download::read_embedded_build_version;
 use super::release::parse_version;
 use super::*;
 
+pub fn is_installer_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.eq_ignore_ascii_case(INSTALLER_ASSET_NAME)
+        || name.ends_with("-Setup.exe")
+        || name.contains("Setup")
+}
+
+pub fn launch_installer(installer: &Path) -> Result<(), String> {
+    if !installer.is_file() {
+        return Err("O instalador baixado não foi encontrado.".to_owned());
+    }
+    let mut command = Command::new(installer);
+    command.arg("/SILENT");
+    command.arg("/CLOSEAPPLICATIONS");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0000_0200);
+    }
+    if let Err(error) = command.spawn() {
+        return Err(format!(
+            "Não foi possível iniciar o instalador de atualização: {error}"
+        ));
+    }
+    tracing::info!("Instalador de atualização iniciado; aguardando fechamento do aplicativo");
+    Ok(())
+}
+
 pub fn stage_and_launch(downloaded: PathBuf, expected_version: String) -> Result<(), String> {
     if !downloaded.is_file() {
         return Err("O executável baixado não foi encontrado.".to_owned());
+    }
+    if is_installer_path(&downloaded) {
+        return launch_installer(&downloaded);
     }
     let downloaded_version = read_embedded_build_version(&downloaded)?;
     if downloaded_version != expected_version {
@@ -402,5 +435,25 @@ mod tests {
         assert!(dummy_helper.exists());
         cleanup_stale_helpers();
         assert!(!dummy_helper.exists());
+    }
+
+    #[test]
+    fn is_installer_path_recognizes_installer_names() {
+        assert!(is_installer_path(Path::new(
+            "C:\\path\\P2P-Voz-e-tela-Setup.exe"
+        )));
+        assert!(is_installer_path(Path::new(
+            "C:\\path\\P2P-Voz-e-tela-Setup-1.0.1.exe"
+        )));
+        assert!(!is_installer_path(Path::new("C:\\path\\p2p-client.exe")));
+        assert!(!is_installer_path(Path::new("C:\\path\\downloaded.exe")));
+    }
+
+    #[test]
+    fn launch_installer_fails_for_non_existent_file() {
+        let missing = PathBuf::from("non-existent-setup.exe");
+        let result = launch_installer(&missing);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("não foi encontrado"));
     }
 }

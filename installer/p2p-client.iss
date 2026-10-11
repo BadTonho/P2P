@@ -38,7 +38,7 @@ Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "p2p-client.exe"; Flags: ign
 Name: "{group}\P2P - Voz e tela"; Filename: "{app}\p2p-client.exe"
 
 [Run]
-Filename: "{app}\p2p-client.exe"; Description: "Abrir P2P - Voz e tela"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\p2p-client.exe"; Description: "Abrir P2P - Voz e tela"; Flags: postinstall nowait runascurrentuser
 
 [UninstallDelete]
 Type: files; Name: "{localappdata}\P2P-Voz-e-tela\settings.json"

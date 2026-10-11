@@ -22,10 +22,23 @@ pub(super) fn test_directory() -> std::path::PathBuf {
 pub(super) fn manifest() -> UpdateManifest {
     UpdateManifest {
         version: "1.0.1".to_owned(),
+        download_url:
+            "https://github.com/BadTonho/P2P/releases/download/v1.0.1/P2P-Voz-e-tela-Setup.exe"
+                .to_owned(),
+        size_bytes: 123,
+        sha256: "a".repeat(64),
+        asset_name: "P2P-Voz-e-tela-Setup.exe".to_owned(),
+    }
+}
+
+pub(super) fn portable_manifest() -> UpdateManifest {
+    UpdateManifest {
+        version: "1.0.1".to_owned(),
         download_url: "https://github.com/BadTonho/P2P/releases/download/v1.0.1/p2p-client.exe"
             .to_owned(),
         size_bytes: 123,
         sha256: "a".repeat(64),
+        asset_name: "p2p-client.exe".to_owned(),
     }
 }
 

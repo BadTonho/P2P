@@ -168,6 +168,7 @@ mod tests {
             download_url: "https://example.test/p2p-client.exe".to_owned(),
             size_bytes: 10,
             sha256: "a".repeat(64),
+            asset_name: "p2p-client.exe".to_owned(),
         }
     }
 

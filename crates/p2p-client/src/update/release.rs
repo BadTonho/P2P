@@ -110,20 +110,46 @@ pub(super) fn parse_github_release(bytes: &[u8]) -> Result<UpdateManifest, Strin
         .to_owned();
     parse_version(&version)?;
 
-    let mut assets = release
+    let asset = if let Some(installer) = release
         .assets
-        .into_iter()
-        .filter(|asset| asset.name == RELEASE_ASSET_NAME);
-    let Some(asset) = assets.next() else {
+        .iter()
+        .find(|asset| asset.name == INSTALLER_ASSET_NAME)
+    {
+        if release
+            .assets
+            .iter()
+            .filter(|asset| asset.name == INSTALLER_ASSET_NAME)
+            .count()
+            > 1
+        {
+            return Err(format!(
+                "O último release contém mais de um arquivo {INSTALLER_ASSET_NAME}."
+            ));
+        }
+        installer
+    } else if let Some(portable) = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == PORTABLE_ASSET_NAME)
+    {
+        if release
+            .assets
+            .iter()
+            .filter(|asset| asset.name == PORTABLE_ASSET_NAME)
+            .count()
+            > 1
+        {
+            return Err(format!(
+                "O último release contém mais de um arquivo {PORTABLE_ASSET_NAME}."
+            ));
+        }
+        portable
+    } else {
         return Err(format!(
-            "O último release não contém o arquivo {RELEASE_ASSET_NAME}."
+            "O último release não contém o arquivo {INSTALLER_ASSET_NAME} nem {PORTABLE_ASSET_NAME}."
         ));
     };
-    if assets.next().is_some() {
-        return Err(format!(
-            "O último release contém mais de um arquivo {RELEASE_ASSET_NAME}."
-        ));
-    }
+
     let sha256 = asset
         .digest
         .as_deref()
@@ -132,16 +158,17 @@ pub(super) fn parse_github_release(bytes: &[u8]) -> Result<UpdateManifest, Strin
         .to_owned();
     let manifest = UpdateManifest {
         version,
-        download_url: asset.browser_download_url,
+        download_url: asset.browser_download_url.clone(),
         size_bytes: asset.size,
         sha256,
+        asset_name: asset.name.clone(),
     };
     validate_manifest(&manifest)?;
-    validate_release_asset_url(&manifest.download_url)?;
+    validate_release_asset_url(&manifest.download_url, &manifest.asset_name)?;
     Ok(manifest)
 }
 
-fn validate_release_asset_url(value: &str) -> Result<(), String> {
+fn validate_release_asset_url(value: &str, expected_asset_name: &str) -> Result<(), String> {
     let url = reqwest::Url::parse(value)
         .map_err(|_| "O link do executável no GitHub Release é inválido.".to_owned())?;
     let expected_prefix = format!("/{GITHUB_OWNER}/{GITHUB_REPOSITORY}/releases/download/");
@@ -150,7 +177,7 @@ fn validate_release_asset_url(value: &str) -> Result<(), String> {
         || !url.username().is_empty()
         || url.password().is_some()
         || !url.path().starts_with(&expected_prefix)
-        || !url.path().ends_with(&format!("/{RELEASE_ASSET_NAME}"))
+        || !url.path().ends_with(&format!("/{expected_asset_name}"))
     {
         return Err(
             "O link do executável não pertence aos releases HTTPS deste repositório.".to_owned(),
@@ -283,8 +310,8 @@ mod tests {
         let body = br#"{
             "tag_name":"v1.0.1",
             "assets":[{
-                "name":"p2p-client.exe",
-                "browser_download_url":"https://github.com/BadTonho/P2P/releases/download/v1.0.1/p2p-client.exe",
+                "name":"P2P-Voz-e-tela-Setup.exe",
+                "browser_download_url":"https://github.com/BadTonho/P2P/releases/download/v1.0.1/P2P-Voz-e-tela-Setup.exe",
                 "size":123,
                 "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }]
@@ -292,6 +319,43 @@ mod tests {
         assert_eq!(parse_github_release(body).unwrap(), manifest());
         assert!(looks_like_html(b" <!doctype html><html>GitHub error"));
         assert!(parse_github_release(b"<html>login</html>").is_err());
+    }
+
+    #[test]
+    fn prioritizes_installer_over_portable_when_both_present() {
+        use crate::update::test_support::portable_manifest;
+        let body = br#"{
+            "tag_name":"v1.0.1",
+            "assets":[
+                {
+                    "name":"p2p-client.exe",
+                    "browser_download_url":"https://github.com/BadTonho/P2P/releases/download/v1.0.1/p2p-client.exe",
+                    "size":123,
+                    "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                    "name":"P2P-Voz-e-tela-Setup.exe",
+                    "browser_download_url":"https://github.com/BadTonho/P2P/releases/download/v1.0.1/P2P-Voz-e-tela-Setup.exe",
+                    "size":123,
+                    "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            ]
+        }"#;
+        assert_eq!(parse_github_release(body).unwrap(), manifest());
+
+        let portable_only = br#"{
+            "tag_name":"v1.0.1",
+            "assets":[{
+                "name":"p2p-client.exe",
+                "browser_download_url":"https://github.com/BadTonho/P2P/releases/download/v1.0.1/p2p-client.exe",
+                "size":123,
+                "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        }"#;
+        assert_eq!(
+            parse_github_release(portable_only).unwrap(),
+            portable_manifest()
+        );
     }
 
     #[test]
