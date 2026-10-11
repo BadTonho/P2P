@@ -83,7 +83,11 @@ pub struct AppSettings {
     pub show_local_preview: bool,
     #[serde(default)]
     pub include_system_audio: bool,
-    #[serde(default)]
+    #[serde(default = "default_exclude_self_audio")]
+    pub exclude_self_audio: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_audio_applications: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excluded_audio_application_path: Option<String>,
     #[serde(default)]
     pub profile_display_name: String,
@@ -104,6 +108,10 @@ pub struct AppSettings {
     pub fixed_room_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_manual_join_code: Option<String>,
+}
+
+pub const fn default_exclude_self_audio() -> bool {
+    true
 }
 
 const fn default_log_errors_file() -> bool {
@@ -172,6 +180,8 @@ impl Default for AppSettings {
             video_decoder_preference: VideoDecoderPreference::Automatic,
             show_local_preview: true,
             include_system_audio: false,
+            exclude_self_audio: default_exclude_self_audio(),
+            excluded_audio_applications: Vec::new(),
             excluded_audio_application_path: None,
             profile_display_name: String::new(),
             remote_audio_default_volume_percent: default_remote_audio_volume_percent(),
@@ -314,6 +324,17 @@ fn load_from(path: &Path) -> (AppSettings, Option<String>) {
         migration_warnings.push("A seleção de anfitrião inválida foi limpa.");
     }
 
+    if settings.excluded_audio_applications.is_empty() {
+        if let Some(path) = settings.excluded_audio_application_path.as_ref() {
+            if !path.trim().is_empty() {
+                settings.excluded_audio_applications.push(path.clone());
+            }
+        }
+    } else if settings.excluded_audio_application_path.is_none() {
+        settings.excluded_audio_application_path =
+            settings.excluded_audio_applications.first().cloned();
+    }
+
     let default_gain = AppSettings::default().monitor_gain_db;
     if !settings.monitor_gain_db.is_finite() {
         settings.monitor_gain_db = default_gain;
@@ -340,6 +361,10 @@ fn save_to(path: &Path, settings: &AppSettings) -> io::Result<()> {
 
     let mut stored = settings.clone();
     stored.schema_version = SETTINGS_SCHEMA_VERSION;
+    if stored.excluded_audio_application_path.is_none() {
+        stored.excluded_audio_application_path =
+            stored.excluded_audio_applications.first().cloned();
+    }
     if !stored.monitor_gain_db.is_finite() {
         stored.monitor_gain_db = AppSettings::default().monitor_gain_db;
     } else {
@@ -407,14 +432,21 @@ pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn temporary_directory() -> PathBuf {
+        let count = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after UNIX epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("p2p-settings-test-{}-{nonce}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "p2p-settings-test-{}-{nonce}-{count}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -438,6 +470,7 @@ mod tests {
             control_ipv4: Some(Ipv4Addr::new(26, 10, 20, 30)),
             video_decoder_preference: VideoDecoderPreference::PreferDxva,
             excluded_audio_application_path: Some("C:\\Apps\\Music.exe".to_owned()),
+            excluded_audio_applications: vec!["C:\\Apps\\Music.exe".to_owned()],
             ..AppSettings::default()
         };
 
@@ -525,6 +558,61 @@ mod tests {
             loaded.excluded_audio_application_path.as_deref(),
             Some("C:\\Apps\\Music.exe")
         );
+    }
+
+    #[test]
+    fn excluded_audio_applications_are_saved_locally() {
+        let settings = AppSettings {
+            exclude_self_audio: true,
+            excluded_audio_applications: vec![
+                "C:\\Apps\\Browser.exe".to_owned(),
+                "C:\\Apps\\Game.exe".to_owned(),
+            ],
+            ..AppSettings::default()
+        };
+        let stored = serde_json::to_value(&settings).expect("settings should serialize");
+        let loaded: AppSettings =
+            serde_json::from_value(stored).expect("settings should deserialize");
+        assert!(loaded.exclude_self_audio);
+        assert_eq!(
+            loaded.excluded_audio_applications,
+            vec!["C:\\Apps\\Browser.exe", "C:\\Apps\\Game.exe"]
+        );
+    }
+
+    #[test]
+    fn legacy_settings_migrates_single_excluded_path_to_list() {
+        let mut stored =
+            serde_json::to_value(AppSettings::default()).expect("settings should serialize");
+        stored.as_object_mut().unwrap().insert(
+            "excluded_audio_application_path".to_owned(),
+            serde_json::Value::String("C:\\Legacy\\App.exe".to_owned()),
+        );
+
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).expect("test directory should be created");
+        let settings_path = directory.join(SETTINGS_FILE);
+        fs::write(&settings_path, serde_json::to_vec(&stored).unwrap())
+            .expect("should write settings");
+
+        let (loaded, warning) = load_from(&settings_path);
+        assert!(warning.is_none());
+        assert_eq!(
+            loaded.excluded_audio_applications,
+            vec!["C:\\Legacy\\App.exe"]
+        );
+        assert_eq!(
+            loaded.excluded_audio_application_path.as_deref(),
+            Some("C:\\Legacy\\App.exe")
+        );
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn default_settings_enable_exclude_self_audio() {
+        let default_settings = AppSettings::default();
+        assert!(default_settings.exclude_self_audio);
+        assert!(default_settings.excluded_audio_applications.is_empty());
     }
 
     #[test]
