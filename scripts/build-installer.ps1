@@ -38,6 +38,10 @@ if (-not $env:RC -and -not (Get-Command 'rc.exe' -ErrorAction SilentlyContinue))
     }
 }
 
+if (-not $env:CMAKE_GENERATOR) {
+    $env:CMAKE_GENERATOR = 'Visual Studio 17 2022'
+}
+
 Push-Location $repoRoot
 try {
     & cargo build --release --offline -p p2p-client
