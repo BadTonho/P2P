@@ -10,6 +10,14 @@ impl ClientUi {
                 .as_nanos();
             self.participant_id = format!("{}-{nonce:x}", std::process::id());
         }
+        if self.mesh_identity.is_none() {
+            match crate::mesh_identity::MeshIdentity::generate() {
+                Ok(identity) => self.mesh_identity = Some(std::sync::Arc::new(identity)),
+                Err(error) => {
+                    tracing::error!(error = %error, "Falha ao criar a identidade da malha")
+                }
+            }
+        }
         let control_address = if self.room_mode == RoomMode::InternetTest {
             String::new()
         } else {
@@ -38,7 +46,10 @@ impl ClientUi {
             },
             supports_group_screen_share: self.room_mode == RoomMode::Local,
             supports_group_session_ids: self.room_mode == RoomMode::Local,
-            public_key: None,
+            public_key: self
+                .mesh_identity
+                .as_ref()
+                .map(|identity| identity.public_key().to_owned()),
         }
     }
 
@@ -151,7 +162,13 @@ impl ClientUi {
         if let Some(mesh) = &self.control_mesh {
             mesh.update_roster(self.participants.clone(), leader_id, leader_address);
         } else if !code.is_empty() {
-            match ControlMesh::start(local, code, leader_id.clone(), leader_address.clone()) {
+            match ControlMesh::start(
+                local,
+                code,
+                leader_id.clone(),
+                leader_address.clone(),
+                self.mesh_identity.clone(),
+            ) {
                 Ok(mesh) => {
                     mesh.update_roster(self.participants.clone(), leader_id, leader_address);
                     self.control_mesh = Some(mesh);

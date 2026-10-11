@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::mesh_identity::{MeshIdentity, new_nonce, verify_challenge};
 use futures_util::{SinkExt, StreamExt};
 use signaling_protocol::{ControlMessage, ParticipantInfo};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -90,6 +92,7 @@ impl ControlMesh {
         room_code: String,
         leader_id: String,
         leader_address: String,
+        identity: Option<Arc<MeshIdentity>>,
     ) -> Result<Self, String> {
         Self::start_on(
             local,
@@ -97,6 +100,7 @@ impl ControlMesh {
             leader_id,
             leader_address,
             CONTROL_LISTEN_ADDRESS.to_owned(),
+            identity,
         )
     }
 
@@ -106,6 +110,7 @@ impl ControlMesh {
         leader_id: String,
         leader_address: String,
         listen_address: String,
+        identity: Option<Arc<MeshIdentity>>,
     ) -> Result<Self, String> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = std_mpsc::channel();
@@ -130,6 +135,7 @@ impl ControlMesh {
                     leader_id,
                     leader_address,
                     listen_address,
+                    identity,
                     command_rx,
                     event_tx,
                 ));
@@ -305,6 +311,7 @@ struct Election {
 
 struct MeshState {
     local: ParticipantInfo,
+    identity: Option<Arc<MeshIdentity>>,
     room_code: String,
     roster: Vec<ParticipantInfo>,
     known_since: HashMap<String, Instant>,
@@ -329,12 +336,16 @@ struct MeshState {
 
 type SharedState = std::sync::Arc<Mutex<MeshState>>;
 
+// A identidade opcional da sessão fez a lista passar de 7 parâmetros; agrupá-los
+// exigiria reestruturar o pipeline da malha sem ganho prático.
+#[allow(clippy::too_many_arguments)]
 async fn run_mesh(
     local: ParticipantInfo,
     room_code: String,
     leader_id: String,
     leader_address: String,
     listen_address: String,
+    identity: Option<Arc<MeshIdentity>>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: std_mpsc::Sender<ControlEvent>,
 ) {
@@ -352,6 +363,7 @@ async fn run_mesh(
     let leader_is_local = leader_id == local.id;
     let state = std::sync::Arc::new(Mutex::new(MeshState {
         local,
+        identity,
         room_code,
         roster: Vec::new(),
         known_since: HashMap::new(),
@@ -535,6 +547,29 @@ fn log_control_connect_failure(address: &str, error: String) {
     }
 }
 
+/// Lê a resposta `Auth` do par logo após o Hello, com o mesmo prazo da apresentação.
+async fn receive_auth<S>(websocket: &mut WebSocketStream<S>) -> Result<String, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let incoming = timeout(Duration::from_secs(5), websocket.next())
+        .await
+        .map_err(|_| "timeout ao autenticar o participante".to_owned())?
+        .ok_or_else(|| "canal de controle encerrado durante a autenticação".to_owned())?
+        .map_err(|error| error.to_string())?;
+    match incoming {
+        WebSocketMessage::Text(text) => {
+            match serde_json::from_str::<ControlMessage>(text.as_str())
+                .map_err(|error| error.to_string())?
+            {
+                ControlMessage::Auth { signature } => Ok(signature),
+                _ => Err("autenticação ausente no canal de controle".to_owned()),
+            }
+        }
+        _ => Err("autenticação ausente no canal de controle".to_owned()),
+    }
+}
+
 async fn attach_socket<S>(
     mut websocket: WebSocketStream<S>,
     state: SharedState,
@@ -544,16 +579,24 @@ async fn attach_socket<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (local, room_code) = {
+    let (local, room_code, identity) = {
         let state = state.lock().await;
-        (state.local.clone(), state.room_code.clone())
+        (
+            state.local.clone(),
+            state.room_code.clone(),
+            state.identity.clone(),
+        )
     };
+    let local_nonce = identity.as_ref().map(|_| new_nonce());
+    if local_nonce.as_deref().is_some_and(str::is_empty) {
+        return Err("não foi possível gerar o desafio de autenticação".to_owned());
+    }
     send_ws(
         &mut websocket,
         ControlMessage::Hello {
             room_code: room_code.clone(),
             participant: local.clone(),
-            nonce: None,
+            nonce: local_nonce.clone(),
         },
     )
     .await?;
@@ -562,15 +605,15 @@ where
         .map_err(|_| "timeout ao apresentar o participante".to_owned())?
         .ok_or_else(|| "canal de controle encerrado durante a entrada".to_owned())?
         .map_err(|error| error.to_string())?;
-    let claimed_remote = match incoming {
+    let (claimed_remote, remote_nonce) = match incoming {
         WebSocketMessage::Text(text) => match serde_json::from_str::<ControlMessage>(text.as_str())
             .map_err(|error| error.to_string())?
         {
             ControlMessage::Hello {
                 room_code: peer_room,
                 participant,
-                ..
-            } if peer_room == room_code => participant,
+                nonce,
+            } if peer_room == room_code => (participant, nonce),
             ControlMessage::Hello { .. } => {
                 return Err("o participante informou outra sala".to_owned());
             }
@@ -597,16 +640,47 @@ where
     }
     if let (Some(incoming_ip), Some(expected_ip)) =
         (peer_ip, parse_ip_from_address(&remote.control_address))
+        && !incoming_ip.is_loopback()
+        && incoming_ip != expected_ip
     {
-        if !incoming_ip.is_loopback() && incoming_ip != expected_ip {
+        tracing::warn!(
+            expected = %expected_ip,
+            actual = %incoming_ip,
+            remote_id = %remote.id,
+            "Conexão de controle rejeitada: IP de conexão inconsistente com o roster"
+        );
+        return Err("endereço de controle inconsistente com o endereço IP de conexão".to_owned());
+    }
+
+    if let (Some(identity), Some(local_nonce)) = (&identity, &local_nonce) {
+        // Prova a titularidade do nosso ID assinando o desafio do par.
+        if let Some(remote_nonce) = remote_nonce.as_deref().filter(|nonce| !nonce.is_empty()) {
+            let signature =
+                identity.sign_challenge(&room_code, remote_nonce, &local.id, &remote.id);
+            send_ws(&mut websocket, ControlMessage::Auth { signature }).await?;
+        }
+        // Exige a prova do par sempre que o roster (autoria do servidor) traz uma chave
+        // para esse ID; só pares legados, sem chave publicada, são aceitos sem prova.
+        if let Some(remote_key) = remote.public_key.as_deref() {
+            let signature = receive_auth(&mut websocket).await?;
+            if !verify_challenge(
+                remote_key,
+                &signature,
+                &room_code,
+                local_nonce,
+                &remote.id,
+                &local.id,
+            ) {
+                tracing::warn!(
+                    remote_id = %remote.id,
+                    "Conexão de controle rejeitada: assinatura de autenticação inválida"
+                );
+                return Err("o participante não comprovou a titularidade do seu ID".to_owned());
+            }
+        } else {
             tracing::warn!(
-                expected = %expected_ip,
-                actual = %incoming_ip,
                 remote_id = %remote.id,
-                "Conexão de controle rejeitada: IP de conexão inconsistente com o roster"
-            );
-            return Err(
-                "endereço de controle inconsistente com o endereço IP de conexão".to_owned(),
+                "Participante sem chave pública aceito sem autenticação (versão antiga)"
             );
         }
     }
@@ -1566,6 +1640,7 @@ mod tests {
         compare_queue_entries, control_link_timeout_elapsed, fail_current_candidate,
         initiate_election, own_worst_metrics, parse_ip_from_address,
     };
+    use crate::mesh_identity::MeshIdentity;
     use signaling_protocol::ParticipantInfo;
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::Arc;
@@ -1585,6 +1660,16 @@ mod tests {
             supports_group_session_ids: false,
             public_key: None,
         }
+    }
+
+    // Os testes de integração abrem sockets reais em portas efêmeras escolhidas por
+    // `free_local_address`; serializá-los evita corridas de porta e de tempo entre si.
+    static MESH_INTEGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn mesh_lock() -> std::sync::MutexGuard<'static, ()> {
+        MESH_INTEGRATION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn free_local_address() -> String {
@@ -1655,6 +1740,7 @@ mod tests {
         }
         MeshState {
             local,
+            identity: None,
             room_code: "SAMECODE".to_owned(),
             roster,
             known_since: HashMap::new(),
@@ -1975,8 +2061,98 @@ mod tests {
         assert!(ending_events_rx.try_recv().is_err());
     }
 
+    fn authenticated_pair(
+        guest_identity: std::sync::Arc<MeshIdentity>,
+        roster_guest_key: String,
+    ) -> (ControlMesh, ControlMesh) {
+        let host_identity = std::sync::Arc::new(MeshIdentity::generate().unwrap());
+        let host_address = free_local_address();
+        let mut host = participant("host", 1, false);
+        host.control_address = host_address.clone();
+        host.public_key = Some(host_identity.public_key().to_owned());
+        let guest_address = free_local_address();
+        let mut guest = participant("guest", 2, true);
+        guest.control_address = guest_address.clone();
+        guest.public_key = Some(roster_guest_key);
+        let roster = vec![host.clone(), guest.clone()];
+
+        let host_mesh = ControlMesh::start_on(
+            host.clone(),
+            "SAMECODE".to_owned(),
+            host.id.clone(),
+            "ws://127.0.0.1:9000".to_owned(),
+            host_address,
+            Some(host_identity),
+        )
+        .unwrap();
+        host_mesh.update_roster(
+            roster.clone(),
+            host.id.clone(),
+            "ws://127.0.0.1:9000".to_owned(),
+        );
+        let guest_mesh = ControlMesh::start_on(
+            guest.clone(),
+            "SAMECODE".to_owned(),
+            host.id.clone(),
+            "ws://127.0.0.1:9000".to_owned(),
+            guest_address,
+            Some(guest_identity),
+        )
+        .unwrap();
+        guest_mesh.update_roster(roster, host.id.clone(), "ws://127.0.0.1:9000".to_owned());
+        (host_mesh, guest_mesh)
+    }
+
+    fn fully_linked(event: &ControlEvent) -> bool {
+        matches!(
+            event,
+            ControlEvent::LinksUpdated {
+                connected: 1,
+                total: 1
+            }
+        )
+    }
+
+    #[test]
+    fn authenticated_peers_with_matching_keys_connect() {
+        let _lock = mesh_lock();
+        let guest_identity = std::sync::Arc::new(MeshIdentity::generate().unwrap());
+        let key = guest_identity.public_key().to_owned();
+        let (host_mesh, guest_mesh) = authenticated_pair(guest_identity, key);
+
+        assert!(
+            receive_until(&host_mesh.events, Duration::from_secs(7), fully_linked).is_some(),
+            "host should accept the guest that proves its key"
+        );
+        assert!(
+            receive_until(&guest_mesh.events, Duration::from_secs(7), fully_linked).is_some(),
+            "guest should accept the host that proves its key"
+        );
+    }
+
+    #[test]
+    fn impostor_using_another_members_id_with_a_different_key_is_rejected() {
+        let _lock = mesh_lock();
+        let legitimate_guest = MeshIdentity::generate().unwrap();
+        let impostor = std::sync::Arc::new(MeshIdentity::generate().unwrap());
+        // O roster (autoria do servidor) registra a chave do convidado legítimo, mas
+        // quem se apresenta como "guest" assina com outra chave.
+        let (host_mesh, guest_mesh) =
+            authenticated_pair(impostor, legitimate_guest.public_key().to_owned());
+
+        assert!(
+            receive_until(&host_mesh.events, Duration::from_secs(4), fully_linked).is_none(),
+            "host must not link with a peer that cannot prove the registered key"
+        );
+        assert!(
+            receive_until(&guest_mesh.events, Duration::from_secs(1), fully_linked).is_none(),
+            "impostor must not obtain a link either"
+        );
+    }
+
     #[test]
     fn direct_mesh_connects_and_orders_a_normal_host_handoff() {
+        let _lock = mesh_lock();
         let host_address = free_local_address();
         let mut host = participant("host", 1, false);
         host.control_address = host_address.clone();
@@ -1986,6 +2162,7 @@ mod tests {
             host.id.clone(),
             "ws://127.0.0.1:9000".to_owned(),
             host_address,
+            None,
         )
         .unwrap();
         assert!(
@@ -2011,6 +2188,7 @@ mod tests {
             host.id.clone(),
             "ws://127.0.0.1:9000".to_owned(),
             guest_address,
+            None,
         )
         .unwrap();
         guest_mesh.update_roster(roster, host.id.clone(), "ws://127.0.0.1:9000".to_owned());

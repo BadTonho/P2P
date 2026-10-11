@@ -15,6 +15,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rand = "0.9"
+ring = "0.17"
 sha2 = "0.10"
 openh264 = { version = "0.9.8", features = ["source"] }
 opus = "0.3.1"

@@ -199,6 +199,7 @@ struct ClientUi {
     addresses_loaded: bool,
     control_network_window_open: bool,
     participant_id: String,
+    mesh_identity: Option<std::sync::Arc<crate::mesh_identity::MeshIdentity>>,
     may_host: bool,
     participants: Vec<ParticipantInfo>,
     current_leader_id: String,

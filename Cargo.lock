@@ -3431,6 +3431,7 @@ dependencies = [
  "rand 0.9.5",
  "reqwest",
  "rfd",
+ "ring",
  "rtc",
  "rtrb",
  "serde",

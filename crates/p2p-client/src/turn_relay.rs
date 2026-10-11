@@ -45,7 +45,7 @@ pub struct TurnRoomConfig {
 
 impl TurnRoomConfig {
     pub fn is_valid(&self) -> bool {
-        self.turn.as_ref().map_or(true, TurnCredentials::is_valid)
+        self.turn.as_ref().is_none_or(TurnCredentials::is_valid)
     }
 }
 

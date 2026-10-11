@@ -62,12 +62,12 @@ pub fn cleanup_stale_helpers() {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("P2P-Voz-e-tela-update-helper-") && name.ends_with(".exe") {
-                    let _ = fs::remove_file(&path);
-                }
-            }
+        if path.is_file()
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with("P2P-Voz-e-tela-update-helper-")
+            && name.ends_with(".exe")
+        {
+            let _ = fs::remove_file(&path);
         }
     }
 }

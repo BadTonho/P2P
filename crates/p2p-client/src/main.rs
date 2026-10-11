@@ -4,6 +4,7 @@ mod app;
 mod audio_capture;
 mod control_mesh;
 mod logging;
+mod mesh_identity;
 mod mf_video;
 mod profile;
 mod screen_capture;
