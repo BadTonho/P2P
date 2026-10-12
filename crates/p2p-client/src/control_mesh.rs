@@ -16,8 +16,8 @@ use tokio_tungstenite::{WebSocketStream, accept_async, connect_async};
 
 const CONTROL_LISTEN_ADDRESS: &str = "0.0.0.0:9001";
 const MESH_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
-const LISTENER_BIND_ATTEMPTS: u32 = 15;
-const LISTENER_BIND_RETRY_DELAY: Duration = Duration::from_millis(200);
+const LISTENER_BIND_ATTEMPTS: u32 = 25;
+const LISTENER_BIND_RETRY_DELAY: Duration = Duration::from_millis(150);
 const ROSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const ROSTER_WAIT_POLL: Duration = Duration::from_millis(100);
 const PROBE_PERIOD: Duration = Duration::from_secs(1);
@@ -1713,8 +1713,9 @@ mod tests {
     use super::{
         CONTROL_LINK_STARTUP_GRACE, ControlEvent, ControlMesh, EMPTY_ELECTION_RETRY_INTERVAL,
         Election, HOST_TIMEOUT, MeshState, Metrics, PeerLink, PeerStats, Probe, QueueEntry,
-        compare_queue_entries, control_link_timeout_elapsed, fail_current_candidate,
-        initiate_election, ip_mismatch, own_worst_metrics, parse_ip_from_address,
+        bind_listener_with_retry, compare_queue_entries, control_link_timeout_elapsed,
+        fail_current_candidate, initiate_election, ip_mismatch, own_worst_metrics,
+        parse_ip_from_address,
     };
     use crate::mesh_identity::MeshIdentity;
     use signaling_protocol::ParticipantInfo;
@@ -2427,17 +2428,36 @@ mod tests {
             "OTHERCODE".to_owned(),
             local.id.clone(),
             "ws://127.0.0.1:9000".to_owned(),
-            address,
+            address.clone(),
             None,
         )
         .unwrap();
         assert!(
-            receive_until(&second.events, Duration::from_secs(3), |event| matches!(
+            receive_until(&second.events, Duration::from_secs(5), |event| matches!(
                 event,
                 ControlEvent::Ready
             ))
             .is_some(),
             "a nova malha deve abrir a mesma porta logo após a anterior ser descartada"
+        );
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn bind_listener_retries_and_succeeds_once_port_is_freed() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = occupied.local_addr().unwrap().to_string();
+
+        let release_handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(occupied);
+        });
+
+        let listener = bind_listener_with_retry(&address).await;
+        release_handle.join().unwrap();
+        assert!(
+            listener.is_ok(),
+            "listener deve conseguir vincular após a porta ser liberada"
         );
     }
 }

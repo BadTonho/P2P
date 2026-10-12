@@ -16,6 +16,8 @@ const LOCAL_SERVER_ADDRESS: &str = "0.0.0.0:9000";
 const LOCAL_CLIENT_URL: &str = "ws://127.0.0.1:9000";
 const DIAGNOSTIC_PAYLOAD: &str = "diagnostic-ping-v1";
 const DIAGNOSTIC_ACK_PAYLOAD: &str = "diagnostic-pong-v1";
+const SERVER_BIND_ATTEMPTS: u32 = 25;
+const SERVER_BIND_RETRY_DELAY: Duration = Duration::from_millis(150);
 
 fn default_participant() -> ParticipantInfo {
     let nonce = SystemTime::now()
@@ -336,7 +338,7 @@ async fn run_client(
     let mut server_task = None;
     if let Some(reservation) = local_server {
         tracing::info!(listen_address = %local_server_address, "Iniciando servidor de sinalização integrado");
-        let listener = match TcpListener::bind(local_server_address).await {
+        let listener = match bind_server_listener_with_retry(&local_server_address).await {
             Ok(listener) => listener,
             Err(error) => {
                 tracing::error!(error = %error, "Falha ao abrir a porta TCP do servidor de sinalização");
@@ -679,20 +681,42 @@ async fn stop_local_server(
     }
 }
 
+async fn bind_server_listener_with_retry(listen_address: &str) -> std::io::Result<TcpListener> {
+    let mut attempt = 1;
+    loop {
+        match TcpListener::bind(listen_address).await {
+            Ok(listener) => return Ok(listener),
+            Err(error)
+                if attempt < SERVER_BIND_ATTEMPTS
+                    && error.kind() == std::io::ErrorKind::AddrInUse =>
+            {
+                tracing::debug!(
+                    attempt,
+                    listen_address,
+                    "Porta do servidor de sinalização ainda em uso; aguardando liberação pelo sistema"
+                );
+                attempt += 1;
+                tokio::time::sleep(SERVER_BIND_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{SignalingClient, SignalingEvent};
+    use super::{SignalingClient, SignalingEvent, bind_server_listener_with_retry};
 
     #[test]
     fn hosting_reports_a_clear_error_when_the_port_is_occupied() {
         let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = occupied.local_addr().unwrap().to_string();
         let client = SignalingClient::start_host_at(&address).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(6);
 
         loop {
             if let Some(event) = client.try_recv() {
@@ -707,5 +731,23 @@ mod tests {
         }
         drop(client);
         drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn bind_server_listener_retries_and_succeeds_once_port_is_freed() {
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = occupied.local_addr().unwrap().to_string();
+
+        let release_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            drop(occupied);
+        });
+
+        let listener = bind_server_listener_with_retry(&address).await;
+        release_handle.join().unwrap();
+        assert!(
+            listener.is_ok(),
+            "listener deve conseguir vincular após a porta ser liberada"
+        );
     }
 }
