@@ -58,6 +58,7 @@ impl ClientUi {
         participants: Vec<ParticipantInfo>,
         leader_id: String,
         room_mode: RoomMode,
+        context: &egui::Context,
     ) {
         self.room_mode = room_mode;
         self.participants = participants;
@@ -75,26 +76,59 @@ impl ClientUi {
             .retain(|id| member_ids.contains(id));
         self.group_auto_focus_pending
             .retain(|id| member_ids.contains(id));
-        self.group_outbound_sessions
-            .retain(|id, _| member_ids.contains(id));
-        self.group_inbound_sessions
-            .retain(|id, _| member_ids.contains(id));
-        self.group_outbound_generations
-            .retain(|id, _| member_ids.contains(id));
-        self.group_inbound_generations
-            .retain(|id, _| member_ids.contains(id));
+
+        // Limpa sessões de espectadores que saíram da sala preservando os demais
+        let departed_viewers = self
+            .group_outbound_sessions
+            .keys()
+            .chain(self.group_outbound_generations.keys())
+            .chain(self.group_outbound_ports.keys())
+            .filter(|id| !member_ids.contains(*id))
+            .cloned()
+            .collect::<HashSet<_>>();
+        for viewer_id in departed_viewers {
+            if let Some(session) = self.group_outbound_sessions.remove(&viewer_id) {
+                group_sharing::log_final_group_session_diagnostics(
+                    &session,
+                    "sender",
+                    "viewer_departed",
+                );
+            }
+            if let Some(generation) = self.group_outbound_generations.remove(&viewer_id) {
+                self.mark_group_generation_closed(&viewer_id, generation);
+            }
+            self.group_outbound_ports.remove(&viewer_id);
+        }
+
+        // Limpa sessões de telas transmitidas por participantes que saíram
+        let departed_sharers = self
+            .group_inbound_sessions
+            .keys()
+            .chain(self.group_inbound_generations.keys())
+            .chain(self.group_inbound_ports.keys())
+            .filter(|id| !member_ids.contains(*id))
+            .cloned()
+            .collect::<HashSet<_>>();
+        for sharer_id in departed_sharers {
+            if let Some(session) = self.group_inbound_sessions.remove(&sharer_id) {
+                group_sharing::log_final_group_session_diagnostics(
+                    &session,
+                    "receiver",
+                    "sharer_departed",
+                );
+            }
+            if let Some(generation) = self.group_inbound_generations.remove(&sharer_id) {
+                self.mark_group_generation_closed(&sharer_id, generation);
+            }
+            self.group_inbound_ports.remove(&sharer_id);
+            self.group_remote_textures.remove(&sharer_id);
+            self.group_remote_sequences.remove(&sharer_id);
+        }
+
         self.pending_group_ice
             .retain(|(id, _), _| member_ids.contains(id));
         self.closed_group_generations
             .retain(|(id, _), _| member_ids.contains(id));
-        self.group_outbound_ports
-            .retain(|id, _| member_ids.contains(id));
-        self.group_inbound_ports
-            .retain(|id, _| member_ids.contains(id));
-        self.group_remote_textures
-            .retain(|id, _| member_ids.contains(id));
-        self.group_remote_sequences
-            .retain(|id, _| member_ids.contains(id));
         if self
             .focused_group_screen
             .as_ref()
@@ -106,6 +140,26 @@ impl ClientUi {
             .retain(|id, _| member_ids.contains(id));
         self.group_audio_status
             .retain(|id, _| member_ids.contains(id));
+
+        let has_other_participants = self
+            .participants
+            .iter()
+            .any(|participant| participant.id != self.participant_id);
+        self.peer_connected = has_other_participants;
+
+        if !has_other_participants {
+            if self.connection_status.as_deref()
+                != Some("Seu amigo desconectou; a sala aguarda outra conexão.")
+            {
+                self.connection_status =
+                    Some("Você está sozinho na sala; aguardando outro participante.".to_owned());
+            }
+        } else if self.connection_status.as_deref()
+            == Some("Seu amigo desconectou; a sala aguarda outra conexão.")
+        {
+            self.connection_status = None;
+        }
+
         if self.room_mode != RoomMode::Local
             && (self.group_local_sharing
                 || !self.group_watched_shares.is_empty()
@@ -123,6 +177,8 @@ impl ClientUi {
             self.stop_group_media(true);
             self.screen_share_status = Some(if self.group_sharing_upgrade_required() {
                 "O compartilhamento em grupo foi encerrado: todos precisam da versão 1.1.3 para correlacionar cada sessão.".to_owned()
+            } else if self.participants.len() < 2 {
+                "O compartilhamento foi encerrado porque você está sozinho na sala.".to_owned()
             } else {
                 "O compartilhamento em grupo foi encerrado: todos os participantes precisam de uma versão compatível.".to_owned()
             });
@@ -180,6 +236,7 @@ impl ClientUi {
             }
         }
         if self.group_local_sharing && self.group_sharing_compatible() {
+            self.rebalance_group_outbound(context, None);
             let _ = self.send_screen_share_signal(SignalKind::ScreenShareAvailable, String::new());
         }
     }
@@ -351,5 +408,85 @@ impl ClientUi {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_participant(id: &str, order: u8) -> ParticipantInfo {
+        ParticipantInfo {
+            id: id.to_owned(),
+            display_name: format!("Participante {order}"),
+            order,
+            may_host: true,
+            control_address: "127.0.0.1:9001".to_owned(),
+            avatar_jpeg_base64: None,
+            supports_group_screen_share: true,
+            supports_group_session_ids: true,
+            public_key: None,
+        }
+    }
+
+    #[test]
+    fn test_update_room_roster_preserves_group_screen_share_when_a_participant_leaves() {
+        let mut app = ClientUi::default();
+        app.participant_id = "local".to_owned();
+        app.group_local_sharing = true;
+        app.room_mode = RoomMode::Local;
+
+        let p_local = dummy_participant("local", 1);
+        let p_peer1 = dummy_participant("peer-1", 2);
+        let p_peer2 = dummy_participant("peer-2", 3);
+
+        app.participants = vec![p_local.clone(), p_peer1.clone(), p_peer2.clone()];
+        app.group_outbound_generations
+            .insert("peer-1".to_owned(), "gen-1".to_owned());
+        app.group_outbound_generations
+            .insert("peer-2".to_owned(), "gen-2".to_owned());
+        app.group_outbound_ports.insert("peer-1".to_owned(), 9002);
+        app.group_outbound_ports.insert("peer-2".to_owned(), 9003);
+
+        let ctx = egui::Context::default();
+
+        app.update_room_roster(
+            vec![p_local.clone(), p_peer1.clone()],
+            "local".to_owned(),
+            RoomMode::Local,
+            &ctx,
+        );
+
+        assert!(app.group_local_sharing);
+        assert!(app.peer_connected);
+
+        assert!(!app.group_outbound_generations.contains_key("peer-2"));
+        assert!(!app.group_outbound_ports.contains_key("peer-2"));
+
+        assert!(app.group_outbound_generations.contains_key("peer-1"));
+        assert!(app.group_outbound_ports.contains_key("peer-1"));
+    }
+
+    #[test]
+    fn test_update_room_roster_stops_group_share_when_alone_in_room() {
+        let mut app = ClientUi::default();
+        app.participant_id = "local".to_owned();
+        app.group_local_sharing = true;
+        app.room_mode = RoomMode::Local;
+
+        let p_local = dummy_participant("local", 1);
+        let p_peer1 = dummy_participant("peer-1", 2);
+
+        app.participants = vec![p_local.clone(), p_peer1];
+        let ctx = egui::Context::default();
+
+        app.update_room_roster(vec![p_local], "local".to_owned(), RoomMode::Local, &ctx);
+
+        assert!(!app.group_local_sharing);
+        assert!(!app.peer_connected);
+        assert_eq!(
+            app.screen_share_status,
+            Some("O compartilhamento foi encerrado porque você está sozinho na sala.".to_owned())
+        );
     }
 }

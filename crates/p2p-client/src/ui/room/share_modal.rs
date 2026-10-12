@@ -543,7 +543,9 @@ mod tests {
         assert!(app.screen_share_modal_open);
         assert_eq!(
             app.selected_share_source,
-            Some(ShareSourceSelection::Monitor(r"\\.\DISPLAY1".to_owned()))
+            app.available_monitors
+                .first()
+                .map(|m| ShareSourceSelection::Monitor(m.device_id.clone()))
         );
     }
 

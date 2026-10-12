@@ -312,16 +312,27 @@ impl ClientUi {
                 }
                 SignalingEvent::PeerLeft => {
                     tracing::warn!("Outro participante saiu ou desconectou da sala");
-                    self.stop_screen_share(false);
-                    self.peer_connected = false;
-                    self.connection_status =
-                        Some("Seu amigo desconectou; a sala aguarda outra conexão.".to_owned());
-                    self.diagnostic_status = None;
-                    if self.outgoing_transfer.is_some() {
-                        self.outgoing_transfer = None;
-                        self.handoff_error = Some(
-                            "O outro participante desconectou antes da transferência.".to_owned(),
-                        );
+                    let other_peers_count = self
+                        .participants
+                        .iter()
+                        .filter(|p| p.id != self.participant_id)
+                        .count();
+                    if other_peers_count <= 1 {
+                        self.stop_screen_share(false);
+                        self.peer_connected = false;
+                        self.connection_status =
+                            Some("Seu amigo desconectou; a sala aguarda outra conexão.".to_owned());
+                        self.diagnostic_status = None;
+                        if self.outgoing_transfer.is_some() {
+                            self.outgoing_transfer = None;
+                            self.handoff_error = Some(
+                                "O outro participante desconectou antes da transferência."
+                                    .to_owned(),
+                            );
+                        }
+                    } else {
+                        self.peer_connected = true;
+                        self.diagnostic_status = None;
                     }
                 }
                 SignalingEvent::RoomRoster {
@@ -330,7 +341,7 @@ impl ClientUi {
                     room_mode,
                 } => {
                     tracing::info!(participants = participants.len(), room_mode = ?room_mode, "Lista de participantes atualizada");
-                    self.update_room_roster(participants, leader_id, room_mode);
+                    self.update_room_roster(participants, leader_id, room_mode, context);
                 }
                 SignalingEvent::HostTransferPending { code, token } => {
                     tracing::info!(

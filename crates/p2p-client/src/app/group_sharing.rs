@@ -581,71 +581,38 @@ impl ClientUi {
             );
             return;
         }
-        let bitrate_unchanged = self.group_outbound_target_bitrate_bps == Some(bitrate);
-        if bitrate_unchanged {
-            let desired_set: std::collections::HashSet<&String> = viewers.iter().collect();
-            let departed: Vec<String> = self
-                .group_outbound_sessions
-                .keys()
-                .filter(|peer| !desired_set.contains(peer))
-                .cloned()
-                .collect();
-            for viewer in departed {
-                if let Some(session) = self.group_outbound_sessions.remove(&viewer) {
-                    log_final_group_session_diagnostics(&session, "sender", "viewer_departed");
-                }
-                if let Some(generation) = self.group_outbound_generations.remove(&viewer) {
-                    let _ = self.send_screen_share_signal_to_stream(
-                        &viewer,
-                        generation.clone(),
-                        SignalKind::ScreenShareStopped,
-                        String::new(),
-                    );
-                    self.mark_group_generation_closed(&viewer, generation);
-                }
-                self.group_outbound_ports.remove(&viewer);
+        let desired_set: std::collections::HashSet<&String> = viewers.iter().collect();
+        let departed: Vec<String> = self
+            .group_outbound_sessions
+            .keys()
+            .filter(|peer| !desired_set.contains(peer))
+            .cloned()
+            .collect();
+        for viewer in departed {
+            if let Some(session) = self.group_outbound_sessions.remove(&viewer) {
+                log_final_group_session_diagnostics(&session, "sender", "viewer_departed");
             }
-            for viewer in viewers {
-                if !self.group_outbound_sessions.contains_key(&viewer) {
-                    self.start_group_outbound(viewer, context, bitrate);
-                }
+            if let Some(generation) = self.group_outbound_generations.remove(&viewer) {
+                let _ = self.send_screen_share_signal_to_stream(
+                    &viewer,
+                    generation.clone(),
+                    SignalKind::ScreenShareStopped,
+                    String::new(),
+                );
+                self.mark_group_generation_closed(&viewer, generation);
             }
-            tracing::info!(
-                viewers = self.group_outbound_sessions.len(),
-                target_bitrate_bps = bitrate,
-                "Sessões de envio de grupo atualizadas preservando espectadores existentes"
-            );
-            return;
+            self.group_outbound_ports.remove(&viewer);
         }
-
-        let old_generations = self
-            .group_outbound_generations
-            .iter()
-            .map(|(peer, generation)| (peer.clone(), generation.clone()))
-            .collect::<Vec<_>>();
-        for (viewer, generation) in old_generations {
-            let _ = self.send_screen_share_signal_to_stream(
-                &viewer,
-                generation.clone(),
-                SignalKind::ScreenShareStopped,
-                String::new(),
-            );
-            self.mark_group_generation_closed(&viewer, generation);
-        }
-        for session in self.group_outbound_sessions.values() {
-            log_final_group_session_diagnostics(session, "sender", "bitrate_rebalance");
-        }
-        self.group_outbound_sessions.clear();
-        self.group_outbound_generations.clear();
-        self.group_outbound_ports.clear();
-        self.group_outbound_target_bitrate_bps = Some(bitrate);
         for viewer in viewers {
-            self.start_group_outbound(viewer, context, bitrate);
+            if !self.group_outbound_sessions.contains_key(&viewer) {
+                self.start_group_outbound(viewer, context, bitrate);
+            }
         }
+        self.group_outbound_target_bitrate_bps = Some(bitrate);
         tracing::info!(
             viewers = self.group_outbound_sessions.len(),
             target_bitrate_bps = bitrate,
-            "Encoder de grupo reequilibrado dentro do limite de banda"
+            "Sessões de envio de grupo atualizadas preservando espectadores existentes"
         );
     }
 
@@ -1236,6 +1203,31 @@ mod tests {
             .filter(|peer| !single.contains(peer))
             .collect();
         assert_eq!(new_viewers, vec!["viewer-b".to_owned()]);
+    }
+
+    #[test]
+    fn rebalance_preserves_active_viewers_when_viewer_departs_and_bitrate_changes() {
+        let three = vec![
+            "viewer-a".to_owned(),
+            "viewer-b".to_owned(),
+            "viewer-c".to_owned(),
+        ];
+        let two = vec!["viewer-a".to_owned(), "viewer-b".to_owned()];
+        assert_ne!(group_share_bitrate(3), group_share_bitrate(2));
+
+        let desired: HashSet<&String> = two.iter().collect();
+        let departed: Vec<String> = three
+            .iter()
+            .filter(|peer| !desired.contains(peer))
+            .cloned()
+            .collect();
+        assert_eq!(departed, vec!["viewer-c".to_owned()]);
+
+        let remaining: Vec<String> = three
+            .into_iter()
+            .filter(|peer| desired.contains(peer))
+            .collect();
+        assert_eq!(remaining, two);
     }
 
     #[test]
