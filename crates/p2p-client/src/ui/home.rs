@@ -63,7 +63,7 @@ fn show_network_window(
 fn show_control_network_window(ui: &mut egui::Ui, app: &mut ClientUi) {
     let mut open = app.control_network_window_open;
     show_network_window(ui.ctx(), &mut open, |window| {
-        window.label("Escolha o endereço que seu amigo consegue alcançar.");
+        window.label("A seleção automática prioriza o Radmin ativo.");
         app.show_control_address_picker(window);
         window.checkbox(
             &mut app.may_host,
@@ -71,12 +71,66 @@ fn show_control_network_window(ui: &mut egui::Ui, app: &mut ClientUi) {
         );
         window.collapsing("Requisitos de rede", |window| {
                 window.label("A interface selecionada será usada para controle e vídeo.");
-                window.label("Libere TCP 9001 e UDP 9002–9009 no firewall do Windows.");
+                window.label("Libere TCP 9000–9001 e UDP 8999 e 9002–9009 no firewall do Windows.");
                 window.label("Use Radmin VPN quando o amigo entrar pelo endereço Radmin; use Ethernet/Wi-Fi na rede local.");
                 window.label("A permissão para hospedar só permite assumir a sala se o anfitrião sair.");
             });
     });
     app.control_network_window_open = open;
+}
+
+fn show_discovered_rooms(
+    ui: &mut egui::Ui,
+    rooms: &[crate::discovery::DiscoveredRoom],
+    error: Option<&str>,
+    searching: bool,
+    enabled: bool,
+) -> Option<crate::discovery::DiscoveredRoom> {
+    ui.label(egui::RichText::new("Salas nesta rede").strong());
+    ui.small("Escolha uma sala para entrar sem digitar endereço ou código.");
+    if let Some(error) = error {
+        ClientUi::show_notice(ui, "Descoberta indisponível:", error);
+        ui.small("Você pode usar a entrada manual abaixo.");
+    }
+    if rooms.is_empty() && error.is_none() {
+        if searching {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Buscando salas…");
+            });
+        } else {
+            ui.label("Nenhuma sala encontrada.");
+            ui.small("O anfitrião precisa criar uma sala e permitir o anúncio nesta rede.");
+        }
+    }
+    let mut selected = None;
+    egui::ScrollArea::vertical()
+        .id_salt("discovered-rooms")
+        .max_height(220.0)
+        .show(ui, |ui| {
+            for room in rooms {
+                ui.separator();
+                ui.push_id((room.ipv4, &room.advertisement.code), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(&room.advertisement.host_name);
+                        ui.small(format!(
+                            "{}/8 participantes",
+                            room.advertisement.participants
+                        ));
+                        if ui
+                            .add_enabled(
+                                enabled && room.advertisement.participants < 8,
+                                egui::Button::new("Entrar"),
+                            )
+                            .clicked()
+                        {
+                            selected = Some(room.clone());
+                        }
+                    });
+                });
+            }
+        });
+    selected
 }
 
 fn primary_action_button(
@@ -412,7 +466,7 @@ impl ClientUi {
             Self::show_notice(ui, "Erro de conexão:", error);
         }
         ui.collapsing("Como entrar", |ui| {
-            ui.label("Escolha um anfitrião salvo na tela inicial; use Gerenciar anfitriões para adicionar ou editar endereços.");
+            ui.label("Em Rede local / Radmin, escolha uma sala encontrada e clique em Entrar. Para salas sem anúncio ou clientes antigos, use Entrada manual.");
         });
     }
 
@@ -544,7 +598,13 @@ impl ClientUi {
     fn show_create_room_card(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.heading("Criar sala");
-            ui.label("Hospede neste computador e compartilhe o código com seu amigo.");
+            if self.create_room_mode == RoomMode::Local {
+                ui.label("Hospede neste computador para seus amigos encontrarem a sala.");
+                ui.checkbox(&mut self.announce_local_room, "Anunciar sala nesta rede");
+                ui.small("Com o anúncio ativo, quem estiver nesta rede poderá entrar sem código.");
+            } else {
+                ui.label("Hospede neste computador e compartilhe o código com seu amigo.");
+            }
             ui.add_space(4.0);
             let checkbox_resp =
                 ui.checkbox(&mut self.use_fixed_room, "Sala fixa (código permanente)");
@@ -594,89 +654,109 @@ impl ClientUi {
         let mut manage_hosts = false;
         ui.group(|ui| {
             ui.heading("Entrar em uma sala");
-            let selected_label = self
-                .selected_host_index
-                .and_then(|index| self.saved_hosts.get(index))
-                .map(|profile| profile.name.as_str())
-                .unwrap_or("Endereço manual");
-            let old_host_index = self.selected_host_index;
-            let (_, manage_response) = show_host_picker_and_manage(
-                ui,
-                selected_label,
-                &mut self.selected_host_index,
-                self.saved_hosts
-                    .iter()
-                    .enumerate()
-                    .map(|(index, profile)| (index, profile.name.as_str())),
-            );
-            manage_hosts = manage_response.clicked();
-            if self.selected_host_index != old_host_index {
-                self.select_host(self.selected_host_index);
-            }
-            if let Some(index) = self.selected_host_index {
-                if let Some(profile) = self.saved_hosts.get(index) {
-                    ui.small(format!("Endereço: {}", profile.address));
-                    if let Err(error) = signaling_ws_url(&profile.address) {
-                        Self::show_notice(ui, "Perfil inválido:", &error);
-                    }
+            if self.create_room_mode == RoomMode::Local {
+                let enabled =
+                    room_actions_enabled(self.connecting, self.update_blocks_room_actions());
+                let searching = self.discovery.is_some()
+                    && self.discovery_attempted_at.is_some_and(|started| {
+                        started.elapsed() < std::time::Duration::from_secs(2)
+                    });
+                if let Some(room) = show_discovered_rooms(
+                    ui,
+                    &self.discovered_rooms,
+                    self.discovery_error.as_deref(),
+                    searching,
+                    enabled,
+                ) {
+                    self.join_discovered_room(room);
                 }
-            } else {
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.server_url)
-                            .hint_text("IP ou nome DDNS do anfitrião")
-                            .desired_width(ui.available_width().min(300.0)),
+            }
+            ui.collapsing("Entrada manual · endereço e código", |ui| {
+                let selected_label = self
+                    .selected_host_index
+                    .and_then(|index| self.saved_hosts.get(index))
+                    .map(|profile| profile.name.as_str())
+                    .unwrap_or("Endereço manual");
+                let old_host_index = self.selected_host_index;
+                let (_, manage_response) = show_host_picker_and_manage(
+                    ui,
+                    selected_label,
+                    &mut self.selected_host_index,
+                    self.saved_hosts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, profile)| (index, profile.name.as_str())),
+                );
+                manage_hosts = manage_response.clicked();
+                if self.selected_host_index != old_host_index {
+                    self.select_host(self.selected_host_index);
+                }
+                if let Some(index) = self.selected_host_index {
+                    if let Some(profile) = self.saved_hosts.get(index) {
+                        ui.small(format!("Endereço: {}", profile.address));
+                        if let Err(error) = signaling_ws_url(&profile.address) {
+                            Self::show_notice(ui, "Perfil inválido:", &error);
+                        }
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.server_url)
+                                .hint_text("IP ou nome DDNS do anfitrião")
+                                .desired_width(ui.available_width().min(300.0)),
+                        );
+                        if !self.server_url.trim().is_empty()
+                            && self.saved_hosts.len() < MAX_SAVED_HOSTS
+                            && ui.small_button("+ Salvar anfitrião").clicked()
+                        {
+                            let room_code = if self.join_code.trim().is_empty() {
+                                None
+                            } else {
+                                Some(sanitize_room_code(&self.join_code))
+                            };
+                            self.saved_hosts.push(SavedHostProfile {
+                                name: format!("Anfitrião {}", self.saved_hosts.len() + 1),
+                                address: self.server_url.trim().to_owned(),
+                                room_code,
+                            });
+                            self.selected_host_index = Some(self.saved_hosts.len() - 1);
+                        }
+                    });
+                }
+                ui.label("Digite o código da sala:");
+                ui.horizontal_wrapped(|ui| {
+                    let field_width =
+                        (ui.available_width() - PRIMARY_ACTION_WIDTH - ui.spacing().item_spacing.x)
+                            .max(80.0);
+                    let code_edit = ui.add_sized(
+                        egui::vec2(field_width, PRIMARY_ACTION_HEIGHT),
+                        egui::TextEdit::singleline(&mut self.join_code)
+                            .hint_text("Código da sala")
+                            .desired_width(field_width),
                     );
-                    if !self.server_url.trim().is_empty()
-                        && self.saved_hosts.len() < MAX_SAVED_HOSTS
-                        && ui.small_button("+ Salvar anfitrião").clicked()
-                    {
-                        let room_code = if self.join_code.trim().is_empty() {
-                            None
-                        } else {
-                            Some(sanitize_room_code(&self.join_code))
-                        };
-                        self.saved_hosts.push(SavedHostProfile {
-                            name: format!("Anfitrião {}", self.saved_hosts.len() + 1),
-                            address: self.server_url.trim().to_owned(),
-                            room_code,
-                        });
-                        self.selected_host_index = Some(self.saved_hosts.len() - 1);
+                    if code_edit.changed() {
+                        self.set_join_code(&self.join_code.clone());
+                    }
+
+                    let address = self.join_address();
+                    let valid_address = signaling_ws_url(address).is_ok();
+                    let enabled = join_action_enabled(
+                        !self.join_code.trim().is_empty(),
+                        valid_address,
+                        self.connecting,
+                        self.update_blocks_room_actions(),
+                    );
+                    let response =
+                        primary_action_button(ui, "Entrar", PRIMARY_ACTION_WIDTH, enabled);
+                    let clicked = response.clicked();
+                    if self.join_code.trim().is_empty() {
+                        response.on_hover_text("Digite o código da sala para habilitar Entrar.");
+                    }
+                    if clicked {
+                        let code = self.join_code.trim().to_ascii_uppercase();
+                        self.start_join(code);
                     }
                 });
-            }
-            ui.label("Digite o código da sala:");
-            ui.horizontal_wrapped(|ui| {
-                let field_width =
-                    (ui.available_width() - PRIMARY_ACTION_WIDTH - ui.spacing().item_spacing.x)
-                        .max(80.0);
-                let code_edit = ui.add_sized(
-                    egui::vec2(field_width, PRIMARY_ACTION_HEIGHT),
-                    egui::TextEdit::singleline(&mut self.join_code)
-                        .hint_text("Código da sala")
-                        .desired_width(field_width),
-                );
-                if code_edit.changed() {
-                    self.set_join_code(&self.join_code.clone());
-                }
-
-                let address = self.join_address();
-                let valid_address = signaling_ws_url(address).is_ok();
-                let enabled = join_action_enabled(
-                    !self.join_code.trim().is_empty(),
-                    valid_address,
-                    self.connecting,
-                    self.update_blocks_room_actions(),
-                );
-                let response = primary_action_button(ui, "Entrar", PRIMARY_ACTION_WIDTH, enabled);
-                let clicked = response.clicked();
-                if self.join_code.trim().is_empty() {
-                    response.on_hover_text("Digite o código da sala para habilitar Entrar.");
-                }
-                if clicked {
-                    let code = self.join_code.trim().to_ascii_uppercase();
-                    self.start_join(code);
-                }
             });
         });
         if manage_hosts {

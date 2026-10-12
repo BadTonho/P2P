@@ -5,13 +5,82 @@ use eframe::egui;
 use super::*;
 use crate::settings::{MAX_SAVED_HOSTS, SavedHostProfile};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct HostAddress {
     pub(crate) adapter: String,
+    pub(crate) description: String,
     pub(crate) ipv4: Ipv4Addr,
+    pub(crate) prefix_len: u32,
+    pub(crate) lan: bool,
+    pub(crate) has_gateway: bool,
+    pub(crate) metric: u32,
+}
+
+fn discovery_prefix(ipv4: Ipv4Addr, prefixes: &[(IpAddr, u32)]) -> u32 {
+    prefixes
+        .iter()
+        .filter_map(|(network, prefix)| {
+            let IpAddr::V4(network) = network else {
+                return None;
+            };
+            // GetAdaptersAddresses includes /32 host routes alongside the actual subnet.
+            if !(1..=30).contains(prefix) {
+                return None;
+            }
+            let mask = u32::MAX << (32 - prefix);
+            (u32::from(ipv4) & mask == u32::from(*network) & mask).then_some(*prefix)
+        })
+        .max()
+        .unwrap_or(32)
+}
+
+pub(crate) fn select_network_address(
+    addresses: &[HostAddress],
+    selection: NetworkSelection,
+    saved: Option<Ipv4Addr>,
+) -> Option<usize> {
+    if selection == NetworkSelection::Manual
+        && let Some(index) = addresses
+            .iter()
+            .position(|address| Some(address.ipv4) == saved)
+    {
+        return Some(index);
+    }
+    addresses
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, address)| {
+            let radmin = format!("{} {}", address.adapter, address.description)
+                .to_ascii_lowercase()
+                .contains("radmin");
+            let priority = if radmin {
+                0
+            } else if address.lan && address.has_gateway {
+                1
+            } else if address.lan {
+                2
+            } else {
+                3
+            };
+            (
+                priority,
+                address.metric,
+                address.adapter.as_str(),
+                address.ipv4,
+            )
+        })
+        .map(|(index, _)| index)
 }
 
 impl ClientUi {
+    pub(crate) fn network_is_locked(&self) -> bool {
+        self.room_code.is_some()
+            || self.connecting
+            || self.signaling.is_some()
+            || self.pending_signaling.is_some()
+            || self.control_mesh.is_some()
+    }
+
     pub(crate) fn select_host(&mut self, index: Option<usize>) {
         self.selected_host_index = index;
         self.join_code = if let Some(index) = self.selected_host_index {
@@ -52,9 +121,23 @@ impl ClientUi {
     }
 
     pub(crate) fn refresh_host_addresses(&mut self) {
+        if self.network_is_locked() {
+            return;
+        }
         self.addresses_loaded = true;
+        self.last_adapter_refresh = Some(Instant::now());
         match enumerate_host_addresses() {
             Ok(addresses) => {
+                if self.host_addresses == addresses {
+                    self.host_addresses_error = None;
+                    self.selected_host_address = select_network_address(
+                        &addresses,
+                        self.network_selection,
+                        self.preferred_control_ipv4,
+                    )
+                    .unwrap_or(0);
+                    return;
+                }
                 tracing::info!(
                     adapter_count = addresses.len(),
                     "Lista de adaptadores IPv4 atualizada"
@@ -65,19 +148,12 @@ impl ClientUi {
                 self.host_addresses = addresses;
                 self.host_addresses_error = None;
                 if !self.host_addresses.is_empty() {
-                    self.selected_host_address = self
-                        .preferred_control_ipv4
-                        .and_then(|preferred| {
-                            self.host_addresses
-                                .iter()
-                                .position(|address| address.ipv4 == preferred)
-                        })
-                        .unwrap_or(0);
-                    let selected_ipv4 = self.host_addresses[self.selected_host_address].ipv4;
-                    if self.preferred_control_ipv4 != Some(selected_ipv4) {
-                        self.preferred_control_ipv4 = Some(selected_ipv4);
-                        tracing::info!(ipv4 = %selected_ipv4, "Adaptador de controle padrão selecionado porque o IPv4 salvo não está ativo");
-                    }
+                    self.selected_host_address = select_network_address(
+                        &self.host_addresses,
+                        self.network_selection,
+                        self.preferred_control_ipv4,
+                    )
+                    .unwrap_or(0);
                 }
             }
             Err(error) => {
@@ -89,23 +165,47 @@ impl ClientUi {
     }
 
     pub(crate) fn show_control_address_picker(&mut self, ui: &mut egui::Ui) {
+        let old_selection = self.network_selection;
+        ui.add_enabled_ui(!self.network_is_locked(), |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut self.network_selection,
+                    NetworkSelection::Automatic,
+                    "Automática (prioriza Radmin)",
+                );
+                ui.selectable_value(
+                    &mut self.network_selection,
+                    NetworkSelection::Manual,
+                    "Manual",
+                );
+            });
+        });
+        if old_selection != self.network_selection {
+            self.refresh_host_addresses();
+            self.discovery_attempted_at = None;
+        }
         if !self.host_addresses.is_empty() {
             let previous_selection = self.selected_host_address;
             self.selected_host_address = self
                 .selected_host_address
                 .min(self.host_addresses.len().saturating_sub(1));
             let selected = &self.host_addresses[self.selected_host_address];
-            egui::ComboBox::from_id_salt("control-ip-address")
-                .selected_text(format!("{} — {}", selected.adapter, selected.ipv4))
-                .show_ui(ui, |ui| {
-                    for (index, address) in self.host_addresses.iter().enumerate() {
-                        ui.selectable_value(
-                            &mut self.selected_host_address,
-                            index,
-                            format!("{} — {}", address.adapter, address.ipv4),
-                        );
-                    }
-                });
+            ui.add_enabled_ui(
+                self.network_selection == NetworkSelection::Manual && !self.network_is_locked(),
+                |ui| {
+                    egui::ComboBox::from_id_salt("control-ip-address")
+                        .selected_text(format!("{} — {}", selected.adapter, selected.ipv4))
+                        .show_ui(ui, |ui| {
+                            for (index, address) in self.host_addresses.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.selected_host_address,
+                                    index,
+                                    format!("{} — {}", address.adapter, address.ipv4),
+                                );
+                            }
+                        });
+                },
+            );
             if previous_selection != self.selected_host_address {
                 let selected = &self.host_addresses[self.selected_host_address];
                 self.preferred_control_ipv4 = Some(selected.ipv4);
@@ -124,6 +224,9 @@ impl ClientUi {
         if ui.button("Atualizar adaptadores de controle").clicked() {
             self.refresh_host_addresses();
         }
+        if self.network_is_locked() {
+            ui.small("O adaptador permanece fixo até você sair da sala.");
+        }
     }
 
     pub(crate) fn show_host_address_picker(&mut self, ui: &mut egui::Ui) {
@@ -133,17 +236,22 @@ impl ClientUi {
                 .selected_host_address
                 .min(self.host_addresses.len().saturating_sub(1));
             let selected = &self.host_addresses[self.selected_host_address];
-            egui::ComboBox::from_id_salt("host-ip-address")
-                .selected_text(format!("{} — {}", selected.adapter, selected.ipv4))
-                .show_ui(ui, |ui| {
-                    for (index, address) in self.host_addresses.iter().enumerate() {
-                        ui.selectable_value(
-                            &mut self.selected_host_address,
-                            index,
-                            format!("{} — {}", address.adapter, address.ipv4),
-                        );
-                    }
-                });
+            ui.add_enabled_ui(
+                self.network_selection == NetworkSelection::Manual && !self.network_is_locked(),
+                |ui| {
+                    egui::ComboBox::from_id_salt("host-ip-address")
+                        .selected_text(format!("{} — {}", selected.adapter, selected.ipv4))
+                        .show_ui(ui, |ui| {
+                            for (index, address) in self.host_addresses.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.selected_host_address,
+                                    index,
+                                    format!("{} — {}", address.adapter, address.ipv4),
+                                );
+                            }
+                        });
+                },
+            );
             if previous_selection != self.selected_host_address {
                 let selected = &self.host_addresses[self.selected_host_address];
                 self.preferred_control_ipv4 = Some(selected.ipv4);
@@ -204,7 +312,15 @@ pub(crate) fn enumerate_host_addresses() -> Result<Vec<HostAddress>, String> {
                 }
                 addresses.push(HostAddress {
                     adapter: adapter.friendly_name().to_owned(),
+                    description: adapter.description().to_owned(),
                     ipv4: *ipv4,
+                    prefix_len: discovery_prefix(*ipv4, adapter.prefixes()),
+                    lan: matches!(
+                        adapter.if_type(),
+                        ipconfig::IfType::EthernetCsmacd | ipconfig::IfType::Ieee80211
+                    ),
+                    has_gateway: !adapter.gateways().is_empty(),
+                    metric: adapter.ipv4_metric(),
                 });
             }
         }
@@ -395,6 +511,21 @@ pub(crate) fn signaling_address_for_control(control_address: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_prefix_uses_subnet_instead_of_windows_host_route() {
+        let ip = Ipv4Addr::new(26, 1, 2, 3);
+        let prefixes = [
+            (IpAddr::V4(ip), 32),
+            (IpAddr::V4(Ipv4Addr::new(26, 0, 0, 0)), 8),
+            (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        ];
+        assert_eq!(discovery_prefix(ip, &prefixes), 8);
+        assert_eq!(
+            discovery_prefix(Ipv4Addr::new(192, 168, 1, 2), &prefixes),
+            32
+        );
+    }
 
     #[test]
     fn signaling_address_accepts_ipv4_or_ddns_with_fixed_port() {

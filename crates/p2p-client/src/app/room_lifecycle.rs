@@ -115,10 +115,15 @@ impl ClientUi {
     }
 
     pub(super) fn start_join(&mut self, code: String) {
+        self.refresh_host_addresses();
+        self.start_join_at(self.join_address().to_owned(), code);
+    }
+
+    pub(super) fn start_join_at(&mut self, endpoint: String, code: String) {
         if self.signaling.is_some() || self.connecting || self.update_blocks_room_actions() {
             return;
         }
-        let server_url = match signaling_ws_url(self.join_address()) {
+        let server_url = match signaling_ws_url(&endpoint) {
             Ok(url) => url,
             Err(error) => {
                 tracing::error!(reason = %error, "Endereço do anfitrião inválido ao entrar em sala");
@@ -812,6 +817,9 @@ impl ClientUi {
     }
 
     pub(super) fn leave_room(&mut self) {
+        if let Some(discovery) = &self.discovery {
+            discovery.advertise(None);
+        }
         tracing::info!("Saindo da sala e liberando recursos locais");
         self.fullscreen_video = false;
         self.stop_microphone();

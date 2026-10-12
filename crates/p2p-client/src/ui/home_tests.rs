@@ -7,6 +7,45 @@ use super::{
 use crate::settings::SavedHostProfile;
 use eframe::egui;
 
+#[test]
+fn discovered_room_list_renders_without_code_and_never_selects_automatically() {
+    let rooms = vec![crate::discovery::DiscoveredRoom {
+        ipv4: [26, 1, 2, 3].into(),
+        advertisement: crate::discovery::RoomAdvertisement {
+            code: "HIDDEN123".to_owned(),
+            host_name: "Amigo".to_owned(),
+            participants: 3,
+        },
+    }];
+    for width in [340.0, 640.0] {
+        let context = egui::Context::default();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                assert!(super::show_discovered_rooms(ui, &rooms, None, false, true).is_none());
+            },
+        );
+        let texts: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|text| text.contains("Amigo")));
+        assert!(texts.iter().any(|text| text.contains("3/8")));
+        assert!(!texts.iter().any(|text| text.contains("HIDDEN123")));
+        output.textures_delta.clear();
+    }
+}
+
 struct HomeActionLayout {
     create_card: egui::Rect,
     create_button: egui::Rect,

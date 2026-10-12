@@ -28,6 +28,14 @@ pub struct SavedHostProfile {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum NetworkSelection {
+    #[default]
+    Automatic,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VideoDecoderPreference {
     #[default]
     Automatic,
@@ -80,6 +88,9 @@ pub struct AppSettings {
     pub use_turn_on_create: bool,
     pub may_host: bool,
     pub control_ipv4: Option<Ipv4Addr>,
+    pub network_selection: NetworkSelection,
+    #[serde(default = "default_announce_local_room")]
+    pub announce_local_room: bool,
     pub video_decoder_preference: VideoDecoderPreference,
     pub screen_share_quality: ScreenShareQuality,
     pub show_local_preview: bool,
@@ -113,6 +124,10 @@ pub struct AppSettings {
 }
 
 pub const fn default_exclude_self_audio() -> bool {
+    true
+}
+
+pub const fn default_announce_local_room() -> bool {
     true
 }
 
@@ -179,6 +194,8 @@ impl Default for AppSettings {
             use_turn_on_create: true,
             may_host: false,
             control_ipv4: None,
+            network_selection: NetworkSelection::Automatic,
+            announce_local_room: default_announce_local_room(),
             video_decoder_preference: VideoDecoderPreference::Automatic,
             screen_share_quality: ScreenShareQuality::default(),
             show_local_preview: true,

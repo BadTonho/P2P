@@ -3,6 +3,7 @@
 mod app;
 mod audio_capture;
 mod control_mesh;
+mod discovery;
 mod logging;
 mod mesh_identity;
 mod mf_video;

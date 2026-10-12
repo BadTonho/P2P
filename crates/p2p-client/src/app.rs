@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::audio_capture::{AudioApplication, AudioExclusionConfig, MicrophoneTest};
 use crate::control_mesh::{ControlEvent, ControlMesh, QueueEntry};
+use crate::discovery::{DiscoveredRoom, DiscoveryService, RoomAdvertisement};
 use crate::logging::{
     DiagnosticSnapshot, LoggingState, safe_signaling_endpoint, safe_stun_endpoint,
 };
@@ -18,7 +19,9 @@ use crate::screen_capture::{
 };
 use crate::screen_quality::ScreenShareQuality;
 use crate::screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
-use crate::settings::{AppSettings, LoggingLevel, SavedHostProfile, VideoDecoderPreference};
+use crate::settings::{
+    AppSettings, LoggingLevel, NetworkSelection, SavedHostProfile, VideoDecoderPreference,
+};
 use crate::signaling_client::{SignalingClient, SignalingEvent};
 use crate::turn_relay::{TurnCredentials, TurnRelayServer, TurnRoomConfig};
 use crate::update::{UpdateEvent, UpdateManager, UpdateManifest};
@@ -28,6 +31,8 @@ use signaling_protocol::{ParticipantInfo, RoomMode, SignalKind};
 
 #[path = "app/audio.rs"]
 mod audio;
+#[path = "app/discovery.rs"]
+mod discovery;
 #[path = "app/group_sharing.rs"]
 mod group_sharing;
 #[path = "app/hosts.rs"]
@@ -205,6 +210,13 @@ struct ClientUi {
     host_addresses_error: Option<String>,
     selected_host_address: usize,
     preferred_control_ipv4: Option<Ipv4Addr>,
+    network_selection: NetworkSelection,
+    announce_local_room: bool,
+    last_adapter_refresh: Option<Instant>,
+    discovery: Option<DiscoveryService>,
+    discovery_attempted_at: Option<Instant>,
+    discovered_rooms: Vec<DiscoveredRoom>,
+    discovery_error: Option<String>,
     addresses_loaded: bool,
     control_network_window_open: bool,
     participant_id: String,
@@ -425,6 +437,8 @@ impl ClientUi {
             use_turn_on_create: self.use_turn_on_create,
             may_host: self.may_host,
             control_ipv4: self.preferred_control_ipv4,
+            network_selection: self.network_selection,
+            announce_local_room: self.announce_local_room,
             use_fixed_room: self.use_fixed_room,
             fixed_room_code: if self.fixed_room_code.trim().is_empty() {
                 None
@@ -464,6 +478,8 @@ impl ClientUi {
         self.use_turn_on_create = preferences.use_turn_on_create;
         self.may_host = preferences.may_host;
         self.preferred_control_ipv4 = preferences.control_ipv4;
+        self.network_selection = preferences.network_selection;
+        self.announce_local_room = preferences.announce_local_room;
         self.use_fixed_room = preferences.use_fixed_room;
         self.fixed_room_code = preferences.fixed_room_code.unwrap_or_default();
         self.last_manual_join_code = preferences.last_manual_join_code;
@@ -641,6 +657,7 @@ impl ClientUi {
         self.refresh_turn_state();
         self.refresh_screen_share(&context);
         self.refresh_control_mesh(&context);
+        self.refresh_discovery(&context);
         self.refresh_updates(&context);
         self.handle_window_close(&context);
 
@@ -1200,6 +1217,7 @@ impl Drop for ClientUi {
             tracing::error!(error = %error, "Não foi possível salvar as preferências ao encerrar");
         }
         tracing::info!("Encerrando aplicativo e liberando capturas e conexões");
+        self.discovery = None;
         self.updates.cancel_download();
         self.stop_microphone();
         self.stop_screen_share(true);

@@ -234,7 +234,10 @@ impl ClientUi {
         ui.group(|ui| {
             ui.label("Adaptador para controle e mídia");
             self.show_control_address_picker(ui);
-            ui.small("O endereço escolhido vale para TCP 9001 e UDP 9002–9009.");
+            ui.small("O endereço escolhido vale para descoberta, controle e mídia.");
+            ui.checkbox(&mut self.announce_local_room, "Anunciar minhas salas locais nesta rede");
+            ui.small("Com o anúncio ativo, outras pessoas nesta rede podem entrar sem código.");
+            ui.small("Descoberta: UDP 8999. Sinalização e controle: TCP 9000–9001. Mídia: UDP 9002–9009.");
         });
 
         ui.add_space(8.0);

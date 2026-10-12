@@ -25,9 +25,17 @@ Na tela inicial, **Seu perfil** permite informar um nome e escolher uma foto; am
 ## Rede local ou Radmin VPN
 
 1. As duas pessoas entram na mesma rede local ou na mesma rede Radmin VPN.
-2. O anfitrião seleciona **Rede local / Radmin** e clica em **Criar sala**. Escolhe o adaptador cujo IPv4 o amigo pode alcançar e compartilha o endereço `ws://IP:9000` e o código da sala. O servidor integrado usa `ws://` sem TLS; o cliente aceita `wss://` quando há um serviço externo com TLS encaminhando para o servidor.
-3. O convidado seleciona **Rede local / Radmin** para escolher seu adaptador de controle, abre **Configurações > Conexão**, informa o endereço do anfitrião e volta à tela inicial. Digita o código e clica em **Entrar**.
+2. O anfitrião seleciona **Rede local / Radmin** e clica em **Criar sala**, mantendo **Anunciar sala nesta rede** ativo.
+3. O convidado escolhe a sala em **Salas nesta rede** e clica em **Entrar**. Não precisa digitar IP nem código. A lista mostra o nome do anfitrião e a ocupação; encontrar uma sala nunca inicia a conexão sozinho.
 4. Os participantes escolhem uma tela ou janela. Em uma sala compatível com grupo, cada pessoa pode clicar em **Compartilhar minha tela**; quem quiser assistir escolhe **Assistir** na transmissão correspondente. As telas assistidas aparecem na grade. Em uma sala com cliente antigo, o compartilhamento continua no fluxo de duas pessoas, com pedido e aceite.
+
+## Descoberta e seleção de rede
+
+A seleção de rede **Automática** prioriza o Radmin ativo e usa Ethernet/Wi-Fi quando ele não está disponível. Em **Configurações > Conexão**, **Manual** permite escolher outro adaptador. A lista de adaptadores se atualiza enquanto você está fora de uma sala; durante a sessão, a rede fica fixa até você sair.
+
+Com o anúncio ativo, quem estiver na mesma rede poderá encontrar e entrar na sala sem informar o código. O anfitrião pode desativá-lo na criação ou em **Configurações > Conexão**. Para salas sem anúncio, clientes antigos ou quando a descoberta não funcionar, use **Entrada manual · endereço e código**.
+
+A descoberta usa broadcast **UDP 8999** somente no adaptador selecionado. Permita essa porta nos PCs participantes, além de **TCP 9000–9001** e **UDP 9002–9009**. O aplicativo não altera regras do firewall. Salas desaparecem da lista após seis segundos sem anúncio. Os códigos recebidos pela descoberta ficam apenas em memória e não são salvos nem registrados nos logs. Redes virtuais que não transportem broadcast precisarão da entrada manual.
 
 ## Escolher a qualidade da tela
 
@@ -57,9 +65,10 @@ Portas para permitir no firewall:
 
 - TCP 9000 no PC anfitrião, para a sinalização da sala.
 - TCP 9001 em cada PC, para controle e sucessão do anfitrião.
+- UDP 8999 nos PCs, para encontrar salas automaticamente.
 - UDP 9002–9009 nos PCs, para as sessões de vídeo em grupo.
 
-No Radmin, escolham o adaptador e o endereço IPv4 da VPN. Todos precisam estar conectados à mesma rede virtual. A sucessão só funciona se os participantes elegíveis permitirem hospedagem e a malha de controle conseguir se conectar.
+No Radmin, a seleção automática usa o adaptador da VPN. Todos precisam estar conectados à mesma rede virtual. A sucessão só funciona se os participantes elegíveis permitirem hospedagem e a malha de controle conseguir se conectar.
 
 O compartilhamento em grupo requer que todos usem um build com suporte a IDs próprios de sessão para ofertas, respostas e ICE. Builds anteriores podem continuar usando o fluxo tradicional entre duas pessoas, mas o compartilhamento em grupo fica desativado até todos atualizarem. A sala aceita até oito participantes, mas cada PC tem oito portas UDP de mídia disponíveis (9002–9009); sessões simultâneas de envio e recepção podem atingir esse limite antes de a sala chegar a oito pessoas. Se isso ocorrer, pare de assistir a uma tela que não seja necessária e tente novamente.
 

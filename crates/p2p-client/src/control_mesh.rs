@@ -2243,21 +2243,30 @@ mod tests {
         let mut host = participant("host", 1, false);
         host.control_address = host_address.clone();
         host.public_key = Some(host_identity.public_key().to_owned());
-        let guest_address = free_local_address();
-        let mut guest = participant("guest", 2, true);
-        guest.control_address = guest_address.clone();
-        guest.public_key = Some(roster_guest_key);
-        let roster = vec![host.clone(), guest.clone()];
-
         let host_mesh = ControlMesh::start_on(
             host.clone(),
             "SAMECODE".to_owned(),
             host.id.clone(),
             "ws://127.0.0.1:9000".to_owned(),
-            host_address,
+            host_address.clone(),
             Some(host_identity),
         )
         .unwrap();
+        // Keep the host's chosen port bound before asking Windows for another free port.
+        // Authentication is tested against ready listeners, independently of startup races.
+        assert!(
+            receive_until(&host_mesh.events, Duration::from_secs(3), |event| {
+                matches!(event, ControlEvent::Ready)
+            })
+            .is_some(),
+            "authenticated host listener must be ready"
+        );
+        let guest_address = free_local_address();
+        assert_ne!(host_address, guest_address);
+        let mut guest = participant("guest", 2, true);
+        guest.control_address = guest_address.clone();
+        guest.public_key = Some(roster_guest_key);
+        let roster = vec![host.clone(), guest.clone()];
         host_mesh.update_roster(
             roster.clone(),
             host.id.clone(),
@@ -2272,6 +2281,13 @@ mod tests {
             Some(guest_identity),
         )
         .unwrap();
+        assert!(
+            receive_until(&guest_mesh.events, Duration::from_secs(3), |event| {
+                matches!(event, ControlEvent::Ready)
+            })
+            .is_some(),
+            "authenticated guest listener must be ready"
+        );
         guest_mesh.update_roster(roster, host.id.clone(), "ws://127.0.0.1:9000".to_owned());
         (host_mesh, guest_mesh)
     }

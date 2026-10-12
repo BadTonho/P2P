@@ -77,6 +77,7 @@ O **P2P — Voz e Tela** foi criado para oferecer uma alternativa direta, transp
 ```
 
 - **Porta TCP 9000:** Usada apenas para sinalização inicial (troca de ofertas, respostas e candidatos ICE).
+- **Porta UDP 8999:** Descoberta de salas por broadcast no adaptador selecionado.
 - **Porta TCP 9001:** Malha de controle descentralizada entre todos os membros (monitoramento de saúde da rede e eleição de anfitrião).
 - **Portas UDP 9002–9009:** Mídia WebRTC de áudio e vídeo direta entre os computadores.
 
@@ -95,12 +96,12 @@ Baixe a versão mais recente na página de [Releases do GitHub](https://github.c
    - **Rede local / Radmin:** Para computadores na mesma rede Wi-Fi/cabo ou conectados em redes virtuais como Radmin VPN / ZeroTier / Tailscale.
    - **Internet (teste):** Para conexões ponto a ponto diretas via IP público ou DDNS.
 3. Clique em **Criar sala**.
-4. Envie o endereço exibido (`ws://SEU-IP:9000`) e o código da sala para seus amigos. Esse endereço usa sinalização sem TLS. O cliente também aceita `wss://` quando o endereço aponta para um serviço que termina TLS e encaminha a conexão ao servidor da sala.
+4. Em rede local/Radmin, mantenha **Anunciar sala nesta rede** ativo para seus amigos encontrarem a sala. Quem estiver nessa rede poderá entrar pelo anúncio sem código. Para entrada manual ou Internet, envie o endereço exibido (`ws://SEU-IP:9000`) e o código; a sinalização integrada usa `ws://` sem TLS.
 
 ### 3. Entrando na Sala
 1. Abra o aplicativo.
-2. Em **Configurações > Conexão**, insira o endereço do anfitrião (`ws://IP-DO-ANFITRIAO:9000`). Use `wss://` somente se o endpoint estiver configurado para TLS; o servidor integrado do aplicativo não termina TLS por conta própria.
-3. Na tela inicial, digite o código da sala e clique em **Entrar**.
+2. Em **Rede local / Radmin**, escolha a sala em **Salas nesta rede** e clique em **Entrar**, sem digitar IP nem código. O app prioriza o Radmin ativo; na ausência dele, usa Ethernet/Wi-Fi. A descoberta exige UDP 8999 liberado no firewall e uma rede que transporte broadcast.
+3. Para salas sem anúncio ou clientes antigos, use **Entrada manual · endereço e código**. Configure o endereço do anfitrião e informe o código. Use `wss://` somente com um endpoint TLS externo; o servidor integrado não termina TLS por conta própria.
 
 ### 4. Compartilhando Tela e Áudio
 - Selecione o monitor ou janela desejada.

@@ -1,0 +1,108 @@
+use super::*;
+use crate::discovery::DiscoveryNetwork;
+
+impl ClientUi {
+    fn local_room_advertisement(&self) -> Option<RoomAdvertisement> {
+        if !self.announce_local_room
+            || !self.hosting_locally
+            || self.signaling.is_none()
+            || self.room_mode != RoomMode::Local
+            || (!self.current_leader_id.is_empty() && self.current_leader_id != self.participant_id)
+        {
+            return None;
+        }
+        let name = self.profile_display_name.trim();
+        let advertisement = RoomAdvertisement {
+            code: self.room_code.clone()?,
+            host_name: if name.is_empty() {
+                "Anfitrião".to_owned()
+            } else {
+                name.chars().take(64).collect()
+            },
+            participants: self.participants.len().clamp(1, 8) as u8,
+        };
+        advertisement.valid().then_some(advertisement)
+    }
+
+    fn discovery_network(&self) -> Option<DiscoveryNetwork> {
+        let mode = if self.network_is_locked() {
+            self.room_mode
+        } else {
+            self.create_room_mode
+        };
+        if mode != RoomMode::Local {
+            return None;
+        }
+        self.host_addresses
+            .get(self.selected_host_address)
+            .map(|address| DiscoveryNetwork {
+                adapter: address.adapter.clone(),
+                ipv4: address.ipv4,
+                prefix_len: address.prefix_len,
+            })
+    }
+
+    pub(super) fn refresh_discovery(&mut self, context: &egui::Context) {
+        let now = Instant::now();
+        if !self.network_is_locked()
+            && self
+                .last_adapter_refresh
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5))
+        {
+            self.refresh_host_addresses();
+        }
+        let network = self.discovery_network();
+        if self
+            .discovery
+            .as_ref()
+            .is_some_and(|service| Some(&service.network) != network.as_ref())
+        {
+            self.discovery = None;
+            self.discovered_rooms.clear();
+            self.discovery_attempted_at = None;
+        }
+        if let Some(network) = network {
+            context.request_repaint_after(Duration::from_millis(250));
+            if self.discovery.is_none()
+                && self
+                    .discovery_attempted_at
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5))
+            {
+                self.discovery_attempted_at = Some(now);
+                match DiscoveryService::start(network) {
+                    Ok(service) => {
+                        self.discovery = Some(service);
+                        self.discovery_error = None;
+                    }
+                    Err(error) => self.discovery_error = Some(error),
+                }
+            }
+        } else {
+            self.discovery_error = None;
+            self.discovered_rooms.clear();
+            // Allows detecting Radmin or Ethernet/Wi-Fi becoming active while idle.
+            context.request_repaint_after(Duration::from_secs(2));
+        }
+        if let Some(service) = &self.discovery {
+            service.advertise(self.local_room_advertisement());
+            let (rooms, error) = service.snapshot();
+            self.discovered_rooms = rooms;
+            self.discovery_error = error;
+        }
+    }
+
+    pub(super) fn join_discovered_room(&mut self, room: DiscoveredRoom) {
+        // The code goes directly to signaling, never through set_join_code/preferences.
+        if self.discovered_rooms.contains(&room) {
+            self.start_join_at(room.endpoint(), room.advertisement.code);
+        } else {
+            self.connection_error = Some(
+                "Esta sala não está mais disponível. Aguarde a atualização da lista.".to_owned(),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "discovery_tests.rs"]
+mod tests;
