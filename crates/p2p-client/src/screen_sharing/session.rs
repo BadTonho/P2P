@@ -1777,6 +1777,9 @@ async fn create_sender(
         );
         let mut sample_rx = sample_rx;
         while let Some(encoded_frame) = sample_rx.recv().await {
+            if !writer_metrics.p2p_connected.load(Ordering::Relaxed) {
+                continue;
+            }
             let sample_bytes = encoded_frame.bytes.len() as u64;
             let frame_kind = encoded_frame.kind;
             let sample = Sample {
@@ -1856,9 +1859,9 @@ async fn create_sender(
     let audio_task = match (system_audio, audio_track) {
         (Some((capture, encoder)), Some(audio_track)) => {
             let audio_events = events.clone();
-            let session_id = metrics.session_id;
+            let audio_metrics = Arc::clone(&metrics);
             Some(tokio::spawn(async move {
-                send_system_audio(capture, encoder, audio_track, audio_events, session_id).await;
+                send_system_audio(capture, encoder, audio_track, audio_events, audio_metrics).await;
             }))
         }
         _ => None,
@@ -1896,8 +1899,9 @@ async fn send_system_audio(
     mut encoder: opus::Encoder,
     track: Arc<TrackLocalStaticSample>,
     events: std_mpsc::Sender<ScreenShareEvent>,
-    session_id: u64,
+    metrics: Arc<SharedMetrics>,
 ) {
+    let session_id = metrics.session_id;
     let Some(ssrc) = track.ssrcs().await.first().copied() else {
         let message = "A faixa Opus não recebeu um identificador RTP.".to_owned();
         tracing::error!(
@@ -1958,6 +1962,14 @@ async fn send_system_audio(
                 kind.map(|kind| format!(" ({kind:?})")).unwrap_or_default()
             )));
             break;
+        }
+
+        if !metrics.p2p_connected.load(Ordering::Relaxed) {
+            // Enquanto o handshake DTLS/ICE não for concluído, descarta amostras
+            // capturadas para não acumular atraso nem tentar envio SRTP antes da chave.
+            let _ = capture.read_samples(&mut pcm);
+            filled = 0;
+            continue;
         }
 
         filled += capture.read_samples(&mut pcm[filled..]);
