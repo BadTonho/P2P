@@ -648,6 +648,18 @@ fn decode_h264_access_unit(
                 }
                 None => {}
             }
+            let expected_bytes = (width as usize)
+                .saturating_mul(height as usize)
+                .saturating_mul(4);
+            if width == 0 || height == 0 || rgba.len() != expected_bytes {
+                tracing::warn!(
+                    width,
+                    height,
+                    rgba_len = rgba.len(),
+                    "Quadro decodificado possui dimensões inválidas; descartando antes da publicação"
+                );
+                return None;
+            }
             let next_sequence = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             *remote_frame
                 .lock()

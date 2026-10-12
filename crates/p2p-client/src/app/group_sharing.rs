@@ -885,30 +885,38 @@ impl ClientUi {
                         .copied()
                         .unwrap_or(0);
                     if sequence != frame.sequence {
-                        let image = egui::ColorImage::from_rgba_unmultiplied(
-                            [frame.width as usize, frame.height as usize],
-                            &frame.rgba,
-                        );
-                        if let Some(texture) = self.group_remote_textures.get_mut(&peer_id) {
-                            texture.set(image, egui::TextureOptions::LINEAR);
-                        } else {
-                            self.group_remote_textures.insert(
-                                peer_id.clone(),
-                                context.load_texture(
-                                    format!("group-screen-{peer_id}"),
-                                    image,
-                                    egui::TextureOptions::LINEAR,
-                                ),
-                            );
-                        }
-                        session.record_ui_texture_update();
-                        if self.group_auto_focus_pending.remove(&peer_id)
-                            && should_auto_focus_group_screen(self.focused_group_screen.as_deref())
+                        let expected_bytes = (frame.width as usize)
+                            .saturating_mul(frame.height as usize)
+                            .saturating_mul(4);
+                        if frame.width > 0 && frame.height > 0 && frame.rgba.len() == expected_bytes
                         {
-                            self.focused_group_screen = Some(peer_id.clone());
+                            let image = egui::ColorImage::from_rgba_unmultiplied(
+                                [frame.width as usize, frame.height as usize],
+                                &frame.rgba,
+                            );
+                            if let Some(texture) = self.group_remote_textures.get_mut(&peer_id) {
+                                texture.set(image, egui::TextureOptions::LINEAR);
+                            } else {
+                                self.group_remote_textures.insert(
+                                    peer_id.clone(),
+                                    context.load_texture(
+                                        format!("group-screen-{peer_id}"),
+                                        image,
+                                        egui::TextureOptions::LINEAR,
+                                    ),
+                                );
+                            }
+                            session.record_ui_texture_update();
+                            if self.group_auto_focus_pending.remove(&peer_id)
+                                && should_auto_focus_group_screen(
+                                    self.focused_group_screen.as_deref(),
+                                )
+                            {
+                                self.focused_group_screen = Some(peer_id.clone());
+                            }
+                            self.group_remote_sequences
+                                .insert(peer_id.clone(), frame.sequence);
                         }
-                        self.group_remote_sequences
-                            .insert(peer_id.clone(), frame.sequence);
                     }
                 }
             }

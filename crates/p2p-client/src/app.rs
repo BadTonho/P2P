@@ -1943,27 +1943,32 @@ impl ClientUi {
         if let Some(frame) = remote_frame
             && self.remote_screen_sequence != frame.sequence
         {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                &frame.rgba,
-            );
-            if let Some(texture) = self.remote_screen_texture.as_mut() {
-                texture.set(image, egui::TextureOptions::LINEAR);
-            } else {
-                self.remote_screen_texture = Some(context.load_texture(
-                    "remote-screen",
-                    image,
-                    egui::TextureOptions::LINEAR,
-                ));
+            let expected_bytes = (frame.width as usize)
+                .saturating_mul(frame.height as usize)
+                .saturating_mul(4);
+            if frame.width > 0 && frame.height > 0 && frame.rgba.len() == expected_bytes {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [frame.width as usize, frame.height as usize],
+                    &frame.rgba,
+                );
+                if let Some(texture) = self.remote_screen_texture.as_mut() {
+                    texture.set(image, egui::TextureOptions::LINEAR);
+                } else {
+                    self.remote_screen_texture = Some(context.load_texture(
+                        "remote-screen",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                if let Some(session) = self.screen_share_session.as_ref() {
+                    session.record_ui_texture_update();
+                }
+                if self.remote_screen_sequence == 0 {
+                    self.screen_share_status =
+                        Some("Primeiro quadro da tela recebido e decodificado.".to_owned());
+                }
+                self.remote_screen_sequence = frame.sequence;
             }
-            if let Some(session) = self.screen_share_session.as_ref() {
-                session.record_ui_texture_update();
-            }
-            if self.remote_screen_sequence == 0 {
-                self.screen_share_status =
-                    Some("Primeiro quadro da tela recebido e decodificado.".to_owned());
-            }
-            self.remote_screen_sequence = frame.sequence;
         }
     }
 
