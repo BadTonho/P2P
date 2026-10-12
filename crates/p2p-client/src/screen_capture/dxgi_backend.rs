@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)] // Capture owns the independent preview, shutdown and quality controls.
 pub(super) fn capture_dxgi_monitor(
     monitor: Monitor,
     context: egui::Context,

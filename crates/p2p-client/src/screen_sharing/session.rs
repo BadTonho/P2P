@@ -65,6 +65,7 @@ struct TestRtpLossInjector {
     read_queue: VecDeque<TaggedPacket>,
     write_queue: VecDeque<TaggedPacket>,
     metrics: Option<Arc<SharedMetrics>>,
+    dropped_packet: Option<(u32, u16)>,
 }
 
 #[cfg(test)]
@@ -85,6 +86,17 @@ impl sansio::Protocol<TaggedPacket, TaggedPacket, ()> for TestRtpLossInjector {
     }
 
     fn handle_write(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
+        if let InterceptorPacket::Rtp(packet) = &message.message.packet {
+            let identity = (packet.header.ssrc, packet.header.sequence_number);
+            if self.dropped_packet == Some(identity) {
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .test_retransmitted_outbound_rtp
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.dropped_packet = None;
+            }
+        }
         if matches!(&message.message.packet, InterceptorPacket::Rtp(_))
             && self.metrics.as_ref().is_some_and(|metrics| {
                 metrics
@@ -97,6 +109,9 @@ impl sansio::Protocol<TaggedPacket, TaggedPacket, ()> for TestRtpLossInjector {
                 metrics
                     .test_dropped_outbound_rtp
                     .fetch_add(1, Ordering::Relaxed);
+            }
+            if let InterceptorPacket::Rtp(packet) = &message.message.packet {
+                self.dropped_packet = Some((packet.header.ssrc, packet.header.sequence_number));
             }
             return Ok(());
         }
@@ -430,7 +445,7 @@ impl ScreenShareSession {
                 ));
                 // Soltar o runtime esperaria sem limite as tarefas bloqueantes (codificador);
                 // limita a espera para não travar a interface ao parar o compartilhamento.
-                runtime.shutdown_timeout(Duration::from_secs(2));
+                runtime.shutdown_timeout(Duration::from_millis(100));
             })
             .map_err(|error| format!("Não foi possível iniciar a sessão de tela: {error}"))?;
 
@@ -626,16 +641,30 @@ impl ScreenShareSession {
     }
 
     pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
         let _ = self.commands.send(Command::Stop);
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                tracing::warn!(
+                    "A sessão de tela não encerrou no prazo; a porta UDP pode continuar ocupada"
+                );
+            }
         }
     }
 }
 
 impl Drop for ScreenShareSession {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Stop);
+        self.shutdown();
     }
 }
 
@@ -1513,7 +1542,8 @@ async fn create_peer(
     );
     #[cfg(test)]
     let interceptors = interceptors.with(
-        Slot::Custom(3_000),
+        // Drop on the wire side of the NACK cache, as real network loss would.
+        Slot::Custom(500),
         TestRtpLossInjector {
             metrics: Some(Arc::clone(&metrics)),
             ..TestRtpLossInjector::default()
@@ -1573,19 +1603,26 @@ async fn create_peer(
         .with_udp_addrs(vec![udp_address.to_owned()])
         .build()
         .await
-        .map_err(|error| {
-            let port = udp_address
-                .rsplit_once(':')
-                .and_then(|(_, port)| port.parse::<u16>().ok());
-            if port.is_some_and(|port| (9002..=9009).contains(&port)) {
-                format!(
-                    "Não foi possível abrir UDP {MEDIA_UDP_PORT} para o compartilhamento. Verifique se a porta está livre e permita o aplicativo ou UDP {MEDIA_UDP_PORT} no firewall do Windows: {error}"
-                )
-            } else {
-                format!("Não foi possível criar a conexão WebRTC P2P: {error}")
-            }
-        })?;
+        .map_err(|error| media_connection_error(udp_address, &error))?;
     Ok(Arc::new(connection))
+}
+
+fn media_connection_error(udp_address: &str, error: &InterceptorError) -> String {
+    let port = udp_address
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok());
+    let Some(port) = port.filter(|port| (9002..=9009).contains(port)) else {
+        return format!("Não foi possível criar a conexão WebRTC P2P: {error}");
+    };
+    if matches!(error, InterceptorError::Io(io) if io.0.kind() == std::io::ErrorKind::AddrInUse) {
+        format!(
+            "Não foi possível abrir UDP {port}: a porta já está em uso. Feche outra instância do aplicativo ou aguarde a sessão anterior encerrar: {error}"
+        )
+    } else {
+        format!(
+            "Não foi possível abrir UDP {port} para o compartilhamento. Confira o endereço local e as permissões de rede do aplicativo: {error}"
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2306,10 +2343,11 @@ async fn close_peer(mut peer: PeerSession) {
     if let Some(feedback) = peer.rtcp_feedback_task.take() {
         feedback.abort();
     }
+    // Release the socket before waiting for the blocking encoder to finish.
+    let _ = timeout(Duration::from_secs(2), peer.connection.close()).await;
     if let Some(encoder) = peer.encoder_task.take() {
         let _ = timeout(Duration::from_secs(2), encoder).await;
     }
-    let _ = timeout(Duration::from_secs(2), peer.connection.close()).await;
 }
 
 #[cfg(test)]

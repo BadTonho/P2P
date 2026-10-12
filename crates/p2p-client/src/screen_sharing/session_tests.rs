@@ -221,6 +221,88 @@ fn test_frame(sequence: u64, value: u8) -> PreviewFrame {
 }
 
 #[test]
+fn regression_dropping_screen_session_releases_its_worker_socket() {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    let (commands, mut command_rx) = mpsc::unbounded_channel();
+    let (_, events) = std_mpsc::channel();
+    let worker = thread::spawn(move || {
+        assert!(matches!(command_rx.blocking_recv(), Some(Command::Stop)));
+        thread::sleep(Duration::from_millis(50));
+        drop(socket);
+    });
+    let session = ScreenShareSession {
+        commands,
+        events,
+        remote_frame: Arc::new(Mutex::new(None)),
+        remote_track: Arc::new(Mutex::new(None)),
+        metrics: Arc::new(SharedMetrics::default()),
+        remote_audio_volume: RemoteAudioVolume::default(),
+        encoder_bitrate_bps: Arc::new(AtomicU32::new(0)),
+        worker: Some(worker),
+    };
+    drop(session);
+    assert!(
+        std::net::UdpSocket::bind(address).is_ok(),
+        "a replacement session must be able to reuse UDP immediately after Drop"
+    );
+}
+
+#[test]
+fn occupied_media_port_reports_the_actual_port_without_blaming_firewall() {
+    let error = InterceptorError::from(std::io::Error::from(std::io::ErrorKind::AddrInUse));
+    let message = media_connection_error("127.0.0.1:9003", &error);
+    assert!(message.contains("UDP 9003"));
+    assert!(message.contains("em uso"));
+    assert!(!message.contains("9002"));
+    assert!(!message.contains("firewall"));
+}
+
+#[test]
+fn loopback_screen_session_releases_bound_udp_after_an_offer() {
+    let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    for _ in 0..3 {
+        let session = ScreenShareSession::with_udp_address_and_audio_factory(
+            egui::Context::default(),
+            address.to_string(),
+            None,
+            None,
+            VideoDecoderPreference::Cpu,
+            Arc::new(SyntheticAudioPlaybackFactory {
+                probe: Arc::new(SyntheticAudioProbe::default()),
+            }),
+        )
+        .unwrap();
+        let source = LatestFrame::default();
+        source.publish(test_frame(1, 64));
+        session.start_sending(source).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match session.try_recv() {
+                Some(ScreenShareEvent::Signal {
+                    kind: SignalKind::Offer,
+                    ..
+                }) => break,
+                Some(ScreenShareEvent::Error(error)) => panic!("offer failed: {error}"),
+                _ => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "offer must confirm that the peer was built"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(session);
+        assert!(
+            std::net::UdpSocket::bind(address).is_ok(),
+            "the previous peer must release UDP before its replacement starts"
+        );
+    }
+}
+
+#[test]
 fn synthetic_pcm_tone_and_silence_roundtrip_through_opus_without_audio_devices() {
     let probe = Arc::new(SyntheticAudioProbe::default());
     let mut source = SyntheticAudioSource::new(Arc::clone(&probe));
@@ -751,7 +833,7 @@ fn loopback_webrtc_requests_pli_and_recovers_with_another_decodable_idr() {
 }
 
 #[test]
-fn loopback_controlled_rtp_loss_correlates_nack_packet_stats() {
+fn loopback_controlled_rtp_loss_correlates_nack_and_retransmits_the_missing_packet() {
     let context = egui::Context::default();
     let sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
     let receiver = ScreenShareSession::new_loopback_with_decoder_preference(
@@ -784,6 +866,11 @@ fn loopback_controlled_rtp_loss_correlates_nack_packet_stats() {
             .load(Ordering::Relaxed)
             > 0;
         if injected
+            && sender
+                .metrics
+                .test_retransmitted_outbound_rtp
+                .load(Ordering::Relaxed)
+                > 0
             && receiver_metrics
                 .nack_packets_sent
                 .is_some_and(|count| count > 0)
@@ -809,6 +896,10 @@ fn loopback_controlled_rtp_loss_correlates_nack_packet_stats() {
         .metrics
         .test_dropped_outbound_rtp
         .load(Ordering::Relaxed);
+    let retransmitted_packets = sender
+        .metrics
+        .test_retransmitted_outbound_rtp
+        .load(Ordering::Relaxed);
     receiver.stop();
     sender.stop();
 
@@ -819,6 +910,10 @@ fn loopback_controlled_rtp_loss_correlates_nack_packet_stats() {
     assert_eq!(
         injected_packets, 1,
         "exactly one video RTP packet is dropped"
+    );
+    assert!(
+        retransmitted_packets > 0,
+        "NACK must retransmit the packet dropped after the send cache"
     );
     assert!(
         nack_stats_correlated,

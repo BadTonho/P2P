@@ -33,6 +33,9 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4};
 use windows::core::{IUnknown, Interface};
 
+mod event_pump;
+use event_pump::{InputEventPump, wait_for_input};
+
 const DEFAULT_FRAME_RATE: u32 = 30;
 const MAX_SUPPORTED_FRAME_RATE: u32 = 60;
 const BITRATE: u32 = 4_000_000;
@@ -83,6 +86,8 @@ struct Transform {
 }
 
 impl Transform {
+    // Mirrors the media types and device/quality parameters of MFT activation.
+    #[allow(clippy::too_many_arguments)]
     fn configure(
         activate: &IMFActivate,
         input_subtype: windows::core::GUID,
@@ -118,6 +123,11 @@ impl Transform {
         } else {
             None
         };
+
+        // This is a preference: unsupported hardware must retain the normal fallback.
+        if unsafe { attributes.SetUINT32(&MF_LOW_LATENCY, 1) }.is_err() {
+            tracing::debug!("Codec Media Foundation não aceitou preferência de baixa latência");
+        }
 
         if let Some(manager) = decoder_device_manager {
             unsafe {
@@ -166,6 +176,23 @@ impl Transform {
                     .SetOutputType(0, &output_type, 0)
                     .map_err(|e| format!("O decodificador não aceitou NV12 como saída: {e}"))?;
             }
+        }
+
+        if output_subtype == MFVideoFormat_H264 {
+            let codec_api = transform.cast::<ICodecAPI>().map_err(|error| {
+                format!("O encoder não expõe controle de bitrate; usando fallback: {error}")
+            })?;
+            configure_encoder_rate_control(bitrate, |property, value| {
+                unsafe { codec_api.IsSupported(property) }.map_err(|error| {
+                    format!("O encoder não suporta o controle de taxa solicitado: {error}")
+                })?;
+                let value = codec_u32_variant(value);
+                unsafe { codec_api.SetValue(property, &value) }
+                    .map_err(|error| format!("O encoder não aceitou o limite de bitrate: {error}"))
+            })?;
+        }
+
+        unsafe {
             transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
                 .map_err(|e| format!("Não foi possível iniciar o codec: {e}"))?;
@@ -214,7 +241,7 @@ impl Transform {
             }
         }
         let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
+        loop {
             let event = unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) };
             if let Ok(event) = event {
                 let event_type = unsafe { event.GetType() }
@@ -230,17 +257,31 @@ impl Transform {
                 if event_type == desired {
                     return Ok(true);
                 }
-                let mut pending = self
-                    .pending_events
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if pending.len() < 64 {
+                if event_type == METransformNeedInput.0 as u32
+                    || event_type == METransformHaveOutput.0 as u32
+                {
+                    let mut pending = self
+                        .pending_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if pending.len() >= 64 {
+                        return Err("O codec excedeu o limite de eventos pendentes.".to_owned());
+                    }
                     pending.push_back(event_type);
                 }
+                // Consume already queued events without a sleep between each credit.
+                continue;
+            } else if let Err(error) = event
+                && error.code() != MF_E_NO_EVENTS_AVAILABLE
+            {
+                return Err(format!("Não foi possível receber evento do codec: {error}"));
             }
-            thread::sleep(Duration::from_millis(1));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            thread::sleep(remaining.min(Duration::from_millis(1)));
         }
-        Ok(false)
     }
 
     fn send_input(&mut self, bytes: &[u8], time_hns: i64) -> Result<(), String> {
@@ -249,9 +290,7 @@ impl Transform {
     }
 
     fn send_sample(&mut self, sample: &IMFSample, time_hns: i64) -> Result<(), String> {
-        if self.async_transform
-            && !self.wait_for_event(METransformNeedInput.0 as u32, MF_EVENT_WAIT)?
-        {
+        if self.async_transform && !wait_for_input(self, MF_EVENT_WAIT)? {
             return Err(
                 "O codec de hardware não solicitou um quadro de entrada no prazo.".to_owned(),
             );
@@ -277,6 +316,11 @@ impl Transform {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push_back(output);
+                    }
+                    if self.async_transform && !wait_for_input(self, MF_EVENT_WAIT)? {
+                        return Err(
+                            "O codec não liberou nova entrada após drenar a saída.".to_owned()
+                        );
                     }
                     result = unsafe { self.transform.ProcessInput(0, sample, 0) };
                 }
@@ -417,6 +461,107 @@ impl Transform {
     }
 }
 
+fn codec_u32_variant(value: u32) -> VARIANT {
+    VARIANT {
+        Anonymous: VARIANT_0 {
+            Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                vt: VT_UI4,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: VARIANT_0_0_0 { ulVal: value },
+            }),
+        },
+    }
+}
+
+fn configure_encoder_rate_control(
+    bitrate: u32,
+    mut set: impl FnMut(&windows::core::GUID, u32) -> Result<(), String>,
+) -> Result<(), String> {
+    // MF_MT_AVG_BITRATE alone does not select the driver's rate-control mode.
+    // A transform that rejects these controls must use the existing CPU fallback.
+    set(
+        &CODECAPI_AVEncCommonRateControlMode,
+        eAVEncCommonRateControlMode_CBR.0 as u32,
+    )?;
+    set(&CODECAPI_AVEncCommonMeanBitRate, bitrate)
+}
+
+#[cfg(test)]
+mod rate_control_tests {
+    use super::*;
+
+    #[test]
+    fn encoder_requests_cbr_and_the_selected_bitrate() {
+        let mut controls = Vec::new();
+        configure_encoder_rate_control(2_000_000, |property, value| {
+            controls.push((*property, value));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            controls,
+            [
+                (
+                    CODECAPI_AVEncCommonRateControlMode,
+                    eAVEncCommonRateControlMode_CBR.0 as u32
+                ),
+                (CODECAPI_AVEncCommonMeanBitRate, 2_000_000)
+            ]
+        );
+    }
+
+    #[test]
+    fn rejected_rate_control_triggers_fallback_instead_of_unbounded_hardware_output() {
+        let error = configure_encoder_rate_control(4_000_000, |_, _| Err("unsupported".to_owned()))
+            .unwrap_err();
+        assert_eq!(error, "unsupported");
+        let error = configure_encoder_rate_control(4_000_000, |property, _| {
+            if *property == CODECAPI_AVEncCommonMeanBitRate {
+                Err("bitrate rejected".to_owned())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error, "bitrate rejected");
+    }
+}
+
+impl InputEventPump for Transform {
+    fn poll_input_credit(&mut self, wait: Duration) -> Result<bool, String> {
+        self.wait_for_event(METransformNeedInput.0 as u32, wait)
+    }
+
+    fn drain_pending_output(&mut self) -> Result<(), String> {
+        if let Some(sample) =
+            self.process_output_sample(Duration::ZERO, self.transform_provides_sample)?
+        {
+            let mut pending = self
+                .pending_output_samples
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.len() >= 16 {
+                return Err("O codec excedeu o limite de amostras de saída pendentes.".to_owned());
+            }
+            pending.push_back(sample);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Transform {
+    fn drop(&mut self) {
+        if self.async_transform
+            && let Ok(shutdown) = self.transform.cast::<IMFShutdown>()
+        {
+            let _ = unsafe { shutdown.Shutdown() };
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // One activation receives both media types and the device/quality settings.
 fn activate_hardware_transform(
     category: windows::core::GUID,
     input_subtype: windows::core::GUID,

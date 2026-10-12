@@ -137,6 +137,14 @@ pub struct LoggingState {
 pub fn install_panic_hook() {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
+        let payload = panic.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied());
+        if let Some(details) = message.and_then(safe_renderer_panic_details) {
+            tracing::error!(details = %details, "Falha de buffer do renderer gráfico");
+        }
         if let Some(location) = panic.location() {
             tracing::error!(
                 file = location.file(),
@@ -149,6 +157,30 @@ pub fn install_panic_hook() {
         }
         previous_hook(panic);
     }));
+}
+
+// Only the known renderer message with numeric sizes is safe to retain. Other
+// panic payloads may contain room codes, endpoints or temporary credentials.
+fn safe_renderer_panic_details(message: &str) -> Option<String> {
+    for (kind, count_label) in [("index", "Index"), ("vertex", "Vertex")] {
+        let prefix =
+            format!("Failed to create staging buffer for {kind} data. {count_label} count: ");
+        let Some(rest) = message.strip_prefix(&prefix) else {
+            continue;
+        };
+        let (count, rest) = rest.split_once(&format!(". Required {kind} buffer size: "))?;
+        let (required, rest) = rest.split_once(". Actual size ")?;
+        let (actual, capacity) = rest.split_once(" and capacity: ")?;
+        let capacity = capacity.strip_suffix(" (bytes)")?;
+        let count = count.parse::<u64>().ok()?;
+        let required = required.parse::<u64>().ok()?;
+        let actual = actual.parse::<u64>().ok()?;
+        let capacity = capacity.parse::<u64>().ok()?;
+        return Some(format!(
+            "buffer={kind}, count={count}, required_bytes={required}, actual_bytes={actual}, capacity_bytes={capacity}"
+        ));
+    }
+    None
 }
 
 #[derive(Default)]
@@ -1105,6 +1137,20 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use time::{Duration, OffsetDateTime};
     use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn renderer_panic_diagnostics_keep_sizes_without_arbitrary_payloads() {
+        let message = "Failed to create staging buffer for index data. Index count: 25200. Required index buffer size: 100800. Actual size 187200 and capacity: 187200 (bytes)";
+        assert_eq!(
+            super::safe_renderer_panic_details(message).as_deref(),
+            Some(
+                "buffer=index, count=25200, required_bytes=100800, actual_bytes=187200, capacity_bytes=187200"
+            )
+        );
+        assert!(super::safe_renderer_panic_details("room=PRIVATE token=SECRET").is_none());
+        assert!(super::safe_renderer_panic_details(&format!("{message} token=SECRET")).is_none());
+        assert!(super::safe_renderer_panic_details(&message.replace("25200", "PRIVATE")).is_none());
+    }
 
     #[test]
     fn date_key_is_sortable_iso_date() {

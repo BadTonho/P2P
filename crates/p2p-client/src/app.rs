@@ -1236,14 +1236,19 @@ pub(super) fn run() -> eframe::Result {
 
     tracing::info!("Interface gráfica sendo inicializada");
 
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_icon(application_icon()),
-        ..Default::default()
-    };
-
-    eframe::run_ui_native("P2P - Voz e tela", native_options, move |ui, _frame| {
+    eframe::run_ui_native("P2P - Voz e tela", native_options(), move |ui, _frame| {
         app.show(ui);
     })
+}
+
+fn native_options() -> eframe::NativeOptions {
+    // egui-wgpu 0.36.2 panics on staging-buffer failure (upstream #8450).
+    // Keep the UI on the supported OpenGL renderer; capture/codecs still use D3D11.
+    eframe::NativeOptions {
+        renderer: eframe::Renderer::Glow,
+        viewport: egui::ViewportBuilder::default().with_icon(application_icon()),
+        ..Default::default()
+    }
 }
 
 fn application_icon() -> egui::IconData {
@@ -1277,6 +1282,14 @@ mod tests {
         ClientUi, allocate_app_header_row, centered_header_rect, copy_confirmation_visible, egui,
         right_aligned_header_rect, room_header_code_label, settings_navigation_button,
     };
+
+    #[test]
+    fn native_ui_uses_glow_to_avoid_wgpu_staging_buffer_panic() {
+        assert!(matches!(
+            super::native_options().renderer,
+            eframe::Renderer::Glow
+        ));
+    }
 
     fn local_preview_frame(
         sequence: u64,

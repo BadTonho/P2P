@@ -389,6 +389,15 @@ pub(super) fn begin_stream_resync(
 }
 
 impl H264AccessUnitAssembler {
+    fn push_ordered(&mut self, packet: RtpPacket, now: Instant) -> Vec<Result<Vec<u8>, String>> {
+        let mut ready = Vec::new();
+        if let Some(error) = self.push(packet) {
+            ready.push(Err(error));
+        }
+        ready.extend(self.take_ready(now));
+        ready
+    }
+
     fn push(&mut self, packet: RtpPacket) -> Option<String> {
         let timestamp = packet.header.timestamp;
         if let Some(discard_timestamp) = self.discard_timestamp {
@@ -432,18 +441,15 @@ impl H264AccessUnitAssembler {
         self.discard_timestamp = resume_timestamp;
     }
 
-    fn take_ready(
-        &mut self,
-        now: Instant,
-        reorder_delay: Duration,
-    ) -> Vec<Result<Vec<u8>, String>> {
+    fn take_ready(&mut self, now: Instant) -> Vec<Result<Vec<u8>, String>> {
         let mut ready_timestamps = self
             .frames
             .iter()
             .filter_map(|(timestamp, frame)| {
                 let age = now.saturating_duration_since(frame.first_received);
-                (age >= reorder_delay && frame.marker_seen || age >= MAX_RTP_FRAME_AGE)
-                    .then_some(*timestamp)
+                // RtpReorderBuffer has already restored sequence order. Waiting again
+                // delays complete frames and can overflow this queue on a burst.
+                (frame.marker_seen || age >= MAX_RTP_FRAME_AGE).then_some(*timestamp)
             })
             .collect::<Vec<_>>();
         ready_timestamps.sort_by(|left, right| {
@@ -1620,23 +1626,14 @@ impl PeerEvents {
                         );
                     }
                 }
+                let mut ready_units = Vec::new();
                 for packet in reorder_update.ordered_packets {
-                    if let Some(error) = assembler.push(packet) {
-                        metrics.record_assembly_error(error);
-                        if !awaiting_sequence_recovery {
-                            begin_stream_resync(
-                                &decoder_generation,
-                                &metrics,
-                                &keyframe_request_tx,
-                                PliReason::AssemblyError,
-                            );
-                            awaiting_sequence_recovery = true;
-                        }
-                        context.request_repaint();
-                    }
+                    // A recovered gap may release many complete frames at once.
+                    // Drain each marker before the next frame can fill the assembler.
+                    ready_units.extend(assembler.push_ordered(packet, Instant::now()));
                 }
-
-                for result in assembler.take_ready(Instant::now(), reorder_window.delay()) {
+                ready_units.extend(assembler.take_ready(Instant::now()));
+                for result in ready_units {
                     match result {
                         Ok(access_unit) => {
                             metrics.record_assembled_access_unit(&access_unit);

@@ -1,4 +1,8 @@
 use std::sync::mpsc as std_mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -96,7 +100,9 @@ enum ClientCommand {
 pub struct SignalingClient {
     commands: mpsc::UnboundedSender<ClientCommand>,
     events: std_mpsc::Receiver<SignalingEvent>,
-    _worker: JoinHandle<()>,
+    worker: Option<JoinHandle<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    active: Arc<AtomicBool>,
 }
 
 impl SignalingClient {
@@ -200,6 +206,9 @@ impl SignalingClient {
     ) -> Result<Self, String> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = std_mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let active = Arc::new(AtomicBool::new(false));
+        let worker_active = Arc::clone(&active);
         let worker = thread::Builder::new()
             .name("p2p-signaling-client".to_owned())
             .spawn(move || {
@@ -215,22 +224,32 @@ impl SignalingClient {
                         return;
                     }
                 };
-                runtime.block_on(run_client(
-                    server_url,
-                    initial_message,
-                    local_server,
-                    local_server_address,
-                    participant,
-                    command_rx,
-                    event_tx,
-                ));
+                runtime.block_on(async {
+                    let client = run_client(
+                        server_url,
+                        initial_message,
+                        local_server,
+                        local_server_address,
+                        participant,
+                        command_rx,
+                        event_tx,
+                        worker_active,
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx => {}
+                        _ = client => {}
+                    }
+                });
             })
             .map_err(|error| format!("Nao foi possivel iniciar a conexao: {error}"))?;
 
         Ok(Self {
             commands: command_tx,
             events: event_rx,
-            _worker: worker,
+            worker: Some(worker),
+            shutdown: Some(shutdown_tx),
+            active,
         })
     }
 
@@ -322,9 +341,37 @@ impl SignalingClient {
 impl Drop for SignalingClient {
     fn drop(&mut self) {
         let _ = self.commands.send(ClientCommand::Leave);
+        if !self.active.load(Ordering::Acquire)
+            && let Some(shutdown) = self.shutdown.take()
+        {
+            let _ = shutdown.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(4);
+            while !worker.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if !worker.is_finished()
+                && let Some(shutdown) = self.shutdown.take()
+            {
+                let _ = shutdown.send(());
+                let deadline = std::time::Instant::now() + Duration::from_millis(250);
+                while !worker.is_finished() && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                tracing::warn!(
+                    "A sinalização não encerrou no prazo; a porta TCP pode continuar ocupada"
+                );
+            }
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)] // The active flag distinguishes startup cancellation from graceful room exit.
 async fn run_client(
     server_url: String,
     initial_message: ClientMessage,
@@ -333,6 +380,7 @@ async fn run_client(
     participant: ParticipantInfo,
     mut commands: mpsc::UnboundedReceiver<ClientCommand>,
     events: std_mpsc::Sender<SignalingEvent>,
+    active: Arc<AtomicBool>,
 ) {
     let mut server_shutdown = None;
     let mut server_task = None;
@@ -411,6 +459,7 @@ async fn run_client(
         return;
     }
 
+    active.store(true, Ordering::Release);
     let mut failed = false;
     let mut transfer_complete = false;
     loop {
@@ -710,6 +759,105 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{SignalingClient, SignalingEvent, bind_server_listener_with_retry};
+
+    #[tokio::test]
+    async fn dropping_connected_client_sends_leave_room_before_closing() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = SignalingClient::start_worker(
+            format!("ws://{}", listener.local_addr().unwrap()),
+            signaling_protocol::ClientMessage::CreateRoom,
+            None,
+            "unused".to_owned(),
+            super::default_participant(),
+        )
+        .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        assert!(matches!(
+            socket.next().await.unwrap().unwrap(),
+            Message::Text(_)
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !client.active.load(super::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("client must enter the active signaling loop");
+        let dropped = tokio::task::spawn_blocking(move || drop(client));
+        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Message::Text(text) = message else {
+            panic!("client closed before announcing its departure")
+        };
+        assert!(matches!(
+            serde_json::from_str::<signaling_protocol::ClientMessage>(&text).unwrap(),
+            signaling_protocol::ClientMessage::LeaveRoom
+        ));
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&signaling_protocol::ServerMessage::RoomLeft)
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        socket.send(Message::Close(None)).await.unwrap();
+        dropped.await.unwrap();
+    }
+
+    #[test]
+    fn dropping_signaling_client_cancels_pending_server_bind() {
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client =
+            SignalingClient::start_host_at(&occupied.local_addr().unwrap().to_string()).unwrap();
+        let commands = client.commands.clone();
+        drop(client);
+        assert!(
+            commands.is_closed(),
+            "a cancelled client must not bind a server after Drop"
+        );
+    }
+
+    #[test]
+    fn dropping_host_releases_its_tcp_listener_before_replacement() {
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap().to_string();
+        drop(reservation);
+        for _ in 0..3 {
+            let client = SignalingClient::start_worker(
+                format!("ws://{address}"),
+                signaling_protocol::ClientMessage::CreateRoom,
+                Some(None),
+                address.clone(),
+                super::default_participant(),
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match client.try_recv() {
+                    Some(SignalingEvent::RoomCreated(_)) => break,
+                    Some(SignalingEvent::Error(error)) => panic!("hosting failed: {error}"),
+                    _ => {}
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "host must create the room before shutdown"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            drop(client);
+            assert!(
+                TcpListener::bind(&address).is_ok(),
+                "host shutdown must release TCP immediately"
+            );
+        }
+    }
 
     #[test]
     fn hosting_reports_a_clear_error_when_the_port_is_occupied() {

@@ -202,6 +202,7 @@ fn access_unit_with_parameter_sets(nals: &[&[u8]], sps: &[u8], pps: &[u8]) -> Ve
     output
 }
 
+#[allow(clippy::too_many_arguments)] // The worker receives independent stop, keyframe and bitrate controls.
 pub(super) fn encode_latest_frames(
     source: LatestFrame,
     samples: mpsc::Sender<EncodedFrame>,

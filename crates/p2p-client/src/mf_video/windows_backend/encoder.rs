@@ -1,7 +1,6 @@
 use super::*;
 
 pub struct HardwareEncoder {
-    _apartment: ComApartment,
     _device: Option<ID3D11Device>,
     _device_manager: Option<IMFDXGIDeviceManager>,
     transform: Transform,
@@ -12,6 +11,7 @@ pub struct HardwareEncoder {
     name: String,
     force_keyframe_available: Option<bool>,
     gpu_surface_input_enabled: bool,
+    _apartment: ComApartment,
 }
 
 impl HardwareEncoder {

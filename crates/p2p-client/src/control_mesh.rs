@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -9,7 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use signaling_protocol::{ControlMessage, ParticipantInfo};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{interval, timeout};
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::{WebSocketStream, accept_async, connect_async};
@@ -89,6 +90,8 @@ pub struct ControlMesh {
     commands: mpsc::UnboundedSender<Command>,
     events: std_mpsc::Receiver<ControlEvent>,
     worker: Option<JoinHandle<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    active: Arc<AtomicBool>,
 }
 
 impl ControlMesh {
@@ -119,6 +122,9 @@ impl ControlMesh {
     ) -> Result<Self, String> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = std_mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let active = Arc::new(AtomicBool::new(false));
+        let worker_active = Arc::clone(&active);
         let worker = thread::Builder::new()
             .name("p2p-control-mesh".to_owned())
             .spawn(move || {
@@ -134,22 +140,32 @@ impl ControlMesh {
                         return;
                     }
                 };
-                runtime.block_on(run_mesh(
-                    local,
-                    room_code,
-                    leader_id,
-                    leader_address,
-                    listen_address,
-                    identity,
-                    command_rx,
-                    event_tx,
-                ));
+                runtime.block_on(async {
+                    let mesh = run_mesh(
+                        local,
+                        room_code,
+                        leader_id,
+                        leader_address,
+                        listen_address,
+                        identity,
+                        command_rx,
+                        event_tx,
+                        worker_active,
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx => {}
+                        _ = mesh => {}
+                    }
+                });
             })
             .map_err(|error| format!("Não foi possível iniciar o controle direto: {error}"))?;
         Ok(Self {
             commands: command_tx,
             events: event_rx,
             worker: Some(worker),
+            shutdown: Some(shutdown_tx),
+            active,
         })
     }
 
@@ -192,12 +208,26 @@ impl ControlMesh {
 impl Drop for ControlMesh {
     fn drop(&mut self) {
         let _ = self.commands.send(Command::Stop);
+        if !self.active.load(Ordering::Acquire)
+            && let Some(shutdown) = self.shutdown.take()
+        {
+            let _ = shutdown.send(());
+        }
         // Espera (com limite) a thread encerrar para que a porta 9001 seja liberada antes
         // de uma nova malha tentar abrir o listener (evita o erro 10048).
         if let Some(worker) = self.worker.take() {
             let deadline = Instant::now() + MESH_SHUTDOWN_WAIT;
             while !worker.is_finished() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
+            }
+            if !worker.is_finished()
+                && let Some(shutdown) = self.shutdown.take()
+            {
+                let _ = shutdown.send(());
+                let deadline = Instant::now() + Duration::from_millis(250);
+                while !worker.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
             }
             if worker.is_finished() {
                 let _ = worker.join();
@@ -366,6 +396,7 @@ async fn run_mesh(
     identity: Option<Arc<MeshIdentity>>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: std_mpsc::Sender<ControlEvent>,
+    active: Arc<AtomicBool>,
 ) {
     tracing::info!(listen_address = %listen_address, "Iniciando malha direta de controle");
     let listener = match bind_listener_with_retry(&listen_address).await {
@@ -373,11 +404,13 @@ async fn run_mesh(
         Err(error) => {
             tracing::error!(error = %error, "Falha ao abrir o listener TCP da malha de controle");
             let _ = events.send(ControlEvent::Error(format!(
-                "Não foi possível abrir a porta de controle 9001. Libere-a no firewall e feche outro aplicativo que a esteja usando: {error}"
+                "Não foi possível abrir a porta de controle 9001: {}",
+                control_bind_error_details(&error)
             )));
             return;
         }
     };
+    active.store(true, Ordering::Release);
     let leader_is_local = leader_id == local.id;
     let state = std::sync::Arc::new(Mutex::new(MeshState {
         local,
@@ -499,6 +532,16 @@ async fn run_mesh(
                 tick_mesh(&state, &events).await;
             }
         }
+    }
+}
+
+fn control_bind_error_details(error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        format!(
+            "A porta já está em uso. Feche outra instância do aplicativo ou aguarde a sessão anterior encerrar: {error}"
+        )
+    } else {
+        format!("Confira o endereço local e as permissões de rede do aplicativo: {error}")
     }
 }
 
@@ -1748,6 +1791,35 @@ mod tests {
     use std::sync::mpsc as std_mpsc;
     use std::time::{Duration, Instant};
     use tokio::sync::{Mutex, mpsc};
+
+    #[test]
+    fn dropping_control_mesh_cancels_pending_listener_bind() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = participant("host", 1, true);
+        let mesh = ControlMesh::start_on(
+            local.clone(),
+            "TEST".to_owned(),
+            local.id.clone(),
+            "ws://127.0.0.1:9000".to_owned(),
+            occupied.local_addr().unwrap().to_string(),
+            None,
+        )
+        .unwrap();
+        let commands = mesh.commands.clone();
+        drop(mesh);
+        assert!(
+            commands.is_closed(),
+            "a cancelled mesh must not retry binding after Drop"
+        );
+    }
+
+    #[test]
+    fn occupied_control_port_is_not_reported_as_firewall_block() {
+        let error = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let message = super::control_bind_error_details(&error);
+        assert!(message.contains("em uso"));
+        assert!(!message.contains("firewall"));
+    }
 
     fn participant(id: &str, order: u8, may_host: bool) -> ParticipantInfo {
         ParticipantInfo {

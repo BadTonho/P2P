@@ -22,6 +22,30 @@ fn rtp_packet(sequence: u16, timestamp: u32, marker: bool, payload: &[u8]) -> Rt
 }
 
 #[test]
+fn regression_ordered_frames_do_not_wait_for_a_second_reorder_window() {
+    let mut assembler = H264AccessUnitAssembler::default();
+    for sequence in 0..16 {
+        assert!(
+            assembler
+                .push(rtp_packet(
+                    sequence,
+                    u32::from(sequence),
+                    true,
+                    &[0x41, 0x99, 0x05, 0x01]
+                ))
+                .is_none()
+        );
+        let ready = assembler.take_ready(Instant::now());
+        assert_eq!(
+            ready.len(),
+            1,
+            "an ordered complete frame must be released immediately, including bursts"
+        );
+        assert!(ready[0].is_ok());
+    }
+}
+
+#[test]
 fn adaptive_dxva_fallback_waits_for_warmup_and_full_window() {
     let start = Instant::now();
     let mut monitor = DxvaThroughputMonitor::default();
@@ -502,7 +526,6 @@ fn rtp_reorder_buffer_confirms_loss_discards_late_packet_and_handles_wrap() {
 fn rtp_reorder_buffer_is_bounded_and_reorders_fu_a_before_assembly() {
     let start = Instant::now();
     let mut buffer = RtpReorderBuffer::default();
-    let adaptive_delay = Duration::from_millis(80);
     buffer.push(rtp_packet(9, 99, true, &[0x41, 1]), start);
     let mut assembler = H264AccessUnitAssembler::default();
 
@@ -526,7 +549,7 @@ fn rtp_reorder_buffer_is_bounded_and_reorders_fu_a_before_assembly() {
     for packet in start_fragment.ordered_packets {
         assert!(assembler.push(packet).is_none());
     }
-    let ready = assembler.take_ready(start + Duration::from_millis(120), adaptive_delay);
+    let ready = assembler.take_ready(start + Duration::from_millis(120));
     let frame = ready
         .into_iter()
         .find_map(Result::ok)
@@ -556,6 +579,42 @@ fn rtp_reorder_buffer_is_bounded_and_reorders_fu_a_before_assembly() {
 }
 
 #[test]
+fn ordered_burst_after_a_recovered_gap_does_not_overflow_the_frame_assembler() {
+    let start = Instant::now();
+    let mut buffer = RtpReorderBuffer::default();
+    let mut assembler = H264AccessUnitAssembler::default();
+    buffer.push(rtp_packet(10, 10, true, &[0x41, 0x99, 0x05, 0x01]), start);
+    for sequence in 12..32 {
+        assert!(
+            buffer
+                .push(
+                    rtp_packet(
+                        sequence,
+                        u32::from(sequence),
+                        true,
+                        &[0x41, 0x99, 0x05, 0x01]
+                    ),
+                    start
+                )
+                .ordered_packets
+                .is_empty()
+        );
+    }
+    let recovered = buffer.push(
+        rtp_packet(11, 11, true, &[0x41, 0x99, 0x05, 0x01]),
+        start + Duration::from_millis(20),
+    );
+    assert_eq!(recovered.ordered_packets.len(), 21);
+    let mut ready = Vec::new();
+    for packet in recovered.ordered_packets {
+        ready.extend(assembler.push_ordered(packet, start + Duration::from_millis(20)));
+    }
+    assert_eq!(ready.len(), 21);
+    assert!(ready.iter().all(Result::is_ok));
+    assert!(assembler.frames.is_empty());
+}
+
+#[test]
 fn confirmed_loss_discards_damaged_fu_a_timestamp_and_accepts_next_idr() {
     let now = Instant::now();
     let mut buffer = RtpReorderBuffer::default();
@@ -581,7 +640,7 @@ fn confirmed_loss_discards_damaged_fu_a_timestamp_and_accepts_next_idr() {
     }
     assert!(
         assembler
-            .take_ready(now + Duration::from_millis(100), INITIAL_RTP_REORDER_DELAY)
+            .take_ready(now + Duration::from_millis(100))
             .is_empty()
     );
 
@@ -594,7 +653,7 @@ fn confirmed_loss_discards_damaged_fu_a_timestamp_and_accepts_next_idr() {
     }
     assert!(
         assembler
-            .take_ready(now + Duration::from_millis(100), INITIAL_RTP_REORDER_DELAY)
+            .take_ready(now + Duration::from_millis(100))
             .iter()
             .any(|unit| unit
                 .as_ref()

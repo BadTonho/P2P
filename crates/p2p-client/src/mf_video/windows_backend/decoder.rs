@@ -7,7 +7,6 @@ pub struct DecodedFrame {
 }
 
 pub struct HardwareDecoder {
-    _apartment: ComApartment,
     _device: ID3D11Device,
     context: ID3D11DeviceContext,
     _device_manager: IMFDXGIDeviceManager,
@@ -17,6 +16,8 @@ pub struct HardwareDecoder {
     next_time_hns: i64,
     name: String,
     staging_texture: Option<ID3D11Texture2D>,
+    // COM must outlive all transform/device references during field destruction.
+    _apartment: ComApartment,
 }
 
 impl HardwareDecoder {
