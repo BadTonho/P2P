@@ -1230,13 +1230,24 @@ async fn tick_mesh(state: &SharedState, events: &std_mpsc::Sender<ControlEvent>)
             tracing::warn!(epoch, "Anfitrião sem pulsos; timeout de liveness iniciado");
             initiate_election(state, events, false, true, None).await;
         } else if remote_host_unstable || local_host_unstable {
-            tracing::warn!(
-                epoch,
-                remote_host_unstable,
-                local_host_unstable,
-                "Enlace do anfitrião excedeu limite de estabilidade"
-            );
-            initiate_election(state, events, false, false, None).await;
+            let can_retry_election = {
+                let state_guard = state.lock().await;
+                state_guard
+                    .empty_election_retry
+                    .map_or(true, |(last, rev)| {
+                        rev != state_guard.eligibility_revision
+                            || now.duration_since(last) >= EMPTY_ELECTION_RETRY_INTERVAL
+                    })
+            };
+            if can_retry_election {
+                tracing::warn!(
+                    epoch,
+                    remote_host_unstable,
+                    local_host_unstable,
+                    "Enlace do anfitrião excedeu limite de estabilidade"
+                );
+                initiate_election(state, events, false, false, None).await;
+            }
         }
     }
 }
@@ -1636,9 +1647,24 @@ async fn fail_current_candidate(
             });
         }
     } else {
-        tracing::error!(epoch, "Todos os candidatos falharam; encerrando sala");
-        broadcast(state, ControlMessage::EndRoom { epoch }).await;
-        let _ = events.send(ControlEvent::RoomEnded);
+        let should_keep_host = {
+            let state = state.lock().await;
+            state.leader_id == state.local.id
+                && departing_id.as_deref() != Some(state.local.id.as_str())
+        };
+        if should_keep_host {
+            tracing::warn!(
+                epoch,
+                "Todos os candidatos à sucessão falharam; anfitrião atual continua mantendo a sala aberta"
+            );
+            let mut mesh = state.lock().await;
+            mesh.election = None;
+            mesh.empty_election_retry = Some((Instant::now(), mesh.eligibility_revision));
+        } else {
+            tracing::error!(epoch, "Todos os candidatos falharam; encerrando sala");
+            broadcast(state, ControlMessage::EndRoom { epoch }).await;
+            let _ = events.send(ControlEvent::RoomEnded);
+        }
     }
 }
 
@@ -2459,5 +2485,31 @@ mod tests {
             listener.is_ok(),
             "listener deve conseguir vincular após a porta ser liberada"
         );
+    }
+
+    #[tokio::test]
+    async fn host_survives_failed_succession_candidates_without_closing_room() {
+        let local = participant("host", 1, true);
+        let mut mesh_state = test_state(local, false);
+        mesh_state.leader_id = "host".to_owned();
+        mesh_state.election = Some(Election {
+            epoch: 5,
+            candidates: vec!["failing_candidate".to_owned()],
+            index: 0,
+            deadline: Instant::now() + Duration::from_secs(10),
+            departing_id: None,
+        });
+        let state = Arc::new(Mutex::new(mesh_state));
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+
+        fail_current_candidate(&state, &event_tx, 5).await;
+
+        assert!(
+            event_rx.try_recv().is_err(),
+            "anfitrião online não deve fechar a sala quando os candidatos falham"
+        );
+        let locked = state.lock().await;
+        assert!(locked.election.is_none());
+        assert!(locked.empty_election_retry.is_some());
     }
 }
