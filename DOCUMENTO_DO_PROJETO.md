@@ -1,5 +1,7 @@
 # Documento do projeto
 
+> Registro da concepção inicial. Ele preserva requisitos e decisões da fase de planejamento, alguns dos quais mudaram durante o desenvolvimento. Para o comportamento atual, consulte `README.md`, `COMO_USAR.md` e `ROADMAP.md`.
+
 ## Objetivo
 
 Criar um aplicativo instalado no computador para fazer chamadas de voz e compartilhar a tela com amigos. O aplicativo será desenvolvido primeiro para Windows e distribuído como instalador.

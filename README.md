@@ -7,7 +7,7 @@
 [![DirectX 11](https://img.shields.io/badge/DirectX-11%20DXGI-0078D7.svg)](https://learn.microsoft.com/windows/win32/direct3ddxgi/desktop-dup-api)
 [![WebRTC](https://img.shields.io/badge/WebRTC-P2P%20Direto-green.svg)](https://webrtc.org/)
 
-Compartilhamento de tela em tempo real e transmissão de áudio do computador **diretamente entre amigos (Peer-to-Peer)**, com máxima performance, aceleração por GPU e privacidade absoluta. 
+Compartilhamento de tela em tempo real e transmissão de áudio do computador **diretamente entre amigos (Peer-to-Peer)**, com aceleração por GPU e mídia criptografada de ponta a ponta.
 
 Construído 100% em **Rust**, sem servidores de nuvem intermediando o seu vídeo, sem contas obrigatórias e sem telemetria.
 
@@ -19,10 +19,10 @@ Plataformas tradicionais de comunicação costumam retransmitir o vídeo por ser
 
 O **P2P — Voz e Tela** foi criado para oferecer uma alternativa direta, transparente e de altíssimo desempenho:
 
-1. **Conexão Direta (P2P real):** O vídeo da sua tela e o som do seu computador trafegam diretamente do seu PC para o dos seus amigos via WebRTC (DTLS-SRTP criptografado).
-2. **Sem Servidores Centrais de Mídia:** O próprio anfitrião roda o servidor de sinalização temporário (porta 9000). Nenhum dado de vídeo ou áudio passa por servidores da internet.
+1. **Conexão Direta (P2P real):** O vídeo da sua tela e o som do seu computador trafegam diretamente do seu PC para o dos seus amigos via WebRTC (DTLS-SRTP criptografado), quando a rede permite um caminho direto. Se TURN estiver ativo e necessário, o tráfego de mídia será retransmitido pelo servidor TURN.
+2. **Sem Servidores Centrais de Mídia:** O servidor de sinalização do anfitrião troca metadados de conexão, não mídia. Se a conexão direta falhar e TURN estiver ativo, o servidor TURN no PC anfitrião pode retransmitir áudio e vídeo.
 3. **Resiliência e Tolerância a Falhas:** Conta com uma malha de controle distribuída com **eleição automática de novo anfitrião** caso o host original fique instável ou caia.
-4. **Privacidade por Padrão:** Não há cadastro, login, rastreadores ou armazenamento em nuvem. Suas configurações ficam salvas apenas no seu próprio computador.
+4. **Privacidade por Padrão:** Não há cadastro, login, rastreadores ou armazenamento em nuvem. As configurações ficam salvas apenas no seu computador. A sinalização usa `ws://` sem TLS por padrão; consulte a seção de segurança antes de usar pela Internet.
 
 ---
 
@@ -48,7 +48,7 @@ O **P2P — Voz e Tela** foi criado para oferecer uma alternativa direta, transp
 
 ### 🛡️ Praticidade e Atualizações
 - **Interface Gráfica Leve (GUI):** Desenvolvida em Rust puro com `egui` e `eframe` (inicia instantaneamente e consome pouca memória RAM).
-- **Atualizador Integrado com GitHub Releases:** Notifica sobre novas versões, valida integridade (SHA-256 e assinatura PE) e aplica atualizações com rollback seguro em 1 clique.
+- **Atualizador Integrado com GitHub Releases:** Notifica sobre novas versões, confere SHA-256 e a estrutura do executável PE e aplica atualizações com rollback.
 - **Instalador sem privilégios de Admin:** Instalador Inno Setup por usuário ou executável portátil.
 
 ---
@@ -95,11 +95,11 @@ Baixe a versão mais recente na página de [Releases do GitHub](https://github.c
    - **Rede local / Radmin:** Para computadores na mesma rede Wi-Fi/cabo ou conectados em redes virtuais como Radmin VPN / ZeroTier / Tailscale.
    - **Internet (teste):** Para conexões ponto a ponto diretas via IP público ou DDNS.
 3. Clique em **Criar sala**.
-4. Envie o endereço exibido (`ws://SEU-IP:9000`) e o código da sala para seus amigos.
+4. Envie o endereço exibido (`ws://SEU-IP:9000`) e o código da sala para seus amigos. Esse endereço usa sinalização sem TLS. O cliente também aceita `wss://` quando o endereço aponta para um serviço que termina TLS e encaminha a conexão ao servidor da sala.
 
 ### 3. Entrando na Sala
 1. Abra o aplicativo.
-2. Em **Configurações > Conexão**, insira o endereço do anfitrião (`ws://IP-DO-ANFITRIAO:9000`).
+2. Em **Configurações > Conexão**, insira o endereço do anfitrião (`ws://IP-DO-ANFITRIAO:9000`). Use `wss://` somente se o endpoint estiver configurado para TLS; o servidor integrado do aplicativo não termina TLS por conta própria.
 3. Na tela inicial, digite o código da sala e clique em **Entrar**.
 
 ### 4. Compartilhando Tela e Áudio
@@ -114,7 +114,7 @@ Para instruções completas e dicas de portas de roteador e firewall, consulte o
 ## 🛠️ Compilando a partir do Código-Fonte
 
 ### Pré-requisitos
-- [Rust](https://rustup.rs/) (Edição 2024 / versão 1.85 ou superior)
+- [Rust](https://rustup.rs/) (Edição 2024 / versão 1.95 ou superior)
 - Windows 10 (1803+) ou Windows 11
 - Visual Studio C++ Build Tools ou Windows SDK (com `rc.exe` disponível para compilar os recursos de ícone/manifesto)
 - [Inno Setup 6](https://jrsoftware.org/isdl.php) (opcional, apenas para compilar o instalador)
@@ -161,7 +161,7 @@ P2P/
 ├── crates/
 │   ├── p2p-client/            # Cliente desktop com GUI (egui), WebRTC, captura DXGI,
 │   │                          # Media Foundation, áudio WASAPI, malha e atualizador
-│   ├── signaling-server/      # Servidor de sinalização WebSocket leve em Tokio/Axum
+│   ├── signaling-server/      # Servidor de sinalização WebSocket em Tokio/Tungstenite
 │   └── signaling-protocol/    # Tipos e mensagens de protocolo compartilhados (Serde)
 ├── installer/                 # Scripts do Inno Setup para empacotamento Windows
 ├── scripts/                   # Scripts utilitários de build e automação PowerShell
@@ -177,6 +177,7 @@ P2P/
 - **Zero Coleta de Dados:** O aplicativo não possui telemetria, não se conecta a servidores de terceiros para enviar dados analíticos e não grava sessões.
 - **Mídia Criptografada:** Toda a transmissão de áudio e vídeo WebRTC utiliza criptografia padronizada de ponta a ponta (DTLS e SRTP).
 - **Configurações Locais:** Suas preferências são salvas exclusivamente em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json`. Códigos de sala e credenciais temporárias nunca são persistidos no disco.
+- **Sinalização:** O anfitrião integrado anuncia `ws://` e não fornece TLS. Nesse modo, códigos de sala, metadados de conexão e credenciais TURN temporárias podem ser observados na rede. O cliente aceita `wss://` para um endpoint com TLS configurado externamente; isso protege o transporte até esse endpoint, mas não altera a criptografia da mídia WebRTC.
 
 ---
 

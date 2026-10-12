@@ -25,7 +25,7 @@ Na tela inicial, **Seu perfil** permite informar um nome e escolher uma foto; am
 ## Rede local ou Radmin VPN
 
 1. As duas pessoas entram na mesma rede local ou na mesma rede Radmin VPN.
-2. O anfitrião seleciona **Rede local / Radmin** e clica em **Criar sala**. Escolhe o adaptador cujo IPv4 o amigo pode alcançar e compartilha o endereço `ws://IP:9000` e o código da sala.
+2. O anfitrião seleciona **Rede local / Radmin** e clica em **Criar sala**. Escolhe o adaptador cujo IPv4 o amigo pode alcançar e compartilha o endereço `ws://IP:9000` e o código da sala. O servidor integrado usa `ws://` sem TLS; o cliente aceita `wss://` quando há um serviço externo com TLS encaminhando para o servidor.
 3. O convidado seleciona **Rede local / Radmin** para escolher seu adaptador de controle, abre **Configurações > Conexão**, informa o endereço do anfitrião e volta à tela inicial. Digita o código e clica em **Entrar**.
 4. Os participantes escolhem uma tela ou janela. Em uma sala compatível com grupo, cada pessoa pode clicar em **Compartilhar minha tela**; quem quiser assistir escolhe **Assistir** na transmissão correspondente. As telas assistidas aparecem na grade. Em uma sala com cliente antigo, o compartilhamento continua no fluxo de duas pessoas, com pedido e aceite.
 
@@ -51,7 +51,7 @@ O modo Internet aceita apenas duas pessoas. O anfitrião precisa permanecer onli
 
 1. O anfitrião configura seu IPv4 público ou DDNS em **Configurações > Conexão** e encaminha TCP 9000 no roteador para o próprio PC. Permite o aplicativo no firewall.
 2. Na tela inicial, seleciona **Internet (teste)**. A opção **Usar TURN como alternativa** vem ativada. Com TURN ativo, também encaminha UDP 3478 e UDP 50000–50100 no roteador para o PC anfitrião e permite essas portas no firewall.
-3. Clica em **Criar sala** e envia ao amigo o endereço público `ws://...:9000` e o código da sala.
+3. Clica em **Criar sala** e envia ao amigo o endereço público `ws://...:9000` e o código da sala. Esse endereço não cifra a sinalização. Para usar `wss://`, o anfitrião precisa disponibilizar um endpoint TLS externo que encaminhe as conexões ao servidor integrado.
 4. O convidado configura esse endereço em **Configurações > Conexão**, digita o código na tela inicial e clica em **Entrar**. O servidor informa que a sala está no modo Internet.
 5. Os dois escolhem uma tela ou janela. O vídeo usa conexão direta quando possível; se ICE não encontrar um caminho direto e o anfitrião ativou TURN, o vídeo pode ser retransmitido pelo PC anfitrião.
 
@@ -59,18 +59,18 @@ Os dois PCs devem permitir UDP 9002 no firewall do Windows para a tentativa de v
 
 STUN ajuda a procurar uma rota direta e não retransmite mídia. TURN retransmite vídeo, aumenta o uso de banda do anfitrião e depende das portas UDP acima. Se TURN for desativado, a conexão depende de um caminho direto. UDP 9002 é usado pelo vídeo direto nos dois PCs.
 
-**Segurança:** a sinalização da versão 1.0.0 usa `ws://` sem criptografia ou autenticação. Credenciais TURN temporárias também passam por esse canal. Use o modo Internet apenas em testes controlados com pessoas conhecidas; não reutilize códigos ou credenciais e não considere essa conexão privada contra terceiros na rede.
+**Segurança:** o servidor integrado usa `ws://` sem criptografia de transporte. Códigos, metadados de sinalização e credenciais TURN temporárias passam por esse canal e podem ser observados na rede. O cliente aceita `wss://` se o endereço configurado apontar para um endpoint com TLS; o servidor integrado não configura TLS sozinho. Use o modo Internet apenas com pessoas de confiança e proteja o endpoint de sinalização antes de expô-lo a redes não confiáveis.
 
 ## Diagnóstico
 
 - Se não conectar à sala, confira o endereço, o código, TCP 9000, o encaminhamento do roteador e o firewall do anfitrião.
 - Se a sala conectar, mas o vídeo não, confira a mensagem ICE, a URI STUN e as portas UDP. O anfitrião também deve conferir UDP 3478 e UDP 50000–50100 quando TURN estiver ativo.
-- **Configurações > Atualizações** permite verificar, baixar e aplicar uma versão do GitHub Releases. Quem ainda usa o `.exe` 1.0.0 com o atualizador antigo precisa instalar manualmente a versão migrada uma vez.
+- **Configurações > Atualizações** permite verificar, baixar e aplicar uma versão do GitHub Releases. O atualizador prioriza `P2P-Voz-e-tela-Setup.exe` e usa `p2p-client.exe` como fallback quando o instalador não estiver no release.
 - Use **Exportar logs** para salvar diagnóstico local. Os logs podem incluir endereços IP e nomes de adaptadores; revise o arquivo antes de compartilhar.
 
 ## Atualizações publicadas pelo GitHub
 
-O atualizador consulta o último release público do [repositório no GitHub](https://github.com/BadTonho/P2P/releases/latest) e procura o asset `p2p-client.exe`. Consulte [ATUALIZACOES.md](ATUALIZACOES.md) para publicar uma nova versão. Não é necessário criar ou enviar um manifesto separado.
+O atualizador consulta o último release público do [repositório no GitHub](https://github.com/BadTonho/P2P/releases/latest), prioriza `P2P-Voz-e-tela-Setup.exe` e mantém `p2p-client.exe` como fallback. Consulte [ATUALIZACOES.md](ATUALIZACOES.md) para publicar uma nova versão. Não é necessário criar ou enviar um manifesto separado.
 
 ## Nível de logs
 

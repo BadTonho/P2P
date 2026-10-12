@@ -1,8 +1,16 @@
 # Roadmap do aplicativo P2P
 
+## Estado atual — 12/10/2026
+
+O workspace está na versão 1.2.6. O código inclui salas locais/Radmin, modo Internet de teste com TURN integrado opcional, compartilhamento de tela em grupo e atualização pelo GitHub Releases. O guia de uso está em `COMO_USAR.md`; o processo de publicação está em `ATUALIZACOES.md`.
+
+A hospedagem integrada de sinalização usa `ws://` e não termina TLS. O cliente aceita `wss://` quando se conecta a um endpoint TLS configurado externamente. No modo `ws://`, a sinalização e as credenciais TURN temporárias não têm criptografia de transporte. O compartilhamento em grupo cria sessões por participante; as portas UDP 9002–9009 podem limitar sessões simultâneas. Este resumo descreve o código, não substitui validação manual em redes e dispositivos reais.
+
+As etapas abaixo preservam o histórico do planejamento e da implementação. Os estados, versões e pendências descritos em cada etapa correspondem ao momento em que o texto foi registrado; use o resumo acima e os guias atuais para o estado e as instruções vigentes.
+
 Este roteiro divide o projeto em etapas para serem feitas uma de cada vez. Ao concluir uma etapa, você pode pedir: **“faça a etapa 1 do roadmap”**. Eu explico o que será feito e avanço para a próxima apenas quando você pedir.
 
-## Escopo atual
+## Escopo original
 
 - O desenvolvimento e a hospedagem de uma sala serão feitos no PC de quem cria a sala. Não é necessário manter um notebook separado ligado.
 - Aplicativo instalado primeiro no Windows.

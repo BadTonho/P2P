@@ -20,7 +20,7 @@ Ao desinstalar, o instalador remove o arquivo de preferências e a foto opcional
 
 ## Validação e segurança
 
-O app baixa o instalador ou executável por HTTPS e confere o tamanho, o SHA-256 informado pela API do GitHub e a assinatura PE (`MZ`). Para o executável portátil direto, também confere o marcador de versão embutido no build. Essas verificações detectam arquivos incompatíveis ou corrompidos, mas não autenticam quem publicou o arquivo.
+O app baixa o instalador ou executável por HTTPS e confere o tamanho e o SHA-256 informados pela API do GitHub. Também valida a estrutura PE do arquivo (`MZ`, deslocamento do cabeçalho e marcador `PE\0\0`); isso não é uma assinatura digital Authenticode. Para o executável portátil direto, também confere o marcador de versão embutido no build. Essas verificações detectam arquivos incompatíveis ou corrompidos, mas não autenticam quem publicou o arquivo.
 
 Não há assinatura digital. O SHA-256 detecta corrupção durante o download, mas não prova a identidade do publicador se o repositório ou a conta do GitHub forem comprometidos. Um repositório e seus releases públicos podem ser vistos e baixados por qualquer pessoa.
 
