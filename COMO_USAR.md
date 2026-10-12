@@ -29,6 +29,24 @@ Na tela inicial, **Seu perfil** permite informar um nome e escolher uma foto; am
 3. O convidado seleciona **Rede local / Radmin** para escolher seu adaptador de controle, abre **Configurações > Conexão**, informa o endereço do anfitrião e volta à tela inicial. Digita o código e clica em **Entrar**.
 4. Os participantes escolhem uma tela ou janela. Em uma sala compatível com grupo, cada pessoa pode clicar em **Compartilhar minha tela**; quem quiser assistir escolhe **Assistir** na transmissão correspondente. As telas assistidas aparecem na grade. Em uma sala com cliente antigo, o compartilhamento continua no fluxo de duas pessoas, com pedido e aceite.
 
+## Escolher a qualidade da tela
+
+Antes de iniciar uma transmissão, escolha no modal a resolução e a cadência: **720p** ou **1080p**, e **30 FPS** ou **60 FPS**. Os quatro perfis são permitidos. A escolha é salva somente neste computador e restaurada na próxima vez; configurações antigas começam em **720p30**. A captura preserva a proporção da tela e não amplia fontes menores que o perfil escolhido.
+
+As taxas abaixo são alvos configurados para o vídeo de saída. Em uma transmissão individual, vale o limite individual. Em grupo, o orçamento total é dividido entre os espectadores ativos, sem ultrapassar o limite individual de cada um.
+
+| Perfil | Alvo individual / limite por espectador | Alvo total em grupo |
+|---|---:|---:|
+| 720p30 | 4 Mbps | 8 Mbps |
+| 720p60 ou 1080p30 | 6 Mbps | 12 Mbps |
+| 1080p60 | 8 Mbps | 16 Mbps |
+
+Por exemplo, em 1080p60 com quatro espectadores, o orçamento total de 16 Mbps permite até cerca de 4 Mbps por espectador. Esses valores não são consumo fixo nem garantia de qualidade: o tráfego real depende do que aparece na tela e inclui dados adicionais de rede. O aplicativo não reduz o perfil automaticamente quando a conexão fica instável; escolha um perfil mais leve se isso acontecer. Em grupo, o custo de codificação também cresce com o número de espectadores.
+
+O perfil define a cadência desejada, mas não garante que o computador consiga codificar todos os quadros. Em uma máquina sem capacidade para 60 FPS, a transmissão pode entregar menos quadros sem alterar a preferência salva. A aceleração de hardware e o fallback por CPU podem ter desempenhos diferentes.
+
+O perfil escolhido ainda não é negociado com cada receptor. Versões antigas podem ter limites diferentes de decodificação ou aceleração; ao testar computadores com versões distintas, comece em 720p30 e atualize os clientes antes de avaliar os perfis maiores.
+
 ## Áudio reproduzido pelo computador
 
 Antes de iniciar o compartilhamento, marque **Incluir som do computador** na barra da sala para enviar também o áudio que está tocando na saída padrão do Windows. A opção fica desligada por padrão e não usa o microfone. O áudio segue diretamente pela conexão WebRTC para quem recebe aquela tela; o servidor da sala não recebe a mídia. Para cada tela assistida, o app reproduz o áudio remoto pela saída padrão do participante.

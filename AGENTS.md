@@ -9,7 +9,7 @@
 - Preserve o download iniciado pelo usuário, a validação HTTPS/tamanho/SHA-256/assinatura PE e a aplicação de atualização. Não registre dados privados ou tokens.
 - Preserve as preferências locais em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json` durante atualizações. Não salve códigos de sala nem credenciais temporárias.
 - Mantenha `ATUALIZACOES.md` alinhado à implementação e ao processo de publicação.
-- A primeira versão pública será 1.0.0 com o atualizador do GitHub. Não reintroduza dependência do Google Drive nem instruções de migração do Drive sem pedido explícito.
+- A versão pública inicial 1.0.0 já foi publicada. Para novas versões estáveis, siga a versão do workspace e a regra de tags numéricas descrita acima. Não reintroduza dependência do Google Drive nem instruções de migração do Drive sem pedido explícito.
 
 ## Preparar um release
 

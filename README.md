@@ -33,7 +33,7 @@ O **P2P — Voz e Tela** foi criado para oferecer uma alternativa direta, transp
 - **Aceleração por Hardware (GPU NVENC / Intel QuickSync / AMD AMF):** Codificação H.264 acelerada por hardware via Media Foundation com pipeline *zero-copy*.
 - **Decodificação por Hardware DXVA2:** Reprodução fluida de vídeo remoto sem sobrecarregar a CPU.
 - **Fallback Automático para CPU (OpenH264):** Garante compatibilidade caso o computador não possua GPU dedicada.
-- **Controle Adaptativo de Taxa (Frame Pacer):** Transmite em até 60 FPS quando há movimento na tela e reduz inteligentemente a taxa em telas estáticas para economizar banda e processamento.
+- **Qualidade de transmissão configurável:** Antes de iniciar, escolha 720p ou 1080p e 30 ou 60 FPS. A preferência fica salva neste computador. O limitador acompanha o perfil escolhido e descarta quadros quando necessário; o computador pode entregar menos FPS se não conseguir acompanhar. A taxa configurada é um alvo do encoder, não uma garantia de tráfego ou qualidade. Em grupo, o orçamento total é dividido entre quem está assistindo; veja os valores e limitações em [COMO_USAR.md](COMO_USAR.md).
 
 ### 🎧 Áudio do Sistema de Alta Fidelidade
 - **WASAPI Loopback de Baixa Latência:** Captura o som exato do que está tocando no Windows acionada por eventos do sistema.
