@@ -162,6 +162,16 @@ fn discovery_loopback_receives_room_updates_without_persisting_or_connecting() {
     let discovered = guest.snapshot().0.remove(0);
     assert_eq!(discovered.endpoint(), "ws://127.0.0.2:9000");
     assert_eq!(discovered.advertisement.code, "DISCOVERED");
+    assert!(host.diagnostics().announcements_sent > 0);
+    assert!(guest.diagnostics().announcements_received > 0);
+    let source = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0)).unwrap();
+    source
+        .send_to(b"invalid PRIVATE_CODE", guest_address)
+        .unwrap();
+    wait_for(|| guest.diagnostics().invalid_datagrams > 0);
+    let diagnostics = format!("{:?}", guest.diagnostics());
+    assert!(!diagnostics.contains("DISCOVERED"));
+    assert!(!diagnostics.contains("PRIVATE_CODE"));
     host.advertise(Some(room("DISCOVERED", 5)));
     wait_for(|| guest.snapshot().0[0].advertisement.participants == 5);
     host.advertise(None);

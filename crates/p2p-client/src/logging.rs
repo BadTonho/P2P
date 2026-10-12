@@ -197,6 +197,7 @@ pub struct DiagnosticSnapshot {
     pub microphone_level_dbfs: f32,
     pub microphone_gain_db: f32,
     pub adapters: Vec<(String, String)>,
+    pub discovery_state: String,
     pub screen_share_state: String,
     pub screen_metrics: String,
 }
@@ -363,6 +364,7 @@ impl LoggingState {
         }
         tracing::info!(
             app_version = env!("CARGO_PKG_VERSION"),
+            build_id = env!("P2P_BUILD_ID"),
             build_version_marker = crate::update::build_version_marker(),
             os = std::env::consts::OS,
             architecture = std::env::consts::ARCH,
@@ -471,6 +473,7 @@ impl LoggingState {
             "Versão do aplicativo: {}\n",
             env!("CARGO_PKG_VERSION")
         ));
+        output.push_str(&format!("Build: {}\n", env!("P2P_BUILD_ID")));
         output.push_str(&format!(
             "Sistema: {} {}\n",
             std::env::consts::OS,
@@ -506,6 +509,10 @@ impl LoggingState {
             snapshot.screen_share_state
         ));
         output.push_str(&format!("Métricas de vídeo: {}\n", snapshot.screen_metrics));
+        output.push_str(&format!(
+            "Descoberta de salas: {}\n",
+            snapshot.discovery_state
+        ));
         output.push_str("Adaptadores e IPv4 visíveis pelo aplicativo:\n");
         if snapshot.adapters.is_empty() {
             output.push_str("  (nenhum adaptador IPv4 encontrado)\n");
@@ -1126,6 +1133,23 @@ fn prune_logs(directory: &Path) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_identity_contains_version_revision_timestamp_and_profile() {
+        let identity = env!("P2P_BUILD_ID");
+        assert!(identity.starts_with(concat!(env!("CARGO_PKG_VERSION"), "-")));
+        assert!(
+            identity
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric()
+                    || character == '-'
+                    || character == '.')
+        );
+        let mut pieces = identity.rsplit('-');
+        assert!(matches!(pieces.next(), Some("debug" | "release")));
+        assert!(pieces.next().unwrap().parse::<u64>().unwrap() > 0);
+        assert!(!pieces.next().unwrap().is_empty());
+    }
+
     use super::{
         DiagnosticSnapshot, LOG_FILE_PREFIX, LogMessage, LoggingState, RollingSink,
         SharedLogWriter, date_key, log_filter, log_writer_worker, open_log_file_if_enabled,
@@ -1368,6 +1392,7 @@ mod tests {
                 .to_owned(),
             stun_server: "stun:user:secret@stun.example:3478?transport=udp".to_owned(),
             adapters: vec![("Radmin VPN".to_owned(), "26.1.2.3".to_owned())],
+            discovery_state: "UDP 8999; consultas enviadas=3, anúncios recebidos=2".to_owned(),
             ..DiagnosticSnapshot::default()
         };
 
@@ -1375,6 +1400,8 @@ mod tests {
 
         let contents = fs::read_to_string(&export).unwrap();
         assert!(contents.contains("Radmin VPN: 26.1.2.3"));
+        assert!(contents.contains(env!("P2P_BUILD_ID")));
+        assert!(contents.contains("UDP 8999; consultas enviadas=3, anúncios recebidos=2"));
         assert!(contents.contains("current_session_event=true"));
         assert!(!contents.contains("previous_session_event=true"));
         assert!(contents.contains("ws://192.168.1.25:9000"));
@@ -1416,6 +1443,7 @@ mod tests {
         let contents = fs::read_to_string(&export).unwrap();
         assert!(contents.contains("esta exportacao contem apenas o relatorio de diagnostico"));
         assert!(!contents.contains("private_event_history"));
+        assert!(contents.contains(env!("P2P_BUILD_ID")));
         let _ = fs::remove_file(export);
         let _ = fs::remove_dir_all(directory);
     }

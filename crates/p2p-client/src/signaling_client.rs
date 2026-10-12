@@ -462,6 +462,7 @@ async fn run_client(
     active.store(true, Ordering::Release);
     let mut failed = false;
     let mut transfer_complete = false;
+    let mut intentional_leave = false;
     loop {
         tokio::select! {
             incoming = reader.next() => {
@@ -626,6 +627,7 @@ async fn run_client(
                         }
                     }
                     Some(ClientCommand::Leave) | None => {
+                        intentional_leave = true;
                         tracing::info!("Enviando saída da sala e fechando conexão WebSocket");
                         let _ = send_client_message(&mut writer, ClientMessage::LeaveRoom).await;
                         let close_handshake = timeout(Duration::from_secs(3), async {
@@ -668,13 +670,17 @@ async fn run_client(
         }
     }
 
-    if !failed && !transfer_complete {
+    if !failed && !transfer_complete && !intentional_leave {
         tracing::warn!("Cliente de sinalização desconectado sem transferência concluída");
         let _ = events.send(SignalingEvent::Disconnected);
+    }
+    if intentional_leave {
+        tracing::info!("Cliente de sinalização encerrado após saída solicitada");
     }
     tracing::debug!(
         failed,
         transfer_complete,
+        intentional_leave,
         "Encerrando tarefas do servidor integrado"
     );
     stop_local_server(server_shutdown, server_task).await;
@@ -754,6 +760,52 @@ async fn bind_server_listener_with_retry(listen_address: &str) -> std::io::Resul
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn intentional_leave_does_not_report_an_unexpected_disconnect() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        for intentional in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = SignalingClient::start_worker(
+                format!("ws://{}", listener.local_addr().unwrap()),
+                signaling_protocol::ClientMessage::CreateRoom,
+                None,
+                "unused".to_owned(),
+                super::default_participant(),
+            )
+            .unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.next().await.unwrap().unwrap();
+            if intentional {
+                client.commands.send(super::ClientCommand::Leave).unwrap();
+                let message = socket.next().await.unwrap().unwrap();
+                assert!(matches!(message, Message::Text(_)));
+                socket
+                    .send(Message::Text(
+                        serde_json::to_string(&signaling_protocol::ServerMessage::RoomLeft)
+                            .unwrap()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            socket.send(Message::Close(None)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !client.worker.as_ref().unwrap().is_finished() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let disconnected = client
+                .events
+                .try_iter()
+                .any(|event| matches!(event, super::SignalingEvent::Disconnected));
+            assert_eq!(disconnected, !intentional);
+        }
+    }
+
     use std::net::TcpListener;
     use std::thread;
     use std::time::{Duration, Instant};

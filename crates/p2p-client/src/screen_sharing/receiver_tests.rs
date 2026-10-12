@@ -1,5 +1,205 @@
 use super::*;
 
+#[test]
+fn regression_queue_recovery_keeps_decoder_and_its_performance_history() {
+    let start = Instant::now();
+    let mut codec = DecoderContinuity {
+        decoder: Some(42_u64),
+        using_cpu_pending_sps: true,
+        ..Default::default()
+    };
+    for tick in 0..160 {
+        let now = start + Duration::from_millis(tick * 40);
+        if tick % 50 == 0 {
+            let generation = tick / 50 + 1;
+            assert_eq!(
+                codec.synchronize(generation, generation),
+                DecoderGenerationStatus::Recover
+            );
+            assert_eq!(
+                codec.decoder,
+                Some(42),
+                "queue recovery must not recreate a working codec"
+            );
+        }
+        codec.throughput.observe(now, tick % 3 == 0);
+    }
+    assert!(
+        codec
+            .throughput
+            .observe(start + Duration::from_millis(6400), false)
+            .is_some(),
+        "recovery every two seconds must not postpone the fallback window forever"
+    );
+    assert_eq!(codec.synchronize(2, 4), DecoderGenerationStatus::Stale);
+    assert_eq!(codec.generation, 4);
+    assert_eq!(codec.decoder, Some(42));
+    assert!(
+        should_try_hardware_decoder(
+            VideoDecoderPreference::Automatic,
+            false,
+            codec.decoder.is_none(),
+            codec.using_cpu_pending_sps,
+            true,
+        ),
+        "a temporary CPU decoder must still upgrade when SPS/PPS/IDR arrive after recovery"
+    );
+}
+
+#[test]
+fn regression_slow_decoder_with_successful_idrs_detects_queue_pressure() {
+    let start = Instant::now();
+    let mut codec = DecoderContinuity {
+        decoder: Some(7),
+        ..Default::default()
+    };
+    let mut decision = None;
+    for second in 0..=6 {
+        codec.synchronize(second + 1, second + 1);
+        let totals = DecoderWorkTotals {
+            assembled: second * 30,
+            published: second,
+            queue_drops: second * 2,
+        };
+        decision = codec
+            .throughput
+            .observe_pressure(start + Duration::from_secs(second), totals)
+            .or(decision);
+    }
+    let decision = decision.expect("decoded IDRs alone must not hide the discarded deltas");
+    assert_eq!(decision.inputs, 90);
+    assert_eq!(decision.outputs, 3);
+    assert_eq!(codec.decoder, Some(7));
+}
+
+#[test]
+fn queue_pressure_ignores_startup_network_loss_and_one_transient_overflow() {
+    let start = Instant::now();
+    for drops in [0, 1] {
+        let mut monitor = DxvaThroughputMonitor::default();
+        for second in 0..=7 {
+            let totals = DecoderWorkTotals {
+                assembled: second * 30,
+                published: second,
+                queue_drops: u64::from(second >= 3) * drops,
+            };
+            assert!(
+                monitor
+                    .observe_pressure(start + Duration::from_secs(second), totals)
+                    .is_none()
+            );
+        }
+    }
+    let mut healthy = DxvaThroughputMonitor::default();
+    for second in 0..=7 {
+        let totals = DecoderWorkTotals {
+            assembled: second * 30,
+            published: second * 29,
+            queue_drops: second * 2,
+        };
+        assert!(
+            healthy
+                .observe_pressure(start + Duration::from_secs(second), totals)
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn decoder_recovery_reconfigures_only_when_the_resolution_changes() {
+    let mut codec = DecoderContinuity {
+        decoder: Some(7),
+        ..Default::default()
+    };
+    codec.set_dimensions(Some((1920, 1080)));
+    codec.synchronize(1, 1);
+    codec.set_dimensions(Some((1920, 1080)));
+    assert_eq!(codec.decoder, Some(7));
+    codec.set_dimensions(None);
+    assert_eq!(codec.decoder, Some(7));
+    codec.set_dimensions(Some((1280, 720)));
+    assert!(codec.decoder.is_none());
+    assert_eq!(codec.dimensions, Some((1280, 720)));
+}
+
+#[test]
+fn retained_decoder_recovers_real_h264_after_discarded_frames() {
+    let mut encoder = super::openh264_encoder(4_000_000).unwrap();
+    let mut codec = DecoderContinuity {
+        decoder: Some(ActiveH264Decoder::OpenH264(Decoder::new().unwrap())),
+        ..Default::default()
+    };
+    let mut source = PreviewFrame {
+        sequence: 1,
+        width: 320,
+        height: 240,
+        rgba: (0..320 * 240 * 4).map(|i| (i % 251) as u8).collect(),
+        #[cfg(windows)]
+        gpu_nv12: None,
+        #[cfg(windows)]
+        cpu_nv12: None,
+    };
+    let remote_frame = Arc::new(Mutex::new(None));
+    let sequence = AtomicU64::new(0);
+    let metrics = SharedMetrics::default();
+    let context = egui::Context::default();
+    let mut cached_sps = None;
+    let mut cached_pps = None;
+    for generation in 1..=3 {
+        // Simulate an access unit discarded by the queue, then the requested IDR.
+        let discarded = encode_frame(&mut encoder, &source).unwrap();
+        assert!(!discarded.is_empty());
+        assert_eq!(
+            codec.synchronize(generation, generation),
+            DecoderGenerationStatus::Recover
+        );
+        encoder.force_intra_frame();
+        source.sequence += 1;
+        let idr = encode_frame(&mut encoder, &source).unwrap();
+        let recovery = update_cached_idr(&idr, &mut cached_sps, &mut cached_pps).unwrap();
+        let mut waiting_for_idr = true;
+        assert!(should_decode_access_unit(&mut waiting_for_idr, &recovery));
+        assert!(
+            decode_h264_access_unit(
+                &recovery,
+                codec.decoder.as_mut().expect("working decoder retained"),
+                &context,
+                &remote_frame,
+                &sequence,
+                &metrics,
+            )
+            .is_none()
+        );
+
+        source.sequence += 1;
+        source.rgba[0] = source.rgba[0].wrapping_add(40);
+        let delta = encode_frame(&mut encoder, &source).unwrap();
+        assert!(annex_b_nal_types(&delta).contains(&1));
+        assert!(should_decode_access_unit(&mut waiting_for_idr, &delta));
+        assert!(
+            decode_h264_access_unit(
+                &delta,
+                codec.decoder.as_mut().unwrap(),
+                &context,
+                &remote_frame,
+                &sequence,
+                &metrics,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            metrics.published_frames.load(Ordering::Relaxed),
+            generation * 2
+        );
+    }
+    assert_eq!(metrics.decode_errors.load(Ordering::Relaxed), 0);
+    let published = remote_frame.lock().unwrap();
+    assert_eq!(
+        published.as_ref().map(|frame| (frame.width, frame.height)),
+        Some((320, 240))
+    );
+}
+
 fn annex_b_access_unit(nals: &[&[u8]]) -> Vec<u8> {
     let mut access_unit = Vec::new();
     for nal in nals {

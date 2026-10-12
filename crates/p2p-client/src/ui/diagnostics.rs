@@ -11,6 +11,11 @@ impl ClientUi {
         egui::CollapsingHeader::new("Diagnóstico")
             .default_open(false)
             .show(ui, |ui| {
+                ui.label(format!("Build: {}", env!("P2P_BUILD_ID")));
+                ui.small(format!(
+                    "Descoberta: {}",
+                    self.discovery_diagnostic_summary()
+                ));
                 if ui.button("Exportar logs").clicked() {
                     *export_logs = true;
                 }
@@ -125,9 +130,10 @@ impl ClientUi {
                 ));
                 ui.label(&self.screen_share_metrics.selected_ice_pair);
                 ui.label(format!(
-                    "RTP enviado: {} pacotes, {} bytes.",
+                    "RTP enviado: {} pacotes, {} bytes; repetições do RTP original na saída: {}.",
                     self.screen_share_metrics.outbound_rtp_packets,
-                    self.screen_share_metrics.outbound_rtp_bytes
+                    self.screen_share_metrics.outbound_rtp_bytes,
+                    self.screen_share_metrics.original_rtp_repeats_sent
                 ));
                 ui.label(&self.screen_share_metrics.rtc_outbound_summary);
                 ui.label(&self.screen_share_metrics.h264_diagnostics);

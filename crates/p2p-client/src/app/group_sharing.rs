@@ -195,6 +195,7 @@ fn log_group_session_diagnostics(
         inbound_video_ssrc = ?metrics.inbound_video_ssrc,
         nack_sent_video_ssrc = ?metrics.inbound_video_ssrc,
         nack_received_video_ssrc = ?metrics.outbound_video_ssrc,
+        original_rtp_repeats_sent_total = metrics.original_rtp_repeats_sent,
         assembled_idr_with_parameters_total = metrics.assembled_idr_with_parameters,
         assembled_idr_without_parameters_total = metrics.assembled_idr_without_parameters,
         assembled_delta_units_total = metrics.assembled_delta_units,

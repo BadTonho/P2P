@@ -813,9 +813,103 @@ struct DxvaThroughputMonitor {
     first_input_at: Option<Instant>,
     measurement_started_at: Option<Instant>,
     samples: VecDeque<(Instant, bool)>,
+    pressure_started_at: Option<Instant>,
+    pressure_baseline: Option<(Instant, DecoderWorkTotals)>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DecoderWorkTotals {
+    assembled: u64,
+    published: u64,
+    queue_drops: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DecoderGenerationStatus {
+    Stale,
+    Current,
+    Recover,
+}
+
+struct DecoderContinuity<D> {
+    decoder: Option<D>,
+    using_cpu_pending_sps: bool,
+    generation: u64,
+    throughput: DxvaThroughputMonitor,
+    dimensions: Option<(u32, u32)>,
+}
+
+impl<D> Default for DecoderContinuity<D> {
+    fn default() -> Self {
+        Self {
+            decoder: None,
+            using_cpu_pending_sps: false,
+            generation: 0,
+            throughput: DxvaThroughputMonitor::default(),
+            dimensions: None,
+        }
+    }
+}
+
+impl<D> DecoderContinuity<D> {
+    fn set_dimensions(&mut self, dimensions: Option<(u32, u32)>) {
+        let Some(dimensions) = dimensions else {
+            return;
+        };
+        if self
+            .dimensions
+            .is_some_and(|previous| previous != dimensions)
+        {
+            self.decoder = None;
+            self.throughput = DxvaThroughputMonitor::default();
+        }
+        self.dimensions = Some(dimensions);
+    }
+
+    fn synchronize(&mut self, queued: u64, current: u64) -> DecoderGenerationStatus {
+        if queued != current {
+            return DecoderGenerationStatus::Stale;
+        }
+        if self.generation == queued {
+            return DecoderGenerationStatus::Current;
+        }
+        self.generation = queued;
+        // A complete IDR restores references on the existing decoder. Recreating it
+        // for every queue overflow stalls the worker and fills the queue again.
+        // Keep the performance history across these recoveries as well.
+        DecoderGenerationStatus::Recover
+    }
 }
 
 impl DxvaThroughputMonitor {
+    fn observe_pressure(
+        &mut self,
+        now: Instant,
+        totals: DecoderWorkTotals,
+    ) -> Option<DxvaThroughputSnapshot> {
+        let started = *self.pressure_started_at.get_or_insert(now);
+        if now.saturating_duration_since(started) < DXVA_ADAPTIVE_WARMUP {
+            return None;
+        }
+        let (baseline_at, baseline) = *self.pressure_baseline.get_or_insert((now, totals));
+        if now.saturating_duration_since(baseline_at) < DXVA_ADAPTIVE_WINDOW {
+            return None;
+        }
+        self.pressure_baseline = Some((now, totals));
+        let inputs = totals.assembled.saturating_sub(baseline.assembled) as usize;
+        let outputs = totals.published.saturating_sub(baseline.published) as usize;
+        let queue_drops = totals.queue_drops.saturating_sub(baseline.queue_drops);
+        if inputs < DXVA_ADAPTIVE_MIN_INPUTS || queue_drops < 2 {
+            return None;
+        }
+        let output_ratio = outputs as f64 / inputs as f64;
+        (output_ratio < DXVA_ADAPTIVE_MIN_OUTPUT_RATIO).then_some(DxvaThroughputSnapshot {
+            inputs,
+            outputs,
+            output_ratio,
+        })
+    }
+
     fn observe(&mut self, now: Instant, produced_output: bool) -> Option<DxvaThroughputSnapshot> {
         let first_input_at = *self.first_input_at.get_or_insert(now);
         if now.saturating_duration_since(first_input_at) < DXVA_ADAPTIVE_WARMUP {
@@ -984,22 +1078,19 @@ impl PeerEvents {
             let worker = thread::Builder::new()
                 .name("p2p-h264-decoder".to_owned())
                 .spawn(move || {
-                    let mut decoder: Option<ActiveH264Decoder> = None;
-                    let mut using_cpu_pending_sps = false;
+                    let mut codec = DecoderContinuity::<ActiveH264Decoder>::default();
                     let mut cpu_waiting_for_idr = true;
                     let mut hardware_frames_without_output = 0u32;
-                    let mut generation_seen = 0_u64;
                     let mut cached_sps = None;
                     let mut cached_pps = None;
                     let mut cached_idr = None;
                     let mut cached_gop = CachedH264Gop::default();
-                    let mut dxva_throughput = DxvaThroughputMonitor::default();
                     let mut last_hardware_input_at: Option<Instant> = None;
                     let mut hardware_decoder_disabled =
                         worker_decoder_preference == VideoDecoderPreference::Cpu;
                     loop {
                         let watchdog_wait = if matches!(
-                            decoder.as_ref(),
+                            codec.decoder.as_ref(),
                             Some(ActiveH264Decoder::MediaFoundation(_))
                         ) && hardware_frames_without_output > 0
                         {
@@ -1014,7 +1105,7 @@ impl PeerEvents {
                             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
                             Err(std_mpsc::RecvTimeoutError::Timeout) => {
                                 if !matches!(
-                                    decoder.as_ref(),
+                                    codec.decoder.as_ref(),
                                     Some(ActiveH264Decoder::MediaFoundation(_))
                                 ) || hardware_frames_without_output == 0
                                     || !dxva_watchdog_expired(last_hardware_input_at, Instant::now())
@@ -1034,8 +1125,8 @@ impl PeerEvents {
                                             "CPU — OpenH264".to_owned(),
                                             Some(reason),
                                         );
-                                        decoder = Some(ActiveH264Decoder::OpenH264(cpu));
-                                        using_cpu_pending_sps = false;
+                                        codec.decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                        codec.using_cpu_pending_sps = false;
                                         hardware_frames_without_output = 0;
                                         last_hardware_input_at = None;
                                         cpu_waiting_for_idr = true;
@@ -1044,7 +1135,7 @@ impl PeerEvents {
                                             let before = worker_metrics.decoded_frames.load(Ordering::Relaxed);
                                             if should_decode_access_unit(&mut cpu_waiting_for_idr, idr) {
                                                 worker_metrics.record_decoder_input_cached_replay();
-                                                if let Some(active_decoder) = decoder.as_mut() {
+                                                if let Some(active_decoder) = codec.decoder.as_mut() {
                                                     let failure = decode_h264_access_unit(
                                                         idr,
                                                         active_decoder,
@@ -1065,7 +1156,7 @@ impl PeerEvents {
                                                     &worker_keyframe_request_tx,
                                                     PliReason::DecodeError,
                                                 );
-                                                generation_seen = generation;
+                                                codec.generation = generation;
                                                 cpu_waiting_for_idr = true;
                                             }
                                         } else {
@@ -1075,7 +1166,7 @@ impl PeerEvents {
                                                 &worker_keyframe_request_tx,
                                                 PliReason::DecodeError,
                                             );
-                                            generation_seen = generation;
+                                            codec.generation = generation;
                                             cpu_waiting_for_idr = true;
                                         }
                                     }
@@ -1090,18 +1181,15 @@ impl PeerEvents {
                             }
                         };
                         let current_generation = worker_generation.load(Ordering::Relaxed);
-                        if queued.generation != current_generation {
+                        let generation_status = codec.synchronize(queued.generation, current_generation);
+                        if generation_status == DecoderGenerationStatus::Stale {
                             worker_metrics.record_drop_stale_generation();
                             continue;
                         }
-                        if queued.generation != generation_seen {
-                            generation_seen = queued.generation;
-                            decoder = None;
-                            using_cpu_pending_sps = false;
+                        if generation_status == DecoderGenerationStatus::Recover {
                             cpu_waiting_for_idr = true;
                             hardware_frames_without_output = 0;
                             last_hardware_input_at = None;
-                            dxva_throughput = DxvaThroughputMonitor::default();
                             cached_gop.invalidate_delta_chain();
                         }
                         let access_unit = queued.bytes;
@@ -1119,20 +1207,21 @@ impl PeerEvents {
                             let nals = annex_b_nal_types(&access_unit);
                             nals.contains(&7) && nals.contains(&8) && nals.contains(&5)
                         };
+                        codec.set_dimensions(mf_video::sps_dimensions(&access_unit));
 
                         #[cfg(windows)]
                         let should_try_hardware = should_try_hardware_decoder(
                             worker_decoder_preference,
                             hardware_decoder_disabled,
-                            decoder.is_none(),
-                            using_cpu_pending_sps,
+                            codec.decoder.is_none(),
+                            codec.using_cpu_pending_sps,
                             has_sps_and_idr,
                         );
                         #[cfg(not(windows))]
                         let should_try_hardware = false;
 
                         #[cfg(windows)]
-                        if decoder.is_none()
+                        if codec.decoder.is_none()
                             && (worker_decoder_preference == VideoDecoderPreference::Cpu
                                 || hardware_decoder_disabled)
                         {
@@ -1171,8 +1260,8 @@ impl PeerEvents {
                                         decoder_preference = worker_decoder_preference.label(),
                                         "Decoder OpenH264 selecionado pelo usuário"
                                     );
-                                    decoder = Some(ActiveH264Decoder::OpenH264(cpu));
-                                    using_cpu_pending_sps = false;
+                                    codec.decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                    codec.using_cpu_pending_sps = false;
                                     cpu_waiting_for_idr = true;
                                 }
                                 Err(error) => {
@@ -1203,8 +1292,8 @@ impl PeerEvents {
                                                 height,
                                                 "Decodificador H.264 DXVA ativado"
                                             );
-                                            decoder = Some(ActiveH264Decoder::MediaFoundation(hardware));
-                                            using_cpu_pending_sps = false;
+                                            codec.decoder = Some(ActiveH264Decoder::MediaFoundation(hardware));
+                                            codec.using_cpu_pending_sps = false;
                                         }
                                         Err(error) => {
                                             let reason = format!("DXVA indisponível: {error}");
@@ -1215,8 +1304,8 @@ impl PeerEvents {
                                                         "CPU — OpenH264".to_owned(),
                                                         Some(reason),
                                                     );
-                                                    decoder = Some(ActiveH264Decoder::OpenH264(cpu));
-                                                    using_cpu_pending_sps = false;
+                                                    codec.decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                                    codec.using_cpu_pending_sps = false;
                                                     cpu_waiting_for_idr = true;
                                                 }
                                                 Err(cpu_error) => {
@@ -1229,7 +1318,7 @@ impl PeerEvents {
                                             }
                                         }
                                     }
-                                } else if decoder.is_none() {
+                                } else if codec.decoder.is_none() {
                                     let reason = "Aguardando SPS/PPS para iniciar DXVA; usando CPU neste quadro".to_owned();
                                     match Decoder::new() {
                                         Ok(cpu) => {
@@ -1237,8 +1326,8 @@ impl PeerEvents {
                                                 "CPU — OpenH264 (aguardando SPS/PPS)".to_owned(),
                                                 Some(reason),
                                             );
-                                            decoder = Some(ActiveH264Decoder::OpenH264(cpu));
-                                            using_cpu_pending_sps = true;
+                                            codec.decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                            codec.using_cpu_pending_sps = true;
                                             cpu_waiting_for_idr = true;
                                         }
                                         Err(error) => {
@@ -1253,14 +1342,14 @@ impl PeerEvents {
                         }
 
                         #[cfg(not(windows))]
-                        if decoder.is_none() {
+                        if codec.decoder.is_none() {
                             match Decoder::new() {
                                 Ok(cpu) => {
                                     worker_metrics.set_decoder_backend(
                                         "CPU — OpenH264".to_owned(),
                                         Some("Aceleração Media Foundation está disponível apenas no Windows.".to_owned()),
                                     );
-                                    decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                    codec.decoder = Some(ActiveH264Decoder::OpenH264(cpu));
                                     cpu_waiting_for_idr = true;
                                 }
                                 Err(error) => {
@@ -1277,7 +1366,7 @@ impl PeerEvents {
                             continue;
                         }
 
-                        if let Some(active_decoder) = decoder.as_mut() {
+                        if let Some(active_decoder) = codec.decoder.as_mut() {
                             let decoding_on_hardware = matches!(
                                 active_decoder,
                                 ActiveH264Decoder::MediaFoundation(_)
@@ -1320,8 +1409,8 @@ impl PeerEvents {
                                             "CPU — OpenH264".to_owned(),
                                             Some(reason),
                                         );
-                                        decoder = Some(ActiveH264Decoder::OpenH264(cpu));
-                                        using_cpu_pending_sps = false;
+                                        codec.decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                        codec.using_cpu_pending_sps = false;
                                         cpu_waiting_for_idr = true;
                                         decoder_entered_resync = true;
                                     }
@@ -1334,7 +1423,7 @@ impl PeerEvents {
                                 }
                             }
 
-                            if matches!(decoder.as_ref(), Some(ActiveH264Decoder::MediaFoundation(_)))
+                            if matches!(codec.decoder.as_ref(), Some(ActiveH264Decoder::MediaFoundation(_)))
                                 && worker_metrics.decoded_frames.load(Ordering::Relaxed) == decoded_before
                             {
                                 last_hardware_input_at = Some(Instant::now());
@@ -1349,8 +1438,8 @@ impl PeerEvents {
                                                 "CPU — OpenH264".to_owned(),
                                                 Some(reason),
                                             );
-                                            decoder = Some(ActiveH264Decoder::OpenH264(cpu));
-                                            using_cpu_pending_sps = false;
+                                            codec.decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                            codec.using_cpu_pending_sps = false;
                                             hardware_frames_without_output = 0;
                                             last_hardware_input_at = None;
                                             cpu_waiting_for_idr = true;
@@ -1378,17 +1467,17 @@ impl PeerEvents {
                                     &worker_keyframe_request_tx,
                                     PliReason::DecodeError,
                                 );
-                                generation_seen = generation;
+                                codec.generation = generation;
                                 cpu_waiting_for_idr = true;
                                 if !decoder_entered_resync {
-                                    decoder = None;
+                                    codec.decoder = None;
                                 }
                             }
 
                             if should_use_adaptive_decoder_fallback(worker_decoder_preference)
                                 && hardware_error.is_none()
                                 && matches!(
-                                    decoder.as_ref(),
+                                    codec.decoder.as_ref(),
                                     Some(ActiveH264Decoder::MediaFoundation(_))
                                 )
                             {
@@ -1396,8 +1485,15 @@ impl PeerEvents {
                                     .decoded_frames
                                     .load(Ordering::Relaxed)
                                     > decoded_before;
+                                let now = Instant::now();
+                                let pressure = DecoderWorkTotals {
+                                    assembled: worker_metrics.total_assembled_access_units.load(Ordering::Relaxed),
+                                    published: worker_metrics.published_frames.load(Ordering::Relaxed),
+                                    queue_drops: worker_metrics.decoder_queue_drops.load(Ordering::Relaxed),
+                                };
+                                let overloaded = codec.throughput.observe_pressure(now, pressure);
                                 if let Some(window) =
-                                    dxva_throughput.observe(Instant::now(), produced_output)
+                                    codec.throughput.observe(now, produced_output).or(overloaded)
                                 {
                                     let reason = format!(
                                         "DXVA publicou {}/{} quadros na janela de 3 s ({:.0}%); abaixo de 80%. Mudando para OpenH264 na CPU.",
@@ -1410,6 +1506,9 @@ impl PeerEvents {
                                         decoder_inputs = window.inputs,
                                         decoder_outputs = window.outputs,
                                         output_ratio = window.output_ratio,
+                                        queue_pressure_detected = overloaded.is_some(),
+                                        queue_drops_total = pressure.queue_drops,
+                                        completed_access_units_total = pressure.assembled,
                                         fallback_reason = %reason,
                                         cached_gop_complete = cached_gop.complete,
                                         "Fallback adaptativo de DXVA para OpenH264"
@@ -1421,8 +1520,8 @@ impl PeerEvents {
                                                 "CPU — OpenH264 (fallback adaptativo)".to_owned(),
                                                 Some(reason),
                                             );
-                                            decoder = Some(ActiveH264Decoder::OpenH264(cpu));
-                                            using_cpu_pending_sps = false;
+                                            codec.decoder = Some(ActiveH264Decoder::OpenH264(cpu));
+                                            codec.using_cpu_pending_sps = false;
                                             hardware_frames_without_output = 0;
                                             last_hardware_input_at = None;
                                             cpu_waiting_for_idr = true;
@@ -1450,7 +1549,7 @@ impl PeerEvents {
                                                 }
                                                 worker_metrics.record_decoder_input_cached_replay();
                                                 replayed_access_units += 1;
-                                                let Some(active_decoder) = decoder.as_mut() else {
+                                                let Some(active_decoder) = codec.decoder.as_mut() else {
                                                     replay_failed = true;
                                                     break;
                                                 };
@@ -1485,7 +1584,7 @@ impl PeerEvents {
                                                     &worker_keyframe_request_tx,
                                                     PliReason::DecodeError,
                                                 );
-                                                generation_seen = generation;
+                                                codec.generation = generation;
                                                 cpu_waiting_for_idr = true;
                                                 tracing::info!(
                                                     screen_share_session = worker_metrics.session_id,
@@ -1714,23 +1813,23 @@ impl PeerEvents {
             kind = ?track_kind,
             "Faixa Opus remota recebida; preparando decodificação e saída"
         );
-        let mut playback = match audio_playback_factory.start(session_id, ssrc, remote_audio_volume)
-        {
-            Ok(playback) => playback,
-            Err(error) => {
-                tracing::error!(
-                    screen_share_session = session_id,
-                    audio_track_ssrc = ssrc,
-                    stage = "audio_output_open",
-                    error = %error,
-                    "Não foi possível abrir a saída de áudio"
-                );
-                let _ = events.send(ScreenShareEvent::AudioError(format!(
+        let mut playback =
+            match audio_playback_factory.start(session_id, ssrc, remote_audio_volume.clone()) {
+                Ok(playback) => playback,
+                Err(error) => {
+                    tracing::error!(
+                        screen_share_session = session_id,
+                        audio_track_ssrc = ssrc,
+                        stage = "audio_output_open",
+                        error = %error,
+                        "Não foi possível abrir a saída de áudio"
+                    );
+                    let _ = events.send(ScreenShareEvent::AudioError(format!(
                     "O áudio remoto chegou, mas não foi possível abrir a saída do Windows: {error}"
                 )));
-                return;
-            }
-        };
+                    return;
+                }
+            };
         let mut decoder = match opus::Decoder::new(OPUS_SAMPLE_RATE, opus::Channels::Stereo) {
             Ok(decoder) => decoder,
             Err(error) => {
@@ -1852,6 +1951,7 @@ impl PeerEvents {
                     decoded_non_silent_delta,
                     output_callback_delta,
                     output_non_silent_delta,
+                    remote_audio_volume.percent(),
                 );
                 if audio_state != last_audio_state {
                     let _ = events.send(ScreenShareEvent::AudioState(audio_state.clone()));
@@ -1869,6 +1969,7 @@ impl PeerEvents {
                     opus_decode_errors = decode_errors.saturating_sub(last_decode_errors),
                     output_callbacks = output_callback_delta,
                     output_non_silent_samples = output_non_silent_delta,
+                    volume_percent = remote_audio_volume.percent(),
                     output_underrun_frames = output_underruns.saturating_sub(last_output_underruns),
                     output_queue_drops = output_drops.saturating_sub(last_output_drops),
                     "Resumo periódico da recepção de áudio"
@@ -1898,6 +1999,7 @@ impl PeerEvents {
             opus_decode_errors = decode_errors,
             output_callbacks = playback.callbacks(),
             output_non_silent_samples = playback.non_silent_samples(),
+            volume_percent = remote_audio_volume.percent(),
             output_underrun_frames = playback.output_underflow_frames(),
             output_queue_drops = playback.dropped_frames(),
             "Recepção da faixa de áudio encerrada"

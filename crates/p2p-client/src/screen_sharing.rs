@@ -71,6 +71,8 @@ mod h264;
 mod metrics;
 #[path = "screen_sharing/receiver.rs"]
 mod receiver;
+#[path = "screen_sharing/rtp_diagnostics.rs"]
+mod rtp_diagnostics;
 #[path = "screen_sharing/sdp_diagnostics.rs"]
 mod sdp_diagnostics;
 #[path = "screen_sharing/sender.rs"]
@@ -211,6 +213,8 @@ struct SharedMetrics {
     sent_idr_frames: AtomicU64,
     sent_delta_frames: AtomicU64,
     received_packets: AtomicU64,
+    total_assembled_access_units: AtomicU64,
+    original_rtp_repeats_sent: AtomicU64,
     decoded_frames: AtomicU64,
     decoded_delta_frames: AtomicU64,
     decoded_idr_frames: AtomicU64,

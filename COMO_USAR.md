@@ -55,11 +55,15 @@ O perfil define a cadência desejada, mas não garante que o computador consiga 
 
 O perfil escolhido ainda não é negociado com cada receptor. Versões antigas podem ter limites diferentes de decodificação ou aceleração; ao testar computadores com versões distintas, comece em 720p30 e atualize os clientes antes de avaliar os perfis maiores.
 
+Na preferência de decodificação, **Automático** começa com DXVA e pode mudar para **CPU (OpenH264)** quando o decoder não acompanha os quadros recebidos, incluindo congestionamento persistente da fila. **Preferir DXVA** mantém a GPU mesmo com FPS baixo, usando CPU se DXVA estiver indisponível ou falhar. A escolha vale na próxima sessão de compartilhamento. Uma recuperação por fila cheia mantém o decoder ativo e aguarda um quadro completo de recuperação; a avaliação de desempenho continua entre essas recuperações.
+
 ## Áudio reproduzido pelo computador
 
 Antes de iniciar o compartilhamento, marque **Incluir som do computador** na barra da sala para enviar também o áudio que está tocando na saída padrão do Windows. A opção fica desligada por padrão e não usa o microfone. O áudio segue diretamente pela conexão WebRTC para quem recebe aquela tela; o servidor da sala não recebe a mídia. Para cada tela assistida, o app reproduz o áudio remoto pela saída padrão do participante.
 
 Se a captura de áudio falhar, o vídeo continua. Se a reprodução remota falhar, a tela continua sendo exibida. O app registra erros identificados por sessão e faixa, além de resumos a cada cinco segundos de captura, codificação Opus, pacotes RTP, decodificação e fila de reprodução. Use **Exportar logs** para salvar esse diagnóstico. Em salas com vários participantes, cada tela tem sua própria faixa de áudio; ouvir várias ao mesmo tempo pode misturar os sons.
+
+O volume recebido em **0%** silencia a reprodução e continua salvo conforme sua escolha. Quando há áudio recebido e decodificado, o diagnóstico informa esse silêncio intencional. Os resumos de recepção incluem o volume efetivo de cada faixa.
 
 Portas para permitir no firewall:
 
@@ -94,6 +98,8 @@ STUN ajuda a procurar uma rota direta e não retransmite mídia. TURN retransmit
 - Se a sala conectar, mas o vídeo não, confira a mensagem ICE, a URI STUN e as portas UDP. O anfitrião também deve conferir UDP 3478 e UDP 50000–50100 quando TURN estiver ativo.
 - **Configurações > Atualizações** permite verificar, baixar e aplicar uma versão do GitHub Releases. O atualizador prioriza `P2P-Voz-e-tela-Setup.exe` e usa `p2p-client.exe` como fallback quando o instalador não estiver no release.
 - Use **Exportar logs** para salvar diagnóstico local. Os logs podem incluir endereços IP e nomes de adaptadores; revise o arquivo antes de compartilhar.
+- **Diagnóstico** mostra o identificador **Build**, a rede escolhida e os contadores de consultas e anúncios de descoberta. Esses dados também aparecem na exportação, sem nomes nem códigos das salas descobertas. Para acompanhar os eventos durante um teste, ative **Detalhados** antes de reproduzir o problema.
+- O contador de repetições do RTP original na saída acompanha reenvios separadamente das estatísticas RTX. Ele ajuda a investigar os avisos SRTP; um reenvio por NACK pode ser necessário para recuperar um pacote perdido.
 
 ## Atualizações publicadas pelo GitHub
 

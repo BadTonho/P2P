@@ -1,4 +1,46 @@
 use super::*;
+
+#[test]
+fn ice_diagnostics_resolve_raw_and_prefixed_ids_without_guessing_another_candidate() {
+    use rtc::statistics::stats::ice_candidate::RTCIceCandidateStats;
+    use rtc::statistics::stats::{RTCStats, RTCStatsType};
+    let candidate = |id: &str, local: bool| RTCIceCandidateStats {
+        stats: RTCStats {
+            timestamp: rtc::shared::time::SystemInstant::now(Instant::now()),
+            typ: if local {
+                RTCStatsType::LocalCandidate
+            } else {
+                RTCStatsType::RemoteCandidate
+            },
+            id: id.to_owned(),
+        },
+        transport_id: String::new(),
+        address: Some("127.0.0.1".to_owned()),
+        port: 9002,
+        protocol: "udp".to_owned(),
+        candidate_type: RTCIceCandidateType::Host,
+        priority: 0,
+        url: String::new(),
+        relay_protocol: Default::default(),
+        foundation: String::new(),
+        related_address: String::new(),
+        related_port: 0,
+        username_fragment: String::new(),
+        tcp_type: Default::default(),
+    };
+    let entry = RTCStatsReportEntry::LocalCandidate(candidate("RTCLocalIceCandidate_test", true));
+    assert_eq!(
+        candidate_stats_for_id(&entry, "test", true).unwrap().port,
+        9002
+    );
+    assert!(candidate_stats_for_id(&entry, "RTCLocalIceCandidate_test", true).is_some());
+    assert!(candidate_stats_for_id(&entry, "different", true).is_none());
+    assert!(candidate_stats_for_id(&entry, "test", false).is_none());
+    assert!(candidate_stats_for_id(&entry, "", true).is_none());
+    let remote =
+        RTCStatsReportEntry::RemoteCandidate(candidate("RTCRemoteIceCandidate_peer", false));
+    assert!(candidate_stats_for_id(&remote, "peer", false).is_some());
+}
 use crate::audio_capture::AudioPlaybackSink;
 use rtc::peer_connection::transport::RTCIceCandidateType;
 use std::f32::consts::TAU;
@@ -180,11 +222,16 @@ fn audio_activity_diagnostics_distinguish_silence_from_missing_capture_or_playba
     assert!(capture_audio_state(0, 0, 0, 0).contains("não recebeu callbacks"));
     assert!(capture_audio_state(120, 240, 50, 50).contains("50 quadros Opus"));
 
-    let remote_silent = playback_audio_state(250, 250, 0, 300, 0);
+    let remote_silent = playback_audio_state(250, 250, 0, 300, 0, 100);
     assert!(remote_silent.contains("pode ser silêncio"));
-    assert!(playback_audio_state(0, 0, 0, 0, 0).contains("nenhum pacote RTP"));
-    assert!(playback_audio_state(250, 250, 1500, 0, 0).contains("não executou callbacks"));
-    assert!(playback_audio_state(250, 250, 1500, 300, 6000).contains("saída do Windows ativas"));
+    assert!(playback_audio_state(0, 0, 0, 0, 0, 100).contains("nenhum pacote RTP"));
+    assert!(playback_audio_state(250, 250, 1500, 0, 0, 100).contains("não executou callbacks"));
+    assert!(
+        playback_audio_state(250, 250, 1500, 300, 6000, 100).contains("saída do Windows ativas")
+    );
+    assert!(playback_audio_state(250, 250, 1500, 300, 0, 0).contains("volume em 0%"));
+    assert!(playback_audio_state(0, 0, 0, 300, 0, 0).contains("nenhum pacote RTP"));
+    assert!(playback_audio_state(250, 250, 1500, 300, 0, 100).contains("nenhuma amostra audível"));
 }
 
 fn pump_signals(from: &ScreenShareSession, to: &ScreenShareSession, label: &str) {
@@ -875,6 +922,7 @@ fn loopback_controlled_rtp_loss_correlates_nack_and_retransmits_the_missing_pack
                 .nack_packets_sent
                 .is_some_and(|count| count > 0)
             && sender_metrics.nack_packets_received_observed > 0
+            && sender_metrics.original_rtp_repeats_sent > 0
             && receiver_metrics.nack_packets_sent
                 == Some(sender_metrics.nack_packets_received_observed)
         {
@@ -920,6 +968,14 @@ fn loopback_controlled_rtp_loss_correlates_nack_and_retransmits_the_missing_pack
         "the receiver's NACK count should match packets observed in the sender's inbound RTCP interceptor; sender={sender_metrics:?}, receiver={receiver_metrics:?}"
     );
     assert!(sender_metrics.nack_packets_received.is_some());
+    assert_eq!(sender_metrics.route, Some(MediaRoute::Direct));
+    assert_eq!(receiver_metrics.route, Some(MediaRoute::Direct));
+    assert!(sender_metrics.selected_ice_pair.contains("127.0.0.1"));
+    assert!(!sender_metrics.selected_ice_pair.contains("indisponível"));
+    assert!(
+        sender_metrics.original_rtp_repeats_sent > 0,
+        "original RTP retransmission must be measured separately from RTX"
+    );
     // The RTC exposes retransmission counters in this build, so zero is a known result rather
     // than missing data. This diagnostic test measures NACK delivery; it does not change or
     // assume the negotiated retransmission behavior.

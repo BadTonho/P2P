@@ -1158,8 +1158,9 @@ impl ClientUi {
                 .map(|address| (address.adapter.clone(), address.ipv4.to_string()))
                 .collect(),
             screen_share_state: share_state.to_owned(),
+            discovery_state: self.discovery_diagnostic_summary(),
             screen_metrics: format!(
-                "sessão={}, SSRC={}, P2P={}, rota={:?}; par ICE: {}; RTP enviado: {}; RTP recebido: {}; RTP total enviado={} pacotes/{} bytes, recebido={} pacotes/{} bytes, perda={}, jitter={:.1} ms; codec local/remoto={}/{}, fallback local/remoto={}/{}, ICE local/remoto={}/{}, srflx local/remoto={}/{}, relay local/remoto={}/{}, entradas/quadros H.264/enviados/decodificados={}/{}/{}/{}, IDR/P enviados={}/{}, descartados antes do IDR={}, P montados/decodificados={}/{}, pacotes RTP observados={}, decoder entradas/sem saída/fila cheia={}/{}/{}, quadros publicados/atualizações da prévia={}/{}, PLI fila cheia={}, erros de decodificação={}, diagnóstico H.264={}",
+                "sessão={}, SSRC={}, P2P={}, rota={:?}; par ICE: {}; RTP enviado: {}; RTP recebido: {}; RTP total enviado={} pacotes/{} bytes, recebido={} pacotes/{} bytes, perda={}, jitter={:.1} ms; RTP original repetido na saída={}; codec local/remoto={}/{}, fallback local/remoto={}/{}, ICE local/remoto={}/{}, srflx local/remoto={}/{}, relay local/remoto={}/{}, entradas/quadros H.264/enviados/decodificados={}/{}/{}/{}, IDR/P enviados={}/{}, descartados antes do IDR={}, P montados/decodificados={}/{}, pacotes RTP observados={}, decoder entradas/sem saída/fila cheia={}/{}/{}, quadros publicados/atualizações da prévia={}/{}, PLI fila cheia={}, erros de decodificação={}, diagnóstico H.264={}",
                 metrics.session_id,
                 metrics.track_ssrc.unwrap_or_default(),
                 metrics.p2p_connected,
@@ -1173,6 +1174,7 @@ impl ClientUi {
                 metrics.inbound_rtp_bytes,
                 metrics.inbound_rtp_lost,
                 metrics.inbound_rtp_jitter_ms,
+                metrics.original_rtp_repeats_sent,
                 metrics.encoder_backend,
                 metrics.decoder_backend,
                 metrics.encoder_fallback_reason.as_deref().unwrap_or(""),

@@ -170,6 +170,17 @@ struct Shared {
     advertisement: Option<RoomAdvertisement>,
     cache: RoomCache,
     error: Option<String>,
+    diagnostics: DiscoveryDiagnostics,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DiscoveryDiagnostics {
+    pub queries_sent: u64,
+    pub announcements_sent: u64,
+    pub queries_received: u64,
+    pub announcements_received: u64,
+    pub invalid_datagrams: u64,
+    pub ignored_sources: u64,
 }
 
 pub(crate) struct DiscoveryService {
@@ -233,6 +244,7 @@ impl DiscoveryService {
         receiver.set_read_timeout(Some(Duration::from_millis(100)))?;
         sender.set_write_timeout(Some(Duration::from_millis(100)))?;
         sender.set_broadcast(true)?;
+        tracing::info!(adapter = %network.adapter, ipv4 = %network.ipv4, prefix_len = network.prefix_len, udp_port = DISCOVERY_PORT, targets = targets.len(), "Descoberta de salas iniciada na interface escolhida; códigos omitidos");
         let shared = Arc::new(Mutex::new(Shared::default()));
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_shared = shared.clone();
@@ -260,10 +272,23 @@ impl DiscoveryService {
     }
 
     pub(crate) fn advertise(&self, advertisement: Option<RoomAdvertisement>) {
+        let advertisement = advertisement.filter(RoomAdvertisement::valid);
+        let mut shared = self.shared.lock().expect("discovery state poisoned");
+        if shared.advertisement != advertisement {
+            tracing::info!(
+                announcing = advertisement.is_some(),
+                participants = advertisement.as_ref().map(|room| room.participants),
+                "Estado do anúncio local alterado; nome e código omitidos"
+            );
+            shared.advertisement = advertisement;
+        }
+    }
+
+    pub(crate) fn diagnostics(&self) -> DiscoveryDiagnostics {
         self.shared
             .lock()
             .expect("discovery state poisoned")
-            .advertisement = advertisement.filter(RoomAdvertisement::valid);
+            .diagnostics
     }
 
     pub(crate) fn snapshot(&self) -> (Vec<DiscoveredRoom>, Option<String>) {
@@ -279,6 +304,7 @@ impl Drop for DiscoveryService {
             // Socket reads and writes have short timeouts, including when the network goes away.
             let _ = worker.join();
         }
+        tracing::info!(ipv4 = %self.network.ipv4, "Descoberta encerrada; porta UDP liberada");
     }
 }
 
@@ -295,6 +321,7 @@ fn run_worker(
     let mut last_tick = Instant::now() - INTERVAL;
     let mut last_advertisement = None;
     let mut last_reply = Instant::now() - INTERVAL;
+    let mut last_report = Instant::now();
     while !stopping.load(Ordering::Acquire) {
         let now = Instant::now();
         let advertisement = shared
@@ -326,38 +353,63 @@ fn run_worker(
             {
                 match decode(&buffer[..length]) {
                     Some(Message::Room { room }) => {
+                        let mut shared = shared.lock().expect("discovery state poisoned");
+                        shared.diagnostics.announcements_received += 1;
+                        shared.cache.receive(*source.ip(), room, Instant::now());
+                    }
+                    Some(Message::Query) => {
                         shared
                             .lock()
                             .expect("discovery state poisoned")
-                            .cache
-                            .receive(*source.ip(), room, Instant::now());
-                    }
-                    Some(Message::Query) if last_reply.elapsed() >= INTERVAL => {
-                        if let Some(room) = advertisement {
+                            .diagnostics
+                            .queries_received += 1;
+                        if last_reply.elapsed() >= INTERVAL
+                            && let Some(room) = advertisement
+                        {
                             // Replies use the same local broadcasts, never an attacker-supplied endpoint.
                             send(&sender, &targets, Message::Room { room }, &shared);
                             last_reply = Instant::now();
                         }
                     }
-                    _ => {}
+                    None => {
+                        shared
+                            .lock()
+                            .expect("discovery state poisoned")
+                            .diagnostics
+                            .invalid_datagrams += 1
+                    }
                 }
             }
-            Ok(_) => {}
+            Ok(_) => {
+                shared
+                    .lock()
+                    .expect("discovery state poisoned")
+                    .diagnostics
+                    .ignored_sources += 1
+            }
             Err(error)
                 if matches!(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) => {}
             Err(error) => {
+                tracing::warn!(error = %error, "Descoberta falhou ao receber; entrada manual continua disponível");
                 shared.lock().expect("discovery state poisoned").error =
                     Some(format!("Falha ao receber descoberta: {error}"));
                 break;
             }
         }
+        if last_report.elapsed() >= Duration::from_secs(10) {
+            let mut shared = shared.lock().expect("discovery state poisoned");
+            shared.cache.expire(Instant::now());
+            tracing::info!(ipv4 = %network.ipv4, rooms = shared.cache.entries.len(), counters = ?shared.diagnostics, failed = shared.error.is_some(), "Resumo da descoberta; códigos e nomes omitidos");
+            last_report = Instant::now();
+        }
     }
 }
 
 fn send(sender: &UdpSocket, targets: &[SocketAddrV4], message: Message, shared: &Mutex<Shared>) {
+    let is_query = matches!(message, Message::Query);
     let bytes = encode(message);
     let mut sent = false;
     let mut last_error = None;
@@ -367,7 +419,15 @@ fn send(sender: &UdpSocket, targets: &[SocketAddrV4], message: Message, shared: 
             Err(error) => last_error = Some(error),
         }
     }
-    shared.lock().expect("discovery state poisoned").error = if sent {
+    let mut shared = shared.lock().expect("discovery state poisoned");
+    if sent {
+        if is_query {
+            shared.diagnostics.queries_sent += 1;
+        } else {
+            shared.diagnostics.announcements_sent += 1;
+        }
+    }
+    let error = if sent {
         None
     } else {
         Some(format!(
@@ -378,6 +438,14 @@ fn send(sender: &UdpSocket, targets: &[SocketAddrV4], message: Message, shared: 
             )
         ))
     };
+    if shared.error != error {
+        if let Some(error) = &error {
+            tracing::warn!(error = %error, "Falha da descoberta; entrada manual continua disponível");
+        } else {
+            tracing::info!("Envio da descoberta restabelecido");
+        }
+        shared.error = error;
+    }
 }
 
 #[cfg(windows)]

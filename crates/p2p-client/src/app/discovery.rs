@@ -2,6 +2,27 @@ use super::*;
 use crate::discovery::DiscoveryNetwork;
 
 impl ClientUi {
+    pub(super) fn discovery_diagnostic_summary(&self) -> String {
+        let mode = match self.network_selection {
+            NetworkSelection::Automatic => "Automática",
+            NetworkSelection::Manual => "Manual",
+        };
+        let state = match &self.discovery {
+            Some(service) => format!(
+                "interface={}, UDP 8999, salas={}, contadores={:?}",
+                service.network.ipv4,
+                self.discovered_rooms.len(),
+                service.diagnostics()
+            ),
+            None => "serviço inativo".to_owned(),
+        };
+        format!(
+            "rede={mode}, anúncio habilitado={}, {state}, falha={}",
+            self.announce_local_room,
+            self.discovery_error.as_deref().unwrap_or("nenhuma")
+        )
+    }
+
     fn local_room_advertisement(&self) -> Option<RoomAdvertisement> {
         if !self.announce_local_room
             || !self.hosting_locally
@@ -74,7 +95,12 @@ impl ClientUi {
                         self.discovery = Some(service);
                         self.discovery_error = None;
                     }
-                    Err(error) => self.discovery_error = Some(error),
+                    Err(error) => {
+                        if self.discovery_error.as_ref() != Some(&error) {
+                            tracing::warn!(error = %error, "Não foi possível iniciar descoberta; entrada manual continua disponível");
+                        }
+                        self.discovery_error = Some(error);
+                    }
                 }
             }
         } else {
@@ -94,6 +120,7 @@ impl ClientUi {
     pub(super) fn join_discovered_room(&mut self, room: DiscoveredRoom) {
         // The code goes directly to signaling, never through set_join_code/preferences.
         if self.discovered_rooms.contains(&room) {
+            tracing::info!(ipv4 = %room.ipv4, signaling_port = 9000, "Entrada escolhida pela lista de salas descobertas; código omitido");
             self.start_join_at(room.endpoint(), room.advertisement.code);
         } else {
             self.connection_error = Some(

@@ -267,6 +267,11 @@ async fn discovery_loopback_selection_joins_existing_signaling_and_never_changes
     assert!(app.local_room_advertisement().is_none());
     app.hosting_locally = true;
     app.discovery = Some(host_presence);
+    let diagnostic = app.diagnostic_snapshot().discovery_state;
+    assert!(diagnostic.contains("UDP 8999"));
+    assert!(diagnostic.contains("contadores="));
+    assert!(!diagnostic.contains(&code));
+    assert!(!diagnostic.contains("Friend"));
     // Explicit leave immediately clears presence; signaling shutdown runs off the async server thread.
     let signaling = app.signaling.take();
     let dropping = tokio::task::spawn_blocking(move || drop(signaling));

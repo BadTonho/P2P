@@ -3,6 +3,22 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-changed=src");
+    let revision = Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|revision| revision.trim().to_owned())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let built_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_secs();
+    let version = env::var("CARGO_PKG_VERSION").expect("package version");
+    let profile = env::var("PROFILE").expect("build profile");
+    println!("cargo:rustc-env=P2P_BUILD_ID={version}-{revision}-{built_at}-{profile}");
     println!("cargo:rerun-if-changed=assets/p2p-client.rc");
     println!("cargo:rerun-if-changed=assets/p2p-client.ico");
 

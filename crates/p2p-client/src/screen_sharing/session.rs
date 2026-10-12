@@ -169,11 +169,15 @@ pub(super) fn playback_audio_state(
     decoded_non_silent_samples: u64,
     output_callbacks: u64,
     output_non_silent_samples: u64,
+    volume_percent: u32,
 ) -> String {
     if rtp_packets == 0 {
         "Áudio remoto: nenhum pacote RTP recebido nesta janela.".to_owned()
     } else if decoded_frames == 0 {
         "Áudio remoto: pacotes recebidos, mas nenhum quadro Opus decodificado nesta janela."
+            .to_owned()
+    } else if volume_percent == 0 {
+        "Áudio remoto: recebido e decodificado; volume em 0%, silêncio por escolha do usuário."
             .to_owned()
     } else if decoded_non_silent_samples == 0 {
         "Áudio remoto: quadros Opus decodificados sem amostras audíveis; pode ser silêncio da fonte."
@@ -1257,6 +1261,30 @@ async fn run_session(
     }
 }
 
+fn candidate_stats_for_id<'a>(
+    entry: &'a RTCStatsReportEntry,
+    id: &str,
+    local: bool,
+) -> Option<&'a rtc::statistics::stats::ice_candidate::RTCIceCandidateStats> {
+    if id.is_empty() {
+        return None;
+    }
+    let candidate = match (local, entry) {
+        (true, RTCStatsReportEntry::LocalCandidate(candidate))
+        | (false, RTCStatsReportEntry::RemoteCandidate(candidate)) => candidate,
+        _ => return None,
+    };
+    // rtc 0.21 registers stats with a role prefix, while pair IDs can refer to
+    // the ICE agent's raw candidate ID. Never guess a route from another pair.
+    let prefix = if local {
+        "RTCLocalIceCandidate_"
+    } else {
+        "RTCRemoteIceCandidate_"
+    };
+    (candidate.stats.id == id || candidate.stats.id.strip_prefix(prefix) == Some(id))
+        .then_some(candidate)
+}
+
 fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
     let mut snapshot = PeerStatsSnapshot {
         selected_pair_summary: "Par ICE selecionado: desconhecido (metadados indisponíveis)"
@@ -1276,14 +1304,12 @@ fn peer_stats_snapshot(report: &RTCStatsReport) -> PeerStatsSnapshot {
     });
     if let Some(selected_pair_id) = selected_pair_id {
         if let Some(RTCStatsReportEntry::IceCandidatePair(pair)) = report.get(selected_pair_id) {
-            let local = match report.get(&pair.local_candidate_id) {
-                Some(RTCStatsReportEntry::LocalCandidate(candidate)) => Some(candidate),
-                _ => None,
-            };
-            let remote = match report.get(&pair.remote_candidate_id) {
-                Some(RTCStatsReportEntry::RemoteCandidate(candidate)) => Some(candidate),
-                _ => None,
-            };
+            let local = report
+                .iter()
+                .find_map(|entry| candidate_stats_for_id(entry, &pair.local_candidate_id, true));
+            let remote = report
+                .iter()
+                .find_map(|entry| candidate_stats_for_id(entry, &pair.remote_candidate_id, false));
             let route = media_route_from_candidate_types(
                 local.map(|candidate| candidate.candidate_type),
                 remote.map(|candidate| candidate.candidate_type),
@@ -1539,6 +1565,10 @@ async fn create_peer(
             metrics: Some(Arc::clone(&metrics)),
             ..PliForwarder::default()
         },
+    );
+    let interceptors = interceptors.with(
+        Slot::Custom(600),
+        super::rtp_diagnostics::RtpWireDiagnostics::new(Arc::clone(&metrics)),
     );
     #[cfg(test)]
     let interceptors = interceptors.with(

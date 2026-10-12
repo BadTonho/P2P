@@ -28,6 +28,7 @@ pub struct ScreenShareMetrics {
     pub sent_delta_frames: u64,
     pub received_packets: u64,
     pub assembled_access_units: u64,
+    pub original_rtp_repeats_sent: u64,
     pub received_delta_frames: u64,
     pub decoded_frames: u64,
     pub decoded_delta_frames: u64,
@@ -253,6 +254,7 @@ impl SharedMetrics {
             sent_idr_frames: self.sent_idr_frames.load(Ordering::Relaxed),
             sent_delta_frames: self.sent_delta_frames.load(Ordering::Relaxed),
             received_packets: self.received_packets.load(Ordering::Relaxed),
+            original_rtp_repeats_sent: self.original_rtp_repeats_sent.load(Ordering::Relaxed),
             assembled_access_units: h264_flow.assembled_access_units,
             received_delta_frames: h264_flow.assembled_delta_frames,
             decoded_frames: self.decoded_frames.load(Ordering::Relaxed),
@@ -717,6 +719,8 @@ impl SharedMetrics {
     }
 
     pub(super) fn record_assembled_access_unit(&self, data: &[u8]) -> String {
+        self.total_assembled_access_units
+            .fetch_add(1, Ordering::Relaxed);
         self.interval_assembled_access_units
             .fetch_add(1, Ordering::Relaxed);
         let nals = annex_b_nal_types(data);
