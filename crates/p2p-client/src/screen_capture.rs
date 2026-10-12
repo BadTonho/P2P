@@ -7,6 +7,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::screen_quality::ScreenShareQuality;
 use eframe::egui;
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
@@ -23,9 +24,6 @@ use windows_capture::window::Window;
 mod dxgi_backend;
 mod wgc_backend;
 
-const MAX_FRAME_WIDTH: u32 = 1280;
-const MAX_FRAME_HEIGHT: u32 = 720;
-const MIN_CAPTURE_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
 const CAPTURE_PACING_JITTER_TOLERANCE: Duration = Duration::from_micros(250);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,6 +214,7 @@ pub struct ScreenCapture {
     fallback_reason: Arc<Mutex<Option<String>>>,
     source_closed: Arc<AtomicBool>,
     picker_owner: Option<PickerThreadOwner>,
+    quality: ScreenShareQuality,
 }
 
 struct DxgiCaptureWorker {
@@ -227,6 +226,7 @@ pub struct PendingScreenCapture {
     result: Receiver<PickResult>,
     picker_owner: Option<PickerThreadOwner>,
     preview_enabled: Arc<AtomicBool>,
+    quality: ScreenShareQuality,
 }
 
 struct PickerThreadOwner {
@@ -241,7 +241,10 @@ struct PickerSelection {
 }
 
 impl PendingScreenCapture {
-    pub fn begin(preview_enabled: Arc<AtomicBool>) -> Result<Self, String> {
+    pub fn begin(
+        preview_enabled: Arc<AtomicBool>,
+        quality: ScreenShareQuality,
+    ) -> Result<Self, String> {
         let (result_tx, result) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         // windows-capture initializes WinRT in MTA mode; the eframe UI thread may use another mode.
@@ -289,6 +292,7 @@ impl PendingScreenCapture {
                 thread: Some(picker_thread),
             }),
             preview_enabled,
+            quality,
         })
     }
 
@@ -315,6 +319,7 @@ impl PendingScreenCapture {
                         PickerSelection { item, size, owner },
                         context,
                         Arc::clone(&self.preview_enabled),
+                        self.quality,
                     )
                     .map(Some),
                 )
@@ -386,6 +391,7 @@ impl ScreenCapture {
         device_id: &str,
         context: egui::Context,
         preview_enabled: Arc<AtomicBool>,
+        quality: ScreenShareQuality,
     ) -> Result<Self, String> {
         let monitor = Monitor::enumerate()
             .map_err(|error| {
@@ -423,6 +429,7 @@ impl ScreenCapture {
                     worker_fallback_reason,
                     worker_stop,
                     worker_preview_enabled,
+                    quality,
                 )
             })
             .map_err(|error| format!("Não foi possível iniciar a thread DXGI: {error}"))?;
@@ -440,6 +447,7 @@ impl ScreenCapture {
             fallback_reason,
             source_closed,
             picker_owner: None,
+            quality,
         })
     }
 
@@ -493,15 +501,17 @@ impl ScreenCapture {
         window_id: isize,
         context: egui::Context,
         preview_enabled: Arc<AtomicBool>,
+        quality: ScreenShareQuality,
     ) -> Result<Self, String> {
         let window = Window::from_raw_hwnd(window_id as *mut std::ffi::c_void);
-        Self::start_window(window, context, preview_enabled)
+        Self::start_window(window, context, preview_enabled, quality)
     }
 
     pub fn start_window(
         window: Window,
         context: egui::Context,
         preview_enabled: Arc<AtomicBool>,
+        quality: ScreenShareQuality,
     ) -> Result<Self, String> {
         if !window.is_valid() {
             return Err("A janela selecionada não é mais válida ou foi fechada.".to_owned());
@@ -532,6 +542,7 @@ impl ScreenCapture {
                 performance: Arc::clone(&performance),
                 source_closed: Arc::clone(&source_closed),
                 preview_enabled,
+                quality,
             },
         );
         let control =
@@ -550,6 +561,7 @@ impl ScreenCapture {
             fallback_reason,
             source_closed,
             picker_owner: None,
+            quality,
         })
     }
 
@@ -557,6 +569,7 @@ impl ScreenCapture {
         selected: PickerSelection,
         context: egui::Context,
         preview_enabled: Arc<AtomicBool>,
+        quality: ScreenShareQuality,
     ) -> Result<Self, String> {
         let size = selected.size;
         if size.0 <= 0 || size.1 <= 0 {
@@ -586,6 +599,7 @@ impl ScreenCapture {
                 performance: Arc::clone(&performance),
                 source_closed: Arc::clone(&source_closed),
                 preview_enabled,
+                quality,
             },
         );
         let control =
@@ -608,6 +622,7 @@ impl ScreenCapture {
             fallback_reason,
             source_closed,
             picker_owner: Some(selected.owner),
+            quality,
         })
     }
 
@@ -621,6 +636,10 @@ impl ScreenCapture {
 
     pub fn frame_source(&self) -> LatestFrame {
         self.latest_frame.clone()
+    }
+
+    pub(crate) fn quality(&self) -> ScreenShareQuality {
+        self.quality
     }
 
     pub(crate) fn take_performance_snapshot(&self) -> CapturePerformanceSnapshot {
@@ -718,6 +737,7 @@ struct HandlerFlags {
     performance: Arc<CapturePerformanceCounters>,
     source_closed: Arc<AtomicBool>,
     preview_enabled: Arc<AtomicBool>,
+    quality: ScreenShareQuality,
 }
 
 // windows-capture's picker wrapper owns an HWND guard and is therefore not Send.
@@ -735,12 +755,19 @@ impl TryInto<GraphicsCaptureItemType> for PickerItemForThread {
     }
 }
 
-#[derive(Default)]
 struct FrameRateLimiter {
     next_deadline: Option<Instant>,
+    frame_interval: Duration,
 }
 
 impl FrameRateLimiter {
+    fn new(quality: ScreenShareQuality) -> Self {
+        Self {
+            next_deadline: None,
+            frame_interval: quality.frame_duration(),
+        }
+    }
+
     fn should_process(&mut self, now: Instant) -> bool {
         if let Some(deadline) = self.next_deadline {
             if now + CAPTURE_PACING_JITTER_TOLERANCE < deadline {
@@ -749,20 +776,32 @@ impl FrameRateLimiter {
             // Keep the target cadence anchored to the original timeline. A small early
             // tolerance absorbs callback jitter; late callbacks skip missed slots instead
             // of moving the cadence and causing alternating frame drops.
-            let mut next_deadline = deadline + MIN_CAPTURE_FRAME_INTERVAL;
+            let mut next_deadline = deadline + self.frame_interval;
             while next_deadline <= now {
-                next_deadline += MIN_CAPTURE_FRAME_INTERVAL;
+                next_deadline += self.frame_interval;
             }
             self.next_deadline = Some(next_deadline);
         } else {
-            self.next_deadline = Some(now + MIN_CAPTURE_FRAME_INTERVAL);
+            self.next_deadline = Some(now + self.frame_interval);
         }
         true
     }
 }
 
-fn downsample_rgba(bytes: &[u8], width: u32, height: u32, sequence: u64) -> PreviewFrame {
-    let (out_width, out_height) = scaled_dimensions(width, height);
+impl Default for FrameRateLimiter {
+    fn default() -> Self {
+        Self::new(ScreenShareQuality::default())
+    }
+}
+
+fn downsample_rgba(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    sequence: u64,
+    quality: ScreenShareQuality,
+) -> PreviewFrame {
+    let (out_width, out_height) = scaled_dimensions(width, height, quality);
     let mut rgba = Vec::with_capacity((out_width * out_height * 4) as usize);
 
     for y in 0..out_height {
@@ -808,9 +847,10 @@ fn same_preview_pixels(previous: Option<&PreviewFrame>, candidate: &PreviewFrame
     })
 }
 
-fn scaled_dimensions(width: u32, height: u32) -> (u32, u32) {
-    let scale = (MAX_FRAME_WIDTH as f32 / width as f32)
-        .min(MAX_FRAME_HEIGHT as f32 / height as f32)
+fn scaled_dimensions(width: u32, height: u32, quality: ScreenShareQuality) -> (u32, u32) {
+    let (max_width, max_height) = quality.max_dimensions();
+    let scale = (max_width as f32 / width as f32)
+        .min(max_height as f32 / height as f32)
         .min(1.0);
     (
         even_dimension((width as f32 * scale).round() as u32),
@@ -827,9 +867,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        FrameRateLimiter, MIN_CAPTURE_FRAME_INTERVAL, MonitorOption, PreviewFrame,
-        same_preview_pixels, scaled_dimensions,
+        FrameRateLimiter, MonitorOption, PreviewFrame, same_preview_pixels, scaled_dimensions,
     };
+    use crate::screen_quality::{ScreenShareFrameRate, ScreenShareQuality, ScreenShareResolution};
 
     #[test]
     fn monitor_labels_distinguish_same_name_and_resolution_by_device_id() {
@@ -862,7 +902,7 @@ mod tests {
 
         assert!(limiter.should_process(start));
         assert!(!limiter.should_process(start + Duration::from_millis(16)));
-        assert!(limiter.should_process(start + MIN_CAPTURE_FRAME_INTERVAL));
+        assert!(limiter.should_process(start + ScreenShareQuality::default().frame_duration()));
     }
 
     #[test]
@@ -890,15 +930,15 @@ mod tests {
     #[test]
     fn capture_limiter_caps_60_fps_without_bursts_and_keeps_15_fps() {
         let start = Instant::now();
-        let mut limiter_60 = FrameRateLimiter::default();
+        let mut limiter_30 = FrameRateLimiter::default();
         let accepted_60 = (0..180u64)
             .filter(|frame| {
-                limiter_60.should_process(start + Duration::from_nanos(frame * 16_666_667))
+                limiter_30.should_process(start + Duration::from_nanos(frame * 16_666_667))
             })
             .count();
         assert!(
             (89..=91).contains(&accepted_60),
-            "accepted {accepted_60} frames at 60 FPS"
+            "accepted {accepted_60} frames from a 60 FPS source at the default 30 FPS profile"
         );
 
         let mut limiter_15 = FrameRateLimiter::default();
@@ -908,17 +948,51 @@ mod tests {
             })
             .count();
         assert_eq!(accepted_15, 45);
+
+        let mut limiter_60 = FrameRateLimiter::new(ScreenShareQuality {
+            resolution: ScreenShareResolution::P720,
+            frame_rate: ScreenShareFrameRate::Fps60,
+        });
+        let accepted_60 = (0..180u64)
+            .filter(|frame| {
+                limiter_60.should_process(start + Duration::from_nanos(frame * 16_666_667))
+            })
+            .count();
+        assert!(
+            (178..=180).contains(&accepted_60),
+            "accepted {accepted_60} frames at 60 FPS"
+        );
     }
 
     #[test]
     fn capture_frames_fit_the_720p_h264_limit() {
-        assert_eq!(scaled_dimensions(3840, 2160), (1280, 720));
-        assert_eq!(scaled_dimensions(2560, 1080), (1280, 540));
+        let quality = ScreenShareQuality::default();
+        assert_eq!(scaled_dimensions(3840, 2160, quality), (1280, 720));
+        assert_eq!(scaled_dimensions(2560, 1080, quality), (1280, 540));
+    }
+
+    #[test]
+    fn capture_frames_fit_the_1080p_limit_without_changing_aspect_ratio() {
+        let quality = ScreenShareQuality {
+            resolution: ScreenShareResolution::P1080,
+            frame_rate: ScreenShareFrameRate::Fps60,
+        };
+        assert_eq!(scaled_dimensions(3840, 2160, quality), (1920, 1080));
+        assert_eq!(scaled_dimensions(2560, 1080, quality), (1920, 810));
+    }
+
+    #[test]
+    fn capture_does_not_upscale_sources_below_the_selected_resolution() {
+        let quality = ScreenShareQuality {
+            resolution: ScreenShareResolution::P1080,
+            frame_rate: ScreenShareFrameRate::Fps30,
+        };
+        assert_eq!(scaled_dimensions(960, 540, quality), (960, 540));
     }
 
     #[test]
     fn capture_dimensions_are_even_for_h264() {
-        let (width, height) = scaled_dimensions(1365, 767);
+        let (width, height) = scaled_dimensions(1365, 767, ScreenShareQuality::default());
         assert_eq!(width % 2, 0);
         assert_eq!(height % 2, 0);
         assert!(width <= 1280);

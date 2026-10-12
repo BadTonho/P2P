@@ -109,6 +109,7 @@ impl GpuNv12Processor {
         input_height: u32,
         output_width: u32,
         output_height: u32,
+        frame_rate: u32,
     ) -> Result<Self, String> {
         // O dispositivo é usado pela thread de captura, pela leitura da prévia e pelo
         // codificador Media Foundation; o contexto imediato precisa ser protegido.
@@ -128,13 +129,13 @@ impl GpuNv12Processor {
         let description = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
             InputFrameRate: DXGI_RATIONAL {
-                Numerator: FRAME_RATE,
+                Numerator: frame_rate,
                 Denominator: 1,
             },
             InputWidth: input_width,
             InputHeight: input_height,
             OutputFrameRate: DXGI_RATIONAL {
-                Numerator: FRAME_RATE,
+                Numerator: frame_rate,
                 Denominator: 1,
             },
             OutputWidth: output_width,

@@ -2,6 +2,7 @@ use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, Stroke, Vec2};
 
 use crate::app::ClientUi;
 use crate::screen_capture::{MonitorOption, WindowOption};
+use crate::screen_quality::{ScreenShareFrameRate, ScreenShareResolution};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ScreenShareModalTab {
@@ -32,6 +33,7 @@ impl ClientUi {
         let mut should_start_share = false;
         let mut should_open_picker = false;
         let mut cancel_clicked = false;
+        let mut quality_changed = false;
 
         let modal = egui::Modal::new(egui::Id::new("screen_share_modal_dialog"))
             .backdrop_color(Color32::from_black_alpha(175));
@@ -96,6 +98,62 @@ impl ClientUi {
                     ScreenShareModalTab::Windows => {
                         should_open_picker = self.render_windows_tab(ui);
                     }
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Resolução");
+                    egui::ComboBox::from_id_salt("screen-share-resolution")
+                        .selected_text(self.screen_share_quality.resolution.label())
+                        .show_ui(ui, |ui| {
+                            quality_changed |= ui
+                                .selectable_value(
+                                    &mut self.screen_share_quality.resolution,
+                                    ScreenShareResolution::P720,
+                                    "720p",
+                                )
+                                .changed();
+                            quality_changed |= ui
+                                .selectable_value(
+                                    &mut self.screen_share_quality.resolution,
+                                    ScreenShareResolution::P1080,
+                                    "1080p",
+                                )
+                                .changed();
+                        });
+                    ui.add_space(12.0);
+                    ui.label("Taxa de quadros");
+                    egui::ComboBox::from_id_salt("screen-share-frame-rate")
+                        .selected_text(self.screen_share_quality.frame_rate.label())
+                        .show_ui(ui, |ui| {
+                            quality_changed |= ui
+                                .selectable_value(
+                                    &mut self.screen_share_quality.frame_rate,
+                                    ScreenShareFrameRate::Fps30,
+                                    "30 FPS",
+                                )
+                                .changed();
+                            quality_changed |= ui
+                                .selectable_value(
+                                    &mut self.screen_share_quality.frame_rate,
+                                    ScreenShareFrameRate::Fps60,
+                                    "60 FPS",
+                                )
+                                .changed();
+                        });
+                });
+                ui.small(format!(
+                    "Alvo do encoder: até {} Mbps por espectador; em grupo, até {} Mbps no total, divididos entre eles. O tráfego real varia com a imagem e inclui dados extras de rede. Em grupo, o custo de codificação cresce com o número de espectadores; o computador pode entregar menos FPS se não acompanhar. Se ficar instável, escolha um perfil mais leve.",
+                    self.screen_share_quality.individual_bitrate_bps() / 1_000_000,
+                    self.screen_share_quality.group_aggregate_bitrate_bps() / 1_000_000,
+                ));
+                if quality_changed {
+                    self.save_preferences();
+                    tracing::info!(
+                        resolution = self.screen_share_quality.resolution.label(),
+                        frame_rate = self.screen_share_quality.frames_per_second(),
+                        "Perfil de qualidade da transmissão de tela alterado"
+                    );
                 }
 
                 ui.add_space(10.0);

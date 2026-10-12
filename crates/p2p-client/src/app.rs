@@ -16,6 +16,7 @@ use crate::profile;
 use crate::screen_capture::{
     MonitorOption, PendingScreenCapture, PreviewFrame, ScreenCapture, WindowOption,
 };
+use crate::screen_quality::ScreenShareQuality;
 use crate::screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
 use crate::settings::{AppSettings, LoggingLevel, SavedHostProfile, VideoDecoderPreference};
 use crate::signaling_client::{SignalingClient, SignalingEvent};
@@ -48,8 +49,6 @@ pub(crate) use ui::{ScreenShareModalTab, ShareSourceSelection};
 pub(crate) use updates::*;
 
 const TURN_CONFIG_SIGNAL_PREFIX: &str = "p2p-turn-room-config-v1:";
-const GROUP_SCREEN_MAX_AGGREGATE_BITRATE: u32 = 8_000_000;
-const GROUP_SCREEN_MAX_PEER_BITRATE: u32 = 4_000_000;
 const GROUP_SIGNAL_ID_PREFIX: &str = "p2p-group-session-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,6 +240,7 @@ struct ClientUi {
     participant_avatar_textures: HashMap<String, (Option<String>, Option<egui::TextureHandle>)>,
     screen_capture: Option<ScreenCapture>,
     screen_picker: Option<PendingScreenCapture>,
+    pub(crate) screen_share_quality: ScreenShareQuality,
     available_monitors: Vec<MonitorOption>,
     monitors_loaded: bool,
     dxgi_capture_error: Option<String>,
@@ -414,6 +414,7 @@ impl ClientUi {
             log_performance_metrics: self.log_performance_metrics,
             log_errors_file: self.log_errors_file,
             video_decoder_preference: self.video_decoder_preference,
+            screen_share_quality: self.screen_share_quality,
             show_local_preview: self.show_local_preview,
             include_system_audio: self.include_system_audio,
             exclude_self_audio: self.exclude_self_audio,
@@ -450,6 +451,7 @@ impl ClientUi {
         self.log_errors_file = preferences.log_errors_file;
         self.logging.set_errors_enabled(self.log_errors_file);
         self.video_decoder_preference = preferences.video_decoder_preference;
+        self.screen_share_quality = preferences.screen_share_quality;
         self.show_local_preview = preferences.show_local_preview;
         self.include_system_audio = preferences.include_system_audio;
         self.exclude_self_audio = preferences.exclude_self_audio;
@@ -996,6 +998,7 @@ impl ClientUi {
                     &device_id,
                     context.clone(),
                     Arc::clone(&self.capture_preview_enabled),
+                    self.screen_share_quality,
                 )
             }
             ShareSourceSelection::Window(window_id) => {
@@ -1007,6 +1010,7 @@ impl ClientUi {
                     window_id,
                     context.clone(),
                     Arc::clone(&self.capture_preview_enabled),
+                    self.screen_share_quality,
                 )
             }
         };
@@ -1270,7 +1274,7 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_app_header_row, centered_header_rect, copy_confirmation_visible, egui,
+        ClientUi, allocate_app_header_row, centered_header_rect, copy_confirmation_visible, egui,
         right_aligned_header_rect, room_header_code_label, settings_navigation_button,
     };
 
@@ -1289,6 +1293,20 @@ mod tests {
             #[cfg(windows)]
             cpu_nv12: None,
         }
+    }
+
+    #[test]
+    fn screen_share_quality_survives_preferences_snapshot_and_restore() {
+        let quality = crate::screen_quality::ScreenShareQuality {
+            resolution: crate::screen_quality::ScreenShareResolution::P1080,
+            frame_rate: crate::screen_quality::ScreenShareFrameRate::Fps60,
+        };
+        let mut source = ClientUi::default();
+        source.screen_share_quality = quality;
+
+        let mut restored = ClientUi::default();
+        restored.apply_preferences(source.preferences_snapshot());
+        assert_eq!(restored.screen_share_quality, quality);
     }
 
     fn render_local_preview(

@@ -8,11 +8,12 @@ pub(super) fn capture_dxgi_monitor(
     fallback_reason: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
     preview_enabled: Arc<AtomicBool>,
+    quality: ScreenShareQuality,
 ) -> Result<(), String> {
     let mut duplication = DxgiDuplicationApi::new_options(monitor, &[DxgiDuplicationFormat::Bgra8])
         .map_err(|error| format!("DXGI Desktop Duplication nÃ£o iniciou: {error}"))?;
     let mut sequence = 0u64;
-    let mut limiter = FrameRateLimiter::default();
+    let mut limiter = FrameRateLimiter::new(quality);
     let mut scratch = Vec::new();
     let mut gpu_processor: Option<(crate::mf_video::GpuNv12Processor, (u32, u32, u32, u32))> = None;
     let mut gpu_processor_attempted: Option<(u32, u32, u32, u32)> = None;
@@ -37,7 +38,7 @@ pub(super) fn capture_dxgi_monitor(
                     .map_err(|error| {
                         format!("DXGI nÃ£o recriou a captura apÃ³s mudanÃ§a de tela: {error}")
                     })?;
-                limiter = FrameRateLimiter::default();
+                limiter = FrameRateLimiter::new(quality);
                 continue;
             }
             Err(error) => return Err(format!("Falha ao capturar monitor via DXGI: {error}")),
@@ -52,7 +53,7 @@ pub(super) fn capture_dxgi_monitor(
         if width == 0 || height == 0 {
             continue;
         }
-        let (out_width, out_height) = scaled_dimensions(width, height);
+        let (out_width, out_height) = scaled_dimensions(width, height, quality);
         let dimensions = (width, height, out_width, out_height);
         if gpu_processor_attempted != Some(dimensions) {
             gpu_processor_attempted = Some(dimensions);
@@ -63,6 +64,7 @@ pub(super) fn capture_dxgi_monitor(
                 height,
                 out_width,
                 out_height,
+                quality.frames_per_second(),
             ) {
                 Ok(processor) => {
                     tracing::info!(
@@ -202,7 +204,7 @@ pub(super) fn capture_dxgi_monitor(
                 let bytes = buffer.as_nopadding_buffer(&mut scratch);
                 readback_nanos += started_at.elapsed().as_nanos() as u64;
                 let started_at = Instant::now();
-                let preview = downsample_bgra(bytes, width, height, next_sequence);
+                let preview = downsample_bgra(bytes, width, height, next_sequence, quality);
                 resize_nanos += started_at.elapsed().as_nanos() as u64;
                 preview.rgba
             }
@@ -239,8 +241,14 @@ pub(super) fn capture_dxgi_monitor(
     Ok(())
 }
 
-fn downsample_bgra(bytes: &[u8], width: u32, height: u32, sequence: u64) -> PreviewFrame {
-    let (out_width, out_height) = scaled_dimensions(width, height);
+fn downsample_bgra(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    sequence: u64,
+    quality: ScreenShareQuality,
+) -> PreviewFrame {
+    let (out_width, out_height) = scaled_dimensions(width, height, quality);
     let mut rgba = Vec::with_capacity((out_width * out_height * 4) as usize);
     for y in 0..out_height {
         let source_y = (y * height / out_height).min(height - 1);

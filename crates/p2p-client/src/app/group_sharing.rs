@@ -7,9 +7,9 @@ const MAX_PENDING_GROUP_ICE_TOTAL: usize = 128;
 const MAX_PENDING_GROUP_ICE_SESSIONS: usize = 32;
 const MAX_PENDING_GROUP_ICE_PAYLOAD_BYTES: usize = 4_096;
 
-fn group_share_bitrate(viewer_count: usize) -> u32 {
-    (GROUP_SCREEN_MAX_AGGREGATE_BITRATE / viewer_count.max(1) as u32)
-        .clamp(250_000, GROUP_SCREEN_MAX_PEER_BITRATE)
+fn group_share_bitrate(viewer_count: usize, quality: ScreenShareQuality) -> u32 {
+    (quality.group_aggregate_bitrate_bps() / viewer_count.max(1) as u32)
+        .clamp(250_000, quality.individual_bitrate_bps())
 }
 
 fn group_screen_share_compatible(room_mode: RoomMode, participants: &[ParticipantInfo]) -> bool {
@@ -506,10 +506,10 @@ impl ClientUi {
         context: &egui::Context,
         bitrate: u32,
     ) {
-        let Some(source) = self
+        let Some((source, quality)) = self
             .screen_capture
             .as_ref()
-            .map(ScreenCapture::frame_source)
+            .map(|capture| (capture.frame_source(), capture.quality()))
         else {
             self.screen_share_status = Some("Selecione uma tela antes de compartilhar.".to_owned());
             return;
@@ -533,8 +533,9 @@ impl ClientUi {
             Ok(session) => {
                 let generation =
                     group_generation_id(&self.participant_id, session.metrics().session_id);
-                if let Err(error) = session.start_sending_with_options_and_exclusion(
+                if let Err(error) = session.start_sending_with_quality_and_options_and_exclusion(
                     source,
+                    quality,
                     bitrate,
                     self.include_system_audio,
                     self.audio_exclusion_config(),
@@ -584,7 +585,12 @@ impl ClientUi {
             .cloned()
             .collect::<Vec<_>>();
         current_viewers.sort();
-        let bitrate = group_share_bitrate(viewers.len());
+        let quality = self
+            .screen_capture
+            .as_ref()
+            .map(ScreenCapture::quality)
+            .unwrap_or_default();
+        let bitrate = group_share_bitrate(viewers.len(), quality);
         if !group_outbound_rebalance_needed(
             &current_viewers,
             self.group_share.outbound_target_bitrate_bps,
@@ -620,6 +626,17 @@ impl ClientUi {
                 self.mark_group_generation_closed(&viewer, generation);
             }
             self.group_share.outbound_ports.remove(&viewer);
+        }
+        for (viewer, session) in &self.group_share.outbound_sessions {
+            if let Err(error) = session.set_outbound_video_bitrate(bitrate) {
+                tracing::warn!(
+                    viewer_id = %viewer,
+                    target_bitrate_bps = bitrate,
+                    error = %error,
+                    "Não foi possível aplicar a nova divisão de banda ao encoder de grupo"
+                );
+                self.screen_share_status = Some(error);
+            }
         }
         for viewer in viewers {
             if !self.group_share.outbound_sessions.contains_key(&viewer) {
@@ -1147,6 +1164,7 @@ impl ClientUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::screen_quality::{ScreenShareFrameRate, ScreenShareResolution};
 
     fn participant(id: usize, supports_group_screen_share: bool) -> ParticipantInfo {
         ParticipantInfo {
@@ -1164,14 +1182,43 @@ mod tests {
 
     #[test]
     fn group_sender_bitrate_stays_within_aggregate_limit() {
-        for viewers in [1, 2, 7] {
-            let per_peer = super::group_share_bitrate(viewers);
-            assert!(per_peer <= 4_000_000);
-            assert!(u64::from(per_peer) * viewers as u64 <= 8_000_000);
+        for quality in [
+            ScreenShareQuality::default(),
+            ScreenShareQuality {
+                resolution: ScreenShareResolution::P720,
+                frame_rate: ScreenShareFrameRate::Fps60,
+            },
+            ScreenShareQuality {
+                resolution: ScreenShareResolution::P1080,
+                frame_rate: ScreenShareFrameRate::Fps30,
+            },
+            ScreenShareQuality {
+                resolution: ScreenShareResolution::P1080,
+                frame_rate: ScreenShareFrameRate::Fps60,
+            },
+        ] {
+            for viewers in [1, 2, 4, 8] {
+                let per_peer = super::group_share_bitrate(viewers, quality);
+                assert!(per_peer <= quality.individual_bitrate_bps());
+                assert!(
+                    u64::from(per_peer) * viewers as u64
+                        <= u64::from(quality.group_aggregate_bitrate_bps())
+                );
+            }
         }
-        assert_eq!(super::group_share_bitrate(1), 4_000_000);
-        assert_eq!(super::group_share_bitrate(2), 4_000_000);
-        assert_eq!(super::group_share_bitrate(7), 1_142_857);
+        let quality = ScreenShareQuality::default();
+        assert_eq!(super::group_share_bitrate(1, quality), 4_000_000);
+        assert_eq!(super::group_share_bitrate(2, quality), 4_000_000);
+        assert_eq!(super::group_share_bitrate(4, quality), 2_000_000);
+        assert_eq!(super::group_share_bitrate(8, quality), 1_000_000);
+        let max_quality = ScreenShareQuality {
+            resolution: ScreenShareResolution::P1080,
+            frame_rate: ScreenShareFrameRate::Fps60,
+        };
+        assert_eq!(super::group_share_bitrate(1, max_quality), 8_000_000);
+        assert_eq!(super::group_share_bitrate(2, max_quality), 8_000_000);
+        assert_eq!(super::group_share_bitrate(4, max_quality), 4_000_000);
+        assert_eq!(super::group_share_bitrate(8, max_quality), 2_000_000);
     }
 
     #[test]
@@ -1215,15 +1262,21 @@ mod tests {
         let current = vec!["viewer-a".to_owned(), "viewer-b".to_owned()];
         assert!(!group_outbound_rebalance_needed(
             &current,
-            Some(group_share_bitrate(current.len())),
+            Some(group_share_bitrate(
+                current.len(),
+                ScreenShareQuality::default()
+            )),
             &current,
-            group_share_bitrate(current.len()),
+            group_share_bitrate(current.len(), ScreenShareQuality::default()),
         ));
         assert!(group_outbound_rebalance_needed(
             &current,
-            Some(group_share_bitrate(current.len())),
+            Some(group_share_bitrate(
+                current.len(),
+                ScreenShareQuality::default()
+            )),
             &["viewer-a".to_owned()],
-            group_share_bitrate(1),
+            group_share_bitrate(1, ScreenShareQuality::default()),
         ));
         assert!(group_outbound_rebalance_needed(
             &current,
@@ -1237,8 +1290,14 @@ mod tests {
     fn rebalance_preserves_active_viewers_when_bitrate_is_unchanged() {
         let single = ["viewer-a".to_owned()];
         let two = vec!["viewer-a".to_owned(), "viewer-b".to_owned()];
-        assert_eq!(group_share_bitrate(1), group_share_bitrate(2));
-        assert_eq!(group_share_bitrate(1), GROUP_SCREEN_MAX_PEER_BITRATE);
+        assert_eq!(
+            group_share_bitrate(1, ScreenShareQuality::default()),
+            group_share_bitrate(2, ScreenShareQuality::default())
+        );
+        assert_eq!(
+            group_share_bitrate(1, ScreenShareQuality::default()),
+            ScreenShareQuality::default().individual_bitrate_bps()
+        );
         let desired: HashSet<&String> = two.iter().collect();
         let departed: Vec<String> = single
             .iter()
@@ -1261,7 +1320,10 @@ mod tests {
             "viewer-c".to_owned(),
         ];
         let two = vec!["viewer-a".to_owned(), "viewer-b".to_owned()];
-        assert_ne!(group_share_bitrate(3), group_share_bitrate(2));
+        assert_ne!(
+            group_share_bitrate(3, ScreenShareQuality::default()),
+            group_share_bitrate(2, ScreenShareQuality::default())
+        );
 
         let desired: HashSet<&String> = two.iter().collect();
         let departed: Vec<String> = three

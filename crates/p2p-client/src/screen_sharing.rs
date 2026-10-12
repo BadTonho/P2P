@@ -1,12 +1,13 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::screen_quality::ScreenShareQuality;
 use bytes::Bytes;
 use eframe::egui;
 use openh264::OpenH264API;
@@ -92,6 +93,7 @@ pub use session::{ScreenShareEvent, ScreenShareSession};
 const VIDEO_PAYLOAD_TYPE: PayloadType = 102;
 const AUDIO_PAYLOAD_TYPE: PayloadType = 111;
 const VIDEO_CLOCK_RATE: u32 = 90_000;
+#[cfg(test)]
 const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 30);
 const ENCODER_PACING_JITTER_TOLERANCE: Duration = Duration::from_micros(1_000);
 const STATIC_FRAME_REPEAT_INTERVAL: Duration = Duration::from_secs(1);

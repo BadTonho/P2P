@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+use crate::screen_quality::ScreenShareQuality;
 use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use signaling_protocol::RoomMode;
@@ -80,6 +81,7 @@ pub struct AppSettings {
     pub may_host: bool,
     pub control_ipv4: Option<Ipv4Addr>,
     pub video_decoder_preference: VideoDecoderPreference,
+    pub screen_share_quality: ScreenShareQuality,
     pub show_local_preview: bool,
     #[serde(default)]
     pub include_system_audio: bool,
@@ -178,6 +180,7 @@ impl Default for AppSettings {
             may_host: false,
             control_ipv4: None,
             video_decoder_preference: VideoDecoderPreference::Automatic,
+            screen_share_quality: ScreenShareQuality::default(),
             show_local_preview: true,
             include_system_audio: false,
             exclude_self_audio: default_exclude_self_audio(),
@@ -845,6 +848,41 @@ mod tests {
             loaded.saved_hosts[0].room_code.as_deref(),
             Some("SALA-AMIGO")
         );
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn older_settings_default_screen_share_quality_to_720p30() {
+        let mut stored = serde_json::to_value(AppSettings::default())
+            .expect("settings should serialize")
+            .as_object()
+            .cloned()
+            .expect("settings should be an object");
+        stored.remove("screen_share_quality");
+
+        let loaded: AppSettings = serde_json::from_value(stored.into())
+            .expect("older settings should use screen quality defaults");
+        assert_eq!(loaded.screen_share_quality, ScreenShareQuality::default());
+        assert_eq!(loaded.screen_share_quality.max_dimensions(), (1280, 720));
+        assert_eq!(loaded.screen_share_quality.frames_per_second(), 30);
+    }
+
+    #[test]
+    fn screen_share_quality_is_saved_and_restored() {
+        let directory = temporary_directory();
+        let path = directory.join(SETTINGS_FILE);
+        let settings = AppSettings {
+            screen_share_quality: ScreenShareQuality {
+                resolution: crate::screen_quality::ScreenShareResolution::P1080,
+                frame_rate: crate::screen_quality::ScreenShareFrameRate::Fps60,
+            },
+            ..AppSettings::default()
+        };
+
+        save_to(&path, &settings).expect("quality preference should save");
+        let (loaded, warning) = load_from(&path);
+        assert!(warning.is_none());
+        assert_eq!(loaded.screen_share_quality, settings.screen_share_quality);
         fs::remove_dir_all(directory).expect("test directory should be removed");
     }
 }

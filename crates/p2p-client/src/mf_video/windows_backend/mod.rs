@@ -33,8 +33,10 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4};
 use windows::core::{IUnknown, Interface};
 
-const FRAME_RATE: u32 = 30;
+const DEFAULT_FRAME_RATE: u32 = 30;
+const MAX_SUPPORTED_FRAME_RATE: u32 = 60;
 const BITRATE: u32 = 4_000_000;
+const H264_LEVEL_IDC: u32 = 42;
 const HNS_PER_SECOND: i64 = 10_000_000;
 const MF_OUTPUT_CAPACITY: u32 = 4 * 1024 * 1024;
 const MF_EVENT_WAIT: Duration = Duration::from_millis(500);
@@ -77,6 +79,7 @@ struct Transform {
     output_subtype: windows::core::GUID,
     width: u32,
     height: u32,
+    frame_rate: u32,
 }
 
 impl Transform {
@@ -88,6 +91,7 @@ impl Transform {
         height: u32,
         decoder_device_manager: Option<&IMFDXGIDeviceManager>,
         bitrate: u32,
+        frame_rate: u32,
     ) -> Result<Self, String> {
         let transform: IMFTransform = unsafe { activate.ActivateObject() }
             .map_err(|e| format!("Ativação do transform falhou: {e}"))?;
@@ -125,8 +129,8 @@ impl Transform {
             }
         }
 
-        let input_type = make_video_type(input_subtype, width, height)?;
-        let output_type = make_video_type(output_subtype, width, height)?;
+        let input_type = make_video_type(input_subtype, width, height, frame_rate)?;
+        let output_type = make_video_type(output_subtype, width, height, frame_rate)?;
         if output_subtype == MFVideoFormat_H264 {
             unsafe {
                 output_type
@@ -136,10 +140,10 @@ impl Transform {
                     .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)
                     .map_err(|e| format!("Não foi possível solicitar H.264 Baseline: {e}"))?;
                 output_type
-                    .SetUINT32(&MF_MT_MPEG2_LEVEL, 31)
-                    .map_err(|e| format!("Não foi possível solicitar H.264 nível 3.1: {e}"))?;
+                    .SetUINT32(&MF_MT_MPEG2_LEVEL, H264_LEVEL_IDC)
+                    .map_err(|e| format!("Não foi possível solicitar H.264 nível 4.2: {e}"))?;
                 output_type
-                    .SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, FRAME_RATE)
+                    .SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, frame_rate)
                     .map_err(|e| {
                         format!("Não foi possível definir o intervalo de quadros-chave: {e}")
                     })?;
@@ -187,6 +191,7 @@ impl Transform {
             output_subtype,
             width,
             height,
+            frame_rate,
         })
     }
 
@@ -239,7 +244,7 @@ impl Transform {
     }
 
     fn send_input(&mut self, bytes: &[u8], time_hns: i64) -> Result<(), String> {
-        let sample = make_sample(bytes, time_hns)?;
+        let sample = make_sample(bytes, time_hns, self.frame_rate)?;
         self.send_sample(&sample, time_hns)
     }
 
@@ -256,7 +261,7 @@ impl Transform {
                 .SetSampleTime(time_hns)
                 .map_err(|e| format!("Não foi possível marcar o tempo do quadro: {e}"))?;
             sample
-                .SetSampleDuration(HNS_PER_SECOND / i64::from(FRAME_RATE))
+                .SetSampleDuration(HNS_PER_SECOND / i64::from(self.frame_rate))
                 .map_err(|e| format!("Não foi possível marcar a duração do quadro: {e}"))?;
         }
         let mut result = unsafe { self.transform.ProcessInput(0, sample, 0) };
@@ -391,7 +396,8 @@ impl Transform {
             }
         }
         if !accepted {
-            let fallback = make_video_type(MFVideoFormat_NV12, self.width, self.height)?;
+            let fallback =
+                make_video_type(MFVideoFormat_NV12, self.width, self.height, self.frame_rate)?;
             unsafe { self.transform.SetOutputType(0, &fallback, 0) }.map_err(|error| {
                 format!("O decodificador não aceitou NV12 ao renegociar o fluxo: {error}")
             })?;
@@ -419,6 +425,7 @@ fn activate_hardware_transform(
     height: u32,
     device_manager: Option<&IMFDXGIDeviceManager>,
     bitrate: u32,
+    frame_rate: u32,
 ) -> Result<(Transform, String), String> {
     let input_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
@@ -476,6 +483,7 @@ fn activate_hardware_transform(
             height,
             device_manager,
             bitrate,
+            frame_rate,
         ) {
             Ok(transform) => return Ok((transform, name)),
             Err(error) => failures.push(format!("{name}: {error}")),
@@ -491,6 +499,7 @@ fn make_video_type(
     subtype: windows::core::GUID,
     width: u32,
     height: u32,
+    frame_rate: u32,
 ) -> Result<IMFMediaType, String> {
     let media_type = unsafe { MFCreateMediaType() }
         .map_err(|e| format!("Não foi possível criar tipo de mídia: {e}"))?;
@@ -508,7 +517,7 @@ fn make_video_type(
             )
             .map_err(|e| format!("Não foi possível definir dimensões de vídeo: {e}"))?;
         media_type
-            .SetUINT64(&MF_MT_FRAME_RATE, (u64::from(FRAME_RATE) << 32) | 1)
+            .SetUINT64(&MF_MT_FRAME_RATE, (u64::from(frame_rate) << 32) | 1)
             .map_err(|e| format!("Não foi possível definir taxa de quadros: {e}"))?;
         media_type
             .SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)
@@ -520,7 +529,7 @@ fn make_video_type(
     Ok(media_type)
 }
 
-fn make_sample(bytes: &[u8], time_hns: i64) -> Result<IMFSample, String> {
+fn make_sample(bytes: &[u8], time_hns: i64, frame_rate: u32) -> Result<IMFSample, String> {
     let size = u32::try_from(bytes.len())
         .map_err(|_| "Quadro maior que o limite do Media Foundation.".to_owned())?;
     let buffer = unsafe { MFCreateMemoryBuffer(size.max(1)) }
@@ -548,7 +557,7 @@ fn make_sample(bytes: &[u8], time_hns: i64) -> Result<IMFSample, String> {
             .map_err(|e| format!("Não foi possível anexar buffer de entrada: {e}"))?;
         sample.SetSampleTime(time_hns).map_err(|e| e.to_string())?;
         sample
-            .SetSampleDuration(HNS_PER_SECOND / i64::from(FRAME_RATE))
+            .SetSampleDuration(HNS_PER_SECOND / i64::from(frame_rate))
             .map_err(|e| e.to_string())?;
     }
     Ok(sample)

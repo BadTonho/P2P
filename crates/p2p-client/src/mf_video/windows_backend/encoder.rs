@@ -7,6 +7,7 @@ pub struct HardwareEncoder {
     transform: Transform,
     width: u32,
     height: u32,
+    frame_rate: u32,
     next_time_hns: i64,
     name: String,
     force_keyframe_available: Option<bool>,
@@ -16,10 +17,15 @@ pub struct HardwareEncoder {
 impl HardwareEncoder {
     #[allow(dead_code)]
     pub fn new(width: u32, height: u32) -> Result<Self, String> {
-        Self::new_with_bitrate(width, height, BITRATE)
+        Self::new_with_bitrate_and_frame_rate(width, height, BITRATE, DEFAULT_FRAME_RATE)
     }
 
-    pub fn new_with_bitrate(width: u32, height: u32, bitrate: u32) -> Result<Self, String> {
+    pub fn new_with_bitrate_and_frame_rate(
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        frame_rate: u32,
+    ) -> Result<Self, String> {
         let apartment = ComApartment::enter()?;
         ensure_media_foundation()?;
         let (transform, name) = activate_hardware_transform(
@@ -30,6 +36,7 @@ impl HardwareEncoder {
             height,
             None,
             bitrate,
+            frame_rate,
         )?;
         Ok(Self {
             _apartment: apartment,
@@ -38,6 +45,7 @@ impl HardwareEncoder {
             transform,
             width,
             height,
+            frame_rate,
             next_time_hns: 0,
             name,
             force_keyframe_available: None,
@@ -47,14 +55,21 @@ impl HardwareEncoder {
 
     #[allow(dead_code)]
     pub fn new_gpu(width: u32, height: u32, device: &ID3D11Device) -> Result<Self, String> {
-        Self::new_gpu_with_bitrate(width, height, device, BITRATE)
+        Self::new_gpu_with_bitrate_and_frame_rate(
+            width,
+            height,
+            device,
+            BITRATE,
+            DEFAULT_FRAME_RATE,
+        )
     }
 
-    pub fn new_gpu_with_bitrate(
+    pub fn new_gpu_with_bitrate_and_frame_rate(
         width: u32,
         height: u32,
         device: &ID3D11Device,
         bitrate: u32,
+        frame_rate: u32,
     ) -> Result<Self, String> {
         let apartment = ComApartment::enter()?;
         ensure_media_foundation()?;
@@ -67,6 +82,7 @@ impl HardwareEncoder {
             height,
             Some(&device_manager),
             bitrate,
+            frame_rate,
         )?;
         Ok(Self {
             _apartment: apartment,
@@ -75,6 +91,7 @@ impl HardwareEncoder {
             transform,
             width,
             height,
+            frame_rate,
             next_time_hns: 0,
             name,
             force_keyframe_available: None,
@@ -185,7 +202,7 @@ impl HardwareEncoder {
             ));
         }
         self.transform.send_input(nv12, self.next_time_hns)?;
-        self.next_time_hns += HNS_PER_SECOND / i64::from(FRAME_RATE);
+        self.next_time_hns += HNS_PER_SECOND / i64::from(self.frame_rate);
         self.drain_output()
     }
 
@@ -214,7 +231,7 @@ impl HardwareEncoder {
                 .map_err(|error| format!("Não foi possível anexar a superfície D3D11: {error}"))?;
         }
         self.transform.send_sample(&sample, self.next_time_hns)?;
-        self.next_time_hns += HNS_PER_SECOND / i64::from(FRAME_RATE);
+        self.next_time_hns += HNS_PER_SECOND / i64::from(self.frame_rate);
         self.drain_output()
     }
 

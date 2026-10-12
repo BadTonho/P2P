@@ -146,8 +146,8 @@ fn parse_sps_dimensions(nal: &[u8]) -> Option<(u32, u32)> {
     let height = height.checked_sub((top + bottom).checked_mul(crop_y)?)?;
     if width == 0
         || height == 0
-        || width > 1280
-        || height > 720
+        || width > 1920
+        || height > 1080
         || width % 2 != 0
         || height % 2 != 0
     {
@@ -210,5 +210,70 @@ impl BitReader<'_> {
         } else {
             (code + 1) / 2
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sps_dimensions;
+
+    fn append_bits(bits: &mut Vec<bool>, value: u32, count: usize) {
+        for shift in (0..count).rev() {
+            bits.push((value >> shift) & 1 != 0);
+        }
+    }
+
+    fn append_unsigned_exp_golomb(bits: &mut Vec<bool>, value: u32) {
+        let code = value + 1;
+        let significant_bits = (u32::BITS - code.leading_zeros()) as usize;
+        bits.extend(std::iter::repeat_n(false, significant_bits - 1));
+        append_bits(bits, code, significant_bits);
+    }
+
+    fn baseline_sps(width_mbs: u32, height_map_units: u32, crop_bottom: u32) -> Vec<u8> {
+        let mut bits = Vec::new();
+        append_bits(&mut bits, 66, 8); // Baseline profile.
+        append_bits(&mut bits, 0xe0, 8);
+        append_bits(&mut bits, 42, 8); // Level 4.2.
+        append_unsigned_exp_golomb(&mut bits, 0); // seq_parameter_set_id
+        append_unsigned_exp_golomb(&mut bits, 0); // log2_max_frame_num_minus4
+        append_unsigned_exp_golomb(&mut bits, 2); // pic_order_cnt_type
+        append_unsigned_exp_golomb(&mut bits, 1); // max_num_ref_frames
+        bits.push(false); // gaps_in_frame_num_value_allowed_flag
+        append_unsigned_exp_golomb(&mut bits, width_mbs - 1);
+        append_unsigned_exp_golomb(&mut bits, height_map_units - 1);
+        bits.push(true); // frame_mbs_only_flag
+        bits.push(true); // direct_8x8_inference_flag
+        bits.push(true); // frame_cropping_flag
+        append_unsigned_exp_golomb(&mut bits, 0); // frame_crop_left_offset
+        append_unsigned_exp_golomb(&mut bits, 0); // frame_crop_right_offset
+        append_unsigned_exp_golomb(&mut bits, 0); // frame_crop_top_offset
+        append_unsigned_exp_golomb(&mut bits, crop_bottom);
+        bits.push(false); // vui_parameters_present_flag
+        bits.push(true); // rbsp_stop_one_bit
+        while !bits.len().is_multiple_of(8) {
+            bits.push(false);
+        }
+
+        bits.chunks_exact(8)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .fold(0u8, |byte, bit| (byte << 1) | u8::from(*bit))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sps_parser_accepts_1080p_and_rejects_dimensions_above_the_limit() {
+        let sps_1080p = baseline_sps(120, 68, 4);
+        let mut access_unit = vec![0, 0, 0, 1, 0x67];
+        access_unit.extend_from_slice(&sps_1080p);
+        assert_eq!(sps_dimensions(&access_unit), Some((1920, 1080)));
+
+        let sps_4k = baseline_sps(240, 136, 8);
+        let mut access_unit_4k = vec![0, 0, 0, 1, 0x67];
+        access_unit_4k.extend_from_slice(&sps_4k);
+        assert_eq!(sps_dimensions(&access_unit_4k), None);
     }
 }

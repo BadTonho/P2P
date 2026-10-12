@@ -178,6 +178,7 @@ enum Command {
     StartSending {
         source: LatestFrame,
         bitrate_bps: u32,
+        quality: ScreenShareQuality,
         include_system_audio: bool,
         audio_exclusion_config: AudioExclusionConfig,
         audio_source_override: Option<Box<dyn AudioSampleSource>>,
@@ -199,6 +200,7 @@ pub struct ScreenShareSession {
     remote_track: RemoteTrackStore,
     metrics: Arc<SharedMetrics>,
     remote_audio_volume: RemoteAudioVolume,
+    encoder_bitrate_bps: Arc<AtomicU32>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -387,6 +389,8 @@ impl ScreenShareSession {
             udp_address = %udp_address,
             "Sessão de tela criada para diagnóstico"
         );
+        let encoder_bitrate_bps = Arc::new(AtomicU32::new(0));
+        let worker_encoder_bitrate_bps = Arc::clone(&encoder_bitrate_bps);
         let worker_remote_frame = Arc::clone(&remote_frame);
         let worker_remote_track = Arc::clone(&remote_track);
         let worker_metrics = Arc::clone(&metrics);
@@ -412,6 +416,7 @@ impl ScreenShareSession {
                 runtime.block_on(run_session(
                     commands_rx,
                     events_tx,
+                    worker_encoder_bitrate_bps,
                     context,
                     worker_remote_frame,
                     worker_remote_track,
@@ -436,6 +441,7 @@ impl ScreenShareSession {
             remote_track,
             metrics,
             remote_audio_volume,
+            encoder_bitrate_bps,
             worker: Some(worker),
         })
     }
@@ -495,10 +501,31 @@ impl ScreenShareSession {
         include_system_audio: bool,
         audio_exclusion_config: AudioExclusionConfig,
     ) -> Result<(), String> {
+        self.start_sending_with_quality_and_options_and_exclusion(
+            source,
+            ScreenShareQuality::default(),
+            bitrate_bps,
+            include_system_audio,
+            audio_exclusion_config,
+        )
+    }
+
+    pub fn start_sending_with_quality_and_options_and_exclusion(
+        &self,
+        source: LatestFrame,
+        quality: ScreenShareQuality,
+        bitrate_bps: u32,
+        include_system_audio: bool,
+        audio_exclusion_config: AudioExclusionConfig,
+    ) -> Result<(), String> {
+        let bitrate_bps = bitrate_bps.clamp(250_000, quality.individual_bitrate_bps());
+        self.encoder_bitrate_bps
+            .store(bitrate_bps, Ordering::Relaxed);
         self.commands
             .send(Command::StartSending {
                 source,
-                bitrate_bps: bitrate_bps.clamp(250_000, MAX_PEER_MEDIA_BITRATE),
+                bitrate_bps,
+                quality,
                 include_system_audio,
                 audio_exclusion_config,
                 audio_source_override: None,
@@ -512,10 +539,13 @@ impl ScreenShareSession {
         source: LatestFrame,
         audio_source: Box<dyn AudioSampleSource>,
     ) -> Result<(), String> {
+        self.encoder_bitrate_bps
+            .store(MAX_PEER_MEDIA_BITRATE, Ordering::Relaxed);
         self.commands
             .send(Command::StartSending {
                 source,
                 bitrate_bps: MAX_PEER_MEDIA_BITRATE,
+                quality: ScreenShareQuality::default(),
                 include_system_audio: false,
                 audio_exclusion_config: AudioExclusionConfig::default(),
                 audio_source_override: Some(audio_source),
@@ -549,6 +579,15 @@ impl ScreenShareSession {
         self.commands
             .send(Command::Signal { kind, payload })
             .map_err(|_| "A sessão WebRTC foi encerrada.".to_owned())
+    }
+
+    pub(crate) fn set_outbound_video_bitrate(&self, bitrate_bps: u32) -> Result<(), String> {
+        if self.encoder_bitrate_bps.load(Ordering::Relaxed) == 0 {
+            return Err("A sessão ainda não iniciou o envio de vídeo.".to_owned());
+        }
+        self.encoder_bitrate_bps
+            .store(bitrate_bps.clamp(250_000, 8_000_000), Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn try_recv(&self) -> Option<ScreenShareEvent> {
@@ -837,6 +876,7 @@ impl PeerConnectionEventHandler for PeerEvents {
 async fn run_session(
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: std_mpsc::Sender<ScreenShareEvent>,
+    encoder_bitrate_bps: Arc<AtomicU32>,
     context: egui::Context,
     remote_frame: RemoteFrameStore,
     remote_track: RemoteTrackStore,
@@ -1005,7 +1045,7 @@ async fn run_session(
             command = commands.recv() => {
                 let Some(command) = command else { break };
         match command {
-            Command::StartSending { source, bitrate_bps, include_system_audio, audio_exclusion_config, audio_source_override } => {
+            Command::StartSending { source, bitrate_bps, quality, include_system_audio, audio_exclusion_config, audio_source_override } => {
                 if active_peer.is_some() {
                     let _ = events.send(ScreenShareEvent::Error(
                         "Já existe uma sessão de compartilhamento ativa.".to_owned(),
@@ -1025,6 +1065,8 @@ async fn run_session(
                     turn_credentials.as_ref(),
                     decoder_preference,
                     bitrate_bps,
+                    quality,
+                    Arc::clone(&encoder_bitrate_bps),
                     include_system_audio,
                     audio_exclusion_config,
                     audio_source_override,
@@ -1434,7 +1476,7 @@ async fn create_peer(
             mime_type: MIME_TYPE_H264.to_owned(),
             clock_rate: VIDEO_CLOCK_RATE,
             channels: 0,
-            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a"
                 .to_owned(),
             rtcp_feedback: vec![RTCPFeedback {
                 typ: "nack".to_owned(),
@@ -1560,6 +1602,8 @@ async fn create_sender(
     turn_credentials: Option<&TurnCredentials>,
     decoder_preference: VideoDecoderPreference,
     bitrate_bps: u32,
+    quality: ScreenShareQuality,
+    encoder_bitrate_bps: Arc<AtomicU32>,
     include_system_audio: bool,
     audio_exclusion_config: AudioExclusionConfig,
     audio_source_override: Option<Box<dyn AudioSampleSource>>,
@@ -1627,7 +1671,7 @@ async fn create_sender(
         mime_type: MIME_TYPE_H264.to_owned(),
         clock_rate: VIDEO_CLOCK_RATE,
         channels: 0,
-        sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+        sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a"
             .to_owned(),
         rtcp_feedback: vec![RTCPFeedback {
             typ: "nack".to_owned(),
@@ -1738,6 +1782,7 @@ async fn create_sender(
     let encoder_force_keyframe = Arc::clone(&force_keyframe);
     let encoder_events = events.clone();
     let encoder_metrics = Arc::clone(&metrics);
+    let encoder_bitrate_target = Arc::clone(&encoder_bitrate_bps);
     let encoder_task = tokio::task::spawn_blocking(move || {
         match encode_latest_frames(
             source,
@@ -1746,6 +1791,8 @@ async fn create_sender(
             encoder_metrics,
             encoder_force_keyframe,
             bitrate_bps,
+            quality,
+            encoder_bitrate_target,
         ) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -1784,7 +1831,7 @@ async fn create_sender(
             let frame_kind = encoded_frame.kind;
             let sample = Sample {
                 data: Bytes::from(encoded_frame.bytes),
-                duration: FRAME_DURATION,
+                duration: quality.frame_duration(),
                 ..Sample::new(Instant::now())
             };
             let write_started_at = Instant::now();

@@ -6,6 +6,7 @@ pub(super) struct ScreenFrameHandler {
     performance: Arc<CapturePerformanceCounters>,
     source_closed: Arc<AtomicBool>,
     preview_enabled: Arc<AtomicBool>,
+    quality: ScreenShareQuality,
     scratch: Vec<u8>,
     sequence: u64,
     frame_rate_limiter: FrameRateLimiter,
@@ -22,9 +23,10 @@ impl GraphicsCaptureApiHandler for ScreenFrameHandler {
             performance: context.flags.performance,
             source_closed: context.flags.source_closed,
             preview_enabled: context.flags.preview_enabled,
+            quality: context.flags.quality,
             scratch: Vec::new(),
             sequence: 0,
-            frame_rate_limiter: FrameRateLimiter::default(),
+            frame_rate_limiter: FrameRateLimiter::new(context.flags.quality),
         })
     }
 
@@ -58,7 +60,7 @@ impl GraphicsCaptureApiHandler for ScreenFrameHandler {
         );
         let next_sequence = self.sequence.wrapping_add(1);
         let resize_started_at = Instant::now();
-        let preview = downsample_rgba(rgba, width, height, next_sequence);
+        let preview = downsample_rgba(rgba, width, height, next_sequence, self.quality);
         self.performance.resize_nanos.fetch_add(
             resize_started_at.elapsed().as_nanos() as u64,
             Ordering::Relaxed,

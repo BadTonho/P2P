@@ -4,7 +4,10 @@ impl ClientUi {
     pub(super) fn select_screen(&mut self, _context: &egui::Context) {
         tracing::info!("Usuário abriu o seletor de tela ou janela do Windows");
         self.screen_status = None;
-        match PendingScreenCapture::begin(Arc::clone(&self.capture_preview_enabled)) {
+        match PendingScreenCapture::begin(
+            Arc::clone(&self.capture_preview_enabled),
+            self.screen_share_quality,
+        ) {
             Ok(picker) => {
                 self.screen_picker = Some(picker);
                 self.screen_status =
@@ -431,10 +434,10 @@ impl ClientUi {
                 }) else {
                     return;
                 };
-                let Some(source) = self
+                let Some((source, quality)) = self
                     .screen_capture
                     .as_ref()
-                    .map(ScreenCapture::frame_source)
+                    .map(|capture| (capture.frame_source(), capture.quality()))
                 else {
                     self.screen_share_role = ScreenShareRole::Idle;
                     self.screen_share_status = Some(
@@ -462,11 +465,15 @@ impl ClientUi {
                         if let Some(capture) = self.screen_capture.as_ref() {
                             let _ = capture.take_performance_snapshot();
                         }
-                        if let Err(error) = session.start_sending_with_audio_exclusion(
-                            source,
-                            self.include_system_audio,
-                            self.audio_exclusion_config(),
-                        ) {
+                        if let Err(error) = session
+                            .start_sending_with_quality_and_options_and_exclusion(
+                                source,
+                                quality,
+                                quality.individual_bitrate_bps(),
+                                self.include_system_audio,
+                                self.audio_exclusion_config(),
+                            )
+                        {
                             session.stop();
                             self.screen_share_role = ScreenShareRole::Idle;
                             self.screen_share_status = Some(error);

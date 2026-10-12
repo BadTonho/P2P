@@ -23,8 +23,8 @@ impl HardwareDecoder {
     pub fn new(width: u32, height: u32) -> Result<Self, String> {
         if width < 2
             || height < 2
-            || width > 1280
-            || height > 720
+            || width > 1920
+            || height > 1080
             || !width.is_multiple_of(2)
             || !height.is_multiple_of(2)
         {
@@ -43,6 +43,7 @@ impl HardwareDecoder {
             height,
             Some(&device_manager),
             BITRATE,
+            MAX_SUPPORTED_FRAME_RATE,
         )?;
         Ok(Self {
             _apartment: apartment,
@@ -64,7 +65,7 @@ impl HardwareDecoder {
 
     pub fn decode(&mut self, access_unit: &[u8]) -> Result<Option<DecodedFrame>, String> {
         self.transform.send_input(access_unit, self.next_time_hns)?;
-        self.next_time_hns += HNS_PER_SECOND / i64::from(FRAME_RATE);
+        self.next_time_hns += HNS_PER_SECOND / i64::from(MAX_SUPPORTED_FRAME_RATE);
         let mut decoded = None;
         for output_index in 0..8 {
             let wait = if output_index == 0 {

@@ -1,13 +1,28 @@
 use super::*;
 
-#[derive(Default)]
 struct LatestFramePacer {
     last_sequence: Option<u64>,
     last_encoded_at: Option<Instant>,
     next_frame_due_at: Option<Instant>,
+    frame_duration: Duration,
+}
+
+impl Default for LatestFramePacer {
+    fn default() -> Self {
+        Self::new(ScreenShareQuality::default())
+    }
 }
 
 impl LatestFramePacer {
+    fn new(quality: ScreenShareQuality) -> Self {
+        Self {
+            last_sequence: None,
+            last_encoded_at: None,
+            next_frame_due_at: None,
+            frame_duration: quality.frame_duration(),
+        }
+    }
+
     /// Returns `Some(true)` for a new captured frame and `Some(false)` for a
     /// one-second repeat of the latest image. `None` means keep waiting.
     fn should_encode(&self, sequence: u64, now: Instant) -> Option<bool> {
@@ -37,16 +52,16 @@ impl LatestFramePacer {
         self.last_sequence = Some(sequence);
         self.last_encoded_at = Some(now);
         if is_repeat {
-            self.next_frame_due_at = now.checked_add(FRAME_DURATION);
+            self.next_frame_due_at = now.checked_add(self.frame_duration);
             return;
         }
         let mut next_due = self
             .next_frame_due_at
             .unwrap_or(now)
-            .checked_add(FRAME_DURATION)
+            .checked_add(self.frame_duration)
             .unwrap_or(now);
         while next_due <= now {
-            let Some(advanced) = next_due.checked_add(FRAME_DURATION) else {
+            let Some(advanced) = next_due.checked_add(self.frame_duration) else {
                 break;
             };
             next_due = advanced;
@@ -66,7 +81,7 @@ impl LatestFramePacer {
         }
         let next_due = self
             .next_frame_due_at
-            .unwrap_or_else(|| last_encoded_at + FRAME_DURATION);
+            .unwrap_or_else(|| last_encoded_at + self.frame_duration);
         let tolerance_due = next_due
             .checked_sub(ENCODER_PACING_JITTER_TOLERANCE)
             .unwrap_or(next_due);
@@ -194,14 +209,33 @@ pub(super) fn encode_latest_frames(
     metrics: Arc<SharedMetrics>,
     force_keyframe: Arc<AtomicBool>,
     bitrate_bps: u32,
+    quality: ScreenShareQuality,
+    bitrate_target: Arc<AtomicU32>,
 ) -> Result<(), String> {
     let mut encoder: Option<ActiveH264Encoder> = None;
+    let mut active_bitrate_bps = bitrate_bps;
     let mut hardware_warmup_frames = 0u32;
     let mut forwarding_gate = H264ForwardingGate::default();
-    let mut pacer = LatestFramePacer::default();
+    let mut pacer = LatestFramePacer::new(quality);
     let mut observed_generation = source.generation();
 
     while !stop.load(Ordering::Relaxed) {
+        let requested_bitrate_bps = bitrate_target
+            .load(Ordering::Relaxed)
+            .clamp(250_000, quality.individual_bitrate_bps());
+        if requested_bitrate_bps != active_bitrate_bps {
+            active_bitrate_bps = requested_bitrate_bps;
+            if encoder.take().is_some() {
+                forwarding_gate.reset();
+                hardware_warmup_frames = 0;
+                force_keyframe.store(true, Ordering::Relaxed);
+                tracing::info!(
+                    target_bitrate_bps = active_bitrate_bps,
+                    "Recriando o encoder para aplicar a nova divisão de banda do grupo"
+                );
+            }
+        }
+
         // Do not consume the encoder's first IDR/SPS/PPS while ICE/DTLS is still
         // negotiating. RTP packets written before the peer is connected can be
         // discarded; starting with a P-frame then leaves the receiver without
@@ -231,7 +265,7 @@ pub(super) fn encode_latest_frames(
             observed_generation = generation;
             continue;
         };
-        validate_encoder_frame(&frame)?;
+        validate_encoder_frame(&frame, quality)?;
         metrics.record_video_dimensions(frame.width, frame.height);
         let skipped_sequences = if is_new_capture_frame {
             pacer.last_sequence.map_or(0, |previous| {
@@ -241,7 +275,8 @@ pub(super) fn encode_latest_frames(
             0
         };
         let worker_was_late = pacer.last_encoded_at.is_some_and(|previous| {
-            now.saturating_duration_since(previous) > FRAME_DURATION + Duration::from_millis(3)
+            now.saturating_duration_since(previous)
+                > pacer.frame_duration + Duration::from_millis(3)
         });
         metrics.record_capture_frame_for_encoder(!is_new_capture_frame);
         metrics.record_encoder_worker_delay(worker_was_late, skipped_sequences);
@@ -249,14 +284,20 @@ pub(super) fn encode_latest_frames(
             #[cfg(windows)]
             {
                 let hardware_result = if let Some(surface) = frame.gpu_nv12.as_ref() {
-                    match mf_video::HardwareEncoder::new_gpu_with_bitrate(
+                    match mf_video::HardwareEncoder::new_gpu_with_bitrate_and_frame_rate(
                         frame.width,
                         frame.height,
                         surface.device(),
-                        bitrate_bps,
+                        active_bitrate_bps,
+                        quality.frames_per_second(),
                     ) {
                         Ok(hardware) => Ok((hardware, true, None)),
-                        Err(gpu_error) => mf_video::HardwareEncoder::new_with_bitrate(frame.width, frame.height, bitrate_bps)
+                        Err(gpu_error) => mf_video::HardwareEncoder::new_with_bitrate_and_frame_rate(
+                            frame.width,
+                            frame.height,
+                            active_bitrate_bps,
+                            quality.frames_per_second(),
+                        )
                             .map(|hardware| {
                                 (
                                     hardware,
@@ -271,10 +312,11 @@ pub(super) fn encode_latest_frames(
                             }),
                     }
                 } else {
-                    mf_video::HardwareEncoder::new_with_bitrate(
+                    mf_video::HardwareEncoder::new_with_bitrate_and_frame_rate(
                         frame.width,
                         frame.height,
-                        bitrate_bps,
+                        active_bitrate_bps,
+                        quality.frames_per_second(),
                     )
                     .map(|hardware| (hardware, false, None))
                 };
@@ -297,9 +339,9 @@ pub(super) fn encode_latest_frames(
                             format!("Media Foundation H.264 de hardware indisponível: {error}");
                         tracing::warn!(fallback_reason = %reason, "Usando codificador H.264 OpenH264 na CPU");
                         metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
-                        encoder = Some(ActiveH264Encoder::OpenH264(Box::new(openh264_encoder(
-                            bitrate_bps,
-                        )?)));
+                        encoder = Some(ActiveH264Encoder::OpenH264(Box::new(
+                            openh264_encoder_for_quality(active_bitrate_bps, quality)?,
+                        )));
                     }
                 }
             }
@@ -307,9 +349,9 @@ pub(super) fn encode_latest_frames(
             {
                 let reason = "Media Foundation está disponível apenas no Windows.".to_owned();
                 metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
-                encoder = Some(ActiveH264Encoder::OpenH264(Box::new(openh264_encoder(
-                    bitrate_bps,
-                )?)));
+                encoder = Some(ActiveH264Encoder::OpenH264(Box::new(
+                    openh264_encoder_for_quality(active_bitrate_bps, quality)?,
+                )));
             }
         }
 
@@ -343,7 +385,7 @@ pub(super) fn encode_latest_frames(
         let hardware_failure = match active {
             ActiveH264Encoder::OpenH264(cpu) => {
                 let encode_started_at = Instant::now();
-                let encoded_result = encode_frame(cpu, &frame);
+                let encoded_result = encode_frame_with_quality(cpu, &frame, quality);
                 metrics.record_encode_duration(encode_started_at.elapsed());
                 let encoded = encoded_result?;
                 forward_encoded_access_unit(&encoded, &samples, &metrics, &mut forwarding_gate)?;
@@ -400,10 +442,10 @@ pub(super) fn encode_latest_frames(
             metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
             forwarding_gate.reset();
             hardware_warmup_frames = 0;
-            let mut cpu = openh264_encoder(bitrate_bps)?;
+            let mut cpu = openh264_encoder_for_quality(active_bitrate_bps, quality)?;
             metrics.record_encoder_input_frame();
             let encode_started_at = Instant::now();
-            let encoded_result = encode_frame(&mut cpu, &frame);
+            let encoded_result = encode_frame_with_quality(&mut cpu, &frame, quality);
             metrics.record_encode_duration(encode_started_at.elapsed());
             let encoded = encoded_result?;
             forward_encoded_access_unit(&encoded, &samples, &metrics, &mut forwarding_gate)?;
@@ -419,14 +461,24 @@ enum ActiveH264Encoder {
     MediaFoundation(mf_video::HardwareEncoder),
 }
 
+#[cfg(test)]
 pub(super) fn openh264_encoder(bitrate_bps: u32) -> Result<Encoder, String> {
+    openh264_encoder_for_quality(bitrate_bps, ScreenShareQuality::default())
+}
+
+fn openh264_encoder_for_quality(
+    bitrate_bps: u32,
+    quality: ScreenShareQuality,
+) -> Result<Encoder, String> {
     let encoder_config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(bitrate_bps))
-        .max_frame_rate(FrameRate::from_hz(30.0))
+        .max_frame_rate(FrameRate::from_hz(quality.frames_per_second() as f32))
         .usage_type(UsageType::ScreenContentRealTime)
         .adaptive_quantization(false)
         .background_detection(false)
-        .intra_frame_period(IntraFramePeriod::from_num_frames(30));
+        .intra_frame_period(IntraFramePeriod::from_num_frames(
+            quality.frames_per_second(),
+        ));
     Encoder::with_api_config(OpenH264API::from_source(), encoder_config)
         .map_err(|error| format!("Não foi possível iniciar o codificador H.264 OpenH264: {error}"))
 }
@@ -485,17 +537,19 @@ fn send_encoded_frame(
     send_result.map_err(|_| "O envio de vídeo foi encerrado.".to_owned())
 }
 
-fn validate_encoder_frame(frame: &PreviewFrame) -> Result<(), String> {
+fn validate_encoder_frame(frame: &PreviewFrame, quality: ScreenShareQuality) -> Result<(), String> {
+    let (max_width, max_height) = quality.max_dimensions();
     if frame.width < 2
         || frame.height < 2
-        || frame.width > 1280
-        || frame.height > 720
+        || frame.width > max_width
+        || frame.height > max_height
         || !frame.width.is_multiple_of(2)
         || !frame.height.is_multiple_of(2)
     {
-        return Err(
-            "O quadro excede o limite 1280×720 ou não tem dimensões H.264 válidas.".to_owned(),
-        );
+        return Err(format!(
+            "O quadro excede o limite {}×{} ou não tem dimensões H.264 válidas.",
+            max_width, max_height
+        ));
     }
     let expected_len = (frame.width as usize)
         .checked_mul(frame.height as usize)
@@ -512,8 +566,17 @@ fn validate_encoder_frame(frame: &PreviewFrame) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn encode_frame(encoder: &mut Encoder, frame: &PreviewFrame) -> Result<Vec<u8>, String> {
-    validate_encoder_frame(frame)?;
+    encode_frame_with_quality(encoder, frame, ScreenShareQuality::default())
+}
+
+fn encode_frame_with_quality(
+    encoder: &mut Encoder,
+    frame: &PreviewFrame,
+    quality: ScreenShareQuality,
+) -> Result<Vec<u8>, String> {
+    validate_encoder_frame(frame, quality)?;
 
     let expected_len = frame.width as usize * frame.height as usize * 4;
     let rgba_bytes: Cow<'_, [u8]> = if frame.rgba.len() == expected_len {
@@ -567,6 +630,7 @@ pub(super) fn unique_ssrc() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::screen_quality::{ScreenShareFrameRate, ScreenShareResolution};
 
     #[test]
     fn cpu_encoder_fallback_builds_rgba_from_nv12_without_local_preview() {
@@ -607,7 +671,7 @@ mod tests {
             #[cfg(windows)]
             cpu_nv12: None,
         };
-        assert!(validate_encoder_frame(&frame).is_err());
+        assert!(validate_encoder_frame(&frame, ScreenShareQuality::default()).is_err());
     }
 
     #[cfg(windows)]
@@ -624,7 +688,7 @@ mod tests {
                 stride: 320,
             })),
         };
-        assert!(validate_encoder_frame(&frame).is_ok());
+        assert!(validate_encoder_frame(&frame, ScreenShareQuality::default()).is_ok());
     }
 
     #[test]
@@ -773,7 +837,36 @@ mod tests {
     }
 
     #[test]
-    fn encoder_rejects_frames_above_720p() {
+    fn openh264_fallback_encodes_and_decodes_a_1080p_frame_at_60_fps_profile() {
+        let quality = ScreenShareQuality {
+            resolution: ScreenShareResolution::P1080,
+            frame_rate: ScreenShareFrameRate::Fps60,
+        };
+        let mut encoder = openh264_encoder_for_quality(quality.individual_bitrate_bps(), quality)
+            .expect("OpenH264 should support the selected profile");
+        let frame = PreviewFrame {
+            sequence: 1,
+            width: 1920,
+            height: 1080,
+            rgba: [32, 96, 160, 255].repeat(1920 * 1080),
+            #[cfg(windows)]
+            gpu_nv12: None,
+            #[cfg(windows)]
+            cpu_nv12: None,
+        };
+
+        let encoded = encode_frame_with_quality(&mut encoder, &frame, quality)
+            .expect("OpenH264 should encode a 1080p frame");
+        let mut decoder = Decoder::new().expect("OpenH264 decoder should start");
+        let decoded = decoder
+            .decode(&encoded)
+            .expect("OpenH264 should decode its 1080p output")
+            .expect("encoded output should contain a picture");
+        assert_eq!(decoded.dimensions(), (1920, 1080));
+    }
+
+    #[test]
+    fn encoder_rejects_frames_above_selected_resolution() {
         let mut encoder = Encoder::new().unwrap();
         let frame = PreviewFrame {
             sequence: 1,
@@ -788,33 +881,54 @@ mod tests {
         assert!(encode_frame(&mut encoder, &frame).is_err());
     }
 
+    #[test]
+    fn encoder_validation_accepts_1080p_frames_with_the_matching_profile() {
+        let quality = ScreenShareQuality {
+            resolution: ScreenShareResolution::P1080,
+            frame_rate: ScreenShareFrameRate::Fps60,
+        };
+        let frame = PreviewFrame {
+            sequence: 1,
+            width: 1920,
+            height: 1080,
+            rgba: vec![0; 1920 * 1080 * 4],
+            #[cfg(windows)]
+            gpu_nv12: None,
+            #[cfg(windows)]
+            cpu_nv12: None,
+        };
+        assert!(validate_encoder_frame(&frame, quality).is_ok());
+        assert!(validate_encoder_frame(&frame, ScreenShareQuality::default()).is_err());
+    }
+
     #[cfg(windows)]
     #[test]
     fn frame_pacer_sends_new_frames_at_up_to_30_fps_and_repeats_static_at_1_fps() {
         let start = Instant::now();
+        let frame_duration = ScreenShareQuality::default().frame_duration();
         let mut pacer = LatestFramePacer::default();
         assert_eq!(pacer.should_encode(1, start), Some(true));
         pacer.record_encoded(1, start);
         assert_eq!(
             pacer.should_encode(
                 2,
-                start + FRAME_DURATION - ENCODER_PACING_JITTER_TOLERANCE - Duration::from_nanos(1),
+                start + frame_duration - ENCODER_PACING_JITTER_TOLERANCE - Duration::from_nanos(1),
             ),
             None,
             "não pode exceder 30 FPS"
         );
         assert_eq!(
-            pacer.should_encode(2, start + FRAME_DURATION - ENCODER_PACING_JITTER_TOLERANCE,),
+            pacer.should_encode(2, start + frame_duration - ENCODER_PACING_JITTER_TOLERANCE,),
             Some(true),
             "o quadro novo deve ser enviado assim que o intervalo permitir"
         );
-        pacer.record_encoded(2, start + FRAME_DURATION);
+        pacer.record_encoded(2, start + frame_duration);
         assert_eq!(
-            pacer.should_encode(2, start + FRAME_DURATION + Duration::from_millis(999)),
+            pacer.should_encode(2, start + frame_duration + Duration::from_millis(999)),
             None
         );
         assert_eq!(
-            pacer.should_encode(2, start + FRAME_DURATION + Duration::from_secs(1)),
+            pacer.should_encode(2, start + frame_duration + Duration::from_secs(1)),
             Some(false),
             "imagem estática deve ser repetida a cada segundo"
         );
@@ -823,11 +937,12 @@ mod tests {
     #[test]
     fn frame_pacer_accepts_30_fps_coalesces_60_fps_and_keeps_15_fps() {
         let start = Instant::now();
+        let frame_duration = ScreenShareQuality::default().frame_duration();
         let mut at_30 = LatestFramePacer::default();
         at_30.record_encoded(0, start);
         let mut accepted_30 = 0;
         for index in 1..=30 {
-            let now = start + FRAME_DURATION * index;
+            let now = start + frame_duration * index;
             if at_30.should_encode(index as u64, now).is_some() {
                 accepted_30 += 1;
                 at_30.record_encoded(index as u64, now);
@@ -838,7 +953,7 @@ mod tests {
         let mut at_60 = LatestFramePacer::default();
         assert_eq!(at_60.should_encode(0, start), Some(true));
         at_60.record_encoded(0, start);
-        let half_frame = Duration::from_nanos(FRAME_DURATION.as_nanos() as u64 / 2 + 1);
+        let half_frame = Duration::from_nanos(frame_duration.as_nanos() as u64 / 2 + 1);
         let mut accepted_60 = 0;
         for index in 1..=60 {
             let now = start + half_frame * index;
@@ -855,7 +970,7 @@ mod tests {
         let mut at_15 = LatestFramePacer::default();
         at_15.record_encoded(0, start);
         for index in 1..=15 {
-            let now = start + FRAME_DURATION * (index * 2);
+            let now = start + frame_duration * (index * 2);
             assert_eq!(at_15.should_encode(index as u64, now), Some(true));
             at_15.record_encoded(index as u64, now);
         }
@@ -880,6 +995,26 @@ mod tests {
             accepted_jittered >= 89,
             "pequena variação não deve descartar quadros alternados: {accepted_jittered}/90"
         );
+    }
+
+    #[test]
+    fn frame_pacer_accepts_60_fps_when_selected() {
+        let start = Instant::now();
+        let quality = ScreenShareQuality {
+            resolution: ScreenShareResolution::P1080,
+            frame_rate: ScreenShareFrameRate::Fps60,
+        };
+        let mut pacer = LatestFramePacer::new(quality);
+        pacer.record_encoded(0, start);
+        let mut accepted = 0;
+        for index in 1..=60u64 {
+            let now = start + quality.frame_duration() * index as u32;
+            if pacer.should_encode(index, now).is_some() {
+                accepted += 1;
+                pacer.record_encoded(index, now);
+            }
+        }
+        assert_eq!(accepted, 60);
     }
 
     #[test]

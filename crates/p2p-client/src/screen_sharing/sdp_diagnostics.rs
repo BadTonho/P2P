@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn summarizes_audio_video_direction_and_h264_profile_without_other_sdp_data() {
-        let sdp = "v=0\r\na=sendrecv\r\na=ice-ufrag:secret\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=sendonly\r\na=rtpmap:102 H264/90000\r\na=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\na=candidate:secret-address\r\na=ssrc:123 cname:private-value\r\n";
+        let sdp = "v=0\r\na=sendrecv\r\na=ice-ufrag:secret\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=sendonly\r\na=rtpmap:102 H264/90000\r\na=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a\r\na=candidate:secret-address\r\na=ssrc:123 cname:private-value\r\n";
 
         let summary = summarize_sdp_media(sdp);
 
@@ -192,7 +192,7 @@ mod tests {
         assert!(summary.contains("OPUS/48000/2(pt=111)"));
         assert!(summary.contains("video(accepted=true,direction=sendonly"));
         assert!(
-            summary.contains("H264/90000(pt=102;packetization-mode=1;profile-level-id=42e01f)")
+            summary.contains("H264/90000(pt=102;packetization-mode=1;profile-level-id=42e02a)")
         );
         assert!(!summary.contains("secret"));
         assert!(!summary.contains("123"));

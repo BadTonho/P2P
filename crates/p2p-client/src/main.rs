@@ -8,6 +8,7 @@ mod mesh_identity;
 mod mf_video;
 mod profile;
 mod screen_capture;
+mod screen_quality;
 mod screen_sharing;
 mod settings;
 mod signaling_client;
