@@ -158,20 +158,21 @@ impl ClientUi {
             return;
         }
         let mut peers = self
-            .group_available_shares
+            .group_share
+            .available_shares
             .iter()
             .filter_map(|id| participants.iter().find(|p| &p.id == id))
             .cloned()
             .collect::<Vec<_>>();
         peers.sort_by_key(|participant| participant.order);
-        if peers.is_empty() && !self.group_local_sharing {
+        if peers.is_empty() && !self.group_share.local_sharing {
             return;
         }
         ui.group(|ui| {
             ui.heading("Telas compartilhadas");
             ui.horizontal_wrapped(|ui| {
                 for peer in peers {
-                    let watching = self.group_watched_shares.contains(&peer.id);
+                    let watching = self.group_share.watched_shares.contains(&peer.id);
                     let label = if watching {
                         format!("Parar de assistir {}", peer.display_name)
                     } else {
@@ -181,11 +182,11 @@ impl ClientUi {
                         self.toggle_group_watch(&peer.id);
                     }
                 }
-                if self.group_local_sharing {
+                if self.group_share.local_sharing {
                     ui.label("Sua tela está disponível");
                 }
             });
-            for (peer_id, status) in &self.group_audio_status {
+            for (peer_id, status) in &self.group_share.audio_status {
                 let participant_name = participants
                     .iter()
                     .find(|participant| participant.id == *peer_id)
@@ -197,11 +198,12 @@ impl ClientUi {
     }
 
     fn show_group_screen_stage(&mut self, ui: &mut egui::Ui, stage_height: f32) {
-        let focused = self.focused_group_screen.clone();
+        let focused = self.group_share.focused_screen.clone();
         if let Some(id) = focused.as_deref() {
-            if let Some(texture) = self.group_remote_textures.get(id).cloned() {
+            if let Some(texture) = self.group_share.remote_textures.get(id).cloned() {
                 let current_volume = self
-                    .group_inbound_sessions
+                    .group_share
+                    .inbound_sessions
                     .get(id)
                     .map(ScreenShareSession::remote_audio_volume_percent)
                     .unwrap_or(self.remote_audio_default_volume_percent);
@@ -236,11 +238,11 @@ impl ClientUi {
                         self.toggle_fullscreen(ui.ctx());
                     }
                     if ui.button("Voltar à grade").clicked() {
-                        self.focused_group_screen = None;
+                        self.group_share.focused_screen = None;
                     }
                 });
                 if let Some(volume) = volume_change {
-                    if let Some(session) = self.group_inbound_sessions.get(id) {
+                    if let Some(session) = self.group_share.inbound_sessions.get(id) {
                         session.set_remote_audio_volume_percent(volume);
                     }
                     self.remote_audio_default_volume_percent = volume;
@@ -265,16 +267,16 @@ impl ClientUi {
                             .fit_to_exact_size(source * scale.max(0.01)),
                     );
                     if ui.button("Voltar à grade").clicked() {
-                        self.focused_group_screen = None;
+                        self.group_share.focused_screen = None;
                     }
                 });
                 return;
             }
-            self.focused_group_screen = None;
+            self.group_share.focused_screen = None;
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if self.group_local_sharing && self.show_local_preview {
+                if self.group_share.local_sharing && self.show_local_preview {
                     egui::Frame::group(ui.style()).show(ui, |tile| {
                         tile.set_min_size(egui::vec2(300.0, 195.0));
                         tile.label("Você (prévia local)");
@@ -287,12 +289,13 @@ impl ClientUi {
                             tile.label("Preparando prévia…");
                         }
                         if tile.button("Ampliar").clicked() {
-                            self.focused_group_screen = Some("__local".to_owned());
+                            self.group_share.focused_screen = Some("__local".to_owned());
                         }
                     });
                 }
                 let watched = self
-                    .group_watched_shares
+                    .group_share
+                    .watched_shares
                     .iter()
                     .cloned()
                     .collect::<Vec<_>>();
@@ -304,7 +307,8 @@ impl ClientUi {
                         .map(|p| p.display_name.clone())
                         .unwrap_or_else(|| "Participante".to_owned());
                     let current_volume = self
-                        .group_inbound_sessions
+                        .group_share
+                        .inbound_sessions
                         .get(&peer_id)
                         .map(ScreenShareSession::remote_audio_volume_percent)
                         .unwrap_or(self.remote_audio_default_volume_percent);
@@ -312,7 +316,7 @@ impl ClientUi {
                     egui::Frame::group(ui.style()).show(ui, |tile| {
                         tile.set_min_size(egui::vec2(300.0, 195.0));
                         tile.label(name);
-                        if let Some(texture) = self.group_remote_textures.get(&peer_id) {
+                        if let Some(texture) = self.group_share.remote_textures.get(&peer_id) {
                             let response = tile.add(
                                 egui::Image::new((texture.id(), texture.size_vec2()))
                                     .fit_to_exact_size(egui::vec2(280.0, 158.0))
@@ -321,11 +325,12 @@ impl ClientUi {
                             volume_change =
                                 remote_audio_volume_context_menu(response, current_volume);
                             if tile.button("Ampliar").clicked() {
-                                self.focused_group_screen = Some(peer_id.clone());
+                                self.group_share.focused_screen = Some(peer_id.clone());
                             }
                         } else {
                             tile.label(
-                                self.group_peer_status
+                                self.group_share
+                                    .peer_status
                                     .get(&peer_id)
                                     .map(String::as_str)
                                     .unwrap_or("Aguardando a tela…"),
@@ -333,13 +338,13 @@ impl ClientUi {
                         }
                     });
                     if let Some(volume) = volume_change {
-                        if let Some(session) = self.group_inbound_sessions.get(&peer_id) {
+                        if let Some(session) = self.group_share.inbound_sessions.get(&peer_id) {
                             session.set_remote_audio_volume_percent(volume);
                         }
                         self.remote_audio_default_volume_percent = volume;
                     }
                 }
-                if !self.group_local_sharing && self.group_watched_shares.is_empty() {
+                if !self.group_share.local_sharing && self.group_share.watched_shares.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(stage_height * 0.35);
                         ui.heading("Sala pronta");
@@ -356,10 +361,11 @@ impl ClientUi {
         let available_video_height = (available.y - toolbar_height).max(100.0);
 
         let (texture_opt, current_volume, is_group, group_id) =
-            if let Some(id) = self.focused_group_screen.clone() {
-                let tex = self.group_remote_textures.get(&id).cloned();
+            if let Some(id) = self.group_share.focused_screen.clone() {
+                let tex = self.group_share.remote_textures.get(&id).cloned();
                 let vol = self
-                    .group_inbound_sessions
+                    .group_share
+                    .inbound_sessions
                     .get(&id)
                     .map(ScreenShareSession::remote_audio_volume_percent)
                     .unwrap_or(self.remote_audio_default_volume_percent);
@@ -390,7 +396,7 @@ impl ClientUi {
                     show_screen_audio_and_fullscreen_toolbar(ui, current_volume, true);
                 if let Some(vol) = new_vol {
                     if let Some(ref gid) = group_id {
-                        if let Some(session) = self.group_inbound_sessions.get(gid) {
+                        if let Some(session) = self.group_share.inbound_sessions.get(gid) {
                             session.set_remote_audio_volume_percent(vol);
                         }
                     } else if let Some(session) = &self.screen_share_session {
@@ -402,7 +408,7 @@ impl ClientUi {
                     self.set_fullscreen(ui.ctx(), false);
                 }
                 if is_group && ui.button("Voltar à grade").clicked() {
-                    self.focused_group_screen = None;
+                    self.group_share.focused_screen = None;
                     self.set_fullscreen(ui.ctx(), false);
                 }
             });

@@ -96,7 +96,7 @@ pub(super) fn show_screen_audio_and_fullscreen_toolbar(
 impl ClientUi {
     pub(in crate::app::ui) fn show_room_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            let is_sharing = self.group_local_sharing
+            let is_sharing = self.group_share.local_sharing
                 || matches!(&self.screen_share_role, ScreenShareRole::Sending { .. });
 
             if is_sharing {
@@ -191,14 +191,14 @@ mod tests {
         );
         output.textures_delta.clear();
 
-        assert!(!app.group_local_sharing);
+        assert!(!app.group_share.local_sharing);
     }
 
     #[test]
     fn test_toolbar_renders_stop_sharing_when_sending() {
         let context = egui::Context::default();
         let mut app = ClientUi::default();
-        app.group_local_sharing = true;
+        app.group_share.local_sharing = true;
 
         let mut output = context.run_ui(
             egui::RawInput {
@@ -214,6 +214,6 @@ mod tests {
         );
         output.textures_delta.clear();
 
-        assert!(app.group_local_sharing);
+        assert!(app.group_share.local_sharing);
     }
 }

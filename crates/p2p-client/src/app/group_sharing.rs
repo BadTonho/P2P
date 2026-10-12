@@ -289,10 +289,10 @@ impl ClientUi {
 
     fn prune_group_signal_state(&mut self) {
         let now = Instant::now();
-        self.closed_group_generations.retain(|_, closed_at| {
+        self.group_share.closed_generations.retain(|_, closed_at| {
             now.saturating_duration_since(*closed_at) < CLOSED_GROUP_GENERATION_TTL
         });
-        self.pending_group_ice.retain(|_, candidates| {
+        self.group_share.pending_ice.retain(|_, candidates| {
             candidates.retain(|candidate| {
                 now.saturating_duration_since(candidate.queued_at) < PENDING_GROUP_ICE_TTL
             });
@@ -301,18 +301,21 @@ impl ClientUi {
     }
 
     pub(super) fn mark_group_generation_closed(&mut self, peer_id: &str, generation: String) {
-        self.pending_group_ice
+        self.group_share
+            .pending_ice
             .remove(&(peer_id.to_owned(), generation.clone()));
-        self.closed_group_generations
+        self.group_share
+            .closed_generations
             .insert((peer_id.to_owned(), generation), Instant::now());
-        if self.closed_group_generations.len() > 128
+        if self.group_share.closed_generations.len() > 128
             && let Some(oldest) = self
-                .closed_group_generations
+                .group_share
+                .closed_generations
                 .iter()
                 .min_by_key(|(_, closed_at)| **closed_at)
                 .map(|(key, _)| key.clone())
         {
-            self.closed_group_generations.remove(&oldest);
+            self.group_share.closed_generations.remove(&oldest);
         }
     }
 
@@ -326,7 +329,7 @@ impl ClientUi {
             );
             return;
         }
-        if self.closed_group_generations.contains_key(&key) {
+        if self.group_share.closed_generations.contains_key(&key) {
             tracing::debug!(
                 signal_kind = "ice_candidate",
                 "ICE tardio descartado para geração já encerrada"
@@ -340,35 +343,38 @@ impl ClientUi {
             );
             return;
         }
-        if !self.pending_group_ice.contains_key(&key)
-            && self.pending_group_ice.len() >= MAX_PENDING_GROUP_ICE_SESSIONS
+        if !self.group_share.pending_ice.contains_key(&key)
+            && self.group_share.pending_ice.len() >= MAX_PENDING_GROUP_ICE_SESSIONS
             && let Some(oldest) = self
-                .pending_group_ice
+                .group_share
+                .pending_ice
                 .iter()
                 .min_by_key(|(_, candidates)| candidates.front().map(|item| item.queued_at))
                 .map(|(key, _)| key.clone())
         {
-            self.pending_group_ice.remove(&oldest);
+            self.group_share.pending_ice.remove(&oldest);
         }
         let total = self
-            .pending_group_ice
+            .group_share
+            .pending_ice
             .values()
             .map(VecDeque::len)
             .sum::<usize>();
         if total >= MAX_PENDING_GROUP_ICE_TOTAL
             && let Some(oldest) = self
-                .pending_group_ice
+                .group_share
+                .pending_ice
                 .iter()
                 .min_by_key(|(_, candidates)| candidates.front().map(|item| item.queued_at))
                 .map(|(key, _)| key.clone())
-            && let Some(candidates) = self.pending_group_ice.get_mut(&oldest)
+            && let Some(candidates) = self.group_share.pending_ice.get_mut(&oldest)
         {
             candidates.pop_front();
             if candidates.is_empty() {
-                self.pending_group_ice.remove(&oldest);
+                self.group_share.pending_ice.remove(&oldest);
             }
         }
-        let candidates = self.pending_group_ice.entry(key).or_default();
+        let candidates = self.group_share.pending_ice.entry(key).or_default();
         if candidates.len() >= MAX_PENDING_GROUP_ICE_PER_SESSION {
             candidates.pop_front();
         }
@@ -384,9 +390,10 @@ impl ClientUi {
 
     pub(super) fn allocate_group_media_port(&self) -> Result<u16, String> {
         let used = self
-            .group_outbound_ports
+            .group_share
+            .outbound_ports
             .values()
-            .chain(self.group_inbound_ports.values())
+            .chain(self.group_share.inbound_ports.values())
             .copied()
             .collect::<HashSet<_>>();
         next_group_media_port(&used)
@@ -412,12 +419,13 @@ impl ClientUi {
         };
         match self.send_screen_share_signal(kind, String::new()) {
             Ok(()) => {
-                self.group_local_sharing = enabled;
+                self.group_share.local_sharing = enabled;
                 self.audio_status = None;
                 if !enabled {
                     self.clear_local_preview();
                     let generations = self
-                        .group_outbound_generations
+                        .group_share
+                        .outbound_generations
                         .iter()
                         .map(|(peer, generation)| (peer.clone(), generation.clone()))
                         .collect::<Vec<_>>();
@@ -430,13 +438,13 @@ impl ClientUi {
                         );
                         self.mark_group_generation_closed(&peer_id, generation);
                     }
-                    for session in self.group_outbound_sessions.values() {
+                    for session in self.group_share.outbound_sessions.values() {
                         log_final_group_session_diagnostics(session, "sender", "share_stopped");
                     }
-                    self.group_outbound_sessions.clear();
-                    self.group_outbound_generations.clear();
-                    self.group_outbound_ports.clear();
-                    self.group_outbound_target_bitrate_bps = None;
+                    self.group_share.outbound_sessions.clear();
+                    self.group_share.outbound_generations.clear();
+                    self.group_share.outbound_ports.clear();
+                    self.group_share.outbound_target_bitrate_bps = None;
                 }
                 self.screen_share_status = Some(if enabled {
                     "Sua tela está disponível. Cada participante escolhe se quer assistir."
@@ -451,8 +459,8 @@ impl ClientUi {
     }
 
     pub(super) fn toggle_group_watch(&mut self, peer_id: &str) {
-        if self.group_watched_shares.remove(peer_id) {
-            self.group_auto_focus_pending.remove(peer_id);
+        if self.group_share.watched_shares.remove(peer_id) {
+            self.group_share.auto_focus_pending.remove(peer_id);
             if let Err(error) = self.send_screen_share_signal_to(
                 peer_id,
                 SignalKind::ScreenShareUnwatch,
@@ -460,27 +468,29 @@ impl ClientUi {
             ) {
                 self.screen_share_status = Some(error);
             }
-            if let Some(session) = self.group_inbound_sessions.remove(peer_id) {
+            if let Some(session) = self.group_share.inbound_sessions.remove(peer_id) {
                 log_final_group_session_diagnostics(&session, "receiver", "watch_stopped");
             }
-            if let Some(generation) = self.group_inbound_generations.remove(peer_id) {
+            if let Some(generation) = self.group_share.inbound_generations.remove(peer_id) {
                 self.mark_group_generation_closed(peer_id, generation);
             }
-            self.group_inbound_ports.remove(peer_id);
-            self.group_remote_textures.remove(peer_id);
-            self.group_remote_sequences.remove(peer_id);
-            self.group_peer_status.remove(peer_id);
-            self.group_audio_status.remove(peer_id);
-        } else if self.group_available_shares.contains(peer_id) {
+            self.group_share.inbound_ports.remove(peer_id);
+            self.group_share.remote_textures.remove(peer_id);
+            self.group_share.remote_sequences.remove(peer_id);
+            self.group_share.peer_status.remove(peer_id);
+            self.group_share.audio_status.remove(peer_id);
+        } else if self.group_share.available_shares.contains(peer_id) {
             match self.send_screen_share_signal_to(
                 peer_id,
                 SignalKind::ScreenShareWatch,
                 String::new(),
             ) {
                 Ok(()) => {
-                    self.group_watched_shares.insert(peer_id.to_owned());
-                    self.group_auto_focus_pending.insert(peer_id.to_owned());
-                    self.group_peer_status.insert(
+                    self.group_share.watched_shares.insert(peer_id.to_owned());
+                    self.group_share
+                        .auto_focus_pending
+                        .insert(peer_id.to_owned());
+                    self.group_share.peer_status.insert(
                         peer_id.to_owned(),
                         "Pedido para assistir enviado…".to_owned(),
                     );
@@ -531,10 +541,15 @@ impl ClientUi {
                 ) {
                     self.screen_share_status = Some(error);
                 } else {
-                    self.group_outbound_ports.insert(viewer_id.clone(), port);
-                    self.group_outbound_generations
+                    self.group_share
+                        .outbound_ports
+                        .insert(viewer_id.clone(), port);
+                    self.group_share
+                        .outbound_generations
                         .insert(viewer_id.clone(), generation.clone());
-                    self.group_outbound_sessions.insert(viewer_id, session);
+                    self.group_share
+                        .outbound_sessions
+                        .insert(viewer_id, session);
                 }
             }
             Err(error) => self.screen_share_status = Some(error),
@@ -547,7 +562,8 @@ impl ClientUi {
         additional_viewer: Option<String>,
     ) {
         let mut viewers = self
-            .group_outbound_sessions
+            .group_share
+            .outbound_sessions
             .keys()
             .cloned()
             .collect::<Vec<_>>();
@@ -558,11 +574,12 @@ impl ClientUi {
         }
         viewers.sort();
         if viewers.is_empty() {
-            self.group_outbound_target_bitrate_bps = None;
+            self.group_share.outbound_target_bitrate_bps = None;
             return;
         }
         let mut current_viewers = self
-            .group_outbound_sessions
+            .group_share
+            .outbound_sessions
             .keys()
             .cloned()
             .collect::<Vec<_>>();
@@ -570,7 +587,7 @@ impl ClientUi {
         let bitrate = group_share_bitrate(viewers.len());
         if !group_outbound_rebalance_needed(
             &current_viewers,
-            self.group_outbound_target_bitrate_bps,
+            self.group_share.outbound_target_bitrate_bps,
             &viewers,
             bitrate,
         ) {
@@ -583,16 +600,17 @@ impl ClientUi {
         }
         let desired_set: std::collections::HashSet<&String> = viewers.iter().collect();
         let departed: Vec<String> = self
-            .group_outbound_sessions
+            .group_share
+            .outbound_sessions
             .keys()
             .filter(|peer| !desired_set.contains(peer))
             .cloned()
             .collect();
         for viewer in departed {
-            if let Some(session) = self.group_outbound_sessions.remove(&viewer) {
+            if let Some(session) = self.group_share.outbound_sessions.remove(&viewer) {
                 log_final_group_session_diagnostics(&session, "sender", "viewer_departed");
             }
-            if let Some(generation) = self.group_outbound_generations.remove(&viewer) {
+            if let Some(generation) = self.group_share.outbound_generations.remove(&viewer) {
                 let _ = self.send_screen_share_signal_to_stream(
                     &viewer,
                     generation.clone(),
@@ -601,28 +619,28 @@ impl ClientUi {
                 );
                 self.mark_group_generation_closed(&viewer, generation);
             }
-            self.group_outbound_ports.remove(&viewer);
+            self.group_share.outbound_ports.remove(&viewer);
         }
         for viewer in viewers {
-            if !self.group_outbound_sessions.contains_key(&viewer) {
+            if !self.group_share.outbound_sessions.contains_key(&viewer) {
                 self.start_group_outbound(viewer, context, bitrate);
             }
         }
-        self.group_outbound_target_bitrate_bps = Some(bitrate);
+        self.group_share.outbound_target_bitrate_bps = Some(bitrate);
         tracing::info!(
-            viewers = self.group_outbound_sessions.len(),
+            viewers = self.group_share.outbound_sessions.len(),
             target_bitrate_bps = bitrate,
             "Sessões de envio de grupo atualizadas preservando espectadores existentes"
         );
     }
 
     pub(super) fn stop_group_media(&mut self, announce: bool) {
-        if announce && self.group_local_sharing {
+        if announce && self.group_share.local_sharing {
             let _ =
                 self.send_screen_share_signal(SignalKind::ScreenShareUnavailable, String::new());
         }
         if announce {
-            let watched = self.group_watched_shares.drain().collect::<Vec<_>>();
+            let watched = self.group_share.watched_shares.drain().collect::<Vec<_>>();
             for peer_id in watched {
                 let _ = self.send_screen_share_signal_to(
                     &peer_id,
@@ -631,13 +649,13 @@ impl ClientUi {
                 );
             }
         } else {
-            self.group_watched_shares.clear();
+            self.group_share.watched_shares.clear();
         }
-        self.group_available_shares.clear();
-        for session in self.group_outbound_sessions.values() {
+        self.group_share.available_shares.clear();
+        for session in self.group_share.outbound_sessions.values() {
             log_final_group_session_diagnostics(session, "sender", "room_media_stopped");
         }
-        for (peer_id, generation) in std::mem::take(&mut self.group_outbound_generations) {
+        for (peer_id, generation) in std::mem::take(&mut self.group_share.outbound_generations) {
             if announce {
                 let _ = self.send_screen_share_signal_to_stream(
                     &peer_id,
@@ -648,27 +666,27 @@ impl ClientUi {
             }
             self.mark_group_generation_closed(&peer_id, generation);
         }
-        for session in self.group_inbound_sessions.values() {
+        for session in self.group_share.inbound_sessions.values() {
             log_final_group_session_diagnostics(session, "receiver", "room_media_stopped");
         }
-        for (peer_id, generation) in std::mem::take(&mut self.group_inbound_generations) {
+        for (peer_id, generation) in std::mem::take(&mut self.group_share.inbound_generations) {
             self.mark_group_generation_closed(&peer_id, generation);
         }
-        self.group_outbound_sessions.clear();
-        self.group_inbound_sessions.clear();
-        self.group_outbound_ports.clear();
-        self.group_outbound_target_bitrate_bps = None;
-        self.group_inbound_ports.clear();
-        self.pending_group_ice.clear();
-        self.group_remote_textures.clear();
-        self.group_remote_sequences.clear();
-        self.group_auto_focus_pending.clear();
-        self.group_peer_status.clear();
-        self.group_audio_status.clear();
-        self.group_local_sharing = false;
+        self.group_share.outbound_sessions.clear();
+        self.group_share.inbound_sessions.clear();
+        self.group_share.outbound_ports.clear();
+        self.group_share.outbound_target_bitrate_bps = None;
+        self.group_share.inbound_ports.clear();
+        self.group_share.pending_ice.clear();
+        self.group_share.remote_textures.clear();
+        self.group_share.remote_sequences.clear();
+        self.group_share.auto_focus_pending.clear();
+        self.group_share.peer_status.clear();
+        self.group_share.audio_status.clear();
+        self.group_share.local_sharing = false;
         self.clear_local_preview();
         self.audio_status = None;
-        self.focused_group_screen = None;
+        self.group_share.focused_screen = None;
     }
 
     pub(super) fn handle_group_peer_signal(
@@ -691,7 +709,7 @@ impl ClientUi {
             return;
         }
         let Some(stream_id) = stream_id else {
-            self.group_peer_status.insert(
+            self.group_share.peer_status.insert(
                 peer_id,
                 "A negociação WebRTC veio sem identificação da transmissão.".to_owned(),
             );
@@ -708,11 +726,13 @@ impl ClientUi {
             &peer_id,
             &stream_id,
             kind,
-            self.group_watched_shares.contains(&peer_id),
-            self.group_outbound_generations
+            self.group_share.watched_shares.contains(&peer_id),
+            self.group_share
+                .outbound_generations
                 .get(&peer_id)
                 .map(String::as_str),
-            self.group_inbound_generations
+            self.group_share
+                .inbound_generations
                 .get(&peer_id)
                 .map(String::as_str),
         );
@@ -724,7 +744,11 @@ impl ClientUi {
             return;
         }
         let generation_key = (peer_id.clone(), stream_id.clone());
-        if self.closed_group_generations.contains_key(&generation_key) {
+        if self
+            .group_share
+            .closed_generations
+            .contains_key(&generation_key)
+        {
             tracing::debug!(
                 signal_kind = ?kind,
                 "Sinal atrasado descartado para sessão de grupo encerrada"
@@ -733,12 +757,12 @@ impl ClientUi {
         }
 
         if kind == SignalKind::Offer {
-            if self.group_inbound_generations.get(&peer_id) == Some(&stream_id) {
+            if self.group_share.inbound_generations.get(&peer_id) == Some(&stream_id) {
                 tracing::debug!("Oferta duplicada ignorada para sessão de grupo já ativa");
                 return;
             }
-            if let Some(old_generation) = self.group_inbound_generations.remove(&peer_id) {
-                if let Some(old_session) = self.group_inbound_sessions.remove(&peer_id) {
+            if let Some(old_generation) = self.group_share.inbound_generations.remove(&peer_id) {
+                if let Some(old_session) = self.group_share.inbound_sessions.remove(&peer_id) {
                     log_final_group_session_diagnostics(
                         &old_session,
                         "receiver",
@@ -746,13 +770,13 @@ impl ClientUi {
                     );
                 }
                 self.mark_group_generation_closed(&peer_id, old_generation);
-                self.group_inbound_ports.remove(&peer_id);
-                self.group_remote_textures.remove(&peer_id);
-                self.group_remote_sequences.remove(&peer_id);
+                self.group_share.inbound_ports.remove(&peer_id);
+                self.group_share.remote_textures.remove(&peer_id);
+                self.group_share.remote_sequences.remove(&peer_id);
             }
         }
 
-        if kind == SignalKind::Offer && !self.group_inbound_sessions.contains_key(&peer_id) {
+        if kind == SignalKind::Offer && !self.group_share.inbound_sessions.contains_key(&peer_id) {
             let (address, port) =
                 match (self.selected_media_ipv4(), self.allocate_group_media_port()) {
                     (Ok(address), Ok(port)) => (address, port),
@@ -771,11 +795,15 @@ impl ClientUi {
                 self.remote_audio_default_volume_percent,
             ) {
                 Ok(session) => {
-                    self.group_inbound_ports.insert(peer_id.clone(), port);
-                    self.group_inbound_sessions.insert(peer_id.clone(), session);
-                    self.group_inbound_generations
+                    self.group_share.inbound_ports.insert(peer_id.clone(), port);
+                    self.group_share
+                        .inbound_sessions
+                        .insert(peer_id.clone(), session);
+                    self.group_share
+                        .inbound_generations
                         .insert(peer_id.clone(), stream_id.clone());
-                    self.group_peer_status
+                    self.group_share
+                        .peer_status
                         .insert(peer_id.clone(), "Negociando a tela recebida…".to_owned());
                 }
                 Err(error) => {
@@ -785,14 +813,15 @@ impl ClientUi {
             }
         }
         if kind == SignalKind::Offer {
-            if let Some(session) = self.group_inbound_sessions.get(&peer_id) {
+            if let Some(session) = self.group_share.inbound_sessions.get(&peer_id) {
                 if let Err(error) = session.handle_signal(kind, payload) {
-                    self.group_peer_status
+                    self.group_share
+                        .peer_status
                         .insert(peer_id.clone(), error.clone());
                     self.screen_share_status = Some(error);
                     return;
                 }
-                if let Some(mut candidates) = self.pending_group_ice.remove(&generation_key) {
+                if let Some(mut candidates) = self.group_share.pending_ice.remove(&generation_key) {
                     let mut applied = 0usize;
                     while let Some(candidate) = candidates.pop_front() {
                         if candidate.queued_at.elapsed() < PENDING_GROUP_ICE_TTL
@@ -813,13 +842,13 @@ impl ClientUi {
         }
 
         let session = match signal_route {
-            GroupSignalRoute::Outbound => self.group_outbound_sessions.get(&peer_id),
-            GroupSignalRoute::Inbound => self.group_inbound_sessions.get(&peer_id),
+            GroupSignalRoute::Outbound => self.group_share.outbound_sessions.get(&peer_id),
+            GroupSignalRoute::Inbound => self.group_share.inbound_sessions.get(&peer_id),
             _ => None,
         };
         if let Some(session) = session {
             if let Err(error) = session.handle_signal(kind, payload) {
-                self.group_peer_status.insert(peer_id, error.clone());
+                self.group_share.peer_status.insert(peer_id, error.clone());
                 self.screen_share_status = Some(error);
             }
         } else if signal_route == GroupSignalRoute::QueueEarlyIce {
@@ -835,9 +864,10 @@ impl ClientUi {
     pub(super) fn refresh_group_screen_shares(&mut self, context: &egui::Context) {
         self.prune_group_signal_state();
         let mut peer_ids = self
-            .group_inbound_sessions
+            .group_share
+            .inbound_sessions
             .keys()
-            .chain(self.group_outbound_sessions.keys())
+            .chain(self.group_share.outbound_sessions.keys())
             .cloned()
             .collect::<HashSet<_>>()
             .into_iter()
@@ -852,7 +882,7 @@ impl ClientUi {
             let mut outbound_failed = false;
             let mut inbound_termination_reason = "unknown";
             let mut outbound_termination_reason = "unknown";
-            if let Some(session) = self.group_inbound_sessions.get(&peer_id) {
+            if let Some(session) = self.group_share.inbound_sessions.get(&peer_id) {
                 while let Some(event) = session.try_recv() {
                     match event {
                         ScreenShareEvent::Signal { kind, payload } => {
@@ -860,7 +890,7 @@ impl ClientUi {
                         }
                         ScreenShareEvent::State(state) => states.push(state),
                         ScreenShareEvent::AudioState(state) => {
-                            self.group_audio_status.insert(peer_id.clone(), state);
+                            self.group_share.audio_status.insert(peer_id.clone(), state);
                         }
                         ScreenShareEvent::Error(error) => {
                             inbound_failed = true;
@@ -880,7 +910,8 @@ impl ClientUi {
                 }
                 if let Some(frame) = session.latest_remote_frame() {
                     let sequence = self
-                        .group_remote_sequences
+                        .group_share
+                        .remote_sequences
                         .get(&peer_id)
                         .copied()
                         .unwrap_or(0);
@@ -894,10 +925,12 @@ impl ClientUi {
                                 [frame.width as usize, frame.height as usize],
                                 &frame.rgba,
                             );
-                            if let Some(texture) = self.group_remote_textures.get_mut(&peer_id) {
+                            if let Some(texture) =
+                                self.group_share.remote_textures.get_mut(&peer_id)
+                            {
                                 texture.set(image, egui::TextureOptions::LINEAR);
                             } else {
-                                self.group_remote_textures.insert(
+                                self.group_share.remote_textures.insert(
                                     peer_id.clone(),
                                     context.load_texture(
                                         format!("group-screen-{peer_id}"),
@@ -907,20 +940,21 @@ impl ClientUi {
                                 );
                             }
                             session.record_ui_texture_update();
-                            if self.group_auto_focus_pending.remove(&peer_id)
+                            if self.group_share.auto_focus_pending.remove(&peer_id)
                                 && should_auto_focus_group_screen(
-                                    self.focused_group_screen.as_deref(),
+                                    self.group_share.focused_screen.as_deref(),
                                 )
                             {
-                                self.focused_group_screen = Some(peer_id.clone());
+                                self.group_share.focused_screen = Some(peer_id.clone());
                             }
-                            self.group_remote_sequences
+                            self.group_share
+                                .remote_sequences
                                 .insert(peer_id.clone(), frame.sequence);
                         }
                     }
                 }
             }
-            if let Some(session) = self.group_outbound_sessions.get(&peer_id) {
+            if let Some(session) = self.group_share.outbound_sessions.get(&peer_id) {
                 while let Some(event) = session.try_recv() {
                     match event {
                         ScreenShareEvent::Signal { kind, payload } => {
@@ -928,7 +962,7 @@ impl ClientUi {
                         }
                         ScreenShareEvent::State(state) => states.push(state),
                         ScreenShareEvent::AudioState(state) => {
-                            self.group_audio_status.insert(peer_id.clone(), state);
+                            self.group_share.audio_status.insert(peer_id.clone(), state);
                         }
                         ScreenShareEvent::Error(error) => {
                             outbound_failed = true;
@@ -949,9 +983,9 @@ impl ClientUi {
             }
             for (is_inbound, kind, payload) in signal_events {
                 let generation = if is_inbound {
-                    self.group_inbound_generations.get(&peer_id)
+                    self.group_share.inbound_generations.get(&peer_id)
                 } else {
-                    self.group_outbound_generations.get(&peer_id)
+                    self.group_share.outbound_generations.get(&peer_id)
                 };
                 let result = generation
                     .ok_or_else(|| {
@@ -978,31 +1012,33 @@ impl ClientUi {
                 }
             }
             if let Some(state) = states.last() {
-                self.group_peer_status
+                self.group_share
+                    .peer_status
                     .insert(peer_id.clone(), state.clone());
             }
             if let Some(error) = failures.last() {
                 tracing::error!(error = %error, "Falha isolada em sessão de tela de participante");
-                self.group_peer_status
+                self.group_share
+                    .peer_status
                     .insert(peer_id.clone(), error.clone());
             }
             if inbound_failed {
-                if let Some(session) = self.group_inbound_sessions.remove(&peer_id) {
+                if let Some(session) = self.group_share.inbound_sessions.remove(&peer_id) {
                     log_final_group_session_diagnostics(
                         &session,
                         "receiver",
                         inbound_termination_reason,
                     );
                 }
-                if let Some(generation) = self.group_inbound_generations.remove(&peer_id) {
+                if let Some(generation) = self.group_share.inbound_generations.remove(&peer_id) {
                     self.mark_group_generation_closed(&peer_id, generation);
                 }
-                self.group_inbound_ports.remove(&peer_id);
-                self.group_remote_textures.remove(&peer_id);
-                self.group_remote_sequences.remove(&peer_id);
-                self.group_watched_shares.remove(&peer_id);
-                self.group_auto_focus_pending.remove(&peer_id);
-                self.group_audio_status.remove(&peer_id);
+                self.group_share.inbound_ports.remove(&peer_id);
+                self.group_share.remote_textures.remove(&peer_id);
+                self.group_share.remote_sequences.remove(&peer_id);
+                self.group_share.watched_shares.remove(&peer_id);
+                self.group_share.auto_focus_pending.remove(&peer_id);
+                self.group_share.audio_status.remove(&peer_id);
                 let _ = self.send_screen_share_signal_to(
                     &peer_id,
                     SignalKind::ScreenShareUnwatch,
@@ -1010,15 +1046,15 @@ impl ClientUi {
                 );
             }
             if outbound_failed {
-                if let Some(session) = self.group_outbound_sessions.remove(&peer_id) {
+                if let Some(session) = self.group_share.outbound_sessions.remove(&peer_id) {
                     log_final_group_session_diagnostics(
                         &session,
                         "sender",
                         outbound_termination_reason,
                     );
                 }
-                let generation = self.group_outbound_generations.remove(&peer_id);
-                self.group_outbound_ports.remove(&peer_id);
+                let generation = self.group_share.outbound_generations.remove(&peer_id);
+                self.group_share.outbound_ports.remove(&peer_id);
                 if let Some(generation) = generation {
                     let _ = self.send_screen_share_signal_to_stream(
                         &peer_id,
@@ -1028,7 +1064,7 @@ impl ClientUi {
                     );
                     self.mark_group_generation_closed(&peer_id, generation);
                 }
-                self.group_audio_status.remove(&peer_id);
+                self.group_share.audio_status.remove(&peer_id);
                 outbound_membership_changed = true;
             }
         }
@@ -1038,11 +1074,13 @@ impl ClientUi {
 
         if self.log_performance_metrics
             && self
-                .last_group_metrics_log_at
+                .group_share
+                .last_metrics_log_at
                 .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
         {
             let interval_seconds = self
-                .last_group_metrics_log_at
+                .group_share
+                .last_metrics_log_at
                 .map(|last| last.elapsed().as_secs_f64());
             let capture_performance = self
                 .screen_capture
@@ -1051,7 +1089,7 @@ impl ClientUi {
             let capture_fps = capture_performance.map(|snapshot| {
                 snapshot.processed_frames as f64 / interval_seconds.unwrap_or(5.0).max(0.001)
             });
-            for session in self.group_outbound_sessions.values() {
+            for session in self.group_share.outbound_sessions.values() {
                 log_group_session_diagnostics(
                     session,
                     "sender",
@@ -1061,7 +1099,7 @@ impl ClientUi {
                     None,
                 );
             }
-            for session in self.group_inbound_sessions.values() {
+            for session in self.group_share.inbound_sessions.values() {
                 log_group_session_diagnostics(
                     session,
                     "receiver",
@@ -1073,12 +1111,14 @@ impl ClientUi {
             }
 
             let outbound = self
-                .group_outbound_sessions
+                .group_share
+                .outbound_sessions
                 .values()
                 .map(ScreenShareSession::metrics)
                 .collect::<Vec<_>>();
             let inbound = self
-                .group_inbound_sessions
+                .group_share
+                .inbound_sessions
                 .values()
                 .map(ScreenShareSession::metrics)
                 .collect::<Vec<_>>();
@@ -1095,11 +1135,11 @@ impl ClientUi {
                 capture_processed = capture_performance.map(|snapshot| snapshot.processed_frames),
                 capture_unchanged = capture_performance.map(|snapshot| snapshot.unchanged_frames),
                 capture_skipped = capture_performance.map(|snapshot| snapshot.skipped_frames),
-                watching = self.group_watched_shares.len(),
-                sharing = self.group_local_sharing,
+                watching = self.group_share.watched_shares.len(),
+                sharing = self.group_share.local_sharing,
                 "Resumo agregado de compartilhamento em grupo"
             );
-            self.last_group_metrics_log_at = Some(Instant::now());
+            self.group_share.last_metrics_log_at = Some(Instant::now());
         }
     }
 }
@@ -1353,22 +1393,22 @@ mod tests {
         }
         let key = ("peer-a".to_owned(), generation.clone());
         assert_eq!(
-            app.pending_group_ice.get(&key).map(VecDeque::len),
+            app.group_share.pending_ice.get(&key).map(VecDeque::len),
             Some(MAX_PENDING_GROUP_ICE_PER_SESSION)
         );
 
-        if let Some(candidates) = app.pending_group_ice.get_mut(&key) {
+        if let Some(candidates) = app.group_share.pending_ice.get_mut(&key) {
             for candidate in candidates {
                 candidate.queued_at =
                     Instant::now() - PENDING_GROUP_ICE_TTL - Duration::from_millis(1);
             }
         }
         app.prune_group_signal_state();
-        assert!(!app.pending_group_ice.contains_key(&key));
+        assert!(!app.group_share.pending_ice.contains_key(&key));
 
         app.mark_group_generation_closed("peer-a", generation.clone());
         app.queue_early_group_ice("peer-a", &generation, "late-candidate".to_owned());
-        assert!(!app.pending_group_ice.contains_key(&key));
+        assert!(!app.group_share.pending_ice.contains_key(&key));
     }
 
     #[test]
@@ -1435,13 +1475,13 @@ mod tests {
         let key_a = ("peer-a".to_owned(), generation_a.clone());
         let key_b = ("peer-b".to_owned(), generation_b.clone());
         assert_eq!(
-            app.pending_group_ice[&key_a]
+            app.group_share.pending_ice[&key_a]
                 .front()
                 .map(|candidate| candidate.payload.as_str()),
             Some("candidate-a")
         );
         assert_eq!(
-            app.pending_group_ice[&key_b]
+            app.group_share.pending_ice[&key_b]
                 .front()
                 .map(|candidate| candidate.payload.as_str()),
             Some("candidate-b")
@@ -1449,9 +1489,9 @@ mod tests {
 
         app.mark_group_generation_closed("peer-a", generation_a.clone());
         app.queue_early_group_ice("peer-a", &generation_a, "stale-candidate".to_owned());
-        assert!(!app.pending_group_ice.contains_key(&key_a));
+        assert!(!app.group_share.pending_ice.contains_key(&key_a));
         assert_eq!(
-            app.pending_group_ice[&key_b]
+            app.group_share.pending_ice[&key_b]
                 .front()
                 .map(|candidate| candidate.payload.as_str()),
             Some("candidate-b"),
