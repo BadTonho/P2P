@@ -10,12 +10,12 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::{WebSocketStream, connect_async};
 
+use super::websocket::{spawn_admitted_connection, write_outgoing_messages};
 use super::{
     FAILED_JOIN_WINDOW, MAX_CONNECTIONS_PER_IP, MAX_FAILED_JOINS_PER_WINDOW, MAX_MESSAGE_BYTES,
     MAX_TOTAL_CONNECTIONS, OutboundMessage, Outgoing, OutgoingSendError, ROOM_CODE_LENGTH,
     RoomRegistry, TransferReservation, default_participant, is_small_baseline_jpeg,
-    is_valid_room_code, sanitize_avatar, sanitize_display_name, serve, spawn_admitted_connection,
-    write_outgoing_messages,
+    is_valid_room_code, sanitize_avatar, sanitize_display_name, serve,
 };
 use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage, SignalKind};
 use std::net::{IpAddr, Ipv4Addr};
