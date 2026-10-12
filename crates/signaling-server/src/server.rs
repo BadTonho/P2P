@@ -9,7 +9,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -35,8 +35,51 @@ const TOO_MANY_JOIN_ATTEMPTS_MESSAGE: &str =
     "Muitas tentativas de entrada com codigos invalidos. Aguarde um minuto e tente novamente.";
 
 type ConnectionId = u64;
-type Outgoing = mpsc::UnboundedSender<OutboundMessage>;
 type SharedRooms = Arc<Mutex<RoomRegistry>>;
+
+#[derive(Clone)]
+struct Outgoing {
+    messages: mpsc::Sender<OutboundMessage>,
+    overloaded: watch::Sender<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutgoingSendError {
+    Full,
+    Closed,
+}
+
+impl Outgoing {
+    fn channel() -> (Self, mpsc::Receiver<OutboundMessage>, watch::Receiver<bool>) {
+        Self::channel_with_capacity(MAX_QUEUED_OUTBOUND_MESSAGES)
+    }
+
+    fn channel_with_capacity(
+        capacity: usize,
+    ) -> (Self, mpsc::Receiver<OutboundMessage>, watch::Receiver<bool>) {
+        let (messages, receiver) = mpsc::channel(capacity);
+        let (overloaded, overload_events) = watch::channel(false);
+        (
+            Self {
+                messages,
+                overloaded,
+            },
+            receiver,
+            overload_events,
+        )
+    }
+
+    fn send(&self, message: OutboundMessage) -> Result<(), OutgoingSendError> {
+        match self.messages.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.overloaded.send_replace(true);
+                Err(OutgoingSendError::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(OutgoingSendError::Closed),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct TransferReservation {
@@ -965,11 +1008,12 @@ async fn serve_websocket(
     rooms: SharedRooms,
 ) {
     let (websocket_sender, mut websocket_receiver) = websocket.split();
-    let (outgoing, outgoing_messages) = mpsc::unbounded_channel::<OutboundMessage>();
+    let (outgoing, outgoing_messages, overload_events) = Outgoing::channel();
 
     let mut writer = tokio::spawn(write_outgoing_messages(
         websocket_sender,
         outgoing_messages,
+        overload_events,
         connection_id,
     ));
     let mut writer_finished = false;
@@ -1046,13 +1090,40 @@ async fn serve_websocket(
 
 async fn write_outgoing_messages<S>(
     mut websocket_sender: S,
-    mut outgoing_messages: mpsc::UnboundedReceiver<OutboundMessage>,
+    mut outgoing_messages: mpsc::Receiver<OutboundMessage>,
+    mut overload_events: watch::Receiver<bool>,
     connection_id: ConnectionId,
 ) where
     S: futures_util::Sink<WebSocketMessage> + Unpin,
     S::Error: std::fmt::Display,
 {
-    while let Some(outgoing) = outgoing_messages.recv().await {
+    let mut overload_watch_open = true;
+    loop {
+        let outgoing = tokio::select! {
+            biased;
+            changed = overload_events.changed(), if overload_watch_open => {
+                match changed {
+                    Ok(()) if *overload_events.borrow_and_update() => {
+                        tracing::warn!(
+                            connection_id,
+                            queued = outgoing_messages.len(),
+                            capacity = MAX_QUEUED_OUTBOUND_MESSAGES,
+                            "Cliente lento removido: fila de saída atingiu o limite"
+                        );
+                        break;
+                    }
+                    Ok(()) => continue,
+                    Err(_) => {
+                        overload_watch_open = false;
+                        continue;
+                    }
+                }
+            }
+            message = outgoing_messages.recv() => match message {
+                Some(message) => message,
+                None => break,
+            }
+        };
         let is_close = matches!(
             &outgoing,
             OutboundMessage::Control(WebSocketMessage::Close(_))
@@ -1070,14 +1141,6 @@ async fn write_outgoing_messages<S>(
             OutboundMessage::Control(message) => message,
             OutboundMessage::CloseAcknowledgement(message) => message,
         };
-        if outgoing_messages.len() > MAX_QUEUED_OUTBOUND_MESSAGES {
-            tracing::warn!(
-                connection_id,
-                queued = outgoing_messages.len(),
-                "Cliente lento removido: fila de saída excedeu o limite"
-            );
-            break;
-        }
         match timeout(WRITE_TIMEOUT, websocket_sender.send(message)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -1289,10 +1352,10 @@ mod tests {
 
     use super::{
         FAILED_JOIN_WINDOW, MAX_CONNECTIONS_PER_IP, MAX_FAILED_JOINS_PER_WINDOW, MAX_MESSAGE_BYTES,
-        MAX_TOTAL_CONNECTIONS, OutboundMessage, ROOM_CODE_LENGTH, RoomRegistry,
-        TransferReservation, default_participant, is_small_baseline_jpeg, is_valid_room_code,
-        sanitize_avatar, sanitize_display_name, serve, spawn_admitted_connection,
-        write_outgoing_messages,
+        MAX_TOTAL_CONNECTIONS, OutboundMessage, Outgoing, OutgoingSendError, ROOM_CODE_LENGTH,
+        RoomRegistry, TransferReservation, default_participant, is_small_baseline_jpeg,
+        is_valid_room_code, sanitize_avatar, sanitize_display_name, serve,
+        spawn_admitted_connection, write_outgoing_messages,
     };
     use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage, SignalKind};
     use std::net::{IpAddr, Ipv4Addr};
@@ -1305,6 +1368,12 @@ mod tests {
             0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00, 0xff, 0xd9,
         ];
         base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn test_outgoing_channel() -> (Outgoing, mpsc::Receiver<OutboundMessage>) {
+        let (outgoing, receiver, overload_events) = Outgoing::channel();
+        drop(overload_events);
+        (outgoing, receiver)
     }
 
     struct RecordingSink(Arc<std::sync::Mutex<Vec<WebSocketMessage>>>);
@@ -1348,7 +1417,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_writer_sends_room_left_before_close_and_drops_later_messages() {
-        let (outgoing, receiver) = mpsc::unbounded_channel();
+        let (outgoing, receiver, overload_events) = Outgoing::channel_with_capacity(3);
         outgoing
             .send(OutboundMessage::Protocol(ServerMessage::RoomLeft))
             .unwrap();
@@ -1361,7 +1430,13 @@ mod tests {
         drop(outgoing);
 
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
-        write_outgoing_messages(RecordingSink(Arc::clone(&sent)), receiver, 22).await;
+        write_outgoing_messages(
+            RecordingSink(Arc::clone(&sent)),
+            receiver,
+            overload_events,
+            22,
+        )
+        .await;
 
         let sent = sent
             .lock()
@@ -1380,7 +1455,40 @@ mod tests {
         assert!(matches!(sent.get(1), Some(WebSocketMessage::Close(_))));
     }
 
-    fn server_message(receiver: &mut mpsc::UnboundedReceiver<OutboundMessage>) -> ServerMessage {
+    #[tokio::test]
+    async fn websocket_writer_disconnects_when_bounded_outgoing_queue_overflows() {
+        let (outgoing, receiver, overload_events) = Outgoing::channel_with_capacity(1);
+        outgoing
+            .send(OutboundMessage::Protocol(ServerMessage::PeerLeft))
+            .unwrap();
+        assert_eq!(
+            outgoing.send(OutboundMessage::Protocol(ServerMessage::PeerJoined)),
+            Err(OutgoingSendError::Full)
+        );
+        assert_eq!(
+            receiver.len(),
+            1,
+            "fila não pode ultrapassar sua capacidade"
+        );
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        write_outgoing_messages(
+            RecordingSink(Arc::clone(&sent)),
+            receiver,
+            overload_events,
+            23,
+        )
+        .await;
+
+        assert!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "o escritor deve encerrar o cliente lento ao receber o sinal de sobrecarga"
+        );
+    }
+
+    fn server_message(receiver: &mut mpsc::Receiver<OutboundMessage>) -> ServerMessage {
         match receiver.try_recv().expect("expected a server message") {
             OutboundMessage::Protocol(message) => message,
             OutboundMessage::Control(_) | OutboundMessage::CloseAcknowledgement(_) => {
@@ -1392,7 +1500,7 @@ mod tests {
     #[test]
     fn rooms_have_eight_slots_and_reject_the_ninth_participant() {
         let mut registry = RoomRegistry::default();
-        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let (first_tx, mut first_rx) = test_outgoing_channel();
 
         let code = registry.create_room(1, first_tx).unwrap();
         assert_eq!(code.len(), ROOM_CODE_LENGTH);
@@ -1406,14 +1514,14 @@ mod tests {
         );
 
         for id in 2..=8 {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = test_outgoing_channel();
             registry.join_room(id, &code, sender).unwrap();
             assert_eq!(
                 server_message(&mut receiver),
                 ServerMessage::RoomJoined { code: code.clone() }
             );
         }
-        let (ninth_tx, _ninth_rx) = mpsc::unbounded_channel();
+        let (ninth_tx, _ninth_rx) = test_outgoing_channel();
         assert!(
             registry
                 .join_room(9, &code, ninth_tx)
@@ -1426,8 +1534,8 @@ mod tests {
     #[test]
     fn internet_test_rooms_limit_to_two_disable_handoff_and_hide_control_addresses() {
         let mut registry = RoomRegistry::default();
-        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
-        let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
+        let (host_tx, mut host_rx) = test_outgoing_channel();
+        let (guest_tx, mut guest_rx) = test_outgoing_channel();
         let code = registry
             .create_room_with_mode(1, host_tx, RoomMode::InternetTest, None)
             .unwrap();
@@ -1505,7 +1613,7 @@ mod tests {
             assert_eq!(participants[1].display_name, "Convidado");
         }
 
-        let (third_tx, _third_rx) = mpsc::unbounded_channel();
+        let (third_tx, _third_rx) = test_outgoing_channel();
         let error = registry.join_room(3, &code, third_tx).unwrap_err();
         assert!(error.contains("duas pessoas"));
         assert!(
@@ -1519,8 +1627,8 @@ mod tests {
     #[test]
     fn roster_keeps_join_order_and_host_permission() {
         let mut registry = RoomRegistry::default();
-        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
-        let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
+        let (host_tx, mut host_rx) = test_outgoing_channel();
+        let (guest_tx, mut guest_rx) = test_outgoing_channel();
         let code = registry.create_room(1, host_tx).unwrap();
         let _ = server_message(&mut host_rx);
         registry
@@ -1610,8 +1718,8 @@ mod tests {
     #[test]
     fn leader_departure_promotes_next_participant_as_leader() {
         let mut registry = RoomRegistry::default();
-        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
-        let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
+        let (host_tx, mut host_rx) = test_outgoing_channel();
+        let (guest_tx, mut guest_rx) = test_outgoing_channel();
         let code = registry.create_room(1, host_tx).unwrap();
         let _ = server_message(&mut host_rx);
         registry
@@ -1709,8 +1817,8 @@ mod tests {
             public_key: key,
         };
         let mut registry = RoomRegistry::default();
-        let (host_tx, _host_rx) = mpsc::unbounded_channel();
-        let (guest_tx, _guest_rx) = mpsc::unbounded_channel();
+        let (host_tx, _host_rx) = test_outgoing_channel();
+        let (guest_tx, _guest_rx) = test_outgoing_channel();
         let code = registry.create_room(1, host_tx).unwrap();
         registry
             .rooms
@@ -1778,7 +1886,7 @@ mod tests {
             }),
             ..RoomRegistry::default()
         };
-        let (candidate_tx, mut candidate_rx) = mpsc::unbounded_channel();
+        let (candidate_tx, mut candidate_rx) = test_outgoing_channel();
         registry
             .adopt_transferred_room(10, "SAMECODE", "election-token", candidate_tx)
             .unwrap();
@@ -1821,7 +1929,7 @@ mod tests {
             ["host-id", "candidate-id", "guest-id"]
         );
 
-        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+        let (host_tx, mut host_rx) = test_outgoing_channel();
         registry
             .join_room_identified(
                 11,
@@ -1875,8 +1983,8 @@ mod tests {
     #[test]
     fn signaling_goes_only_to_the_other_participant_and_leave_frees_room() {
         let mut registry = RoomRegistry::default();
-        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
-        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let (first_tx, mut first_rx) = test_outgoing_channel();
+        let (second_tx, mut second_rx) = test_outgoing_channel();
         let code = registry.create_room(1, first_tx).unwrap();
         let _ = server_message(&mut first_rx);
         registry.join_room(2, &code, second_tx).unwrap();
@@ -1907,9 +2015,9 @@ mod tests {
     #[test]
     fn targeted_media_signaling_reaches_only_the_named_room_member() {
         let mut registry = RoomRegistry::default();
-        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
-        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
-        let (third_tx, mut third_rx) = mpsc::unbounded_channel();
+        let (first_tx, mut first_rx) = test_outgoing_channel();
+        let (second_tx, mut second_rx) = test_outgoing_channel();
+        let (third_tx, mut third_rx) = test_outgoing_channel();
         let code = registry.create_room(1, first_tx).unwrap();
         registry.join_room(2, &code, second_tx).unwrap();
         registry.join_room(3, &code, third_tx).unwrap();
@@ -1958,8 +2066,8 @@ mod tests {
     #[test]
     fn canceled_or_expired_transfer_keeps_room_available_on_original_server() {
         let mut registry = RoomRegistry::default();
-        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
-        let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
+        let (host_tx, mut host_rx) = test_outgoing_channel();
+        let (peer_tx, mut peer_rx) = test_outgoing_channel();
         let code = registry.create_room(1, host_tx).unwrap();
         let _ = server_message(&mut host_rx);
         registry.join_room(2, &code, peer_tx).unwrap();
