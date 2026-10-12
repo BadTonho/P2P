@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -897,14 +897,34 @@ pub async fn serve(
             }
         };
         let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(connection_id, peer_address = %address, "Cliente conectado ao servidor de sinalização");
         let rooms = Arc::clone(&rooms);
-        tokio::spawn(async move {
-            handle_connection(stream, connection_id, rooms).await;
-            tracing::info!(connection_id, peer_address = %address, "Cliente desconectado do servidor de sinalização");
-        });
+        let _ = spawn_admitted_connection(stream, connection_id, address, rooms).await;
     }
     Ok(())
+}
+
+async fn spawn_admitted_connection(
+    stream: TcpStream,
+    connection_id: ConnectionId,
+    peer_address: SocketAddr,
+    rooms: SharedRooms,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let peer_ip = Some(peer_address.ip());
+    if let Err(reason) = rooms.lock().await.admit_connection(peer_ip) {
+        tracing::warn!(
+            connection_id,
+            peer_address = %peer_address,
+            reason,
+            "Conexão recusada pelo limite do servidor"
+        );
+        return None;
+    }
+
+    tracing::info!(connection_id, peer_address = %peer_address, "Cliente conectado ao servidor de sinalização");
+    Some(tokio::spawn(async move {
+        handle_connection(stream, connection_id, peer_ip, Arc::clone(&rooms)).await;
+        tracing::info!(connection_id, peer_address = %peer_address, "Cliente desconectado do servidor de sinalização");
+    }))
 }
 
 fn websocket_config() -> WebSocketConfig {
@@ -913,16 +933,12 @@ fn websocket_config() -> WebSocketConfig {
         .max_frame_size(Some(MAX_MESSAGE_BYTES))
 }
 
-async fn handle_connection(stream: TcpStream, connection_id: ConnectionId, rooms: SharedRooms) {
-    let peer_ip = stream.peer_addr().ok().map(|address| address.ip());
-    if let Err(reason) = rooms.lock().await.admit_connection(peer_ip) {
-        tracing::warn!(
-            connection_id,
-            reason,
-            "Conexão recusada pelo limite do servidor"
-        );
-        return;
-    }
+async fn handle_connection(
+    stream: TcpStream,
+    connection_id: ConnectionId,
+    peer_ip: Option<IpAddr>,
+    rooms: SharedRooms,
+) {
     let handshake = timeout(
         HANDSHAKE_TIMEOUT,
         accept_async_with_config(stream, Some(websocket_config())),
@@ -1265,7 +1281,7 @@ mod tests {
 
     use base64::Engine as _;
     use futures_util::{SinkExt, StreamExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{Mutex, mpsc, oneshot};
     use tokio::time::timeout;
     use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
@@ -1274,8 +1290,9 @@ mod tests {
     use super::{
         FAILED_JOIN_WINDOW, MAX_CONNECTIONS_PER_IP, MAX_FAILED_JOINS_PER_WINDOW, MAX_MESSAGE_BYTES,
         MAX_TOTAL_CONNECTIONS, OutboundMessage, ROOM_CODE_LENGTH, RoomRegistry,
-        TransferReservation, default_participant, handle_connection, is_small_baseline_jpeg,
-        is_valid_room_code, sanitize_avatar, sanitize_display_name, serve, write_outgoing_messages,
+        TransferReservation, default_participant, is_small_baseline_jpeg, is_valid_room_code,
+        sanitize_avatar, sanitize_display_name, serve, spawn_admitted_connection,
+        write_outgoing_messages,
     };
     use signaling_protocol::{ClientMessage, ParticipantInfo, RoomMode, ServerMessage, SignalKind};
     use std::net::{IpAddr, Ipv4Addr};
@@ -2159,14 +2176,12 @@ mod tests {
         let next_id = Arc::new(AtomicU64::new(1));
         let accept_task = tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let Ok((stream, peer_address)) = listener.accept().await else {
                     break;
                 };
                 let connection_id = next_id.fetch_add(1, Ordering::Relaxed);
                 let rooms = Arc::clone(&rooms);
-                tokio::spawn(async move {
-                    handle_connection(stream, connection_id, rooms).await;
-                });
+                let _ = spawn_admitted_connection(stream, connection_id, peer_address, rooms).await;
             }
         });
 
@@ -2312,6 +2327,39 @@ mod tests {
         assert_eq!(registry.total_connections, MAX_TOTAL_CONNECTIONS - 1);
     }
 
+    #[tokio::test]
+    async fn accepted_connections_are_admitted_before_handler_is_spawned() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let rooms = Arc::new(Mutex::new(RoomRegistry::default()));
+        let mut clients = Vec::new();
+        let mut handlers = Vec::new();
+
+        for connection_id in 1..=MAX_CONNECTIONS_PER_IP as u64 + 1 {
+            clients.push(TcpStream::connect(address).await.unwrap());
+            let (stream, peer_address) = listener.accept().await.unwrap();
+            let handler =
+                spawn_admitted_connection(stream, connection_id, peer_address, Arc::clone(&rooms))
+                    .await;
+
+            if connection_id <= MAX_CONNECTIONS_PER_IP as u64 {
+                handlers.push(handler.expect("connection under the per-IP limit is admitted"));
+            } else {
+                assert!(
+                    handler.is_none(),
+                    "excess connection must be rejected before spawn"
+                );
+            }
+        }
+
+        assert_eq!(rooms.lock().await.total_connections, MAX_CONNECTIONS_PER_IP);
+        drop(clients);
+        for handler in handlers {
+            handler.await.unwrap();
+        }
+        assert_eq!(rooms.lock().await.total_connections, 0);
+    }
+
     #[test]
     fn repeated_invalid_join_attempts_are_blocked_until_the_window_expires() {
         let mut registry = RoomRegistry::default();
@@ -2339,9 +2387,11 @@ mod tests {
                 };
                 let connection_id = next_id.fetch_add(1, Ordering::Relaxed);
                 let rooms = Arc::clone(&rooms);
-                tokio::spawn(async move {
-                    handle_connection(stream, connection_id, rooms).await;
-                });
+                let peer_address = match stream.peer_addr() {
+                    Ok(address) => address,
+                    Err(_) => continue,
+                };
+                let _ = spawn_admitted_connection(stream, connection_id, peer_address, rooms).await;
             }
         });
         let url = format!("ws://{address}");

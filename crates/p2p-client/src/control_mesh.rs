@@ -1232,12 +1232,10 @@ async fn tick_mesh(state: &SharedState, events: &std_mpsc::Sender<ControlEvent>)
         } else if remote_host_unstable || local_host_unstable {
             let can_retry_election = {
                 let state_guard = state.lock().await;
-                state_guard
-                    .empty_election_retry
-                    .map_or(true, |(last, rev)| {
-                        rev != state_guard.eligibility_revision
-                            || now.duration_since(last) >= EMPTY_ELECTION_RETRY_INTERVAL
-                    })
+                state_guard.empty_election_retry.is_none_or(|(last, rev)| {
+                    rev != state_guard.eligibility_revision
+                        || now.duration_since(last) >= EMPTY_ELECTION_RETRY_INTERVAL
+                })
             };
             if can_retry_election {
                 tracing::warn!(
