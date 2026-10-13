@@ -10,6 +10,8 @@ O app consulta o último [GitHub Release público](https://github.com/BadTonho/P
 4. Crie e publique no GitHub um release estável com uma tag correspondente, como `v1.0.1`.
 5. Anexe ao release `target\release\p2p-client.exe` com o nome exato `p2p-client.exe` e `target\installer\P2P-Voz-e-tela-Setup.exe` com o nome exato `P2P-Voz-e-tela-Setup.exe`.
 
+No PowerShell 7, antes de executar o script, use `$PSNativeCommandArgumentPassing = "Legacy"` nesta sessão. O script fornece definições ao Inno Setup com aspas embutidas; o modo Legacy preserva os caminhos com espaços. A preparação 1.2.7 foi validada com esse ajuste e Inno Setup 6.7.3.
+
 O app encontra atualizações prioritariamente pelo instalador `P2P-Voz-e-tela-Setup.exe` (executando a instalação silenciosa para atualizar arquivos, registro e atalhos), com fallback automático para `p2p-client.exe` caso o release contenha apenas o executável. Repita o processo para cada versão: mude a versão, compile os dois arquivos e publique um novo release. A API do GitHub fornece a tag, o tamanho, o SHA-256 e o link do asset. O atualizador considera releases estáveis publicados, não rascunhos ou pré-lançamentos.
 
 ## Instalação, preferências e remoção
