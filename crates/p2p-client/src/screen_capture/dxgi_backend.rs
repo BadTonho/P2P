@@ -1,4 +1,193 @@
 use super::*;
+use windows::Win32::Graphics::Dxgi::{
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
+};
+
+#[derive(Clone, Debug)]
+struct DxgiCursorShape {
+    width: u32,
+    height: u32,
+    pitch: u32,
+    kind: i32,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct DxgiCursorState {
+    position: Option<(i32, i32)>,
+    visible: bool,
+    shape: Option<DxgiCursorShape>,
+    shape_error_logged: bool,
+    cpu_fallback_logged: bool,
+}
+
+impl DxgiCursorState {
+    fn update(&mut self, frame: &windows_capture::dxgi_duplication_api::DxgiDuplicationFrame<'_>) {
+        let frame_info = *frame.frame_info();
+        if frame_info.PointerShapeBufferSize > 0 {
+            let mut bytes = vec![0; frame_info.PointerShapeBufferSize as usize];
+            let mut required = 0;
+            let mut shape_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+            let result = unsafe {
+                frame.duplication().GetFramePointerShape(
+                    bytes.len() as u32,
+                    bytes.as_mut_ptr().cast(),
+                    &mut required,
+                    &mut shape_info,
+                )
+            };
+            match result {
+                Ok(()) if required as usize <= bytes.len() => {
+                    bytes.truncate(required as usize);
+                    self.shape = Some(DxgiCursorShape {
+                        width: shape_info.Width,
+                        height: shape_info.Height,
+                        pitch: shape_info.Pitch,
+                        kind: shape_info.Type as i32,
+                        bytes,
+                    });
+                    self.shape_error_logged = false;
+                }
+                Ok(()) => {
+                    self.log_shape_error(
+                        "O Windows retornou uma forma de cursor maior que o buffer informado",
+                    );
+                }
+                Err(error) => self.log_shape_error(&format!(
+                    "Não foi possível obter a forma do cursor DXGI: {error}"
+                )),
+            }
+        }
+        let initial_position = self.position.is_none();
+        self.update_position(
+            frame_info.LastMouseUpdateTime != 0 || initial_position,
+            (
+                frame_info.PointerPosition.Position.x,
+                frame_info.PointerPosition.Position.y,
+            ),
+            frame_info.PointerPosition.Visible.as_bool(),
+        );
+    }
+
+    fn update_position(&mut self, changed: bool, position: (i32, i32), visible: bool) {
+        if changed {
+            self.position = Some(position);
+            self.visible = visible;
+        }
+    }
+
+    fn log_shape_error(&mut self, message: &str) {
+        if !self.shape_error_logged {
+            tracing::warn!(
+                error = message,
+                "A composição do cursor DXGI está indisponível neste quadro"
+            );
+            self.shape_error_logged = true;
+        }
+    }
+
+    fn needs_cpu_composition(&self) -> bool {
+        self.visible && self.position.is_some() && self.shape.is_some()
+    }
+
+    fn composite(&self, bgra: &mut [u8], width: u32, height: u32) -> bool {
+        let (Some((x, y)), Some(shape)) = (self.position, self.shape.as_ref()) else {
+            return false;
+        };
+        if !self.visible {
+            return false;
+        }
+        composite_cursor_bgra(bgra, width, height, x, y, shape)
+    }
+}
+
+fn composite_cursor_bgra(
+    bgra: &mut [u8],
+    width: u32,
+    height: u32,
+    cursor_x: i32,
+    cursor_y: i32,
+    shape: &DxgiCursorShape,
+) -> bool {
+    if width == 0 || height == 0 || bgra.len() < width as usize * height as usize * 4 {
+        return false;
+    }
+    let kind = shape.kind;
+    let monochrome = kind == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0;
+    let visual_height = if monochrome {
+        shape.height / 2
+    } else {
+        shape.height
+    };
+    let min_pitch = if monochrome {
+        (shape.width as usize).div_ceil(8)
+    } else {
+        shape.width as usize * 4
+    };
+    if shape.width == 0
+        || visual_height == 0
+        || (shape.pitch as usize) < min_pitch
+        || shape.bytes.len() < shape.pitch as usize * shape.height as usize
+    {
+        return false;
+    }
+    if !monochrome
+        && kind != DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0
+        && kind != DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0
+    {
+        return false;
+    }
+
+    for source_y in 0..visual_height {
+        let target_y = cursor_y + source_y as i32;
+        if !(0..height as i32).contains(&target_y) {
+            continue;
+        }
+        for source_x in 0..shape.width {
+            let target_x = cursor_x + source_x as i32;
+            if !(0..width as i32).contains(&target_x) {
+                continue;
+            }
+            let target_offset = (target_y as usize * width as usize + target_x as usize) * 4;
+            if monochrome {
+                let byte_index = source_y as usize * shape.pitch as usize + source_x as usize / 8;
+                let bit = 0x80 >> (source_x % 8);
+                let and_mask = shape.bytes[byte_index] & bit != 0;
+                let xor_offset = (source_y as usize + visual_height as usize)
+                    * shape.pitch as usize
+                    + source_x as usize / 8;
+                let xor_mask = shape.bytes[xor_offset] & bit != 0;
+                for channel in 0..3 {
+                    bgra[target_offset + channel] = (bgra[target_offset + channel]
+                        & if and_mask { 0xff } else { 0 })
+                        ^ if xor_mask { 0xff } else { 0 };
+                }
+                bgra[target_offset + 3] = 0xff;
+                continue;
+            }
+
+            let source_offset = source_y as usize * shape.pitch as usize + source_x as usize * 4;
+            let source = &shape.bytes[source_offset..source_offset + 4];
+            if kind == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 && source[3] == 0 {
+                for channel in 0..3 {
+                    bgra[target_offset + channel] ^= source[channel];
+                }
+                bgra[target_offset + 3] = 0xff;
+                continue;
+            }
+            let alpha = source[3] as u16;
+            for channel in 0..3 {
+                let destination = bgra[target_offset + channel] as u16;
+                bgra[target_offset + channel] = (source[channel] as u16
+                    + (destination * (255 - alpha) + 127) / 255)
+                    .min(255) as u8;
+            }
+            bgra[target_offset + 3] = 0xff;
+        }
+    }
+    true
+}
 
 #[allow(clippy::too_many_arguments)] // Capture owns the independent preview, shutdown and quality controls.
 pub(super) fn capture_dxgi_monitor(
@@ -21,6 +210,7 @@ pub(super) fn capture_dxgi_monitor(
     let mut gpu_fallback_logged = false;
     let mut gpu_preview_fallback_logged = false;
     let mut staging_texture = None;
+    let mut cursor = DxgiCursorState::default();
 
     while !stop.load(Ordering::Relaxed) {
         let mut frame = match duplication.acquire_next_frame(100) {
@@ -31,6 +221,7 @@ pub(super) fn capture_dxgi_monitor(
                 gpu_processor = None;
                 gpu_processor_attempted = None;
                 staging_texture = None;
+                cursor = DxgiCursorState::default();
                 *fallback_reason
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -44,6 +235,8 @@ pub(super) fn capture_dxgi_monitor(
             }
             Err(error) => return Err(format!("Falha ao capturar monitor via DXGI: {error}")),
         };
+        cursor.update(&frame);
+        let compose_cursor = cursor.needs_cpu_composition();
         performance.received_frames.fetch_add(1, Ordering::Relaxed);
         if !limiter.should_process(Instant::now()) {
             performance.skipped_frames.fetch_add(1, Ordering::Relaxed);
@@ -56,7 +249,16 @@ pub(super) fn capture_dxgi_monitor(
         }
         let (out_width, out_height) = scaled_dimensions(width, height, quality);
         let dimensions = (width, height, out_width, out_height);
-        if gpu_processor_attempted != Some(dimensions) {
+        if compose_cursor {
+            gpu_processor = None;
+            gpu_processor_attempted = None;
+            if !cursor.cpu_fallback_logged {
+                tracing::warn!(
+                    "O DXGI informou um cursor separado; usando composição de cursor no caminho de captura CPU"
+                );
+                cursor.cpu_fallback_logged = true;
+            }
+        } else if gpu_processor_attempted != Some(dimensions) {
             gpu_processor_attempted = Some(dimensions);
             match crate::mf_video::GpuNv12Processor::new(
                 frame.device(),
@@ -92,15 +294,18 @@ pub(super) fn capture_dxgi_monitor(
             }
         }
         let gpu_convert_started_at = Instant::now();
-        let gpu_result = gpu_processor.as_mut().map(|(processor, _)| {
-            performance
-                .pipeline
-                .record_path(crate::video_performance::FramePath::CaptureGpuNv12);
-            let _timer = performance
-                .pipeline
-                .timer(crate::video_performance::Stage::CaptureGpuConvert);
-            processor.process(frame.texture())
-        });
+        let gpu_result = (!compose_cursor)
+            .then(|| gpu_processor.as_mut())
+            .flatten()
+            .map(|(processor, _)| {
+                performance
+                    .pipeline
+                    .record_path(crate::video_performance::FramePath::CaptureGpuNv12);
+                let _timer = performance
+                    .pipeline
+                    .timer(crate::video_performance::Stage::CaptureGpuConvert);
+                processor.process(frame.texture())
+            });
         performance.gpu_convert_nanos.fetch_add(
             gpu_convert_started_at.elapsed().as_nanos() as u64,
             Ordering::Relaxed,
@@ -240,7 +445,15 @@ pub(super) fn capture_dxgi_monitor(
                 let conversion = performance
                     .pipeline
                     .timer(crate::video_performance::Stage::CaptureCpuConvert);
-                let preview = downsample_bgra(bytes, width, height, next_sequence, quality);
+                let mut composited = None;
+                if compose_cursor {
+                    let mut owned = bytes.to_vec();
+                    if cursor.composite(&mut owned, width, height) {
+                        composited = Some(owned);
+                    }
+                }
+                let pixels = composited.as_deref().unwrap_or(bytes);
+                let preview = downsample_bgra(pixels, width, height, next_sequence, quality);
                 drop(conversion);
                 resize_nanos += started_at.elapsed().as_nanos() as u64;
                 preview.rgba
@@ -308,5 +521,152 @@ fn downsample_bgra(
         gpu_nv12: None,
         #[cfg(windows)]
         cpu_nv12: None,
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::{DxgiCursorShape, DxgiCursorState, composite_cursor_bgra};
+    use windows::Win32::Graphics::Dxgi::DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR;
+
+    fn color_shape(color: [u8; 4]) -> DxgiCursorShape {
+        DxgiCursorShape {
+            width: 1,
+            height: 1,
+            pitch: 4,
+            kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0,
+            bytes: color.to_vec(),
+        }
+    }
+
+    #[test]
+    fn cursor_is_composited_at_the_current_position_and_can_remain_stationary() {
+        let shape = color_shape([0, 0, 255, 255]);
+        let mut frame = [0, 0, 0, 255].repeat(4);
+        assert!(composite_cursor_bgra(&mut frame, 2, 2, 1, 0, &shape));
+        assert_eq!(&frame[4..8], &[0, 0, 255, 255]);
+
+        let mut next_frame = [0, 0, 0, 255].repeat(4);
+        assert!(composite_cursor_bgra(&mut next_frame, 2, 2, 1, 0, &shape));
+        assert_eq!(&next_frame[4..8], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn cursor_movement_updates_its_location_without_leaving_the_previous_image() {
+        let shape = color_shape([0, 0, 255, 255]);
+        let mut first_frame = [0, 0, 0, 255].repeat(2);
+        assert!(composite_cursor_bgra(&mut first_frame, 2, 1, 0, 0, &shape));
+        assert_eq!(&first_frame[..4], &[0, 0, 255, 255]);
+
+        let mut moved_frame = [0, 0, 0, 255].repeat(2);
+        assert!(composite_cursor_bgra(&mut moved_frame, 2, 1, 1, 0, &shape));
+        assert_eq!(&moved_frame[..4], &[0, 0, 0, 255]);
+        assert_eq!(&moved_frame[4..8], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn cursor_shape_change_and_negative_position_are_supported() {
+        let mut frame = [0, 0, 0, 255].repeat(4);
+        let changed_shape = DxgiCursorShape {
+            width: 2,
+            height: 1,
+            pitch: 8,
+            kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0,
+            bytes: vec![255, 0, 0, 255, 255, 0, 0, 255],
+        };
+        assert!(composite_cursor_bgra(
+            &mut frame,
+            2,
+            2,
+            -1,
+            1,
+            &changed_shape
+        ));
+        assert_eq!(&frame[8..12], &[255, 0, 0, 255]);
+        assert_eq!(&frame[12..16], &[0, 0, 0, 255]);
+
+        let mut changed = [0, 0, 0, 255].repeat(4);
+        let changed_shape = color_shape([0, 255, 0, 255]);
+        assert!(composite_cursor_bgra(
+            &mut changed,
+            2,
+            2,
+            0,
+            0,
+            &changed_shape
+        ));
+        assert_eq!(&changed[..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn hidden_or_out_of_bounds_cursor_does_not_modify_the_frame() {
+        let shape = color_shape([0, 0, 255, 255]);
+        let mut frame = vec![0, 0, 0, 255];
+        assert!(composite_cursor_bgra(&mut frame, 1, 1, 1, 1, &shape));
+        assert_eq!(frame, vec![0, 0, 0, 255]);
+
+        let mut malformed = shape.clone();
+        malformed.pitch = 3;
+        assert!(!composite_cursor_bgra(&mut frame, 1, 1, 0, 0, &malformed));
+        assert_eq!(frame, vec![0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn monochrome_cursor_applies_and_then_xor_masks() {
+        use windows::Win32::Graphics::Dxgi::DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME;
+        let shape = DxgiCursorShape {
+            width: 2,
+            height: 2,
+            pitch: 1,
+            kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0,
+            bytes: vec![0b1100_0000, 0b0100_0000],
+        };
+        let mut frame = vec![20, 40, 60, 255, 20, 40, 60, 255];
+        assert!(composite_cursor_bgra(&mut frame, 2, 1, 0, 0, &shape));
+        assert_eq!(&frame[..4], &[20, 40, 60, 255]);
+        assert_eq!(&frame[4..8], &[!20, !40, !60, 255]);
+    }
+
+    #[test]
+    fn masked_color_cursor_xors_destination_when_alpha_is_zero() {
+        use windows::Win32::Graphics::Dxgi::DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR;
+        let shape = DxgiCursorShape {
+            width: 1,
+            height: 1,
+            pitch: 4,
+            kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0,
+            bytes: vec![0x0f, 0x33, 0x55, 0],
+        };
+        let mut frame = vec![0xf0, 0x0f, 0xaa, 255];
+        assert!(composite_cursor_bgra(&mut frame, 1, 1, 0, 0, &shape));
+        assert_eq!(frame, vec![0xff, 0x3c, 0xff, 255]);
+    }
+
+    #[test]
+    fn stationary_cursor_keeps_its_last_position_when_frame_has_no_mouse_update() {
+        let mut cursor = DxgiCursorState::default();
+        cursor.update_position(true, (12, 34), true);
+        cursor.update_position(false, (90, 80), false);
+
+        assert_eq!(cursor.position, Some((12, 34)));
+        assert!(cursor.visible);
+    }
+
+    #[test]
+    fn hidden_cursor_is_not_composited() {
+        let mut cursor = DxgiCursorState {
+            position: Some((0, 0)),
+            visible: true,
+            shape: Some(color_shape([0, 0, 255, 255])),
+            ..Default::default()
+        };
+        let mut visible_frame = vec![0, 0, 0, 255];
+        assert!(cursor.composite(&mut visible_frame, 1, 1));
+        assert_eq!(visible_frame, vec![0, 0, 255, 255]);
+
+        cursor.update_position(true, (0, 0), false);
+        let mut hidden_frame = vec![0, 0, 0, 255];
+        assert!(!cursor.composite(&mut hidden_frame, 1, 1));
+        assert_eq!(hidden_frame, vec![0, 0, 0, 255]);
     }
 }

@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::sync::{
-    Arc, Condvar, Mutex,
+    Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, Receiver, SyncSender, TryRecvError},
 };
@@ -9,10 +9,12 @@ use std::time::{Duration, Instant};
 
 use crate::screen_quality::ScreenShareQuality;
 use eframe::egui;
+use windows::Graphics::Capture::{GraphicsCaptureAccess, GraphicsCaptureAccessKind};
+use windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus;
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
 use windows_capture::frame::Frame;
-use windows_capture::graphics_capture_api::InternalCaptureControl;
+use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
 use windows_capture::graphics_capture_picker::{Error as PickerError, GraphicsCapturePicker};
 use windows_capture::monitor::Monitor;
 use windows_capture::settings::{
@@ -25,6 +27,72 @@ mod dxgi_backend;
 mod wgc_backend;
 
 const CAPTURE_PACING_JITTER_TOLERANCE: Duration = Duration::from_micros(250);
+
+fn border_setting_for_access(allowed: bool, supported: bool) -> DrawBorderSettings {
+    if allowed && supported {
+        DrawBorderSettings::WithoutBorder
+    } else {
+        DrawBorderSettings::Default
+    }
+}
+
+fn cursor_setting_for_support(supported: bool) -> CursorCaptureSettings {
+    if supported {
+        CursorCaptureSettings::WithCursor
+    } else {
+        CursorCaptureSettings::Default
+    }
+}
+
+fn windows_graphics_capture_settings() -> (CursorCaptureSettings, DrawBorderSettings) {
+    let cursor_supported = GraphicsCaptureApi::is_cursor_settings_supported()
+        .unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "Não foi possível verificar o suporte à captura explícita do cursor");
+            false
+        });
+    if !cursor_supported {
+        tracing::warn!(
+            "Windows Graphics Capture não permite configurar explicitamente o cursor; usando o padrão do sistema"
+        );
+    }
+
+    let border_supported = GraphicsCaptureApi::is_border_settings_supported()
+        .unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "Não foi possível verificar o suporte à borda da captura");
+            false
+        });
+    let borderless_allowed = border_supported && request_borderless_capture_access();
+    let border = border_setting_for_access(borderless_allowed, border_supported);
+    if border == DrawBorderSettings::WithoutBorder {
+        tracing::info!("O Windows autorizou a captura sem borda indicadora");
+    } else {
+        tracing::info!(
+            border_supported,
+            borderless_allowed,
+            "A borda indicadora da captura será mantida pelo Windows"
+        );
+    }
+    (cursor_setting_for_support(cursor_supported), border)
+}
+
+fn request_borderless_capture_access() -> bool {
+    static BORDERLESS_ACCESS: OnceLock<bool> = OnceLock::new();
+    *BORDERLESS_ACCESS.get_or_init(|| {
+        let result = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless)
+            .and_then(|operation| operation.join());
+        match result {
+            Ok(AppCapabilityAccessStatus::Allowed) => true,
+            Ok(status) => {
+                tracing::info!(?status, "O Windows não autorizou a captura sem borda");
+                false
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "A autorização de captura sem borda não está disponível; mantendo o indicador do Windows");
+                false
+            }
+        }
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowOption {
@@ -530,10 +598,11 @@ impl ScreenCapture {
         let performance = Arc::new(CapturePerformanceCounters::default());
         let fallback_reason = Arc::new(Mutex::new(None));
         let source_closed = Arc::new(AtomicBool::new(false));
+        let (cursor_settings, border_settings) = windows_graphics_capture_settings();
         let settings = Settings::new(
             window,
-            CursorCaptureSettings::Default,
-            DrawBorderSettings::Default,
+            cursor_settings,
+            border_settings,
             SecondaryWindowSettings::Default,
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
@@ -553,7 +622,12 @@ impl ScreenCapture {
                 tracing::error!(error = %error, "Windows Graphics Capture não iniciou para janela");
                 format!("O Windows não iniciou a captura da janela: {error}")
             })?;
-        tracing::info!(width, height, "Captura local da janela iniciada");
+        tracing::info!(
+            backend = "Windows Graphics Capture (Janela)",
+            width,
+            height,
+            "Captura local da janela iniciada"
+        );
 
         Ok(Self {
             backend_name: "Windows Graphics Capture (Janela)",
@@ -587,10 +661,11 @@ impl ScreenCapture {
         let performance = Arc::new(CapturePerformanceCounters::default());
         let fallback_reason = Arc::new(Mutex::new(None));
         let source_closed = Arc::new(AtomicBool::new(false));
+        let (cursor_settings, border_settings) = windows_graphics_capture_settings();
         let settings = Settings::new(
             PickerItemForThread(selected.item.clone()),
-            CursorCaptureSettings::Default,
-            DrawBorderSettings::Default,
+            cursor_settings,
+            border_settings,
             SecondaryWindowSettings::Default,
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
@@ -611,6 +686,7 @@ impl ScreenCapture {
                 format!("O Windows não iniciou a captura da tela: {error}")
             })?;
         tracing::info!(
+            backend = "Windows Graphics Capture",
             width = size.0,
             height = size.1,
             "Captura local da tela iniciada"
@@ -874,9 +950,39 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        FrameRateLimiter, MonitorOption, PreviewFrame, same_preview_pixels, scaled_dimensions,
+        FrameRateLimiter, MonitorOption, PreviewFrame, border_setting_for_access,
+        cursor_setting_for_support, same_preview_pixels, scaled_dimensions,
     };
     use crate::screen_quality::{ScreenShareFrameRate, ScreenShareQuality, ScreenShareResolution};
+    use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
+
+    #[test]
+    fn windows_capture_includes_cursor_only_when_explicit_setting_is_supported() {
+        assert_eq!(
+            cursor_setting_for_support(true),
+            CursorCaptureSettings::WithCursor
+        );
+        assert_eq!(
+            cursor_setting_for_support(false),
+            CursorCaptureSettings::Default
+        );
+    }
+
+    #[test]
+    fn windows_capture_hides_border_only_after_grant_and_when_supported() {
+        assert_eq!(
+            border_setting_for_access(true, true),
+            DrawBorderSettings::WithoutBorder
+        );
+        assert_eq!(
+            border_setting_for_access(false, true),
+            DrawBorderSettings::Default
+        );
+        assert_eq!(
+            border_setting_for_access(true, false),
+            DrawBorderSettings::Default
+        );
+    }
 
     #[test]
     fn monitor_labels_distinguish_same_name_and_resolution_by_device_id() {
