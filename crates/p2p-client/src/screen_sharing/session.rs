@@ -640,6 +640,12 @@ impl ScreenShareSession {
         self.metrics.record_ui_texture_update();
     }
 
+    pub(crate) fn record_ui_texture_duration(&self, duration: Duration) {
+        self.metrics
+            .video_performance
+            .record_duration(crate::video_performance::Stage::UiTexturePrepare, duration);
+    }
+
     pub fn take_performance_snapshot(&self) -> ScreenSharePerformanceSnapshot {
         self.metrics.take_performance_snapshot()
     }

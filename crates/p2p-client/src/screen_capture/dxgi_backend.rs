@@ -92,9 +92,15 @@ pub(super) fn capture_dxgi_monitor(
             }
         }
         let gpu_convert_started_at = Instant::now();
-        let gpu_result = gpu_processor
-            .as_mut()
-            .map(|(processor, _)| processor.process(frame.texture()));
+        let gpu_result = gpu_processor.as_mut().map(|(processor, _)| {
+            performance
+                .pipeline
+                .record_path(crate::video_performance::FramePath::CaptureGpuNv12);
+            let _timer = performance
+                .pipeline
+                .timer(crate::video_performance::Stage::CaptureGpuConvert);
+            processor.process(frame.texture())
+        });
         performance.gpu_convert_nanos.fetch_add(
             gpu_convert_started_at.elapsed().as_nanos() as u64,
             Ordering::Relaxed,
@@ -133,18 +139,34 @@ pub(super) fn capture_dxgi_monitor(
                 (None, None)
             } else {
                 let started_at = Instant::now();
-                match surface.readback_nv12_into(&mut staging_texture) {
+                let result = {
+                    let _timer = performance
+                        .pipeline
+                        .timer(crate::video_performance::Stage::CaptureReadback);
+                    surface.readback_nv12_into(&mut staging_texture)
+                };
+                match result {
                     Ok((nv12, stride)) => {
+                        performance.pipeline.record_readback(
+                            crate::video_performance::Readback::Capture,
+                            nv12.len(),
+                        );
                         readback_nanos += started_at.elapsed().as_nanos() as u64;
                         let cpu_nv12 = Some(Arc::new(CpuNv12Frame {
                             bytes: Arc::new(nv12),
                             stride,
                         }));
                         let started_at = Instant::now();
-                        match surface.to_rgba(
-                            &cpu_nv12.as_ref().expect("NV12 frame was created").bytes,
-                            stride,
-                        ) {
+                        let result = {
+                            let _timer = performance
+                                .pipeline
+                                .timer(crate::video_performance::Stage::CaptureCpuConvert);
+                            surface.to_rgba(
+                                &cpu_nv12.as_ref().expect("NV12 frame was created").bytes,
+                                stride,
+                            )
+                        };
+                        match result {
                             Ok(rgba) => {
                                 resize_nanos += started_at.elapsed().as_nanos() as u64;
                                 gpu_preview_fallback_logged = false;
@@ -199,13 +221,27 @@ pub(super) fn capture_dxgi_monitor(
             None if !wants_preview && (cpu_nv12.is_some() || gpu_surface.is_some()) => Vec::new(),
             None => {
                 let started_at = Instant::now();
+                let reading = performance
+                    .pipeline
+                    .timer(crate::video_performance::Stage::CaptureReadback);
                 let buffer = frame.buffer().map_err(|error| {
                     format!("DXGI nÃ£o conseguiu ler o quadro do monitor: {error}")
                 })?;
                 let bytes = buffer.as_nopadding_buffer(&mut scratch);
+                drop(reading);
+                performance
+                    .pipeline
+                    .record_readback(crate::video_performance::Readback::Capture, bytes.len());
+                performance
+                    .pipeline
+                    .record_path(crate::video_performance::FramePath::CaptureCpuRgba);
                 readback_nanos += started_at.elapsed().as_nanos() as u64;
                 let started_at = Instant::now();
+                let conversion = performance
+                    .pipeline
+                    .timer(crate::video_performance::Stage::CaptureCpuConvert);
                 let preview = downsample_bgra(bytes, width, height, next_sequence, quality);
+                drop(conversion);
                 resize_nanos += started_at.elapsed().as_nanos() as u64;
                 preview.rgba
             }

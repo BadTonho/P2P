@@ -1,4 +1,5 @@
 use super::*;
+use crate::video_performance::{FramePath, Readback, Stage, StageTimer, VideoPerformance};
 
 struct LatestFramePacer {
     last_sequence: Option<u64>,
@@ -282,6 +283,7 @@ pub(super) fn encode_latest_frames(
         metrics.record_capture_frame_for_encoder(!is_new_capture_frame);
         metrics.record_encoder_worker_delay(worker_was_late, skipped_sequences);
         if encoder.is_none() {
+            let _timer = metrics.video_performance.timer(Stage::EncoderInit);
             #[cfg(windows)]
             {
                 let hardware_result = if let Some(surface) = frame.gpu_nv12.as_ref() {
@@ -322,9 +324,10 @@ pub(super) fn encode_latest_frames(
                     .map(|hardware| (hardware, false, None))
                 };
                 match hardware_result {
-                    Ok((hardware, gpu_input, fallback_reason)) => {
+                    Ok((mut hardware, gpu_input, fallback_reason)) => {
+                        hardware.set_performance(Arc::clone(&metrics.video_performance));
                         let name = hardware.name().to_owned();
-                        tracing::info!(codec = %name, width = frame.width, height = frame.height, "Codificador H.264 de hardware ativado");
+                        tracing::info!(screen_share_session = metrics.session_id, codec = %name, gpu_adapter = %hardware.adapter_label(), width = frame.width, height = frame.height, "Codificador H.264 de hardware ativado");
                         metrics
                             .set_encoder_backend(format!("GPU — Media Foundation / {name}"), None);
                         encoder = Some(ActiveH264Encoder::MediaFoundation(hardware));
@@ -386,7 +389,12 @@ pub(super) fn encode_latest_frames(
         let hardware_failure = match active {
             ActiveH264Encoder::OpenH264(cpu) => {
                 let encode_started_at = Instant::now();
-                let encoded_result = encode_frame_with_quality(cpu, &frame, quality);
+                let encoded_result = encode_frame_with_quality(
+                    cpu,
+                    &frame,
+                    quality,
+                    Some(&metrics.video_performance),
+                );
                 metrics.record_encode_duration(encode_started_at.elapsed());
                 let encoded = encoded_result?;
                 forward_encoded_access_unit(&encoded, &samples, &metrics, &mut forwarding_gate)?;
@@ -443,10 +451,18 @@ pub(super) fn encode_latest_frames(
             metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
             forwarding_gate.reset();
             hardware_warmup_frames = 0;
-            let mut cpu = openh264_encoder_for_quality(active_bitrate_bps, quality)?;
+            let mut cpu = {
+                let _timer = metrics.video_performance.timer(Stage::EncoderInit);
+                openh264_encoder_for_quality(active_bitrate_bps, quality)?
+            };
             metrics.record_encoder_input_frame();
             let encode_started_at = Instant::now();
-            let encoded_result = encode_frame_with_quality(&mut cpu, &frame, quality);
+            let encoded_result = encode_frame_with_quality(
+                &mut cpu,
+                &frame,
+                quality,
+                Some(&metrics.video_performance),
+            );
             metrics.record_encode_duration(encode_started_at.elapsed());
             let encoded = encoded_result?;
             forward_encoded_access_unit(&encoded, &samples, &metrics, &mut forwarding_gate)?;
@@ -569,14 +585,18 @@ fn validate_encoder_frame(frame: &PreviewFrame, quality: ScreenShareQuality) -> 
 
 #[cfg(test)]
 pub(super) fn encode_frame(encoder: &mut Encoder, frame: &PreviewFrame) -> Result<Vec<u8>, String> {
-    encode_frame_with_quality(encoder, frame, ScreenShareQuality::default())
+    encode_frame_with_quality(encoder, frame, ScreenShareQuality::default(), None)
 }
 
 fn encode_frame_with_quality(
     encoder: &mut Encoder,
     frame: &PreviewFrame,
     quality: ScreenShareQuality,
+    performance: Option<&Arc<VideoPerformance>>,
 ) -> Result<Vec<u8>, String> {
+    if let Some(performance) = performance {
+        performance.record_path(FramePath::EncoderOpenH264);
+    }
     validate_encoder_frame(frame, quality)?;
 
     let expected_len = frame.width as usize * frame.height as usize * 4;
@@ -589,7 +609,11 @@ fn encode_frame_with_quality(
             let input = if let Some(cpu_nv12) = frame.cpu_nv12.as_deref() {
                 cpu_nv12
             } else if let Some(gpu_nv12) = frame.gpu_nv12.as_deref() {
+                let _timer = StageTimer::optional(performance, Stage::EncoderReadback);
                 let (bytes, stride) = gpu_nv12.readback_nv12()?;
+                if let Some(performance) = performance {
+                    performance.record_readback(Readback::Encoder, bytes.len());
+                }
                 on_demand_nv12 = crate::screen_capture::CpuNv12Frame {
                     bytes: std::sync::Arc::new(bytes),
                     stride,
@@ -598,6 +622,7 @@ fn encode_frame_with_quality(
             } else {
                 return Err("O quadro sem prévia não contém entrada NV12 para OpenH264.".to_owned());
             };
+            let _timer = StageTimer::optional(performance, Stage::EncoderCpuConvert);
             Cow::Owned(mf_video::cpu_nv12_to_rgba(
                 input,
                 frame.width,
@@ -613,7 +638,11 @@ fn encode_frame_with_quality(
         rgba_bytes.as_ref(),
         (frame.width as usize, frame.height as usize),
     );
-    let yuv = YUVBuffer::from_rgba8_source(rgba);
+    let yuv = {
+        let _timer = StageTimer::optional(performance, Stage::EncoderCpuConvert);
+        YUVBuffer::from_rgba8_source(rgba)
+    };
+    let _timer = StageTimer::optional(performance, Stage::CpuEncode);
     encoder
         .encode(&yuv)
         .map(|encoded| encoded.to_vec())
@@ -653,8 +682,22 @@ mod tests {
         };
 
         let mut encoder = Encoder::new().unwrap();
-        let encoded = encode_frame(&mut encoder, &frame).unwrap();
+        let performance = Arc::new(VideoPerformance::default());
+        let encoded = encode_frame_with_quality(
+            &mut encoder,
+            &frame,
+            ScreenShareQuality::default(),
+            Some(&performance),
+        )
+        .unwrap();
         assert!(!encoded.is_empty());
+        let measured = performance.snapshot();
+        assert_eq!(measured.path_count(FramePath::EncoderOpenH264), 1);
+        assert_eq!(measured.path_count(FramePath::EncoderGpuSurface), 0);
+        assert_eq!(measured.timing(Stage::CpuEncode).samples, 1);
+        assert_eq!(measured.timing(Stage::EncoderCpuConvert).samples, 2);
+        assert_eq!(measured.timing(Stage::EncoderReadback).samples, 0);
+        assert_eq!(measured.readback_bytes(Readback::Encoder), 0);
         let mut decoder = Decoder::new().unwrap();
         let decoded = decoder.decode(&encoded).unwrap().unwrap();
         assert_eq!(decoded.dimensions(), (width as usize, height as usize));
@@ -856,7 +899,7 @@ mod tests {
             cpu_nv12: None,
         };
 
-        let encoded = encode_frame_with_quality(&mut encoder, &frame, quality)
+        let encoded = encode_frame_with_quality(&mut encoder, &frame, quality, None)
             .expect("OpenH264 should encode a 1080p frame");
         let mut decoder = Decoder::new().expect("OpenH264 decoder should start");
         let decoded = decoder

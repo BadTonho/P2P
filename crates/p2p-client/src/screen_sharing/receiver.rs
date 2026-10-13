@@ -1,4 +1,5 @@
 use super::*;
+use crate::video_performance::{FramePath, Stage};
 
 #[derive(Default)]
 struct RtpSequenceTracker {
@@ -314,6 +315,7 @@ struct PendingRtpFrame {
 
 struct QueuedAccessUnit {
     generation: u64,
+    enqueued_at: Instant,
     bytes: Vec<u8>,
 }
 
@@ -596,6 +598,11 @@ struct DecodeFailure {
     hardware_decoder: bool,
 }
 
+fn new_cpu_decoder(metrics: &SharedMetrics) -> Result<Decoder, openh264::Error> {
+    let _timer = metrics.video_performance.timer(Stage::DecoderInit);
+    Decoder::new()
+}
+
 fn decode_h264_access_unit(
     access_unit: &[u8],
     decoder: &mut ActiveH264Decoder,
@@ -604,13 +611,22 @@ fn decode_h264_access_unit(
     sequence: &AtomicU64,
     metrics: &SharedMetrics,
 ) -> Option<DecodeFailure> {
+    let _total_timer = metrics.video_performance.timer(Stage::DecodeTotal);
     let nal_types = annex_b_nal_types(access_unit);
     let sample_diagnostics = describe_nal_types(&nal_types, access_unit.len());
     let decoded = match decoder {
-        ActiveH264Decoder::OpenH264(decoder) => decoder
-            .decode(access_unit)
+        ActiveH264Decoder::OpenH264(decoder) => {
+            metrics
+                .video_performance
+                .record_path(FramePath::DecoderOpenH264);
+            let result = {
+                let _timer = metrics.video_performance.timer(Stage::CpuDecode);
+                decoder.decode(access_unit)
+            };
+            result
             .map(|frame| {
                 frame.map(|yuv| {
+                    let _timer = metrics.video_performance.timer(Stage::DecoderCpuConvert);
                     let (width, height) = yuv.dimensions();
                     let mut rgba = vec![0; yuv.rgba8_len()];
                     yuv.write_rgba8(&mut rgba);
@@ -626,12 +642,18 @@ fn decode_h264_access_unit(
                     format!("{error}; quadro: {sample_diagnostics}")
                 };
                 (detail, Some(error.native_code()))
-            }),
+            })
+        }
         #[cfg(windows)]
-        ActiveH264Decoder::MediaFoundation(decoder) => decoder
-            .decode(access_unit)
-            .map(|frame| frame.map(|frame| (frame.width, frame.height, frame.rgba)))
-            .map_err(|error| (format!("{error}; quadro: {sample_diagnostics}"), None)),
+        ActiveH264Decoder::MediaFoundation(decoder) => {
+            metrics
+                .video_performance
+                .record_path(FramePath::DecoderDxva);
+            decoder
+                .decode(access_unit)
+                .map(|frame| frame.map(|frame| (frame.width, frame.height, frame.rgba)))
+                .map_err(|error| (format!("{error}; quadro: {sample_diagnostics}"), None))
+        }
     };
 
     match decoded {
@@ -1118,7 +1140,7 @@ impl PeerEvents {
                                     DXVA_FIRST_OUTPUT_WATCHDOG.as_millis()
                                 );
                                 tracing::warn!(fallback_reason = %reason, cached_idr = cached_idr.is_some(), "Watchdog do primeiro quadro DXVA acionado");
-                                match Decoder::new() {
+                                match new_cpu_decoder(&worker_metrics) {
                                     Ok(cpu) => {
                                         hardware_decoder_disabled = true;
                                         worker_metrics.set_decoder_backend(
@@ -1181,6 +1203,7 @@ impl PeerEvents {
                             }
                         };
                         let current_generation = worker_generation.load(Ordering::Relaxed);
+                        worker_metrics.video_performance.record_duration(Stage::DecoderQueueWait, queued.enqueued_at.elapsed());
                         let generation_status = codec.synchronize(queued.generation, current_generation);
                         if generation_status == DecoderGenerationStatus::Stale {
                             worker_metrics.record_drop_stale_generation();
@@ -1225,7 +1248,7 @@ impl PeerEvents {
                             && (worker_decoder_preference == VideoDecoderPreference::Cpu
                                 || hardware_decoder_disabled)
                         {
-                            match Decoder::new() {
+                            match new_cpu_decoder(&worker_metrics) {
                                 Ok(cpu) => {
                                     let fallback_reason = if worker_decoder_preference
                                         == VideoDecoderPreference::Cpu
@@ -1278,8 +1301,13 @@ impl PeerEvents {
                             {
                                 if let Some((width, height)) = mf_video::sps_dimensions(&access_unit) {
                                     hardware_decoder_disabled = true;
-                                    match mf_video::HardwareDecoder::new(width, height) {
-                                        Ok(hardware) => {
+                                    let hardware = {
+                                        let _timer = worker_metrics.video_performance.timer(Stage::DecoderInit);
+                                        mf_video::HardwareDecoder::new(width, height)
+                                    };
+                                    match hardware {
+                                        Ok(mut hardware) => {
+                                            hardware.set_performance(Arc::clone(&worker_metrics.video_performance));
                                             hardware_decoder_disabled = false;
                                             let name = hardware.name().to_owned();
                                             worker_metrics.set_decoder_backend(
@@ -1287,6 +1315,8 @@ impl PeerEvents {
                                                 None,
                                             );
                                             tracing::info!(
+                                                screen_share_session = worker_metrics.session_id,
+                                                gpu_adapter = %hardware.adapter_label(),
                                                 codec = %name,
                                                 width,
                                                 height,
@@ -1298,7 +1328,7 @@ impl PeerEvents {
                                         Err(error) => {
                                             let reason = format!("DXVA indisponível: {error}");
                                             tracing::warn!(fallback_reason = %reason, "Usando decodificador H.264 OpenH264 na CPU");
-                                            match Decoder::new() {
+                                            match new_cpu_decoder(&worker_metrics) {
                                                 Ok(cpu) => {
                                                     worker_metrics.set_decoder_backend(
                                                         "CPU — OpenH264".to_owned(),
@@ -1320,7 +1350,7 @@ impl PeerEvents {
                                     }
                                 } else if codec.decoder.is_none() {
                                     let reason = "Aguardando SPS/PPS para iniciar DXVA; usando CPU neste quadro".to_owned();
-                                    match Decoder::new() {
+                                    match new_cpu_decoder(&worker_metrics) {
                                         Ok(cpu) => {
                                             worker_metrics.set_decoder_backend(
                                                 "CPU — OpenH264 (aguardando SPS/PPS)".to_owned(),
@@ -1343,7 +1373,7 @@ impl PeerEvents {
 
                         #[cfg(not(windows))]
                         if codec.decoder.is_none() {
-                            match Decoder::new() {
+                            match new_cpu_decoder(&worker_metrics) {
                                 Ok(cpu) => {
                                     worker_metrics.set_decoder_backend(
                                         "CPU — OpenH264".to_owned(),
@@ -1403,7 +1433,7 @@ impl PeerEvents {
                                     .map(|failure| failure.detail.clone())
                                     .unwrap_or_default();
                                 tracing::warn!(fallback_reason = %reason, "Falha do dispositivo DXVA; mudando para OpenH264 na CPU");
-                                match Decoder::new() {
+                                match new_cpu_decoder(&worker_metrics) {
                                     Ok(cpu) => {
                                         worker_metrics.set_decoder_backend(
                                             "CPU — OpenH264".to_owned(),
@@ -1432,7 +1462,7 @@ impl PeerEvents {
                                     hardware_decoder_disabled = true;
                                     let reason = "DXVA recebeu 15 quadros H.264 sem produzir imagem; usando OpenH264 na CPU.".to_owned();
                                     tracing::warn!(fallback_reason = %reason, "Decodificador DXVA sem saída; mudando para OpenH264 na CPU");
-                                    match Decoder::new() {
+                                    match new_cpu_decoder(&worker_metrics) {
                                         Ok(cpu) => {
                                             worker_metrics.set_decoder_backend(
                                                 "CPU — OpenH264".to_owned(),
@@ -1514,7 +1544,7 @@ impl PeerEvents {
                                         "Fallback adaptativo de DXVA para OpenH264"
                                     );
                                     hardware_decoder_disabled = true;
-                                    match Decoder::new() {
+                                    match new_cpu_decoder(&worker_metrics) {
                                         Ok(cpu) => {
                                             worker_metrics.set_decoder_backend(
                                                 "CPU — OpenH264 (fallback adaptativo)".to_owned(),
@@ -1748,6 +1778,7 @@ impl PeerEvents {
                                 continue;
                             }
                             match decoder_tx.try_send(QueuedAccessUnit {
+                                enqueued_at: Instant::now(),
                                 generation: decoder_generation.load(Ordering::Relaxed),
                                 bytes: access_unit,
                             }) {

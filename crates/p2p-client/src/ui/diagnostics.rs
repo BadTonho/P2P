@@ -12,6 +12,7 @@ impl ClientUi {
             .default_open(false)
             .show(ui, |ui| {
                 ui.label(format!("Build: {}", env!("P2P_BUILD_ID")));
+                ui.small(format!("GPU: {}", self.gpu_diagnostic_summary()));
                 ui.small(format!(
                     "Descoberta: {}",
                     self.discovery_diagnostic_summary()

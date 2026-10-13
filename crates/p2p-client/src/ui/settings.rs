@@ -96,6 +96,7 @@ impl ClientUi {
             ui.small(
                 "Desmarcado por padrão para economizar espaço e evitar sobrecarga de I/O em disco.",
             );
+            ui.small("Com logs Detalhados, mede também os motores da GPU durante o compartilhamento de tela.");
             ui.add_space(4.0);
             if ui
                 .checkbox(

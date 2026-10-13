@@ -109,6 +109,10 @@ O atualizador consulta o último release público do [repositório no GitHub](ht
 
 Em **Configurações > Geral**, escolha **Desativados**, **Avisos e erros** ou **Detalhados**. O padrão é **Avisos e erros**; os logs detalhados ficam desligados. **Desativados** não cria arquivos de sessão e preserva os logs antigos. **Exportar logs** continua disponível por ação manual e, com os logs desativados, exporta somente o relatório de diagnóstico, sem histórico de eventos.
 
+Para medir o vídeo, escolha **Detalhados** e marque **Registrar métricas periódicas de desempenho no log** nos dois computadores. Compartilhe uma tela por pelo menos 15 segundos e use **Exportar logs** em cada PC, de preferência durante a transmissão. O diagnóstico mostra o motor de codificação, decodificação, cópia ou 3D que o Windows atribuir ao processo, com média e pico por motor. A coleta ocorre aproximadamente a cada segundo e os resumos são registrados a cada cinco segundos. Quando o Windows ou o driver não fornecerem um contador válido, aparecerá `unavailable`; isso não significa uso de 0%.
+
+As medições do vídeo também distinguem entrada direta da GPU, entrada pela CPU em um codificador de hardware e OpenH264. Registram chamadas de captura, conversão de cores, codificação, decodificação, espera na fila e preparação da imagem, além do tempo e dos bytes copiados da GPU para a CPU. Os tempos são durações das chamadas do aplicativo, incluindo esperas, e algumas etapas se sobrepõem; não representam tempo exclusivo de execução da GPU ou percentual de CPU. Os percentuais dos motores pertencem ao processo inteiro, incluindo interface e outras telas compartilhadas, e não devem ser somados como um percentual total da placa.
+
 ## Excluir um aplicativo do áudio
 
 Abra **Configurações > Áudio**, atualize a lista e escolha o aplicativo em **Não compartilhar o áudio de**. A escolha fica somente nas preferências deste computador e identifica o executável, não o PID. A captura exclui a instância selecionada e os processos filhos dela.

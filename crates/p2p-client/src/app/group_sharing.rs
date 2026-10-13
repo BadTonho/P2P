@@ -171,6 +171,10 @@ fn log_group_session_diagnostics(
         track_ssrc = %track_ssrc,
         role,
         phase,
+        video_timing_scope = "wall_clock_not_gpu_execution",
+        video_pipeline_interval = %performance.video_performance.label(),
+        video_pipeline_total = %metrics.video_performance.label(),
+        encode_avg_ms = ?(performance.encode_samples > 0).then(|| performance.encode_nanos as f64 / performance.encode_samples as f64 / 1_000_000.0),
         termination_reason = termination_reason.unwrap_or(""),
         interval_seconds = ?interval_seconds,
         p2p_connected = metrics.p2p_connected,
@@ -939,6 +943,7 @@ impl ClientUi {
                             .saturating_mul(4);
                         if frame.width > 0 && frame.height > 0 && frame.rgba.len() == expected_bytes
                         {
+                            let texture_started = Instant::now();
                             let image = egui::ColorImage::from_rgba_unmultiplied(
                                 [frame.width as usize, frame.height as usize],
                                 &frame.rgba,
@@ -958,6 +963,7 @@ impl ClientUi {
                                 );
                             }
                             session.record_ui_texture_update();
+                            session.record_ui_texture_duration(texture_started.elapsed());
                             if self.group_share.auto_focus_pending.remove(&peer_id)
                                 && should_auto_focus_group_screen(
                                     self.group_share.focused_screen.as_deref(),
@@ -1153,6 +1159,7 @@ impl ClientUi {
                 capture_processed = capture_performance.map(|snapshot| snapshot.processed_frames),
                 capture_unchanged = capture_performance.map(|snapshot| snapshot.unchanged_frames),
                 capture_skipped = capture_performance.map(|snapshot| snapshot.skipped_frames),
+                capture_pipeline_interval = ?capture_performance.map(|snapshot| snapshot.pipeline.label()),
                 watching = self.group_share.watched_shares.len(),
                 sharing = self.group_share.local_sharing,
                 "Resumo agregado de compartilhamento em grupo"

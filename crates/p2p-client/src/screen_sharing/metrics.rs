@@ -2,6 +2,7 @@ use super::*;
 
 #[derive(Clone, Debug, Default)]
 pub struct ScreenShareMetrics {
+    pub(crate) video_performance: crate::video_performance::VideoPerformanceSnapshot,
     pub session_id: u64,
     pub track_ssrc: Option<u32>,
     pub outbound_video_ssrc: Option<u32>,
@@ -79,6 +80,7 @@ pub struct ScreenShareMetrics {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScreenSharePerformanceSnapshot {
+    pub(crate) video_performance: crate::video_performance::VideoPerformanceSnapshot,
     pub new_capture_frames: u64,
     pub repeated_capture_frames: u64,
     pub encoder_worker_late_frames: u64,
@@ -222,6 +224,7 @@ impl SharedMetrics {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         ScreenShareMetrics {
+            video_performance: self.video_performance.snapshot(),
             session_id: self.session_id,
             track_ssrc: match self.track_ssrc.load(Ordering::Relaxed) {
                 0 => None,
@@ -991,6 +994,7 @@ impl SharedMetrics {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         ScreenSharePerformanceSnapshot {
+            video_performance: self.video_performance.take_interval(),
             new_capture_frames: self.interval_new_capture_frames.swap(0, Ordering::Relaxed),
             repeated_capture_frames: self
                 .interval_repeated_capture_frames

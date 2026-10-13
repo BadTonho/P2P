@@ -2,11 +2,12 @@ use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::slice;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::screen_capture::CpuNv12Frame;
+use crate::video_performance::{FramePath, Readback, Stage, StageTimer, VideoPerformance};
 use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
@@ -26,6 +27,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -45,6 +47,30 @@ const MF_OUTPUT_CAPACITY: u32 = 4 * 1024 * 1024;
 const MF_EVENT_WAIT: Duration = Duration::from_millis(500);
 
 static MF_STARTUP: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn d3d11_adapter_label(device: &ID3D11Device) -> String {
+    let description = (|| -> windows::core::Result<_> {
+        let dxgi: IDXGIDevice = device.cast()?;
+        let adapter = unsafe { dxgi.GetAdapter()? };
+        unsafe { adapter.GetDesc() }
+    })();
+    match description {
+        Ok(description) => {
+            let end = description
+                .Description
+                .iter()
+                .position(|value| *value == 0)
+                .unwrap_or(description.Description.len());
+            format!(
+                "{}; luid_0x{:08x}_0x{:08x}",
+                String::from_utf16_lossy(&description.Description[..end]),
+                description.AdapterLuid.HighPart as u32,
+                description.AdapterLuid.LowPart
+            )
+        }
+        Err(error) => format!("adapter_unavailable: {}", error.code()),
+    }
+}
 
 fn ensure_media_foundation() -> Result<(), String> {
     MF_STARTUP

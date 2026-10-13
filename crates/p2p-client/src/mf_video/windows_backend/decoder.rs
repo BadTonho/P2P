@@ -7,6 +7,7 @@ pub struct DecodedFrame {
 }
 
 pub struct HardwareDecoder {
+    performance: Option<Arc<VideoPerformance>>,
     _device: ID3D11Device,
     context: ID3D11DeviceContext,
     _device_manager: IMFDXGIDeviceManager,
@@ -47,6 +48,7 @@ impl HardwareDecoder {
             MAX_SUPPORTED_FRAME_RATE,
         )?;
         Ok(Self {
+            performance: None,
             _apartment: apartment,
             _device: device,
             context,
@@ -64,8 +66,19 @@ impl HardwareDecoder {
         &self.name
     }
 
+    pub(crate) fn adapter_label(&self) -> String {
+        d3d11_adapter_label(&self._device)
+    }
+
+    pub(crate) fn set_performance(&mut self, performance: Arc<VideoPerformance>) {
+        self.performance = Some(performance);
+    }
+
     pub fn decode(&mut self, access_unit: &[u8]) -> Result<Option<DecodedFrame>, String> {
-        self.transform.send_input(access_unit, self.next_time_hns)?;
+        {
+            let _timer = StageTimer::optional(self.performance.as_ref(), Stage::DecoderSubmit);
+            self.transform.send_input(access_unit, self.next_time_hns)?;
+        }
         self.next_time_hns += HNS_PER_SECOND / i64::from(MAX_SUPPORTED_FRAME_RATE);
         let mut decoded = None;
         for output_index in 0..8 {
@@ -74,14 +87,28 @@ impl HardwareDecoder {
             } else {
                 Duration::from_millis(2)
             };
-            let Some(sample) = self
-                .transform
-                .receive_output_sample(wait, self.transform.transform_provides_sample)?
-            else {
+            let sample = {
+                let _timer =
+                    StageTimer::optional(self.performance.as_ref(), Stage::DecoderOutputWait);
+                self.transform
+                    .receive_output_sample(wait, self.transform.transform_provides_sample)?
+            };
+            let Some(sample) = sample else {
                 break;
             };
-            let (nv12, stride) = read_dxgi_nv12(&sample, &self.context, &mut self.staging_texture)?;
-            let rgba = nv12_to_rgba(&nv12, self.width as usize, self.height as usize, stride)?;
+            let (nv12, stride) = {
+                let _timer =
+                    StageTimer::optional(self.performance.as_ref(), Stage::DecoderReadback);
+                read_dxgi_nv12(&sample, &self.context, &mut self.staging_texture)?
+            };
+            if let Some(performance) = &self.performance {
+                performance.record_readback(Readback::Decoder, nv12.len());
+            }
+            let rgba = {
+                let _timer =
+                    StageTimer::optional(self.performance.as_ref(), Stage::DecoderCpuConvert);
+                nv12_to_rgba(&nv12, self.width as usize, self.height as usize, stride)?
+            };
             decoded = Some(DecodedFrame {
                 width: self.width,
                 height: self.height,

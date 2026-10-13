@@ -752,6 +752,10 @@ impl ClientUi {
                     performance.skipped_capture_sequences,
                 );
                 tracing::info!(
+                    video_timing_scope = "wall_clock_not_gpu_execution",
+                    video_pipeline_interval = %performance.video_performance.label(),
+                    video_pipeline_total = %metrics.video_performance.label(),
+                    capture_pipeline_interval = %capture_performance.pipeline.label(),
                     screen_share_session = metrics.session_id,
                     role = match &self.screen_share_role {
                         ScreenShareRole::Sending { .. } => "sender",
@@ -935,6 +939,7 @@ impl ClientUi {
                 .saturating_mul(frame.height as usize)
                 .saturating_mul(4);
             if frame.width > 0 && frame.height > 0 && frame.rgba.len() == expected_bytes {
+                let texture_started = Instant::now();
                 let image = egui::ColorImage::from_rgba_unmultiplied(
                     [frame.width as usize, frame.height as usize],
                     &frame.rgba,
@@ -950,6 +955,7 @@ impl ClientUi {
                 }
                 if let Some(session) = self.screen_share_session.as_ref() {
                     session.record_ui_texture_update();
+                    session.record_ui_texture_duration(texture_started.elapsed());
                 }
                 if self.remote_screen_sequence == 0 {
                     self.screen_share_status =
@@ -988,6 +994,7 @@ impl ClientUi {
         if let Some(session) = self.screen_share_session.take() {
             let metrics = session.metrics();
             tracing::info!(
+                video_pipeline_total = %metrics.video_performance.label(),
                 screen_share_session = metrics.session_id,
                 track_ssrc = ?metrics.track_ssrc,
                 outbound_video_ssrc = ?metrics.outbound_video_ssrc,

@@ -198,6 +198,8 @@ pub struct DiagnosticSnapshot {
     pub microphone_gain_db: f32,
     pub adapters: Vec<(String, String)>,
     pub discovery_state: String,
+    pub gpu_utilization: String,
+    pub video_performance: String,
     pub screen_share_state: String,
     pub screen_metrics: String,
 }
@@ -509,6 +511,10 @@ impl LoggingState {
             snapshot.screen_share_state
         ));
         output.push_str(&format!("Métricas de vídeo: {}\n", snapshot.screen_metrics));
+        output.push_str(&format!(
+            "GPU do processo: {}\nTempos de vídeo (parede, não execução exclusiva da GPU): {}\n",
+            snapshot.gpu_utilization, snapshot.video_performance
+        ));
         output.push_str(&format!(
             "Descoberta de salas: {}\n",
             snapshot.discovery_state
@@ -1393,6 +1399,8 @@ mod tests {
             stun_server: "stun:user:secret@stun.example:3478?transport=udp".to_owned(),
             adapters: vec![("Radmin VPN".to_owned(), "26.1.2.3".to_owned())],
             discovery_state: "UDP 8999; consultas enviadas=3, anúncios recebidos=2".to_owned(),
+            gpu_utilization: "scope=process; VideoDecode mean_percent=25.00".to_owned(),
+            video_performance: "decoder_gpu_readback: mean_ms=2.00; readback_bytes=1234".to_owned(),
             ..DiagnosticSnapshot::default()
         };
 
@@ -1402,6 +1410,8 @@ mod tests {
         assert!(contents.contains("Radmin VPN: 26.1.2.3"));
         assert!(contents.contains(env!("P2P_BUILD_ID")));
         assert!(contents.contains("UDP 8999; consultas enviadas=3, anúncios recebidos=2"));
+        assert!(contents.contains("scope=process; VideoDecode mean_percent=25.00"));
+        assert!(contents.contains("decoder_gpu_readback: mean_ms=2.00; readback_bytes=1234"));
         assert!(contents.contains("current_session_event=true"));
         assert!(!contents.contains("previous_session_event=true"));
         assert!(contents.contains("ws://192.168.1.25:9000"));

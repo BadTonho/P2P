@@ -52,15 +52,31 @@ impl GraphicsCaptureApiHandler for ScreenFrameHandler {
         }
 
         let readback_started_at = Instant::now();
+        let reading = self
+            .performance
+            .pipeline
+            .timer(crate::video_performance::Stage::CaptureReadback);
         let frame_buffer = frame.buffer()?;
         let rgba = frame_buffer.as_nopadding_buffer(&mut self.scratch);
+        drop(reading);
+        self.performance
+            .pipeline
+            .record_readback(crate::video_performance::Readback::Capture, rgba.len());
+        self.performance
+            .pipeline
+            .record_path(crate::video_performance::FramePath::CaptureCpuRgba);
         self.performance.readback_nanos.fetch_add(
             readback_started_at.elapsed().as_nanos() as u64,
             Ordering::Relaxed,
         );
         let next_sequence = self.sequence.wrapping_add(1);
         let resize_started_at = Instant::now();
+        let conversion = self
+            .performance
+            .pipeline
+            .timer(crate::video_performance::Stage::CaptureCpuConvert);
         let preview = downsample_rgba(rgba, width, height, next_sequence, self.quality);
+        drop(conversion);
         self.performance.resize_nanos.fetch_add(
             resize_started_at.elapsed().as_nanos() as u64,
             Ordering::Relaxed,

@@ -193,6 +193,13 @@ fn retained_decoder_recovers_real_h264_after_discarded_frames() {
         );
     }
     assert_eq!(metrics.decode_errors.load(Ordering::Relaxed), 0);
+    let measured = metrics.video_performance.snapshot();
+    assert_eq!(measured.path_count(FramePath::DecoderOpenH264), 6);
+    assert_eq!(measured.path_count(FramePath::DecoderDxva), 0);
+    assert_eq!(measured.timing(Stage::CpuDecode).samples, 6);
+    assert_eq!(measured.timing(Stage::DecoderCpuConvert).samples, 6);
+    assert_eq!(measured.timing(Stage::DecodeTotal).samples, 6);
+    assert_eq!(measured.timing(Stage::DecoderReadback).samples, 0);
     let published = remote_frame.lock().unwrap();
     assert_eq!(
         published.as_ref().map(|frame| (frame.width, frame.height)),

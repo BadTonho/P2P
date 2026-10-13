@@ -1,6 +1,7 @@
 use super::*;
 
 pub struct HardwareEncoder {
+    performance: Option<Arc<VideoPerformance>>,
     _device: Option<ID3D11Device>,
     _device_manager: Option<IMFDXGIDeviceManager>,
     transform: Transform,
@@ -39,6 +40,7 @@ impl HardwareEncoder {
             frame_rate,
         )?;
         Ok(Self {
+            performance: None,
             _apartment: apartment,
             _device: None,
             _device_manager: None,
@@ -85,6 +87,7 @@ impl HardwareEncoder {
             frame_rate,
         )?;
         Ok(Self {
+            performance: None,
             _apartment: apartment,
             _device: Some(device.clone()),
             _device_manager: Some(device_manager),
@@ -101,6 +104,17 @@ impl HardwareEncoder {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) fn adapter_label(&self) -> String {
+        self._device.as_ref().map_or_else(
+            || "unknown; system-memory MFT input, no adapter bound".to_owned(),
+            d3d11_adapter_label,
+        )
+    }
+
+    pub(crate) fn set_performance(&mut self, performance: Arc<VideoPerformance>) {
+        self.performance = Some(performance);
     }
 
     pub fn force_keyframe(&mut self) -> Result<bool, String> {
@@ -145,6 +159,10 @@ impl HardwareEncoder {
     }
 
     pub fn encode_rgba(&mut self, rgba: &[u8]) -> Result<Vec<u8>, String> {
+        if let Some(performance) = &self.performance {
+            performance.record_path(FramePath::EncoderHardwareCpuRgba);
+        }
+        let conversion = StageTimer::optional(self.performance.as_ref(), Stage::EncoderCpuConvert);
         let expected = self.width as usize * self.height as usize * 4;
         if rgba.len() != expected {
             return Err(
@@ -161,10 +179,15 @@ impl HardwareEncoder {
             nv12.push(u);
             nv12.push(v);
         }
+        drop(conversion);
         self.encode_packed_nv12(&nv12)
     }
 
     pub fn encode_nv12(&mut self, frame: &CpuNv12Frame) -> Result<Vec<u8>, String> {
+        if let Some(performance) = &self.performance {
+            performance.record_path(FramePath::EncoderHardwareCpuNv12);
+        }
+        let conversion = StageTimer::optional(self.performance.as_ref(), Stage::EncoderCpuConvert);
         let width = self.width as usize;
         let height = self.height as usize;
         if !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) || frame.stride < width {
@@ -190,6 +213,7 @@ impl HardwareEncoder {
             let start = uv_start + row * frame.stride;
             packed.extend_from_slice(&frame.bytes[start..start + width]);
         }
+        drop(conversion);
         self.encode_packed_nv12(&packed)
     }
 
@@ -201,12 +225,19 @@ impl HardwareEncoder {
                 nv12.len()
             ));
         }
-        self.transform.send_input(nv12, self.next_time_hns)?;
+        {
+            let _timer = StageTimer::optional(self.performance.as_ref(), Stage::EncoderSubmit);
+            self.transform.send_input(nv12, self.next_time_hns)?;
+        }
         self.next_time_hns += HNS_PER_SECOND / i64::from(self.frame_rate);
         self.drain_output()
     }
 
     pub fn encode_gpu(&mut self, frame: &GpuNv12Surface) -> Result<Vec<u8>, String> {
+        if let Some(performance) = &self.performance {
+            performance.record_path(FramePath::EncoderGpuSurface);
+        }
+        let submission = StageTimer::optional(self.performance.as_ref(), Stage::EncoderSubmit);
         if frame.width != self.width || frame.height != self.height {
             return Err(
                 "A superfície NV12 da GPU não corresponde às dimensões do codificador.".to_owned(),
@@ -231,11 +262,13 @@ impl HardwareEncoder {
                 .map_err(|error| format!("Não foi possível anexar a superfície D3D11: {error}"))?;
         }
         self.transform.send_sample(&sample, self.next_time_hns)?;
+        drop(submission);
         self.next_time_hns += HNS_PER_SECOND / i64::from(self.frame_rate);
         self.drain_output()
     }
 
     fn resolve_cpu_nv12<'a>(
+        &self,
         frame: Option<&'a GpuNv12Surface>,
         cpu_nv12: Option<&'a CpuNv12Frame>,
         rgba: &[u8],
@@ -246,7 +279,15 @@ impl HardwareEncoder {
         }
         if let (true, Some((bytes, stride))) = (
             rgba.is_empty(),
-            frame.and_then(|surface| surface.readback_nv12().ok()),
+            frame.and_then(|surface| {
+                let _timer =
+                    StageTimer::optional(self.performance.as_ref(), Stage::EncoderReadback);
+                let result = surface.readback_nv12().ok();
+                if let (Some(performance), Some((bytes, _))) = (&self.performance, &result) {
+                    performance.record_readback(Readback::Encoder, bytes.len());
+                }
+                result
+            }),
         ) {
             *storage = Some(CpuNv12Frame {
                 bytes: std::sync::Arc::new(bytes),
@@ -265,7 +306,7 @@ impl HardwareEncoder {
     ) -> Result<(Vec<u8>, bool, Option<String>), String> {
         let mut storage = None;
         if !self.gpu_surface_input_enabled {
-            let effective_nv12 = Self::resolve_cpu_nv12(frame, cpu_nv12, rgba, &mut storage);
+            let effective_nv12 = self.resolve_cpu_nv12(frame, cpu_nv12, rgba, &mut storage);
             let result = match effective_nv12 {
                 Some(frame) => self.encode_nv12(frame),
                 None => self.encode_rgba(rgba),
@@ -275,7 +316,7 @@ impl HardwareEncoder {
         let Some(frame) = frame else {
             if self.gpu_surface_input_enabled {
                 self.gpu_surface_input_enabled = false;
-                let effective_nv12 = Self::resolve_cpu_nv12(None, cpu_nv12, rgba, &mut storage);
+                let effective_nv12 = self.resolve_cpu_nv12(None, cpu_nv12, rgba, &mut storage);
                 return self.encode_cpu_input(effective_nv12, rgba).map(|bytes| {
                     (
                         bytes,
@@ -284,7 +325,7 @@ impl HardwareEncoder {
                     )
                 });
             }
-            let effective_nv12 = Self::resolve_cpu_nv12(None, cpu_nv12, rgba, &mut storage);
+            let effective_nv12 = self.resolve_cpu_nv12(None, cpu_nv12, rgba, &mut storage);
             return self
                 .encode_cpu_input(effective_nv12, rgba)
                 .map(|bytes| (bytes, false, None));
@@ -294,7 +335,7 @@ impl HardwareEncoder {
             Err(gpu_error) => {
                 self.gpu_surface_input_enabled = false;
                 let effective_nv12 =
-                    Self::resolve_cpu_nv12(Some(frame), cpu_nv12, rgba, &mut storage);
+                    self.resolve_cpu_nv12(Some(frame), cpu_nv12, rgba, &mut storage);
                 match self.encode_cpu_input(effective_nv12, rgba) {
                     Ok(bytes) => Ok((
                         bytes,
@@ -323,6 +364,7 @@ impl HardwareEncoder {
     }
 
     fn drain_output(&mut self) -> Result<Vec<u8>, String> {
+        let _timer = StageTimer::optional(self.performance.as_ref(), Stage::EncoderOutputWait);
         let mut output = Vec::new();
         let deadline = Instant::now() + Duration::from_millis(250);
         loop {

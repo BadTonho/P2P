@@ -191,6 +191,7 @@ struct PeerStatsSnapshot {
 
 #[derive(Default)]
 struct SharedMetrics {
+    video_performance: Arc<crate::video_performance::VideoPerformance>,
     session_id: u64,
     track_ssrc: AtomicU64,
     remote_video_track_seen: AtomicBool,

@@ -33,6 +33,8 @@ use signaling_protocol::{ParticipantInfo, RoomMode, SignalKind};
 mod audio;
 #[path = "app/discovery.rs"]
 mod discovery;
+#[path = "app/gpu_diagnostics.rs"]
+mod gpu_diagnostics;
 #[path = "app/group_sharing.rs"]
 mod group_sharing;
 #[path = "app/hosts.rs"]
@@ -168,6 +170,8 @@ enum SettingsCategory {
 
 #[derive(Default)]
 struct ClientUi {
+    gpu_telemetry: Option<crate::gpu_telemetry::GpuTelemetry>,
+    last_gpu_metrics_log_at: Option<Instant>,
     room_code: Option<String>,
     join_code: String,
     code_copied_until: Option<Instant>,
@@ -655,6 +659,7 @@ impl ClientUi {
         self.refresh_screen(&context);
         self.refresh_signaling(&context);
         self.refresh_turn_state();
+        self.refresh_gpu_telemetry(&context);
         self.refresh_screen_share(&context);
         self.refresh_control_mesh(&context);
         self.refresh_discovery(&context);
@@ -1159,6 +1164,8 @@ impl ClientUi {
                 .collect(),
             screen_share_state: share_state.to_owned(),
             discovery_state: self.discovery_diagnostic_summary(),
+            gpu_utilization: self.gpu_diagnostic_summary(),
+            video_performance: self.video_performance_summary(),
             screen_metrics: format!(
                 "sessão={}, SSRC={}, P2P={}, rota={:?}; par ICE: {}; RTP enviado: {}; RTP recebido: {}; RTP total enviado={} pacotes/{} bytes, recebido={} pacotes/{} bytes, perda={}, jitter={:.1} ms; RTP original repetido na saída={}; codec local/remoto={}/{}, fallback local/remoto={}/{}, ICE local/remoto={}/{}, srflx local/remoto={}/{}, relay local/remoto={}/{}, entradas/quadros H.264/enviados/decodificados={}/{}/{}/{}, IDR/P enviados={}/{}, descartados antes do IDR={}, P montados/decodificados={}/{}, pacotes RTP observados={}, decoder entradas/sem saída/fila cheia={}/{}/{}, quadros publicados/atualizações da prévia={}/{}, PLI fila cheia={}, erros de decodificação={}, diagnóstico H.264={}",
                 metrics.session_id,

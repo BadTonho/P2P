@@ -167,6 +167,7 @@ impl LatestFrame {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CapturePerformanceSnapshot {
+    pub pipeline: crate::video_performance::VideoPerformanceSnapshot,
     pub received_frames: u64,
     pub processed_frames: u64,
     pub unchanged_frames: u64,
@@ -178,6 +179,7 @@ pub(crate) struct CapturePerformanceSnapshot {
 
 #[derive(Default)]
 struct CapturePerformanceCounters {
+    pipeline: Arc<crate::video_performance::VideoPerformance>,
     received_frames: AtomicU64,
     processed_frames: AtomicU64,
     unchanged_frames: AtomicU64,
@@ -190,6 +192,7 @@ struct CapturePerformanceCounters {
 impl CapturePerformanceCounters {
     fn take_snapshot(&self) -> CapturePerformanceSnapshot {
         CapturePerformanceSnapshot {
+            pipeline: self.pipeline.take_interval(),
             received_frames: self.received_frames.swap(0, Ordering::Relaxed),
             processed_frames: self.processed_frames.swap(0, Ordering::Relaxed),
             unchanged_frames: self.unchanged_frames.swap(0, Ordering::Relaxed),
@@ -644,6 +647,10 @@ impl ScreenCapture {
 
     pub(crate) fn take_performance_snapshot(&self) -> CapturePerformanceSnapshot {
         self.performance.take_snapshot()
+    }
+
+    pub(crate) fn performance_label(&self) -> String {
+        self.performance.pipeline.snapshot().label()
     }
 
     pub fn fallback_reason(&self) -> Option<String> {

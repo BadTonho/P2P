@@ -912,6 +912,12 @@ fn loopback_controlled_rtp_loss_correlates_nack_and_retransmits_the_missing_pack
             .test_dropped_outbound_rtp
             .load(Ordering::Relaxed)
             > 0;
+        // RTP/RTCP recovery and ICE statistics arrive independently. Wait for both
+        // snapshots before asserting the route; a NACK alone does not make them ready.
+        let route_stats_ready = sender_metrics.route == Some(MediaRoute::Direct)
+            && receiver_metrics.route == Some(MediaRoute::Direct)
+            && sender_metrics.selected_ice_pair.contains("127.0.0.1")
+            && !sender_metrics.selected_ice_pair.contains("indisponível");
         if injected
             && sender
                 .metrics
@@ -925,6 +931,7 @@ fn loopback_controlled_rtp_loss_correlates_nack_and_retransmits_the_missing_pack
             && sender_metrics.original_rtp_repeats_sent > 0
             && receiver_metrics.nack_packets_sent
                 == Some(sender_metrics.nack_packets_received_observed)
+            && route_stats_ready
         {
             nack_stats_correlated = true;
             break;
