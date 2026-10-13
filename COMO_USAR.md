@@ -105,6 +105,12 @@ STUN ajuda a procurar uma rota direta e não retransmite mídia. TURN retransmit
 
 O atualizador consulta o último release público do [repositório no GitHub](https://github.com/BadTonho/P2P/releases/latest), prioriza `P2P-Voz-e-tela-Setup.exe` e mantém `p2p-client.exe` como fallback. Consulte [ATUALIZACOES.md](ATUALIZACOES.md) para publicar uma nova versão. Não é necessário criar ou enviar um manifesto separado.
 
+## Buscar novamente as salas da rede
+
+Em **Rede local / Radmin**, o botão **Buscar novamente**, ao lado de **Salas nesta rede**, atualiza os adaptadores e solicita uma consulta imediata na rede selecionada. A interface mostra **Buscando…** por dois segundos e agrega cliques repetidos. A busca automática continua a cada dois segundos; uma consulta manual mantém as salas válidas e não prolonga a validade de anúncios antigos.
+
+Se o serviço estiver ausente ou seu worker tiver encerrado, o botão tenta iniciar a descoberta novamente. Uma falha mostra a causa e mantém a entrada manual disponível. A ação fica desabilitada durante conexão, sala ativa ou atualização que bloqueie ações de sala, e não aparece no modo Internet. A seleção automática continua priorizando o Radmin ativo; a seleção manual segue a rede escolhida. Buscar não conecta a uma sala nem salva códigos recebidos.
+
 ## Nível de logs
 
 Em **Configurações > Geral**, escolha **Desativados**, **Avisos e erros** ou **Detalhados**. O padrão é **Avisos e erros**; os logs detalhados ficam desligados. **Desativados** não cria arquivos de sessão e preserva os logs antigos. **Exportar logs** continua disponível por ação manual e, com os logs desativados, exporta somente o relatório de diagnóstico, sem histórico de eventos.
@@ -112,6 +118,14 @@ Em **Configurações > Geral**, escolha **Desativados**, **Avisos e erros** ou *
 Para medir o vídeo, escolha **Detalhados** e marque **Registrar métricas periódicas de desempenho no log** nos dois computadores. Compartilhe uma tela por pelo menos 15 segundos e use **Exportar logs** em cada PC, de preferência durante a transmissão. O diagnóstico mostra o motor de codificação, decodificação, cópia ou 3D que o Windows atribuir ao processo, com média e pico por motor. A coleta ocorre aproximadamente a cada segundo e os resumos são registrados a cada cinco segundos. Quando o Windows ou o driver não fornecerem um contador válido, aparecerá `unavailable`; isso não significa uso de 0%.
 
 As medições do vídeo também distinguem entrada direta da GPU, entrada pela CPU em um codificador de hardware e OpenH264. Registram chamadas de captura, conversão de cores, codificação, decodificação, espera na fila e preparação da imagem, além do tempo e dos bytes copiados da GPU para a CPU. Os tempos são durações das chamadas do aplicativo, incluindo esperas, e algumas etapas se sobrepõem; não representam tempo exclusivo de execução da GPU ou percentual de CPU. Os percentuais dos motores pertencem ao processo inteiro, incluindo interface e outras telas compartilhadas, e não devem ser somados como um percentual total da placa.
+
+### Brilho ao clicar ou segurar o mouse
+
+A captura de desktop e a apresentação do vídeo usam opacidade total; o canal alpha do DXGI/WGC e o estilo de interação da interface não devem diminuir o brilho dos pixels. O conversor GPU declara entrada RGB completa (0–255) e saída NV12 BT.601 limitada (16–235), conforme o conversor CPU e o shader. Logs detalhados registram o contrato de cor ao criar o conversor e as mudanças entre caminhos GPU e CPU, incluindo composição do cursor, sem salvar imagens.
+
+Para conferir o caso real, use o executável de desenvolvimento atualizado em ambos os computadores. Compartilhe uma imagem fixa com preto, branco, cinzas e cores; compare áreas fora do cursor antes, durante e depois de segurar o botão esquerdo no transmissor e na imagem recebida. Repita com a prévia local, a grade, a imagem ampliada e a tela cheia, em 720p/60, 1080p/30 e 1080p/60. Compare CPU e DXVA no receptor. Mudanças intencionais do conteúdo compartilhado ou escurecimento causado por um diálogo do próprio Windows fazem parte da captura e não representam o mesmo defeito.
+
+A reprodução do sintoma original entre PC e notebook permanece pendente. Os testes sintéticos verificam que alpha e estados de interação não alteram pixels fixos; eles não substituem essa comparação física.
 
 ### Diagnóstico de faixa verde e reprodução em 1080p/60
 

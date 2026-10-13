@@ -211,6 +211,7 @@ pub(super) fn capture_dxgi_monitor(
     let mut gpu_preview_fallback_logged = false;
     let mut staging_texture = None;
     let mut cursor = DxgiCursorState::default();
+    let mut last_color_path = None;
 
     while !stop.load(Ordering::Relaxed) {
         let mut frame = match duplication.acquire_next_frame(100) {
@@ -479,6 +480,20 @@ pub(super) fn capture_dxgi_monitor(
         performance
             .resize_nanos
             .fetch_add(resize_nanos, Ordering::Relaxed);
+        let color_path = if preview.gpu_nv12.is_some() {
+            "gpu_nv12"
+        } else {
+            "cpu_rgba"
+        };
+        if last_color_path != Some(color_path) {
+            tracing::info!(
+                backend = color_path,
+                cursor_composed = compose_cursor,
+                color_contract = "BT.601 limited; opaque desktop",
+                "Caminho de captura de vídeo alterado"
+            );
+            last_color_path = Some(color_path);
+        }
         if same_preview_pixels(latest_frame.latest().as_deref(), &preview) {
             performance.unchanged_frames.fetch_add(1, Ordering::Relaxed);
             continue;
@@ -506,7 +521,7 @@ fn downsample_bgra(
             let source_x = (x * width / out_width).min(width - 1);
             let offset = ((source_y * width + source_x) * 4) as usize;
             if let Some(pixel) = bytes.get(offset..offset + 4) {
-                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
             } else {
                 rgba.extend_from_slice(&[0, 0, 0, 255]);
             }
@@ -668,5 +683,35 @@ mod cursor_tests {
         let mut hidden_frame = vec![0, 0, 0, 255];
         assert!(!cursor.composite(&mut hidden_frame, 1, 1));
         assert_eq!(hidden_frame, vec![0, 0, 0, 255]);
+    }
+}
+
+#[cfg(test)]
+mod brightness_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_and_capture_alpha_do_not_change_background_brightness() {
+        let base = [40, 100, 180, 0].repeat(16);
+        for alpha in [0, 96, 255] {
+            let mut bytes = base.clone();
+            for pixel in bytes.chunks_exact_mut(4) {
+                pixel[3] = alpha;
+            }
+            let shape = DxgiCursorShape {
+                width: 1,
+                height: 1,
+                pitch: 4,
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0,
+                bytes: vec![0, 0, 255, 255],
+            };
+            assert!(composite_cursor_bgra(&mut bytes, 4, 4, 0, 0, &shape));
+            let preview = downsample_bgra(&bytes, 4, 4, 1, ScreenShareQuality::default());
+            assert!(
+                preview.rgba[4..]
+                    .chunks_exact(4)
+                    .all(|pixel| pixel == [180, 100, 40, 255])
+            );
+        }
     }
 }

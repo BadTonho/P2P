@@ -160,6 +160,33 @@ impl GpuNv12Processor {
             unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }.map_err(|error| {
                 format!("Não foi possível iniciar o conversor de vídeo D3D11: {error}")
             })?;
+        // D3D11 bitfields: RGB_Range bit 1, YCbCr_Matrix bit 2,
+        // Nominal_Range bits 4-5. Match the existing CPU BT.601 converter.
+        let input_color = windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+            _bitfield:
+                (windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255.0
+                    as u32)
+                    << 4,
+        };
+        let output_color = windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+            _bitfield: (windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235.0 as u32) << 4,
+        };
+        unsafe {
+            video_context.VideoProcessorSetStreamColorSpace(&processor, 0, &input_color);
+            video_context.VideoProcessorSetOutputColorSpace(&processor, &output_color);
+            video_context.VideoProcessorSetOutputAlphaFillMode(
+                &processor,
+                windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE_OPAQUE,
+                0,
+            );
+        }
+        tracing::info!(
+            input_range = "RGB full 0-255",
+            output_range = "NV12 limited 16-235",
+            matrix = "BT.601",
+            output_alpha = "opaque",
+            "Contrato de cores do conversor D3D11 configurado"
+        );
         Ok(Self {
             device: device.clone(),
             context: context.clone(),
@@ -288,4 +315,93 @@ impl GpuNv12Processor {
             height: self.output_height,
         })
     }
+}
+
+/// Controlled native comparison; no desktop capture or user pixels are read.
+pub(crate) fn validate_color_conversion() -> Result<(), String> {
+    let _apartment = ComApartment::enter()?;
+    let (device, context, _manager) = create_d3d11_device_manager()?;
+    let colors = [
+        [0, 0, 0],
+        [255, 255, 255],
+        [64, 64, 64],
+        [128, 128, 128],
+        [192, 192, 192],
+        [255, 0, 0],
+        [0, 255, 0],
+        [0, 0, 255],
+    ];
+    let (width, height) = (64u32, 16u32);
+    let mut processor = GpuNv12Processor::new(&device, &context, width, height, width, height, 60)?;
+    let mut first = None;
+    for alpha in [0, 96, 255] {
+        let mut rgba = Vec::new();
+        let mut bgra = Vec::new();
+        for _ in 0..height {
+            for x in 0..width {
+                let [r, g, b] = colors[(x / 8) as usize];
+                rgba.extend_from_slice(&[r, g, b, 255]);
+                bgra.extend_from_slice(&[b, g, r, alpha]);
+            }
+        }
+        let cpu_yuv = YUVBuffer::from_rgba8_source(RgbaSliceU8::new(
+            &rgba,
+            (width as usize, height as usize),
+        ));
+        let mut packed = cpu_yuv.y().to_vec();
+        for (&u, &v) in cpu_yuv.u().iter().zip(cpu_yuv.v()) {
+            packed.extend_from_slice(&[u, v]);
+        }
+        let cpu = nv12_to_rgba(&packed, width as usize, height as usize, width as usize)?;
+        let description = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            ..Default::default()
+        };
+        let data = windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA {
+            pSysMem: bgra.as_ptr().cast(),
+            SysMemPitch: width * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut texture = None;
+        unsafe { device.CreateTexture2D(&description, Some(&data), Some(&mut texture)) }
+            .map_err(|error| format!("Textura de validação D3D11 indisponível: {error}"))?;
+        let surface = processor
+            .process(&texture.ok_or_else(|| "Textura de validação ausente.".to_owned())?)?;
+        let (bytes, pitch) = surface.readback_nv12()?;
+        let actual = surface.to_rgba(&bytes, pitch)?;
+        // Sample the interior of each color patch; exclude chroma boundary filtering.
+        for patch in 0..colors.len() {
+            let index = (8 * width as usize + patch * 8 + 4) * 4;
+            for channel in 0..3 {
+                if actual[index + channel].abs_diff(cpu[index + channel]) > 4 {
+                    return Err(format!(
+                        "Conversões CPU/GPU divergem: alpha {alpha}, faixa {patch}, canal {channel}, GPU {}, CPU {}.",
+                        actual[index + channel],
+                        cpu[index + channel]
+                    ));
+                }
+            }
+        }
+        if let Some(first) = &first {
+            if first != &actual {
+                return Err("Alpha da captura alterou cores na conversão GPU.".to_owned());
+            }
+        } else {
+            first = Some(actual);
+        }
+    }
+    println!(
+        "VIDEO_COLOR_VALIDATION_OK: GPU/CPU black, white, grays and RGB matched; capture alpha does not change GPU colors."
+    );
+    Ok(())
 }

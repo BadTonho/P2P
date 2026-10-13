@@ -33,6 +33,8 @@ O **P2P — Voz e Tela** foi criado para oferecer uma alternativa direta, transp
 - **Aceleração por Hardware (GPU NVENC / Intel QuickSync / AMD AMF):** Codificação H.264 acelerada por hardware via Media Foundation com pipeline *zero-copy*.
 - **Decodificação por Hardware DXVA/Direct3D 11:** O receptor normaliza o NV12 usando o tamanho real da superfície e apresenta as cores por shader no OpenGL da interface. A cópia da GPU do decoder para a CPU permanece; se o shader falhar, a sessão usa apresentação RGBA. O desempenho depende do computador e do perfil selecionado.
 - **Fallback Automático para CPU (OpenH264):** Garante compatibilidade caso o computador não possua GPU dedicada.
+- **Busca manual de salas:** o botão **Buscar novamente** envia uma consulta na rede selecionada, preserva anúncios válidos e permite tentar recuperar a descoberta após falha. A busca automática permanece ativa.
+- **Brilho estável do vídeo:** captura e apresentação opacas, com o mesmo contrato BT.601 limitado nos caminhos de conversão CPU/GPU e testes de interação.
 - **Qualidade de transmissão configurável:** Antes de iniciar, escolha 720p ou 1080p e 30 ou 60 FPS. A preferência fica salva neste computador. O limitador acompanha o perfil escolhido e descarta quadros quando necessário; o computador pode entregar menos FPS se não conseguir acompanhar. A taxa configurada é um alvo do encoder, não uma garantia de tráfego ou qualidade. Em grupo, o orçamento total é dividido entre quem está assistindo; veja os valores e limitações em [COMO_USAR.md](COMO_USAR.md).
 
 ### 🎧 Áudio do Sistema de Alta Fidelidade
@@ -148,6 +150,12 @@ Para instruções completas e dicas de portas de roteador e firewall, consulte o
 ### Validando a apresentação NV12 na GPU
 
 Depois de compilar, execute `target/release/p2p-client.exe --validate-nv12-gpu` (ou o executável de debug). Essa opção abre somente um contexto gráfico oculto, compara pixels do shader com a conversão CPU e verifica orientação, bordas, troca de resolução, reutilização e liberação de texturas. Não carrega nem salva as preferências do usuário. O resultado é indicado pelo código de saída e pela mensagem `NV12_GPU_VALIDATION_OK` ou `NV12_GPU_VALIDATION_FAILED` quando executado com saída capturada. Esse teste requer um contexto OpenGL nativo; não substitui a validação entre computadores.
+
+### Validando brilho e interação
+
+A opção `--validate-video-brightness` compara a conversão D3D11 com o caminho CPU usando preto, branco, cinzas e RGB, e testa alpha de captura 0, 96 e 255. Depois executa o shader e a apresentação real do egui em framebuffer, comparando pixels antes, durante e depois de pressionar o mouse nas dimensões de grade, ampliação e tela cheia. `--validate-nv12-gpu` também inclui essa verificação de interação. As imagens são sintéticas e as preferências não são carregadas nem salvas.
+
+No PowerShell, use `Start-Process` com `-WindowStyle Hidden -Wait -PassThru` para aguardar esse executável gráfico e conferir a propriedade `ExitCode`. Quando a saída for capturada, o sucesso inclui `VIDEO_COLOR_VALIDATION_OK`, `VIDEO_CLICK_VALIDATION_OK` e `NV12_GPU_VALIDATION_OK`. A comparação CPU/GPU admite até quatro níveis por canal nas regiões internas das faixas por diferenças de arredondamento; a comparação entre estados de clique exige pixels idênticos. O teste precisa de D3D11 e OpenGL nativos.
 
 ### Rodando os Testes
 Para garantir que todos os componentes estão funcionando:

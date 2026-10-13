@@ -118,9 +118,13 @@ fn local_preview_image(frame: &PreviewFrame) -> Result<Option<egui::ColorImage>,
     if rgba.len() != expected_bytes {
         return Err("Os dados RGBA da prévia estão incompletos.".to_owned());
     }
-    Ok(Some(egui::ColorImage::from_rgba_unmultiplied(
+    // Desktop video is opaque. DXGI/WGC alpha is not a visibility contract,
+    // and must not premultiply or darken unchanged RGB pixels.
+    Ok(Some(egui::ColorImage::new(
         [width, height],
-        &rgba,
+        rgba.chunks_exact(4)
+            .map(|pixel| egui::Color32::from_rgb(pixel[0], pixel[1], pixel[2]))
+            .collect(),
     )))
 }
 
@@ -224,6 +228,7 @@ struct ClientUi {
     last_adapter_refresh: Option<Instant>,
     discovery: Option<DiscoveryService>,
     discovery_attempted_at: Option<Instant>,
+    manual_room_search_at: Option<Instant>,
     discovered_rooms: Vec<DiscoveredRoom>,
     discovery_error: Option<String>,
     addresses_loaded: bool,
@@ -1247,6 +1252,17 @@ impl Drop for ClientUi {
 pub(super) fn run() -> eframe::Result {
     let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     #[cfg(windows)]
+    if arguments.len() == 1 && arguments[0] == "--validate-video-brightness" {
+        let result = std::thread::spawn(crate::mf_video::validate_color_conversion)
+            .join()
+            .unwrap_or_else(|_| Err("A validação nativa de cores foi interrompida.".to_owned()));
+        if let Err(error) = result {
+            eprintln!("VIDEO_COLOR_VALIDATION_FAILED: {error}");
+            std::process::exit(1);
+        }
+        return remote_video::run_gpu_validation();
+    }
+    #[cfg(windows)]
     if arguments.len() == 1 && arguments[0] == "--validate-nv12-gpu" {
         return remote_video::run_gpu_validation();
     }
@@ -1801,5 +1817,34 @@ mod tests {
         assert!((center_rect.center().x - header_rect.center().x).abs() < 0.1);
         assert!((settings_rect.right() - header_rect.right()).abs() < 0.1);
         assert!(following_content_rect.min.y - header_rect.max.y < 50.0);
+    }
+}
+
+#[cfg(test)]
+mod brightness_regression {
+    use super::*;
+
+    #[test]
+    fn desktop_video_brightness_is_independent_of_capture_alpha() {
+        for alpha in [0, 96, 255] {
+            let frame = PreviewFrame {
+                sequence: 1,
+                width: 2,
+                height: 2,
+                rgba: [180, 100, 40, alpha].repeat(4),
+                #[cfg(windows)]
+                gpu_nv12: None,
+                #[cfg(windows)]
+                cpu_nv12: None,
+            };
+            let image = local_preview_image(&frame).unwrap().unwrap();
+            assert!(
+                image
+                    .pixels
+                    .iter()
+                    .all(|pixel| *pixel == egui::Color32::from_rgb(180, 100, 40)),
+                "desktop pixels must remain opaque; capture alpha {alpha} changed brightness"
+            );
+        }
     }
 }

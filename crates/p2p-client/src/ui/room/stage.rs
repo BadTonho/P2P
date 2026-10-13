@@ -1,4 +1,5 @@
 use super::toolbar::{remote_audio_volume_context_menu, show_screen_audio_and_fullscreen_toolbar};
+use crate::app::remote_video::show_opaque_texture;
 use crate::app::{ClientUi, RoomMode, ScreenShareRole, ScreenShareSession};
 use eframe::egui;
 use signaling_protocol::ParticipantInfo;
@@ -92,9 +93,7 @@ impl ClientUi {
                     let image_size = source * scale.max(0.01);
                     stage.vertical_centered(|ui| {
                         ui.add_space(((stage_height - image_size.y) * 0.5).max(0.0));
-                        ui.add(
-                            egui::Image::new((texture.id(), source)).fit_to_exact_size(image_size),
-                        );
+                        show_opaque_texture(ui, texture, image_size, egui::Sense::hover());
                     });
                 } else {
                     stage.vertical_centered(|ui| {
@@ -254,9 +253,11 @@ impl ClientUi {
                     .min(1.0);
                 ui.vertical_centered(|ui| {
                     ui.add_space(((stage_height - source.y * scale.max(0.01)) * 0.5).max(0.0));
-                    ui.add(
-                        egui::Image::new((texture.id(), source))
-                            .fit_to_exact_size(source * scale.max(0.01)),
+                    show_opaque_texture(
+                        ui,
+                        texture,
+                        source * scale.max(0.01),
+                        egui::Sense::hover(),
                     );
                     if ui.button("Voltar à grade").clicked() {
                         self.group_share.focused_screen = None;
@@ -273,9 +274,13 @@ impl ClientUi {
                         tile.set_min_size(egui::vec2(300.0, 195.0));
                         tile.label("Você (prévia local)");
                         if let Some(texture) = &self.screen_texture {
-                            tile.add(
-                                egui::Image::new((texture.id(), texture.size_vec2()))
-                                    .fit_to_exact_size(egui::vec2(280.0, 158.0)),
+                            let source = texture.size_vec2();
+                            let scale = (280.0 / source.x).min(158.0 / source.y);
+                            show_opaque_texture(
+                                tile,
+                                texture,
+                                source * scale,
+                                egui::Sense::hover(),
                             );
                         } else {
                             tile.label("Preparando prévia…");
@@ -405,5 +410,55 @@ impl ClientUi {
         } else {
             self.set_fullscreen(ui.ctx(), false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn opaque_local_grid_video_preserves_source_aspect_ratio() {
+        let context = egui::Context::default();
+        let texture = context.load_texture(
+            "synthetic-local",
+            egui::ColorImage::filled([8, 6], egui::Color32::GREEN),
+            egui::TextureOptions::LINEAR,
+        );
+        let id = texture.id();
+        let mut app = std::mem::ManuallyDrop::new(ClientUi::default());
+        app.group_share.local_sharing = true;
+        app.show_local_preview = true;
+        app.screen_texture = Some(texture);
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 350.0),
+                )),
+                ..Default::default()
+            },
+            |ui| app.show_group_screen_stage(ui, 280.0),
+        );
+        output.textures_delta.clear();
+        let mesh = output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::epaint::Shape::Mesh(mesh) = &shape.shape {
+                    if mesh.texture_id == id {
+                        return Some(mesh);
+                    }
+                }
+                None
+            })
+            .expect("local video must be present in the grid");
+        let rect = mesh.calc_bounds();
+        assert!((rect.width() / rect.height() - 4.0 / 3.0).abs() < 0.0001);
+        assert!(
+            mesh.vertices
+                .iter()
+                .all(|vertex| vertex.color == egui::Color32::WHITE)
+        );
+        app.screen_texture = None;
     }
 }

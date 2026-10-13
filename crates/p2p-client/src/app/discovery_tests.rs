@@ -284,3 +284,108 @@ async fn discovery_loopback_selection_joins_existing_signaling_and_never_changes
     let _ = shutdown.send(());
     server.await.unwrap().unwrap();
 }
+
+#[test]
+fn manual_room_search_recovers_transport_and_preserves_preferences_without_joining() {
+    let mut app = app();
+    let preferences = serde_json::to_string(&app.preferences_snapshot()).unwrap();
+    let network = DiscoveryNetwork {
+        adapter: "test loopback".to_owned(),
+        ipv4: std::net::Ipv4Addr::LOCALHOST,
+        prefix_len: 8,
+    };
+    let context = egui::Context::default();
+    app.start_room_search(&context, Some(network.clone()), |_| {
+        Err("synthetic bind failure".to_owned())
+    });
+    assert_eq!(
+        app.discovery_error.as_deref(),
+        Some("synthetic bind failure")
+    );
+    assert!(app.discovery.is_none());
+    let sink = UdpSocket::bind("127.0.0.2:0").unwrap();
+    let SocketAddr::V4(target) = sink.local_addr().unwrap() else {
+        unreachable!()
+    };
+    app.start_room_search(&context, Some(network), |_| {
+        Ok(DiscoveryService::start_loopback(
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            vec![target],
+        ))
+    });
+    assert!(app.discovery.as_ref().unwrap().is_running());
+    assert!(app.discovery_error.is_none());
+    assert_eq!(
+        serde_json::to_string(&app.preferences_snapshot()).unwrap(),
+        preferences
+    );
+    assert!(app.signaling.is_none());
+    assert!(!app.connecting);
+    app.discovery = None;
+}
+
+#[test]
+fn manual_room_search_handles_no_adapter_and_is_blocked_while_busy() {
+    let mut app = app();
+    app.start_room_search(&egui::Context::default(), None, |_| {
+        panic!("no transport without an adapter")
+    });
+    assert!(
+        app.discovery_error
+            .as_deref()
+            .unwrap()
+            .contains("Nenhum adaptador")
+    );
+    assert!(app.discovery.is_none());
+    assert!(app.can_search_rooms());
+    app.manual_room_search_at = Some(Instant::now());
+    assert!(app.room_search_in_progress());
+    assert!(!app.can_search_rooms());
+    app.manual_room_search_at = Some(Instant::now() - Duration::from_secs(3));
+    assert!(app.can_search_rooms());
+    app.connecting = true;
+    assert!(!app.can_search_rooms());
+    app.connecting = false;
+    app.room_code = Some("ACTIVE".to_owned());
+    assert!(!app.can_search_rooms());
+    app.room_code = None;
+    app.create_room_mode = RoomMode::InternetTest;
+    assert!(!app.can_search_rooms());
+}
+
+#[test]
+fn manual_room_search_restarts_an_ended_worker_on_the_same_adapter() {
+    let mut app = app();
+    let context = egui::Context::default();
+    let network = DiscoveryNetwork {
+        adapter: "test loopback".to_owned(),
+        ipv4: std::net::Ipv4Addr::LOCALHOST,
+        prefix_len: 8,
+    };
+    let sink = UdpSocket::bind("127.0.0.2:0").unwrap();
+    let SocketAddr::V4(target) = sink.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let start = |_| {
+        Ok(DiscoveryService::start_loopback(
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            vec![target],
+        ))
+    };
+    app.start_room_search(&context, Some(network.clone()), start);
+    app.discovery.as_mut().unwrap().stop_worker_for_test();
+    assert!(!app.discovery.as_ref().unwrap().is_running());
+    let mut restarted = false;
+    app.start_room_search(&context, Some(network), |_| {
+        restarted = true;
+        Ok(DiscoveryService::start_loopback(
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            vec![target],
+        ))
+    });
+    assert!(restarted);
+    assert!(app.discovery.as_ref().unwrap().is_running());
+    assert!(app.discovery_error.is_none());
+    assert!(!app.connecting);
+    app.discovery = None;
+}

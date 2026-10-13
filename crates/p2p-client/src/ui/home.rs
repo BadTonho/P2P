@@ -79,14 +79,35 @@ fn show_control_network_window(ui: &mut egui::Ui, app: &mut ClientUi) {
     app.control_network_window_open = open;
 }
 
+#[derive(Default)]
+struct DiscoveredRoomActions {
+    selected: Option<crate::discovery::DiscoveredRoom>,
+    refresh: bool,
+}
+
 fn show_discovered_rooms(
     ui: &mut egui::Ui,
     rooms: &[crate::discovery::DiscoveredRoom],
     error: Option<&str>,
     searching: bool,
     enabled: bool,
-) -> Option<crate::discovery::DiscoveredRoom> {
-    ui.label(egui::RichText::new("Salas nesta rede").strong());
+    refresh_enabled: bool,
+) -> DiscoveredRoomActions {
+    let mut refresh = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Salas nesta rede").strong());
+        let label = if searching {
+            "Buscando…"
+        } else {
+            "Buscar novamente"
+        };
+        if ui
+            .add_enabled(refresh_enabled && !searching, egui::Button::new(label))
+            .clicked()
+        {
+            refresh = true;
+        }
+    });
     ui.small("Escolha uma sala para entrar sem digitar endereço ou código.");
     if let Some(error) = error {
         ClientUi::show_notice(ui, "Descoberta indisponível:", error);
@@ -130,7 +151,7 @@ fn show_discovered_rooms(
                 });
             }
         });
-    selected
+    DiscoveredRoomActions { selected, refresh }
 }
 
 fn primary_action_button(
@@ -657,17 +678,19 @@ impl ClientUi {
             if self.create_room_mode == RoomMode::Local {
                 let enabled =
                     room_actions_enabled(self.connecting, self.update_blocks_room_actions());
-                let searching = self.discovery.is_some()
-                    && self.discovery_attempted_at.is_some_and(|started| {
-                        started.elapsed() < std::time::Duration::from_secs(2)
-                    });
-                if let Some(room) = show_discovered_rooms(
+                let searching = self.room_search_in_progress();
+                let actions = show_discovered_rooms(
                     ui,
                     &self.discovered_rooms,
                     self.discovery_error.as_deref(),
                     searching,
                     enabled,
-                ) {
+                    self.can_search_rooms(),
+                );
+                if actions.refresh {
+                    self.request_room_search(ui.ctx());
+                }
+                if let Some(room) = actions.selected {
                     self.join_discovered_room(room);
                 }
             }

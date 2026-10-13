@@ -893,7 +893,7 @@ fn downsample_rgba(
             let source_x = (x * width / out_width).min(width - 1);
             let offset = ((source_y * width + source_x) * 4) as usize;
             if let Some(pixel) = bytes.get(offset..offset + 4) {
-                rgba.extend_from_slice(pixel);
+                rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
             } else {
                 rgba.extend_from_slice(&[0, 0, 0, 255]);
             }
@@ -1170,5 +1170,23 @@ mod tests {
 
         assert!(same_preview_pixels(Some(&first), &identical));
         assert!(!same_preview_pixels(Some(&first), &changed));
+    }
+}
+
+#[cfg(test)]
+mod brightness_tests {
+    use super::*;
+    #[test]
+    fn rgba_capture_alpha_is_not_transmitted_as_desktop_opacity() {
+        for alpha in [0, 96, 255] {
+            let bytes = [180, 100, 40, alpha].repeat(16);
+            let frame = downsample_rgba(&bytes, 4, 4, 1, ScreenShareQuality::default());
+            assert!(
+                frame
+                    .rgba
+                    .chunks_exact(4)
+                    .all(|pixel| pixel == [180, 100, 40, 255])
+            );
+        }
     }
 }

@@ -28,7 +28,11 @@ fn discovered_room_list_renders_without_code_and_never_selects_automatically() {
                 ..Default::default()
             },
             |ui| {
-                assert!(super::show_discovered_rooms(ui, &rooms, None, false, true).is_none());
+                assert!(
+                    super::show_discovered_rooms(ui, &rooms, None, false, true, true)
+                        .selected
+                        .is_none()
+                );
             },
         );
         let texts: Vec<_> = output
@@ -558,4 +562,77 @@ fn join_room_card_swaps_and_persists_codes_per_host_and_manual() {
         ui_state.last_manual_join_code.as_deref(),
         Some("NOVO-MANUAL")
     );
+}
+
+#[test]
+fn search_again_button_is_clickable_without_joining_and_disabled_while_searching_or_busy() {
+    for (searching, enabled, refresh_enabled) in [
+        (false, true, true),
+        (true, true, true),
+        (false, false, false),
+    ] {
+        let context = egui::Context::default();
+        let mut point = egui::Pos2::ZERO;
+        for phase in 0..3 {
+            let mut events = vec![];
+            if phase > 0 {
+                events.push(egui::Event::PointerMoved(point));
+                events.push(egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: phase == 1,
+                    modifiers: Default::default(),
+                });
+            }
+            let mut actions = None;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(340.0, 300.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    actions = Some(super::show_discovered_rooms(
+                        ui,
+                        &[],
+                        None,
+                        searching,
+                        enabled,
+                        refresh_enabled,
+                    ));
+                },
+            );
+            output.textures_delta.clear();
+            if phase == 0 {
+                let text = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| {
+                        if let egui::epaint::Shape::Text(text) = &shape.shape {
+                            if text.galley.job.text
+                                == if searching {
+                                    "Buscando…"
+                                } else {
+                                    "Buscar novamente"
+                                }
+                            {
+                                return Some(text);
+                            }
+                        }
+                        None
+                    })
+                    .expect("search action must be visible beside the room list title");
+                point = text.pos + egui::vec2(4.0, 4.0);
+            }
+            let actions = actions.unwrap();
+            assert!(actions.selected.is_none());
+            assert_eq!(
+                actions.refresh,
+                phase == 2 && !searching && enabled && refresh_enabled
+            );
+        }
+    }
 }

@@ -952,6 +952,7 @@ mod h264;
 
 pub use decoder::HardwareDecoder;
 pub use encoder::HardwareEncoder;
+pub(crate) use gpu_nv12::validate_color_conversion;
 pub use gpu_nv12::{GpuNv12Processor, GpuNv12Surface};
 use h264::normalize_annex_b;
 pub use h264::sps_dimensions;

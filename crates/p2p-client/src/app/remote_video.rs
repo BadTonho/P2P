@@ -187,11 +187,7 @@ impl RemoteVideoTexture {
 
     pub fn show(&self, ui: &mut egui::Ui, size: egui::Vec2, sense: egui::Sense) -> egui::Response {
         if let Some(texture) = &self.rgba {
-            return ui.add(
-                egui::Image::new((texture.id(), self.size))
-                    .fit_to_exact_size(size)
-                    .sense(sense),
-            );
+            return show_opaque_texture(ui, texture, size, sense);
         }
         let (rect, response) = ui.allocate_exact_size(size, sense);
         let renderer = Arc::clone(&self.renderer);
@@ -566,4 +562,25 @@ mod tests {
         assert!(restarted.rgba.is_none());
         assert!(restarted.slot.lock().unwrap().failed.is_none());
     }
+}
+
+/// Video pixels remain opaque independently of an interactive parent style.
+pub(super) fn show_opaque_texture(
+    ui: &mut egui::Ui,
+    texture: &egui::TextureHandle,
+    size: egui::Vec2,
+    sense: egui::Sense,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let mut painter = ui.painter().clone();
+    painter.set_opacity(1.0);
+    let mut mesh = egui::Mesh::with_texture(texture.id());
+    mesh.add_rect_with_uv(
+        rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+    painter.add(mesh);
+    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::Image));
+    response
 }

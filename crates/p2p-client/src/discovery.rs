@@ -171,6 +171,8 @@ struct Shared {
     cache: RoomCache,
     error: Option<String>,
     diagnostics: DiscoveryDiagnostics,
+    refresh_requested: bool,
+    last_manual_refresh: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -284,6 +286,42 @@ impl DiscoveryService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn stop_worker_for_test(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        !self.stopping.load(Ordering::Acquire)
+            && self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+    }
+
+    /// Coalesce manual requests; only the worker sends packets. Existing cache
+    /// entries keep their original expiry until an announcement refreshes them.
+    pub(crate) fn request_refresh(&self) -> bool {
+        if !self.is_running() {
+            return false;
+        }
+        let now = Instant::now();
+        let mut shared = self.shared.lock().expect("discovery state poisoned");
+        if shared
+            .last_manual_refresh
+            .is_some_and(|last| now.duration_since(last) < INTERVAL)
+        {
+            return false;
+        }
+        shared.last_manual_refresh = Some(now);
+        shared.refresh_requested = true;
+        tracing::info!(ipv4 = %self.network.ipv4, operation = "manual_refresh", "Nova busca de salas solicitada; códigos e nomes omitidos");
+        true
+    }
+
     pub(crate) fn diagnostics(&self) -> DiscoveryDiagnostics {
         self.shared
             .lock()
@@ -324,18 +362,20 @@ fn run_worker(
     let mut last_report = Instant::now();
     while !stopping.load(Ordering::Acquire) {
         let now = Instant::now();
-        let advertisement = shared
-            .lock()
-            .expect("discovery state poisoned")
-            .advertisement
-            .clone();
+        let (advertisement, requested) = {
+            let mut state = shared.lock().expect("discovery state poisoned");
+            (
+                state.advertisement.clone(),
+                std::mem::take(&mut state.refresh_requested),
+            )
+        };
         let periodic = now.duration_since(last_tick) >= INTERVAL;
         let changed = advertisement != last_advertisement;
-        if periodic {
+        if periodic || requested {
             send(&sender, &targets, Message::Query, &shared);
             last_tick = now;
         }
-        if (periodic || changed)
+        if (periodic || requested || changed)
             && let Some(room) = &advertisement
         {
             send(

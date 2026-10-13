@@ -9,7 +9,7 @@ mod windows_backend;
 #[cfg(windows)]
 pub(crate) use windows_backend::{
     GpuNv12Processor, GpuNv12Surface, HardwareDecoder, HardwareEncoder, cpu_nv12_to_rgba,
-    sps_dimensions,
+    sps_dimensions, validate_color_conversion,
 };
 
 #[cfg(not(windows))]

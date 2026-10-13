@@ -229,3 +229,58 @@ fn discovery_reports_transport_failure_without_including_room_code() {
     let error = service.snapshot().1.unwrap();
     assert!(!error.contains("PRIVATE123"));
 }
+
+#[test]
+fn manual_search_queries_immediately_coalesces_clicks_and_preserves_cache() {
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let sink = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
+    sink.set_read_timeout(Some(Duration::from_millis(700)))
+        .unwrap();
+    let SocketAddr::V4(target) = sink.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let service = DiscoveryService::start_loopback(receiver, vec![target]);
+    let mut packet = [0; MAX_PACKET];
+    let (length, _) = sink.recv_from(&mut packet).unwrap();
+    assert!(matches!(decode(&packet[..length]), Some(Message::Query)));
+    service.shared.lock().unwrap().cache.receive(
+        *target.ip(),
+        room("PRESERVED", 2),
+        Instant::now(),
+    );
+    let seen_before = service
+        .shared
+        .lock()
+        .unwrap()
+        .cache
+        .entries
+        .values()
+        .next()
+        .unwrap()
+        .1;
+    // UDP delivery can precede the worker's accounting of that same send.
+    wait_for(|| service.diagnostics().queries_sent >= 1);
+    let before = service.diagnostics().queries_sent;
+    assert!(service.request_refresh());
+    assert!(!service.request_refresh());
+    assert!(!service.request_refresh());
+    let started = Instant::now();
+    let (length, _) = sink
+        .recv_from(&mut packet)
+        .expect("manual query must arrive before the 2-second periodic interval");
+    assert!(started.elapsed() < Duration::from_millis(700));
+    assert!(matches!(decode(&packet[..length]), Some(Message::Query)));
+    wait_for(|| service.diagnostics().queries_sent >= before + 1);
+    assert_eq!(service.diagnostics().queries_sent, before + 1);
+    assert_eq!(service.snapshot().0[0].advertisement.code, "PRESERVED");
+    let shared = service.shared.lock().unwrap();
+    assert_eq!(
+        shared.cache.entries.values().next().unwrap().1,
+        seen_before,
+        "a manual query must not extend stale room expiry"
+    );
+    drop(shared);
+    service.stopping.store(true, Ordering::Release);
+    assert!(!service.is_running());
+    assert!(!service.request_refresh());
+}
