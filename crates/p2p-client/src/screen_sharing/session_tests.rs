@@ -292,6 +292,7 @@ fn regression_dropping_screen_session_releases_its_worker_socket() {
             last_received: 0,
             last_published: 0,
             last_queue_drops: 0,
+            last_recovery_gate_drops: 0,
         }),
         worker: Some(worker),
     };

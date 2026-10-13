@@ -81,7 +81,9 @@ mod sender;
 #[path = "screen_sharing/session.rs"]
 mod session;
 use adaptive_quality::{AdaptiveQualityController, QualityWindow};
-pub(crate) use adaptive_quality::{AdaptiveVideoProfile, QualityDecision, QualityFeedback};
+pub(crate) use adaptive_quality::{
+    AdaptiveVideoProfile, QualityDecision, QualityFeedback, QualityOverloadEvidence,
+};
 use h264::*;
 use metrics::should_log_aggregate_error;
 pub use metrics::{MediaRoute, ScreenShareMetrics, ScreenSharePerformanceSnapshot};

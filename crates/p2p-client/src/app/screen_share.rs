@@ -109,11 +109,18 @@ impl ClientUi {
         }
     }
 
-    pub(super) fn log_minimum_profile_overload(&self, peer_id: &str, stream_id: &str) {
+    pub(super) fn log_minimum_profile_overload(
+        &self,
+        peer_id: &str,
+        stream_id: &str,
+        evidence: screen_sharing::QualityOverloadEvidence,
+    ) {
         tracing::warn!(
             peer = %peer_id,
             stream_id = %stream_id,
             profile = "720p15",
+            decoder_queue_drops = evidence.queue_drops,
+            recovery_gate_drops = evidence.recovery_gate_drops,
             "O receptor continua abaixo da meta no perfil mínimo de vídeo"
         );
     }
@@ -1060,17 +1067,21 @@ impl ClientUi {
                 .map(|participant| participant.id.clone());
             if let Some(peer_id) = peer_id {
                 match decision {
-                    QualityDecision::Changed(feedback) => {
+                    QualityDecision::Changed {
+                        feedback,
+                        overload_evidence,
+                    } => {
                         tracing::info!(
                             screen_share_session = session.metrics().session_id,
                             profile = ?feedback.profile,
                             reason = ?feedback.reason,
+                            overload_evidence = ?overload_evidence,
                             "Solicitando ajuste adaptativo de qualidade"
                         );
                         self.send_quality_feedback(&peer_id, stream_id, feedback);
                     }
-                    QualityDecision::StillOverloadedAtMinimum => {
-                        self.log_minimum_profile_overload(&peer_id, &stream_id);
+                    QualityDecision::StillOverloadedAtMinimum { overload_evidence } => {
+                        self.log_minimum_profile_overload(&peer_id, &stream_id, overload_evidence);
                     }
                 }
             }

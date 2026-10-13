@@ -940,18 +940,26 @@ impl ClientUi {
                     && let Some(decision) = session.observe_quality_feedback()
                 {
                     match decision {
-                        QualityDecision::Changed(feedback) => {
+                        QualityDecision::Changed {
+                            feedback,
+                            overload_evidence,
+                        } => {
                             tracing::info!(
                                 screen_share_session = session.metrics().session_id,
                                 peer = %peer_id,
                                 profile = ?feedback.profile,
                                 reason = ?feedback.reason,
+                                overload_evidence = ?overload_evidence,
                                 "Solicitando ajuste adaptativo de qualidade para participante"
                             );
                             self.send_quality_feedback(&peer_id, generation.clone(), feedback);
                         }
-                        QualityDecision::StillOverloadedAtMinimum => {
-                            self.log_minimum_profile_overload(&peer_id, generation);
+                        QualityDecision::StillOverloadedAtMinimum { overload_evidence } => {
+                            self.log_minimum_profile_overload(
+                                &peer_id,
+                                generation,
+                                overload_evidence,
+                            );
                         }
                     }
                 }

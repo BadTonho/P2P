@@ -213,6 +213,19 @@ pub(crate) fn rtp_recovery_interval_label(
 }
 
 impl SharedMetrics {
+    pub(super) fn adaptive_quality_counters(&self) -> (u64, u64, u64, u64) {
+        let h264_flow = self
+            .h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            h264_flow.assembled_access_units,
+            self.published_frames.load(Ordering::Relaxed),
+            self.decoder_queue_drops.load(Ordering::Relaxed),
+            h264_flow.dropped_recovery_gate_waiting_for_idr,
+        )
+    }
+
     pub(super) fn snapshot(&self) -> ScreenShareMetrics {
         let h264_flow = self
             .h264_flow
@@ -1130,6 +1143,22 @@ mod tests {
         assert_eq!(snapshot.new_capture_frames, 1);
         assert_eq!(snapshot.repeated_capture_frames, 1);
         assert_eq!(snapshot.encoder_input_frames, 2);
+    }
+
+    #[test]
+    fn adaptive_quality_counters_include_recovery_gate_drops() {
+        let metrics = super::SharedMetrics::default();
+        let access_unit = annex_b_access_unit(&[&[0x41, 1]]);
+        metrics.record_assembled_access_unit(&access_unit);
+        metrics.record_assembled_access_unit(&access_unit);
+        metrics
+            .published_frames
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        metrics.record_decoder_queue_drop();
+        metrics.record_drop_recovery_gate_waiting_for_idr();
+        metrics.record_drop_recovery_gate_waiting_for_idr();
+
+        assert_eq!(metrics.adaptive_quality_counters(), (2, 1, 1, 2));
     }
 
     #[test]

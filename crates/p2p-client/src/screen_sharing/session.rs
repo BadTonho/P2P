@@ -230,6 +230,7 @@ struct SessionQualityFeedback {
     last_received: u64,
     last_published: u64,
     last_queue_drops: u64,
+    last_recovery_gate_drops: u64,
 }
 
 #[allow(dead_code)]
@@ -479,6 +480,7 @@ impl ScreenShareSession {
                 last_received: 0,
                 last_published: 0,
                 last_queue_drops: 0,
+                last_recovery_gate_drops: 0,
             }),
             worker: Some(worker),
         })
@@ -646,25 +648,22 @@ impl ScreenShareSession {
     }
 
     pub(crate) fn observe_quality_feedback(&self) -> Option<QualityDecision> {
-        let metrics = self.metrics();
+        let (received, published, queue_drops, recovery_gate_drops) =
+            self.metrics.adaptive_quality_counters();
         let mut state = self
             .adaptive_quality
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let window = QualityWindow {
-            received: metrics
-                .assembled_access_units
-                .saturating_sub(state.last_received),
-            published: metrics
-                .published_frames
-                .saturating_sub(state.last_published),
-            queue_drops: metrics
-                .decoder_queue_drops
-                .saturating_sub(state.last_queue_drops),
+            received: received.saturating_sub(state.last_received),
+            published: published.saturating_sub(state.last_published),
+            queue_drops: queue_drops.saturating_sub(state.last_queue_drops),
+            recovery_gate_drops: recovery_gate_drops.saturating_sub(state.last_recovery_gate_drops),
         };
-        state.last_received = metrics.assembled_access_units;
-        state.last_published = metrics.published_frames;
-        state.last_queue_drops = metrics.decoder_queue_drops;
+        state.last_received = received;
+        state.last_published = published;
+        state.last_queue_drops = queue_drops;
+        state.last_recovery_gate_drops = recovery_gate_drops;
         state.controller.observe(Instant::now(), window)
     }
 

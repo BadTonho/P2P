@@ -109,12 +109,24 @@ pub(crate) struct QualityWindow {
     pub received: u64,
     pub published: u64,
     pub queue_drops: u64,
+    pub recovery_gate_drops: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QualityOverloadEvidence {
+    pub queue_drops: u64,
+    pub recovery_gate_drops: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QualityDecision {
-    Changed(QualityFeedback),
-    StillOverloadedAtMinimum,
+    Changed {
+        feedback: QualityFeedback,
+        overload_evidence: Option<QualityOverloadEvidence>,
+    },
+    StillOverloadedAtMinimum {
+        overload_evidence: QualityOverloadEvidence,
+    },
 }
 
 pub(crate) struct AdaptiveQualityController {
@@ -145,37 +157,51 @@ impl AdaptiveQualityController {
         }
         self.last_evaluated_at = now;
         let ratio = window.published as f64 / window.received.max(1) as f64;
-        let overloaded =
-            window.received >= MIN_FRAMES_FOR_OVERLOAD && ratio < 0.80 && window.queue_drops >= 2;
+        let overload_evidence = QualityOverloadEvidence {
+            queue_drops: window.queue_drops,
+            recovery_gate_drops: window.recovery_gate_drops,
+        };
+        let overloaded = window.received >= MIN_FRAMES_FOR_OVERLOAD
+            && ratio < 0.80
+            && (window.queue_drops >= 2 || window.recovery_gate_drops >= 2);
         if overloaded {
             self.recovery_elapsed = Duration::ZERO;
             if self.profile.index() < MIN_PROFILE_INDEX {
                 self.profile = AdaptiveVideoProfile::from_index(self.profile.index() + 1);
-                return Some(QualityDecision::Changed(QualityFeedback {
-                    version: 1,
-                    profile: self.profile,
-                    reason: QualityFeedbackReason::Overload,
-                }));
+                return Some(QualityDecision::Changed {
+                    feedback: QualityFeedback {
+                        version: 1,
+                        profile: self.profile,
+                        reason: QualityFeedbackReason::Overload,
+                    },
+                    overload_evidence: Some(overload_evidence),
+                });
             }
             if !self.minimum_warning_sent {
                 self.minimum_warning_sent = true;
-                return Some(QualityDecision::StillOverloadedAtMinimum);
+                return Some(QualityDecision::StillOverloadedAtMinimum { overload_evidence });
             }
             return None;
         }
 
-        let recovered = window.received > 0 && ratio >= 0.90 && window.queue_drops == 0;
+        let recovered = window.received > 0
+            && ratio >= 0.90
+            && window.queue_drops == 0
+            && window.recovery_gate_drops == 0;
         if recovered {
             self.recovery_elapsed = self.recovery_elapsed.saturating_add(elapsed);
             if self.recovery_elapsed >= RECOVERY_WINDOW && self.profile.index() > 0 {
                 self.profile = AdaptiveVideoProfile::from_index(self.profile.index() - 1);
                 self.recovery_elapsed = Duration::ZERO;
                 self.minimum_warning_sent = false;
-                return Some(QualityDecision::Changed(QualityFeedback {
-                    version: 1,
-                    profile: self.profile,
-                    reason: QualityFeedbackReason::Recovered,
-                }));
+                return Some(QualityDecision::Changed {
+                    feedback: QualityFeedback {
+                        version: 1,
+                        profile: self.profile,
+                        reason: QualityFeedbackReason::Recovered,
+                    },
+                    overload_evidence: None,
+                });
             }
         } else {
             self.recovery_elapsed = Duration::ZERO;
@@ -198,11 +224,12 @@ mod tests {
             received: 60,
             published: 47,
             queue_drops: 2,
+            recovery_gate_drops: 0,
         }
     }
 
     #[test]
-    fn overload_requires_frame_ratio_and_two_queue_drops() {
+    fn overload_requires_minimum_frames_output_ratio_and_two_drop_events() {
         let start = Instant::now();
         for window in [
             QualityWindow {
@@ -217,11 +244,72 @@ mod tests {
                 queue_drops: 1,
                 ..overload()
             },
+            QualityWindow {
+                queue_drops: 0,
+                recovery_gate_drops: 1,
+                ..overload()
+            },
+            QualityWindow {
+                queue_drops: 1,
+                recovery_gate_drops: 1,
+                ..overload()
+            },
         ] {
             let mut controller = AdaptiveQualityController::new(start);
             assert_eq!(controller.observe(start + CONTROL_WINDOW, window), None);
             assert_eq!(controller.profile(), AdaptiveVideoProfile::P1080Fps60);
         }
+    }
+
+    #[test]
+    fn recovery_gate_drops_trigger_overload_when_decoder_queue_is_clear() {
+        let start = Instant::now();
+        let mut controller = AdaptiveQualityController::new(start);
+        assert_eq!(
+            controller.observe(
+                start + CONTROL_WINDOW,
+                QualityWindow {
+                    queue_drops: 0,
+                    recovery_gate_drops: 2,
+                    ..overload()
+                }
+            ),
+            Some(QualityDecision::Changed {
+                feedback: QualityFeedback {
+                    version: 1,
+                    profile: AdaptiveVideoProfile::P1080Fps30,
+                    reason: QualityFeedbackReason::Overload,
+                },
+                overload_evidence: Some(QualityOverloadEvidence {
+                    queue_drops: 0,
+                    recovery_gate_drops: 2,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn overload_accepts_exact_frame_and_output_thresholds() {
+        let start = Instant::now();
+        let mut controller = AdaptiveQualityController::new(start);
+        assert!(matches!(
+            controller.observe(
+                start + CONTROL_WINDOW,
+                QualityWindow {
+                    received: MIN_FRAMES_FOR_OVERLOAD,
+                    published: 35,
+                    queue_drops: 0,
+                    recovery_gate_drops: 2,
+                }
+            ),
+            Some(QualityDecision::Changed {
+                feedback: QualityFeedback {
+                    profile: AdaptiveVideoProfile::P1080Fps30,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -238,7 +326,7 @@ mod tests {
         assert_eq!(controller.profile(), AdaptiveVideoProfile::P1080Fps60);
         assert!(matches!(
             controller.observe(start + CONTROL_WINDOW, overload()),
-            Some(QualityDecision::Changed(_))
+            Some(QualityDecision::Changed { .. })
         ));
     }
 
@@ -250,17 +338,25 @@ mod tests {
         for step in 1..=3 {
             last = controller.observe(start + CONTROL_WINDOW * step, overload());
         }
-        assert_eq!(
+        assert!(matches!(
             last,
-            Some(QualityDecision::Changed(QualityFeedback {
-                version: 1,
-                profile: AdaptiveVideoProfile::P720Fps15,
-                reason: QualityFeedbackReason::Overload,
-            }))
-        );
+            Some(QualityDecision::Changed {
+                feedback: QualityFeedback {
+                    version: 1,
+                    profile: AdaptiveVideoProfile::P720Fps15,
+                    reason: QualityFeedbackReason::Overload,
+                },
+                overload_evidence: Some(_),
+            })
+        ));
         assert_eq!(
             controller.observe(start + CONTROL_WINDOW * 4, overload()),
-            Some(QualityDecision::StillOverloadedAtMinimum)
+            Some(QualityDecision::StillOverloadedAtMinimum {
+                overload_evidence: QualityOverloadEvidence {
+                    queue_drops: 2,
+                    recovery_gate_drops: 0,
+                }
+            })
         );
         assert_eq!(
             controller.observe(start + CONTROL_WINDOW * 5, overload()),
@@ -279,6 +375,7 @@ mod tests {
             received: 60,
             published: 54,
             queue_drops: 0,
+            recovery_gate_drops: 0,
         };
         assert_eq!(
             controller.observe(start + Duration::from_secs(12), healthy),
@@ -295,12 +392,55 @@ mod tests {
         let decision = controller.observe(start + Duration::from_secs(21), healthy);
         assert_eq!(
             decision,
-            Some(QualityDecision::Changed(QualityFeedback {
-                version: 1,
-                profile: AdaptiveVideoProfile::P720Fps30,
-                reason: QualityFeedbackReason::Recovered,
-            }))
+            Some(QualityDecision::Changed {
+                feedback: QualityFeedback {
+                    version: 1,
+                    profile: AdaptiveVideoProfile::P720Fps30,
+                    reason: QualityFeedbackReason::Recovered,
+                },
+                overload_evidence: None,
+            })
         );
+    }
+
+    #[test]
+    fn recovery_waits_until_recovery_gate_drops_stop() {
+        let start = Instant::now();
+        let mut controller = AdaptiveQualityController::new(start);
+        controller.observe(start + CONTROL_WINDOW, overload());
+        let healthy = QualityWindow {
+            received: 60,
+            published: 54,
+            queue_drops: 0,
+            recovery_gate_drops: 0,
+        };
+        for step in 2..=4 {
+            controller.observe(start + CONTROL_WINDOW * step, healthy);
+        }
+        let with_recovery_drop = QualityWindow {
+            recovery_gate_drops: 1,
+            ..healthy
+        };
+        assert_eq!(
+            controller.observe(start + CONTROL_WINDOW * 5, with_recovery_drop),
+            None
+        );
+        for step in 6..=8 {
+            assert_eq!(
+                controller.observe(start + CONTROL_WINDOW * step, healthy),
+                None
+            );
+        }
+        assert!(matches!(
+            controller.observe(start + CONTROL_WINDOW * 9, healthy),
+            Some(QualityDecision::Changed {
+                feedback: QualityFeedback {
+                    reason: QualityFeedbackReason::Recovered,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]
