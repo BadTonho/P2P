@@ -109,6 +109,7 @@ struct Transform {
     width: u32,
     height: u32,
     frame_rate: u32,
+    output_generation: u64,
 }
 
 impl Transform {
@@ -245,6 +246,7 @@ impl Transform {
             width,
             height,
             frame_rate,
+            output_generation: 0,
         })
     }
 
@@ -478,9 +480,11 @@ impl Transform {
         self.output_capacity = info.cbSize.max(MF_OUTPUT_CAPACITY);
         self.transform_provides_sample =
             info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
-        tracing::warn!(
+        self.output_generation = self.output_generation.wrapping_add(1);
+        tracing::info!(
             width = self.width,
             height = self.height,
+            output_generation = self.output_generation,
             "Decoder Media Foundation renegociou saída NV12 após MF_E_TRANSFORM_STREAM_CHANGE"
         );
         Ok(())
@@ -816,7 +820,8 @@ fn read_dxgi_nv12(
     sample: &IMFSample,
     context: &ID3D11DeviceContext,
     staging: &mut Option<ID3D11Texture2D>,
-) -> Result<(Vec<u8>, usize), String> {
+    visible: (usize, usize, usize, usize),
+) -> Result<(Vec<u8>, crate::nv12::Nv12Layout, usize), String> {
     let buffer = unsafe { sample.ConvertToContiguousBuffer() }
         .map_err(|e| format!("Não foi possível acessar o quadro decodificado: {e}"))?;
     let dxgi_buffer = buffer
@@ -899,22 +904,27 @@ fn read_dxgi_nv12(
         context
             .Map(staging_ref, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
             .map_err(|e| format!("Não foi possível copiar quadro DXVA para a CPU: {e}"))?;
-        let stride = mapped.RowPitch as usize;
-        let height = desc.Height as usize;
-        let width = desc.Width as usize;
-        if mapped.pData.is_null() || stride < width || height == 0 {
-            context.Unmap(staging_ref, 0);
-            return Err(format!(
-                "O DXVA retornou uma superfície sem leitura válida: stride {stride}, dimensões {width}×{height}, dados nulos={}.",
-                mapped.pData.is_null()
-            ));
-        }
-        let length = stride
-            .checked_mul(height + height / 2)
-            .ok_or_else(|| "O tamanho do quadro DXVA excedeu o limite.".to_owned())?;
-        let bytes = slice::from_raw_parts(mapped.pData.cast::<u8>(), length).to_vec();
+        // Run all fallible mapped reads inside a closure, then unmap on every path.
+        let result = (|| {
+            let layout = crate::nv12::Nv12Layout {
+                surface_width: desc.Width as usize,
+                surface_height: desc.Height as usize,
+                pitch: mapped.RowPitch as usize,
+                x: visible.0,
+                y: visible.1,
+                width: visible.2,
+                height: visible.3,
+            };
+            layout.packed_len()?;
+            let length = layout.source_len()?;
+            if mapped.pData.is_null() || length > isize::MAX as usize {
+                return Err("O DXVA retornou uma superfície sem leitura válida.".to_owned());
+            }
+            let bytes = slice::from_raw_parts(mapped.pData.cast::<u8>(), length);
+            Ok((layout.normalize(bytes)?, layout, length))
+        })();
         context.Unmap(staging_ref, 0);
-        Ok((bytes, stride))
+        result
     }
 }
 
@@ -924,34 +934,7 @@ fn nv12_to_rgba(
     height: usize,
     stride: usize,
 ) -> Result<Vec<u8>, String> {
-    let y_bytes = stride
-        .checked_mul(height)
-        .ok_or_else(|| "Dimensões NV12 excederam o limite.".to_owned())?;
-    let uv_bytes = stride
-        .checked_mul(height / 2)
-        .ok_or_else(|| "Dimensões UV excederam o limite.".to_owned())?;
-    if stride < width || nv12.len() < y_bytes + uv_bytes {
-        return Err(format!(
-            "Saída DXVA NV12 incompleta: {} bytes, esperado ao menos {} para {width}×{height}.",
-            nv12.len(),
-            y_bytes + uv_bytes
-        ));
-    }
-    let mut rgba = vec![0u8; width * height * 4];
-    for row in 0..height {
-        for column in 0..width {
-            let y = i32::from(nv12[row * stride + column]).saturating_sub(16);
-            let uv_offset = y_bytes + (row / 2) * stride + (column & !1);
-            let u = i32::from(nv12[uv_offset]) - 128;
-            let v = i32::from(nv12[uv_offset + 1]) - 128;
-            let output = (row * width + column) * 4;
-            rgba[output] = clamp_color((298 * y + 409 * v + 128) >> 8);
-            rgba[output + 1] = clamp_color((298 * y - 100 * u - 208 * v + 128) >> 8);
-            rgba[output + 2] = clamp_color((298 * y + 516 * u + 128) >> 8);
-            rgba[output + 3] = 255;
-        }
-    }
-    Ok(rgba)
+    crate::nv12::to_rgba(nv12, width, height, stride)
 }
 
 pub(crate) fn cpu_nv12_to_rgba(
@@ -960,10 +943,6 @@ pub(crate) fn cpu_nv12_to_rgba(
     height: u32,
 ) -> Result<Vec<u8>, String> {
     nv12_to_rgba(&frame.bytes, width as usize, height as usize, frame.stride)
-}
-
-fn clamp_color(value: i32) -> u8 {
-    value.clamp(0, 255) as u8
 }
 
 mod decoder;

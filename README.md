@@ -31,7 +31,7 @@ O **P2P — Voz e Tela** foi criado para oferecer uma alternativa direta, transp
 ### 🚀 Desempenho e Gráficos de Baixa Latência
 - **Captura Ultrarrápida via DirectX 11 (DXGI Desktop Duplication):** Captura de tela com latência submilisegundo diretamente da VRAM.
 - **Aceleração por Hardware (GPU NVENC / Intel QuickSync / AMD AMF):** Codificação H.264 acelerada por hardware via Media Foundation com pipeline *zero-copy*.
-- **Decodificação por Hardware DXVA2:** Reprodução fluida de vídeo remoto sem sobrecarregar a CPU.
+- **Decodificação por Hardware DXVA/Direct3D 11:** O receptor normaliza o NV12 usando o tamanho real da superfície e apresenta as cores por shader no OpenGL da interface. A cópia da GPU do decoder para a CPU permanece; se o shader falhar, a sessão usa apresentação RGBA. O desempenho depende do computador e do perfil selecionado.
 - **Fallback Automático para CPU (OpenH264):** Garante compatibilidade caso o computador não possua GPU dedicada.
 - **Qualidade de transmissão configurável:** Antes de iniciar, escolha 720p ou 1080p e 30 ou 60 FPS. A preferência fica salva neste computador. O limitador acompanha o perfil escolhido e descarta quadros quando necessário; o computador pode entregar menos FPS se não conseguir acompanhar. A taxa configurada é um alvo do encoder, não uma garantia de tráfego ou qualidade. Em grupo, o orçamento total é dividido entre quem está assistindo; veja os valores e limitações em [COMO_USAR.md](COMO_USAR.md).
 
@@ -144,6 +144,10 @@ Para instruções completas e dicas de portas de roteador e firewall, consulte o
    powershell -ExecutionPolicy Bypass -File scripts/build-installer.ps1
    ```
    O instalador gerado ficará em `target/installer/P2P-Voz-e-tela-Setup.exe`.
+
+### Validando a apresentação NV12 na GPU
+
+Depois de compilar, execute `target/release/p2p-client.exe --validate-nv12-gpu` (ou o executável de debug). Essa opção abre somente um contexto gráfico oculto, compara pixels do shader com a conversão CPU e verifica orientação, bordas, troca de resolução, reutilização e liberação de texturas. Não carrega nem salva as preferências do usuário. O resultado é indicado pelo código de saída e pela mensagem `NV12_GPU_VALIDATION_OK` ou `NV12_GPU_VALIDATION_FAILED` quando executado com saída capturada. Esse teste requer um contexto OpenGL nativo; não substitui a validação entre computadores.
 
 ### Rodando os Testes
 Para garantir que todos os componentes estão funcionando:

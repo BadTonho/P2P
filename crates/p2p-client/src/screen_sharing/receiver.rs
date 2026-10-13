@@ -630,7 +630,7 @@ fn decode_h264_access_unit(
                     let (width, height) = yuv.dimensions();
                     let mut rgba = vec![0; yuv.rgba8_len()];
                     yuv.write_rgba8(&mut rgba);
-                    (width as u32, height as u32, rgba)
+                    (width as u32, height as u32, rgba, None)
                 })
             })
             .map_err(|error| {
@@ -651,13 +651,22 @@ fn decode_h264_access_unit(
                 .record_path(FramePath::DecoderDxva);
             decoder
                 .decode(access_unit)
-                .map(|frame| frame.map(|frame| (frame.width, frame.height, frame.rgba)))
+                .map(|frame| {
+                    frame.map(|frame| {
+                        (
+                            frame.width,
+                            frame.height,
+                            Vec::new(),
+                            Some(Arc::new(frame.nv12)),
+                        )
+                    })
+                })
                 .map_err(|error| (format!("{error}; quadro: {sample_diagnostics}"), None))
         }
     };
 
     match decoded {
-        Ok(Some((width, height, rgba))) => {
+        Ok(Some((width, height, rgba, cpu_nv12))) => {
             if width == 0 || height == 0 {
                 return None;
             }
@@ -679,7 +688,16 @@ fn decode_h264_access_unit(
             let expected_bytes = (width as usize)
                 .saturating_mul(height as usize)
                 .saturating_mul(4);
-            if width == 0 || height == 0 || rgba.len() != expected_bytes {
+            #[cfg(windows)]
+            let valid_nv12 = cpu_nv12.as_ref().is_some_and(|frame| {
+                frame.stride == width as usize && frame.bytes.len() == expected_bytes / 4 * 3 / 2
+            });
+            #[cfg(not(windows))]
+            let valid_nv12 = {
+                let _: Option<()> = cpu_nv12;
+                false
+            };
+            if width == 0 || height == 0 || (!valid_nv12 && rgba.len() != expected_bytes) {
                 tracing::warn!(
                     width,
                     height,
@@ -700,7 +718,7 @@ fn decode_h264_access_unit(
                     #[cfg(windows)]
                     gpu_nv12: None,
                     #[cfg(windows)]
-                    cpu_nv12: None,
+                    cpu_nv12,
                 }));
             metrics.published_frames.fetch_add(1, Ordering::Relaxed);
             metrics

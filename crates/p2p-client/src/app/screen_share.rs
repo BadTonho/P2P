@@ -1092,40 +1092,34 @@ impl ClientUi {
             .as_ref()
             .and_then(ScreenShareSession::latest_remote_frame);
         if let Some(frame) = remote_frame
-            && self.remote_screen_sequence != frame.sequence
+            && (self.remote_screen_sequence != frame.sequence
+                || self
+                    .remote_screen_texture
+                    .as_ref()
+                    .is_some_and(RemoteVideoTexture::needs_fallback))
         {
-            let expected_bytes = (frame.width as usize)
-                .saturating_mul(frame.height as usize)
-                .saturating_mul(4);
-            if frame.width > 0 && frame.height > 0 && frame.rgba.len() == expected_bytes {
-                let conversion_started = Instant::now();
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba,
-                );
-                if let Some(session) = self.screen_share_session.as_ref() {
-                    session.record_ui_rgba_conversion_duration(conversion_started.elapsed());
+            let texture = self
+                .remote_screen_texture
+                .get_or_insert_with(|| self.remote_video_renderer.texture());
+            let started = Instant::now();
+            if let Some(session) = self.screen_share_session.as_ref() {
+                match texture.update(context, Arc::clone(&frame), session.video_performance()) {
+                    Ok(()) => {
+                        session.record_ui_texture_update();
+                        session.record_ui_texture_update_duration(started.elapsed());
+                        if self.remote_screen_sequence == 0 {
+                            self.screen_share_status =
+                                Some("Primeiro quadro da tela recebido e decodificado.".to_owned());
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "Falha ao preparar quadro remoto para apresentação");
+                        self.screen_share_status =
+                            Some("Não foi possível apresentar o quadro recebido.".to_owned());
+                    }
                 }
-                let texture_started = Instant::now();
-                if let Some(texture) = self.remote_screen_texture.as_mut() {
-                    texture.set(image, egui::TextureOptions::LINEAR);
-                } else {
-                    self.remote_screen_texture = Some(context.load_texture(
-                        "remote-screen",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ));
-                }
-                if let Some(session) = self.screen_share_session.as_ref() {
-                    session.record_ui_texture_update();
-                    session.record_ui_texture_update_duration(texture_started.elapsed());
-                }
-                if self.remote_screen_sequence == 0 {
-                    self.screen_share_status =
-                        Some("Primeiro quadro da tela recebido e decodificado.".to_owned());
-                }
-                self.remote_screen_sequence = frame.sequence;
             }
+            self.remote_screen_sequence = frame.sequence;
         }
     }
 

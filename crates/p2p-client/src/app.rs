@@ -37,6 +37,9 @@ mod audio;
 mod discovery;
 #[path = "app/gpu_diagnostics.rs"]
 mod gpu_diagnostics;
+#[path = "app/remote_video.rs"]
+mod remote_video;
+use remote_video::{RemoteVideoRenderer, RemoteVideoTexture};
 #[path = "app/group_sharing.rs"]
 mod group_sharing;
 #[path = "app/hosts.rs"]
@@ -282,7 +285,8 @@ struct ClientUi {
     screen_share_role: ScreenShareRole,
     screen_share_status: Option<String>,
     audio_status: Option<String>,
-    remote_screen_texture: Option<egui::TextureHandle>,
+    remote_screen_texture: Option<RemoteVideoTexture>,
+    remote_video_renderer: RemoteVideoRenderer,
     remote_screen_sequence: u64,
     group_share: GroupShareState,
     include_system_audio: bool,
@@ -324,7 +328,7 @@ struct GroupShareState {
     outbound_ports: HashMap<String, u16>,
     outbound_target_bitrate_bps: Option<u32>,
     inbound_ports: HashMap<String, u16>,
-    remote_textures: HashMap<String, egui::TextureHandle>,
+    remote_textures: HashMap<String, RemoteVideoTexture>,
     remote_sequences: HashMap<String, u64>,
     auto_focus_pending: HashSet<String>,
     peer_status: HashMap<String, String>,
@@ -1242,6 +1246,10 @@ impl Drop for ClientUi {
 
 pub(super) fn run() -> eframe::Result {
     let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    #[cfg(windows)]
+    if arguments.len() == 1 && arguments[0] == "--validate-nv12-gpu" {
+        return remote_video::run_gpu_validation();
+    }
     if let Some(exit_code) = update::helper_arguments(&arguments) {
         std::process::exit(exit_code);
     }
@@ -1265,9 +1273,25 @@ pub(super) fn run() -> eframe::Result {
 
     tracing::info!("Interface gráfica sendo inicializada");
 
-    eframe::run_ui_native("P2P - Voz e tela", native_options(), move |ui, _frame| {
-        app.show(ui);
-    })
+    eframe::run_native(
+        "P2P - Voz e tela",
+        native_options(),
+        Box::new(move |_| Ok(Box::new(app))),
+    )
+}
+
+impl eframe::App for ClientUi {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.remote_video_renderer
+            .begin_frame(frame.gl().map(Arc::as_ref));
+        self.show(ui);
+    }
+
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let Some(gl) = gl {
+            self.remote_video_renderer.destroy(gl);
+        }
+    }
 }
 
 fn native_options() -> eframe::NativeOptions {

@@ -113,6 +113,22 @@ Para medir o vídeo, escolha **Detalhados** e marque **Registrar métricas peri�
 
 As medições do vídeo também distinguem entrada direta da GPU, entrada pela CPU em um codificador de hardware e OpenH264. Registram chamadas de captura, conversão de cores, codificação, decodificação, espera na fila e preparação da imagem, além do tempo e dos bytes copiados da GPU para a CPU. Os tempos são durações das chamadas do aplicativo, incluindo esperas, e algumas etapas se sobrepõem; não representam tempo exclusivo de execução da GPU ou percentual de CPU. Os percentuais dos motores pertencem ao processo inteiro, incluindo interface e outras telas compartilhadas, e não devem ser somados como um percentual total da placa.
 
+### Diagnóstico de faixa verde e reprodução em 1080p/60
+
+O receptor DXVA usa a altura alocada pela GPU para localizar o plano de cores NV12 e copia apenas a imagem visível. Uma superfície de 1088 linhas pode conter um vídeo de 1080 linhas; o preenchimento não deve aparecer na imagem. Os logs detalhados registram `surface_width`, `surface_height`, `visible_width`, `visible_height`, `crop_x`, `crop_y`, `pitch`, `uv_offset` e o adaptador na inicialização e quando o layout mudar.
+
+A apresentação remota tenta o backend `nv12_glow` na grade, na visualização ampliada e na tela cheia. Os planos Y e UV são enviados como texturas e convertidos por shader, evitando a conversão NV12→RGBA na CPU e a preparação de `ColorImage` nesse caminho. A cópia DXVA→CPU continua necessária. Uma falha gráfica é registrada e a mesma sessão passa a usar RGBA; ela não tenta recriar o shader a cada quadro. Reiniciar a transmissão permite uma nova tentativa. Essa alternativa de apresentação é independente da preferência do decoder: **CPU (OpenH264)** continua disponível, e **Automático** e **Preferir DXVA** mantêm suas regras.
+
+Para validar em computadores físicos:
+
+1. Ative logs **Detalhados** e as métricas periódicas nos dois computadores; anote qual executável foi aberto em cada um.
+2. Transmita PC → notebook em 720p/60, 1080p/30 e 1080p/60 por dois minutos em cada perfil. Inclua texto, padrões de cor, movimento e uma imagem parada. O perfil é um limite; confira a resolução efetiva, que pode ser menor que 1080p se a fonte for menor.
+3. Confira as bordas e as cores na grade, na visualização ampliada e na tela cheia. Alterne a qualidade e pare/reinicie o compartilhamento dez vezes; confirme ausência da faixa verde, orientação correta e imagem atualizada.
+4. Repita notebook → PC com os perfis possíveis da fonte. Compare com **CPU (OpenH264)** no receptor para separar problemas de DXVA e apresentação.
+5. Exporte os logs de ambos. No caminho acelerado, `ui_nv12_shader_attempts`, `ui_nv12_upload_call` e `ui_nv12_shader_draw_call` devem ter amostras; `decoder_cpu_color_convert` e `ui_rgba_image_conversion` não devem ganhar amostras para esses quadros. Os tempos medem chamadas e esperas, não tempo exclusivo da GPU. Meça FPS com conteúdo em movimento; uma tela estática pode ser repetida a 1 FPS.
+
+Aceite a correção visual apenas após confirmar ausência da faixa no notebook. Registre separadamente a redução do custo de conversão, o FPS sustentado, perdas e recuperação por quadro-chave. Um teste local do shader ou de rede em loopback não estabelece desempenho ou compatibilidade na AMD Vega 8 do outro computador.
+
 ## Excluir um aplicativo do áudio
 
 Abra **Configurações > Áudio**, atualize a lista e escolha o aplicativo em **Não compartilhar o áudio de**. A escolha fica somente nas preferências deste computador e identifica o executável, não o PID. A captura exclui a instância selecionada e os processos filhos dela.

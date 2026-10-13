@@ -694,6 +694,10 @@ impl ScreenShareSession {
         self.metrics.remote_video_track_seen.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn video_performance(&self) -> Arc<crate::video_performance::VideoPerformance> {
+        Arc::clone(&self.metrics.video_performance)
+    }
+
     pub fn record_ui_texture_update(&self) {
         self.metrics.record_ui_texture_update();
     }

@@ -58,11 +58,7 @@ impl ClientUi {
                     let image_size = source * scale.max(0.01);
                     stage.vertical_centered(|ui| {
                         ui.add_space(((available_video_height - image_size.y) * 0.5).max(0.0));
-                        let response = ui.add(
-                            egui::Image::new((texture.id(), source))
-                                .fit_to_exact_size(image_size)
-                                .sense(egui::Sense::click()),
-                        );
+                        let response = texture.show(ui, image_size, egui::Sense::click());
                         direct_volume_change =
                             remote_audio_volume_context_menu(response, direct_remote_volume);
                         ui.add_space(6.0);
@@ -219,11 +215,7 @@ impl ClientUi {
                     ui.add_space(
                         ((available_video_height - source.y * scale.max(0.01)) * 0.5).max(0.0),
                     );
-                    let response = ui.add(
-                        egui::Image::new((texture.id(), source))
-                            .fit_to_exact_size(source * scale.max(0.01))
-                            .sense(egui::Sense::click()),
-                    );
+                    let response = texture.show(ui, source * scale.max(0.01), egui::Sense::click());
                     volume_change = remote_audio_volume_context_menu(response, current_volume);
                     ui.add_space(6.0);
                     let (bar_volume, toggle_fs) = show_screen_audio_and_fullscreen_toolbar(
@@ -317,11 +309,9 @@ impl ClientUi {
                         tile.set_min_size(egui::vec2(300.0, 195.0));
                         tile.label(name);
                         if let Some(texture) = self.group_share.remote_textures.get(&peer_id) {
-                            let response = tile.add(
-                                egui::Image::new((texture.id(), texture.size_vec2()))
-                                    .fit_to_exact_size(egui::vec2(280.0, 158.0))
-                                    .sense(egui::Sense::click()),
-                            );
+                            let source = texture.size_vec2();
+                            let scale = (280.0 / source.x).min(158.0 / source.y);
+                            let response = texture.show(tile, source * scale, egui::Sense::click());
                             volume_change =
                                 remote_audio_volume_context_menu(response, current_volume);
                             if tile.button("Ampliar").clicked() {
@@ -389,7 +379,7 @@ impl ClientUi {
 
             ui.vertical_centered(|ui| {
                 ui.add_space(((available_video_height - image_size.y) * 0.5).max(0.0));
-                ui.add(egui::Image::new((texture.id(), source)).fit_to_exact_size(image_size));
+                texture.show(ui, image_size, egui::Sense::hover());
 
                 ui.add_space(8.0);
                 let (new_vol, toggle_fs) =

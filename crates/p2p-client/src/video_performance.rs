@@ -26,9 +26,11 @@ pub(crate) enum Stage {
     DecodeTotal,
     UiRgbaConvert,
     UiTextureUpdate,
+    UiNv12Upload,
+    UiNv12Draw,
 }
 
-const STAGES: [(Stage, &str); 19] = [
+const STAGES: [(Stage, &str); 21] = [
     (Stage::CaptureGpuConvert, "capture_gpu_convert_call"),
     (Stage::CaptureReadback, "capture_readback"),
     (Stage::CaptureCpuConvert, "capture_cpu_convert_resize"),
@@ -48,6 +50,8 @@ const STAGES: [(Stage, &str); 19] = [
     (Stage::DecodeTotal, "decode_total"),
     (Stage::UiRgbaConvert, "ui_rgba_image_conversion"),
     (Stage::UiTextureUpdate, "ui_texture_update_enqueue"),
+    (Stage::UiNv12Upload, "ui_nv12_upload_call"),
+    (Stage::UiNv12Draw, "ui_nv12_shader_draw_call"),
 ];
 
 #[derive(Clone, Copy)]
@@ -61,9 +65,11 @@ pub(crate) enum FramePath {
     EncoderOpenH264,
     DecoderDxva,
     DecoderOpenH264,
+    UiNv12Shader,
+    UiRgbaFallback,
 }
 
-const PATHS: [(FramePath, &str); 8] = [
+const PATHS: [(FramePath, &str); 10] = [
     (FramePath::CaptureGpuNv12, "capture_gpu_nv12"),
     (FramePath::CaptureCpuRgba, "capture_cpu_rgba"),
     (FramePath::EncoderGpuSurface, "encoder_hw_gpu_surface"),
@@ -72,6 +78,8 @@ const PATHS: [(FramePath, &str); 8] = [
     (FramePath::EncoderOpenH264, "encoder_openh264"),
     (FramePath::DecoderDxva, "decoder_dxva"),
     (FramePath::DecoderOpenH264, "decoder_openh264"),
+    (FramePath::UiNv12Shader, "ui_nv12_shader"),
+    (FramePath::UiRgbaFallback, "ui_rgba_fallback"),
 ];
 
 #[derive(Clone, Copy)]

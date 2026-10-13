@@ -8,6 +8,7 @@ mod gpu_telemetry;
 mod logging;
 mod mesh_identity;
 mod mf_video;
+mod nv12;
 mod profile;
 mod screen_capture;
 mod screen_quality;

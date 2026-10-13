@@ -980,7 +980,11 @@ mod tests {
             return;
         };
         assert_eq!((decoded.width, decoded.height), (320, 240));
-        assert_eq!(decoded.rgba.len(), 320 * 240 * 4);
+        assert_eq!(decoded.nv12.stride, 320);
+        assert_eq!(decoded.nv12.bytes.len(), 320 * 240 * 3 / 2);
+        let rgba =
+            mf_video::cpu_nv12_to_rgba(&decoded.nv12, decoded.width, decoded.height).unwrap();
+        assert_eq!(rgba.len(), 320 * 240 * 4);
     }
 
     #[test]

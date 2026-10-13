@@ -970,46 +970,44 @@ impl ClientUi {
                         .get(&peer_id)
                         .copied()
                         .unwrap_or(0);
-                    if sequence != frame.sequence {
-                        let expected_bytes = (frame.width as usize)
-                            .saturating_mul(frame.height as usize)
-                            .saturating_mul(4);
-                        if frame.width > 0 && frame.height > 0 && frame.rgba.len() == expected_bytes
-                        {
-                            let conversion_started = Instant::now();
-                            let image = egui::ColorImage::from_rgba_unmultiplied(
-                                [frame.width as usize, frame.height as usize],
-                                &frame.rgba,
-                            );
-                            session
-                                .record_ui_rgba_conversion_duration(conversion_started.elapsed());
-                            let texture_started = Instant::now();
-                            if let Some(texture) =
-                                self.group_share.remote_textures.get_mut(&peer_id)
-                            {
-                                texture.set(image, egui::TextureOptions::LINEAR);
-                            } else {
-                                self.group_share.remote_textures.insert(
-                                    peer_id.clone(),
-                                    context.load_texture(
-                                        format!("group-screen-{peer_id}"),
-                                        image,
-                                        egui::TextureOptions::LINEAR,
-                                    ),
-                                );
+                    let retry_fallback = self
+                        .group_share
+                        .remote_textures
+                        .get(&peer_id)
+                        .is_some_and(RemoteVideoTexture::needs_fallback);
+                    if sequence != frame.sequence || retry_fallback {
+                        let texture = self
+                            .group_share
+                            .remote_textures
+                            .entry(peer_id.clone())
+                            .or_insert_with(|| self.remote_video_renderer.texture());
+                        let texture_started = Instant::now();
+                        match texture.update(
+                            context,
+                            Arc::clone(&frame),
+                            session.video_performance(),
+                        ) {
+                            Ok(()) => {
+                                session.record_ui_texture_update();
+                                session
+                                    .record_ui_texture_update_duration(texture_started.elapsed());
+                                if self.group_share.auto_focus_pending.remove(&peer_id)
+                                    && should_auto_focus_group_screen(
+                                        self.group_share.focused_screen.as_deref(),
+                                    )
+                                {
+                                    self.group_share.focused_screen = Some(peer_id.clone());
+                                }
+                                self.group_share
+                                    .remote_sequences
+                                    .insert(peer_id.clone(), frame.sequence);
                             }
-                            session.record_ui_texture_update();
-                            session.record_ui_texture_update_duration(texture_started.elapsed());
-                            if self.group_share.auto_focus_pending.remove(&peer_id)
-                                && should_auto_focus_group_screen(
-                                    self.group_share.focused_screen.as_deref(),
-                                )
-                            {
-                                self.group_share.focused_screen = Some(peer_id.clone());
+                            Err(error) => {
+                                tracing::error!(peer = %peer_id, error = %error, "Falha ao preparar quadro remoto para apresentação");
+                                self.group_share
+                                    .remote_sequences
+                                    .insert(peer_id.clone(), frame.sequence);
                             }
-                            self.group_share
-                                .remote_sequences
-                                .insert(peer_id.clone(), frame.sequence);
                         }
                     }
                 }
