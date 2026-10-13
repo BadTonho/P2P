@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -65,6 +64,8 @@ use crate::screen_capture::{LatestFrame, PreviewFrame};
 use crate::settings::VideoDecoderPreference;
 use crate::turn_relay::TurnCredentials;
 
+#[path = "screen_sharing/adaptive_quality.rs"]
+mod adaptive_quality;
 #[path = "screen_sharing/h264.rs"]
 mod h264;
 #[path = "screen_sharing/metrics.rs"]
@@ -79,6 +80,8 @@ mod sdp_diagnostics;
 mod sender;
 #[path = "screen_sharing/session.rs"]
 mod session;
+use adaptive_quality::{AdaptiveQualityController, QualityWindow};
+pub(crate) use adaptive_quality::{AdaptiveVideoProfile, QualityDecision, QualityFeedback};
 use h264::*;
 use metrics::should_log_aggregate_error;
 pub use metrics::{MediaRoute, ScreenShareMetrics, ScreenSharePerformanceSnapshot};
@@ -94,6 +97,7 @@ pub use session::{ScreenShareEvent, ScreenShareSession};
 
 const VIDEO_PAYLOAD_TYPE: PayloadType = 102;
 const AUDIO_PAYLOAD_TYPE: PayloadType = 111;
+pub(crate) const QUALITY_FEEDBACK_SIGNAL_PREFIX: &str = "screen-quality-v1:";
 const VIDEO_CLOCK_RATE: u32 = 90_000;
 #[cfg(test)]
 const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 30);

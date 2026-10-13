@@ -24,7 +24,7 @@ fn group_generation_id(participant_id: &str, session_id: u64) -> String {
     format!("{GROUP_SIGNAL_ID_PREFIX}:{participant_id}:{session_id}")
 }
 
-fn is_group_generation_for_peer(peer_id: &str, generation: &str) -> bool {
+pub(super) fn is_group_generation_for_peer(peer_id: &str, generation: &str) -> bool {
     let prefix = format!("{GROUP_SIGNAL_ID_PREFIX}:{peer_id}:");
     generation
         .strip_prefix(&prefix)
@@ -68,6 +68,12 @@ fn route_group_signal(
         }
         SignalKind::IceCandidate if inbound_generation == Some(generation) => {
             GroupSignalRoute::Inbound
+        }
+        SignalKind::Diagnostic
+            if outbound_generation == Some(generation)
+                && is_group_generation_for_peer(peer_id, generation) =>
+        {
+            GroupSignalRoute::Outbound
         }
         SignalKind::IceCandidate
             if watched && is_group_generation_for_peer(peer_id, generation) =>
@@ -930,6 +936,25 @@ impl ClientUi {
                         }
                     }
                 }
+                if let Some(generation) = self.group_share.inbound_generations.get(&peer_id)
+                    && let Some(decision) = session.observe_quality_feedback()
+                {
+                    match decision {
+                        QualityDecision::Changed(feedback) => {
+                            tracing::info!(
+                                screen_share_session = session.metrics().session_id,
+                                peer = %peer_id,
+                                profile = ?feedback.profile,
+                                reason = ?feedback.reason,
+                                "Solicitando ajuste adaptativo de qualidade para participante"
+                            );
+                            self.send_quality_feedback(&peer_id, generation.clone(), feedback);
+                        }
+                        QualityDecision::StillOverloadedAtMinimum => {
+                            self.log_minimum_profile_overload(&peer_id, generation);
+                        }
+                    }
+                }
                 if let Some(frame) = session.latest_remote_frame() {
                     let sequence = self
                         .group_share
@@ -943,11 +968,14 @@ impl ClientUi {
                             .saturating_mul(4);
                         if frame.width > 0 && frame.height > 0 && frame.rgba.len() == expected_bytes
                         {
-                            let texture_started = Instant::now();
+                            let conversion_started = Instant::now();
                             let image = egui::ColorImage::from_rgba_unmultiplied(
                                 [frame.width as usize, frame.height as usize],
                                 &frame.rgba,
                             );
+                            session
+                                .record_ui_rgba_conversion_duration(conversion_started.elapsed());
+                            let texture_started = Instant::now();
                             if let Some(texture) =
                                 self.group_share.remote_textures.get_mut(&peer_id)
                             {
@@ -963,7 +991,7 @@ impl ClientUi {
                                 );
                             }
                             session.record_ui_texture_update();
-                            session.record_ui_texture_duration(texture_started.elapsed());
+                            session.record_ui_texture_update_duration(texture_started.elapsed());
                             if self.group_share.auto_focus_pending.remove(&peer_id)
                                 && should_auto_focus_group_screen(
                                     self.group_share.focused_screen.as_deref(),
@@ -1412,6 +1440,28 @@ mod tests {
         );
         assert_eq!(
             route_group_signal(
+                "peer-b",
+                &generation,
+                SignalKind::Diagnostic,
+                true,
+                Some(&generation),
+                None,
+            ),
+            GroupSignalRoute::Ignore
+        );
+        assert_eq!(
+            route_group_signal(
+                "peer-a",
+                &generation,
+                SignalKind::Diagnostic,
+                true,
+                None,
+                None,
+            ),
+            GroupSignalRoute::Ignore
+        );
+        assert_eq!(
+            route_group_signal(
                 "peer-a",
                 &generation,
                 SignalKind::IceCandidate,
@@ -1442,6 +1492,28 @@ mod tests {
                 None,
             ),
             GroupSignalRoute::Outbound
+        );
+        assert_eq!(
+            route_group_signal(
+                "peer-a",
+                &replacement,
+                SignalKind::Diagnostic,
+                true,
+                Some(&replacement),
+                None,
+            ),
+            GroupSignalRoute::Outbound
+        );
+        assert_eq!(
+            route_group_signal(
+                "peer-a",
+                &replacement,
+                SignalKind::Diagnostic,
+                true,
+                Some(&generation),
+                None,
+            ),
+            GroupSignalRoute::Ignore
         );
         assert!(!group_signal_generation_is_well_formed("peer-a"));
         assert!(!group_signal_generation_is_well_formed(

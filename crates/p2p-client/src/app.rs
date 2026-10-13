@@ -18,7 +18,9 @@ use crate::screen_capture::{
     MonitorOption, PendingScreenCapture, PreviewFrame, ScreenCapture, WindowOption,
 };
 use crate::screen_quality::ScreenShareQuality;
-use crate::screen_sharing::{ScreenShareEvent, ScreenShareMetrics, ScreenShareSession};
+use crate::screen_sharing::{
+    QualityDecision, QualityFeedback, ScreenShareEvent, ScreenShareMetrics, ScreenShareSession,
+};
 use crate::settings::{
     AppSettings, LoggingLevel, NetworkSelection, SavedHostProfile, VideoDecoderPreference,
 };

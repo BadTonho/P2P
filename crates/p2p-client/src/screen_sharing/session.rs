@@ -220,7 +220,16 @@ pub struct ScreenShareSession {
     metrics: Arc<SharedMetrics>,
     remote_audio_volume: RemoteAudioVolume,
     encoder_bitrate_bps: Arc<AtomicU32>,
+    encoder_profile: Arc<AtomicU32>,
+    adaptive_quality: Mutex<SessionQualityFeedback>,
     worker: Option<JoinHandle<()>>,
+}
+
+struct SessionQualityFeedback {
+    controller: AdaptiveQualityController,
+    last_received: u64,
+    last_published: u64,
+    last_queue_drops: u64,
 }
 
 #[allow(dead_code)]
@@ -410,6 +419,8 @@ impl ScreenShareSession {
         );
         let encoder_bitrate_bps = Arc::new(AtomicU32::new(0));
         let worker_encoder_bitrate_bps = Arc::clone(&encoder_bitrate_bps);
+        let encoder_profile = Arc::new(AtomicU32::new(0));
+        let worker_encoder_profile = Arc::clone(&encoder_profile);
         let worker_remote_frame = Arc::clone(&remote_frame);
         let worker_remote_track = Arc::clone(&remote_track);
         let worker_metrics = Arc::clone(&metrics);
@@ -436,6 +447,7 @@ impl ScreenShareSession {
                     commands_rx,
                     events_tx,
                     worker_encoder_bitrate_bps,
+                    worker_encoder_profile,
                     context,
                     worker_remote_frame,
                     worker_remote_track,
@@ -461,6 +473,13 @@ impl ScreenShareSession {
             metrics,
             remote_audio_volume,
             encoder_bitrate_bps,
+            encoder_profile,
+            adaptive_quality: Mutex::new(SessionQualityFeedback {
+                controller: AdaptiveQualityController::new(Instant::now()),
+                last_received: 0,
+                last_published: 0,
+                last_queue_drops: 0,
+            }),
             worker: Some(worker),
         })
     }
@@ -538,6 +557,9 @@ impl ScreenShareSession {
         audio_exclusion_config: AudioExclusionConfig,
     ) -> Result<(), String> {
         let bitrate_bps = bitrate_bps.clamp(250_000, quality.individual_bitrate_bps());
+        let initial_profile = AdaptiveVideoProfile::P1080Fps60.cap_to_quality(quality);
+        self.encoder_profile
+            .store(initial_profile.index() as u32, Ordering::Relaxed);
         self.encoder_bitrate_bps
             .store(bitrate_bps, Ordering::Relaxed);
         self.commands
@@ -609,6 +631,43 @@ impl ScreenShareSession {
         Ok(())
     }
 
+    pub(crate) fn set_outbound_video_profile(
+        &self,
+        desired: AdaptiveVideoProfile,
+        maximum: ScreenShareQuality,
+    ) -> Result<AdaptiveVideoProfile, String> {
+        if self.encoder_bitrate_bps.load(Ordering::Relaxed) == 0 {
+            return Err("A sessão ainda não iniciou o envio de vídeo.".to_owned());
+        }
+        let profile = desired.cap_to_quality(maximum);
+        self.encoder_profile
+            .store(profile.index() as u32, Ordering::Relaxed);
+        Ok(profile)
+    }
+
+    pub(crate) fn observe_quality_feedback(&self) -> Option<QualityDecision> {
+        let metrics = self.metrics();
+        let mut state = self
+            .adaptive_quality
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let window = QualityWindow {
+            received: metrics
+                .assembled_access_units
+                .saturating_sub(state.last_received),
+            published: metrics
+                .published_frames
+                .saturating_sub(state.last_published),
+            queue_drops: metrics
+                .decoder_queue_drops
+                .saturating_sub(state.last_queue_drops),
+        };
+        state.last_received = metrics.assembled_access_units;
+        state.last_published = metrics.published_frames;
+        state.last_queue_drops = metrics.decoder_queue_drops;
+        state.controller.observe(Instant::now(), window)
+    }
+
     pub fn try_recv(&self) -> Option<ScreenShareEvent> {
         self.events.try_recv().ok()
     }
@@ -640,10 +699,16 @@ impl ScreenShareSession {
         self.metrics.record_ui_texture_update();
     }
 
-    pub(crate) fn record_ui_texture_duration(&self, duration: Duration) {
+    pub(crate) fn record_ui_rgba_conversion_duration(&self, duration: Duration) {
         self.metrics
             .video_performance
-            .record_duration(crate::video_performance::Stage::UiTexturePrepare, duration);
+            .record_duration(crate::video_performance::Stage::UiRgbaConvert, duration);
+    }
+
+    pub(crate) fn record_ui_texture_update_duration(&self, duration: Duration) {
+        self.metrics
+            .video_performance
+            .record_duration(crate::video_performance::Stage::UiTextureUpdate, duration);
     }
 
     pub fn take_performance_snapshot(&self) -> ScreenSharePerformanceSnapshot {
@@ -916,6 +981,7 @@ async fn run_session(
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: std_mpsc::Sender<ScreenShareEvent>,
     encoder_bitrate_bps: Arc<AtomicU32>,
+    encoder_profile: Arc<AtomicU32>,
     context: egui::Context,
     remote_frame: RemoteFrameStore,
     remote_track: RemoteTrackStore,
@@ -1106,6 +1172,7 @@ async fn run_session(
                     bitrate_bps,
                     quality,
                     Arc::clone(&encoder_bitrate_bps),
+                    Arc::clone(&encoder_profile),
                     include_system_audio,
                     audio_exclusion_config,
                     audio_source_override,
@@ -1677,6 +1744,7 @@ async fn create_sender(
     bitrate_bps: u32,
     quality: ScreenShareQuality,
     encoder_bitrate_bps: Arc<AtomicU32>,
+    encoder_profile: Arc<AtomicU32>,
     include_system_audio: bool,
     audio_exclusion_config: AudioExclusionConfig,
     audio_source_override: Option<Box<dyn AudioSampleSource>>,
@@ -1856,6 +1924,7 @@ async fn create_sender(
     let encoder_events = events.clone();
     let encoder_metrics = Arc::clone(&metrics);
     let encoder_bitrate_target = Arc::clone(&encoder_bitrate_bps);
+    let encoder_profile_target = Arc::clone(&encoder_profile);
     let encoder_task = tokio::task::spawn_blocking(move || {
         match encode_latest_frames(
             source,
@@ -1866,6 +1935,7 @@ async fn create_sender(
             bitrate_bps,
             quality,
             encoder_bitrate_target,
+            encoder_profile_target,
         ) {
             Ok(()) => Ok(()),
             Err(error) => {

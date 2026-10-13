@@ -442,10 +442,17 @@ impl ClientUi {
                 }
                 SignalingEvent::Signal {
                     from_participant_id,
-                    stream_id: _,
+                    stream_id,
                     kind: SignalKind::Diagnostic,
                     payload,
                 } => {
+                    if self.handle_quality_feedback_signal(
+                        from_participant_id.as_deref(),
+                        stream_id.as_deref(),
+                        &payload,
+                    ) {
+                        continue;
+                    }
                     if let Some(serialized) = payload.strip_prefix(TURN_CONFIG_SIGNAL_PREFIX) {
                         if !self.current_leader_id.is_empty()
                             && from_participant_id.as_deref() != Some(&self.current_leader_id)

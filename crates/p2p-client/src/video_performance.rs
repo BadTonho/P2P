@@ -24,10 +24,11 @@ pub(crate) enum Stage {
     DecoderCpuConvert,
     CpuDecode,
     DecodeTotal,
-    UiTexturePrepare,
+    UiRgbaConvert,
+    UiTextureUpdate,
 }
 
-const STAGES: [(Stage, &str); 18] = [
+const STAGES: [(Stage, &str); 19] = [
     (Stage::CaptureGpuConvert, "capture_gpu_convert_call"),
     (Stage::CaptureReadback, "capture_readback"),
     (Stage::CaptureCpuConvert, "capture_cpu_convert_resize"),
@@ -45,7 +46,8 @@ const STAGES: [(Stage, &str); 18] = [
     (Stage::DecoderCpuConvert, "decoder_cpu_color_convert"),
     (Stage::CpuDecode, "decoder_openh264_call"),
     (Stage::DecodeTotal, "decode_total"),
-    (Stage::UiTexturePrepare, "ui_texture_prepare_enqueue"),
+    (Stage::UiRgbaConvert, "ui_rgba_image_conversion"),
+    (Stage::UiTextureUpdate, "ui_texture_update_enqueue"),
 ];
 
 #[derive(Clone, Copy)]

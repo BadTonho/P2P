@@ -1,5 +1,6 @@
 use super::*;
 use crate::video_performance::{FramePath, Readback, Stage, StageTimer, VideoPerformance};
+use std::borrow::Cow;
 
 struct LatestFramePacer {
     last_sequence: Option<u64>,
@@ -22,6 +23,13 @@ impl LatestFramePacer {
             next_frame_due_at: None,
             frame_duration: quality.frame_duration(),
         }
+    }
+
+    fn set_profile(&mut self, profile: AdaptiveVideoProfile) {
+        self.frame_duration = profile.frame_duration();
+        self.next_frame_due_at = self
+            .last_encoded_at
+            .and_then(|encoded_at| encoded_at.checked_add(self.frame_duration));
     }
 
     /// Returns `Some(true)` for a new captured frame and `Some(false)` for a
@@ -213,18 +221,43 @@ pub(super) fn encode_latest_frames(
     bitrate_bps: u32,
     quality: ScreenShareQuality,
     bitrate_target: Arc<AtomicU32>,
+    profile_target: Arc<AtomicU32>,
 ) -> Result<(), String> {
     let mut encoder: Option<ActiveH264Encoder> = None;
     let mut active_bitrate_bps = bitrate_bps;
     let mut hardware_warmup_frames = 0u32;
     let mut forwarding_gate = H264ForwardingGate::default();
     let mut pacer = LatestFramePacer::new(quality);
+    let mut active_profile =
+        AdaptiveVideoProfile::from_index(profile_target.load(Ordering::Relaxed) as usize)
+            .cap_to_quality(quality);
     let mut observed_generation = source.generation();
 
     while !stop.load(Ordering::Relaxed) {
+        let requested_profile =
+            AdaptiveVideoProfile::from_index(profile_target.load(Ordering::Relaxed) as usize)
+                .cap_to_quality(quality);
+        if requested_profile != active_profile {
+            active_profile = requested_profile;
+            pacer.set_profile(active_profile);
+            if encoder.take().is_some() {
+                forwarding_gate.reset();
+                hardware_warmup_frames = 0;
+            }
+            force_keyframe.store(true, Ordering::Relaxed);
+            tracing::info!(
+                screen_share_session = metrics.session_id,
+                profile = ?active_profile,
+                width = active_profile.dimensions().0,
+                height = active_profile.dimensions().1,
+                fps = active_profile.frames_per_second(),
+                "Perfil adaptativo de vídeo aplicado sem interromper a sessão"
+            );
+        }
         let requested_bitrate_bps = bitrate_target
             .load(Ordering::Relaxed)
-            .clamp(250_000, quality.individual_bitrate_bps());
+            .clamp(250_000, quality.individual_bitrate_bps())
+            .min(active_profile.suggested_bitrate_bps());
         if requested_bitrate_bps != active_bitrate_bps {
             active_bitrate_bps = requested_bitrate_bps;
             if encoder.take().is_some() {
@@ -249,13 +282,15 @@ pub(super) fn encode_latest_frames(
             continue;
         }
 
-        let frame = source.latest();
-        let Some(frame) = frame else {
+        let captured_frame = source.latest();
+        let Some(captured_frame) = captured_frame else {
             let (generation, _, _) =
                 source.wait_for_change(observed_generation, Duration::from_millis(250), &stop);
             observed_generation = generation;
             continue;
         };
+        let frame = resize_frame_for_profile(&captured_frame, active_profile)?;
+        let frame = frame.as_ref();
         let now = Instant::now();
         let Some(is_new_capture_frame) = pacer.should_encode(frame.sequence, now) else {
             let wait = pacer.wait_duration(Some(frame.sequence), now);
@@ -292,14 +327,14 @@ pub(super) fn encode_latest_frames(
                         frame.height,
                         surface.device(),
                         active_bitrate_bps,
-                        quality.frames_per_second(),
+                        active_profile.frames_per_second(),
                     ) {
                         Ok(hardware) => Ok((hardware, true, None)),
                         Err(gpu_error) => mf_video::HardwareEncoder::new_with_bitrate_and_frame_rate(
                             frame.width,
                             frame.height,
                             active_bitrate_bps,
-                            quality.frames_per_second(),
+                            active_profile.frames_per_second(),
                         )
                             .map(|hardware| {
                                 (
@@ -319,7 +354,7 @@ pub(super) fn encode_latest_frames(
                         frame.width,
                         frame.height,
                         active_bitrate_bps,
-                        quality.frames_per_second(),
+                        active_profile.frames_per_second(),
                     )
                     .map(|hardware| (hardware, false, None))
                 };
@@ -344,7 +379,7 @@ pub(super) fn encode_latest_frames(
                         tracing::warn!(fallback_reason = %reason, "Usando codificador H.264 OpenH264 na CPU");
                         metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
                         encoder = Some(ActiveH264Encoder::OpenH264(Box::new(
-                            openh264_encoder_for_quality(active_bitrate_bps, quality)?,
+                            openh264_encoder_for_profile(active_bitrate_bps, active_profile)?,
                         )));
                     }
                 }
@@ -453,7 +488,7 @@ pub(super) fn encode_latest_frames(
             hardware_warmup_frames = 0;
             let mut cpu = {
                 let _timer = metrics.video_performance.timer(Stage::EncoderInit);
-                openh264_encoder_for_quality(active_bitrate_bps, quality)?
+                openh264_encoder_for_profile(active_bitrate_bps, active_profile)?
             };
             metrics.record_encoder_input_frame();
             let encode_started_at = Instant::now();
@@ -483,21 +518,89 @@ pub(super) fn openh264_encoder(bitrate_bps: u32) -> Result<Encoder, String> {
     openh264_encoder_for_quality(bitrate_bps, ScreenShareQuality::default())
 }
 
+#[cfg(test)]
 fn openh264_encoder_for_quality(
     bitrate_bps: u32,
     quality: ScreenShareQuality,
 ) -> Result<Encoder, String> {
+    openh264_encoder_with_fps(bitrate_bps, quality.frames_per_second())
+}
+
+fn openh264_encoder_for_profile(
+    bitrate_bps: u32,
+    profile: AdaptiveVideoProfile,
+) -> Result<Encoder, String> {
+    openh264_encoder_with_fps(bitrate_bps, profile.frames_per_second())
+}
+
+fn openh264_encoder_with_fps(bitrate_bps: u32, fps: u32) -> Result<Encoder, String> {
     let encoder_config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(bitrate_bps))
-        .max_frame_rate(FrameRate::from_hz(quality.frames_per_second() as f32))
+        .max_frame_rate(FrameRate::from_hz(fps as f32))
         .usage_type(UsageType::ScreenContentRealTime)
         .adaptive_quantization(false)
         .background_detection(false)
-        .intra_frame_period(IntraFramePeriod::from_num_frames(
-            quality.frames_per_second(),
-        ));
+        .intra_frame_period(IntraFramePeriod::from_num_frames(fps));
     Encoder::with_api_config(OpenH264API::from_source(), encoder_config)
         .map_err(|error| format!("Não foi possível iniciar o codificador H.264 OpenH264: {error}"))
+}
+
+fn resize_frame_for_profile<'a>(
+    frame: &'a PreviewFrame,
+    profile: AdaptiveVideoProfile,
+) -> Result<Cow<'a, PreviewFrame>, String> {
+    let (max_width, max_height) = profile.dimensions();
+    if frame.width <= max_width && frame.height <= max_height {
+        return Ok(Cow::Borrowed(frame));
+    }
+    let target_width = max_width.min(frame.width) & !1;
+    let target_height = max_height.min(frame.height) & !1;
+    let rgba = if frame.rgba.len() == frame.width as usize * frame.height as usize * 4 {
+        frame.rgba.clone()
+    } else {
+        #[cfg(windows)]
+        {
+            let nv12;
+            let input = if let Some(cpu) = frame.cpu_nv12.as_deref() {
+                cpu
+            } else if let Some(gpu) = frame.gpu_nv12.as_deref() {
+                let (bytes, stride) = gpu.readback_nv12()?;
+                nv12 = crate::screen_capture::CpuNv12Frame {
+                    bytes: Arc::new(bytes),
+                    stride,
+                };
+                &nv12
+            } else {
+                return Err("O quadro não tem uma entrada para reduzir a resolução.".to_owned());
+            };
+            mf_video::cpu_nv12_to_rgba(input, frame.width, frame.height)?
+        }
+        #[cfg(not(windows))]
+        {
+            return Err(
+                "O quadro não tem uma imagem RGBA válida para reduzir a resolução.".to_owned(),
+            );
+        }
+    };
+    let mut resized = Vec::with_capacity(target_width as usize * target_height as usize * 4);
+    for y in 0..target_height {
+        let source_y = (y as u64 * frame.height as u64 / target_height as u64) as usize;
+        for x in 0..target_width {
+            let source_x = (x as u64 * frame.width as u64 / target_width as u64) as usize;
+            let offset = (source_y * frame.width as usize + source_x) * 4;
+            resized.extend_from_slice(&rgba[offset..offset + 4]);
+        }
+    }
+    Ok(Cow::Owned(PreviewFrame {
+        sequence: frame.sequence,
+        width: target_width,
+        height: target_height,
+        rgba: resized,
+        #[cfg(windows)]
+        gpu_nv12: None,
+        #[cfg(windows)]
+        cpu_nv12: None,
+    }))
 }
 
 pub(super) struct EncodedFrame {
@@ -943,6 +1046,46 @@ mod tests {
         };
         assert!(validate_encoder_frame(&frame, quality).is_ok());
         assert!(validate_encoder_frame(&frame, ScreenShareQuality::default()).is_err());
+    }
+
+    #[test]
+    fn adaptive_pacer_uses_temporary_15_fps_profile() {
+        let start = Instant::now();
+        let mut pacer = LatestFramePacer::default();
+        pacer.record_encoded(1, start);
+        pacer.set_profile(AdaptiveVideoProfile::P720Fps15);
+        assert_eq!(
+            pacer.frame_duration,
+            Duration::from_nanos(1_000_000_000 / 15)
+        );
+        assert_eq!(
+            pacer.should_encode(2, start + Duration::from_millis(50)),
+            None
+        );
+        assert_eq!(
+            pacer.should_encode(2, start + Duration::from_millis(67)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn adaptive_720p_profile_resizes_rgba_frames_before_encoder_recreation() {
+        let frame = PreviewFrame {
+            sequence: 9,
+            width: 1282,
+            height: 722,
+            rgba: [21, 42, 63, 255].repeat(1282 * 722),
+            #[cfg(windows)]
+            gpu_nv12: None,
+            #[cfg(windows)]
+            cpu_nv12: None,
+        };
+        let resized = resize_frame_for_profile(&frame, AdaptiveVideoProfile::P720Fps30)
+            .expect("RGBA input can be resized");
+        assert_eq!((resized.width, resized.height), (1280, 720));
+        assert_eq!(resized.sequence, frame.sequence);
+        assert_eq!(resized.rgba.len(), 1280 * 720 * 4);
+        assert_eq!(&resized.rgba[..4], &[21, 42, 63, 255]);
     }
 
     #[cfg(windows)]

@@ -1,6 +1,123 @@
 use super::*;
 
 impl ClientUi {
+    pub(super) fn handle_quality_feedback_signal(
+        &mut self,
+        from_participant_id: Option<&str>,
+        stream_id: Option<&str>,
+        payload: &str,
+    ) -> bool {
+        let Some(serialized) = payload.strip_prefix(screen_sharing::QUALITY_FEEDBACK_SIGNAL_PREFIX)
+        else {
+            return false;
+        };
+        let Some(feedback) = QualityFeedback::parse(serialized) else {
+            tracing::warn!("Feedback adaptativo de vídeo inválido; payload descartado");
+            return true;
+        };
+        let (Some(peer_id), Some(stream_id)) = (from_participant_id, stream_id) else {
+            tracing::warn!("Feedback adaptativo sem participante ou sessão; payload descartado");
+            return true;
+        };
+
+        if self.group_sharing_compatible() {
+            let current_generation = self.group_share.outbound_generations.get(peer_id);
+            if current_generation.map(String::as_str) != Some(stream_id)
+                || !super::group_sharing::is_group_generation_for_peer(peer_id, stream_id)
+            {
+                tracing::debug!(peer = %peer_id, "Feedback adaptativo de uma sessão de grupo encerrada ou desconhecida foi descartado");
+                return true;
+            }
+            if let Some(session) = self.group_share.outbound_sessions.get(peer_id) {
+                let maximum = self
+                    .screen_capture
+                    .as_ref()
+                    .map(ScreenCapture::quality)
+                    .unwrap_or_default();
+                match session.set_outbound_video_profile(feedback.profile, maximum) {
+                    Ok(applied) => tracing::info!(
+                        peer = %peer_id,
+                        stream_id = %stream_id,
+                        requested_profile = ?feedback.profile,
+                        applied_profile = ?applied,
+                        reason = ?feedback.reason,
+                        "Feedback de qualidade aplicado à sessão do participante"
+                    ),
+                    Err(error) => {
+                        tracing::debug!(peer = %peer_id, error = %error, "Feedback adaptativo recebido antes do início do encoder")
+                    }
+                }
+            }
+            return true;
+        }
+
+        let active_request = match &self.screen_share_role {
+            ScreenShareRole::Sending { request_id } => Some(request_id.as_str()),
+            _ => None,
+        };
+        if active_request != Some(stream_id)
+            || !self
+                .participants
+                .iter()
+                .any(|participant| participant.id == peer_id)
+        {
+            tracing::debug!(peer = %peer_id, stream_id = %stream_id, "Feedback adaptativo de outra sessão foi descartado");
+            return true;
+        }
+        if let Some(session) = self.screen_share_session.as_ref() {
+            match session.set_outbound_video_profile(feedback.profile, self.screen_share_quality) {
+                Ok(applied) => tracing::info!(
+                    peer = %peer_id,
+                    stream_id = %stream_id,
+                    requested_profile = ?feedback.profile,
+                    applied_profile = ?applied,
+                    reason = ?feedback.reason,
+                    "Feedback de qualidade aplicado à sessão do participante"
+                ),
+                Err(error) => {
+                    tracing::debug!(peer = %peer_id, error = %error, "Feedback adaptativo recebido antes do início do encoder")
+                }
+            }
+        }
+        true
+    }
+
+    pub(super) fn send_quality_feedback(
+        &self,
+        peer_id: &str,
+        stream_id: String,
+        feedback: QualityFeedback,
+    ) {
+        let serialized = match feedback.serialize() {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(error = %error, "Não foi possível serializar feedback adaptativo");
+                return;
+            }
+        };
+        let payload = format!(
+            "{}{serialized}",
+            screen_sharing::QUALITY_FEEDBACK_SIGNAL_PREFIX
+        );
+        if let Err(error) = self.send_screen_share_signal_to_stream(
+            peer_id,
+            stream_id,
+            SignalKind::Diagnostic,
+            payload,
+        ) {
+            tracing::debug!(peer = %peer_id, error = %error, "Não foi possível enviar feedback adaptativo para a sessão");
+        }
+    }
+
+    pub(super) fn log_minimum_profile_overload(&self, peer_id: &str, stream_id: &str) {
+        tracing::warn!(
+            peer = %peer_id,
+            stream_id = %stream_id,
+            profile = "720p15",
+            "O receptor continua abaixo da meta no perfil mínimo de vídeo"
+        );
+    }
+
     pub(super) fn select_screen(&mut self, _context: &egui::Context) {
         tracing::info!("Usuário abriu o seletor de tela ou janela do Windows");
         self.screen_status = None;
@@ -928,6 +1045,37 @@ impl ClientUi {
             return;
         }
 
+        let receiving_stream_id = match &self.screen_share_role {
+            ScreenShareRole::Receiving { request_id } => Some(request_id.clone()),
+            _ => None,
+        };
+        if let Some(stream_id) = receiving_stream_id
+            && let Some(session) = self.screen_share_session.as_ref()
+            && let Some(decision) = session.observe_quality_feedback()
+        {
+            let peer_id = self
+                .participants
+                .iter()
+                .find(|participant| participant.id != self.participant_id)
+                .map(|participant| participant.id.clone());
+            if let Some(peer_id) = peer_id {
+                match decision {
+                    QualityDecision::Changed(feedback) => {
+                        tracing::info!(
+                            screen_share_session = session.metrics().session_id,
+                            profile = ?feedback.profile,
+                            reason = ?feedback.reason,
+                            "Solicitando ajuste adaptativo de qualidade"
+                        );
+                        self.send_quality_feedback(&peer_id, stream_id, feedback);
+                    }
+                    QualityDecision::StillOverloadedAtMinimum => {
+                        self.log_minimum_profile_overload(&peer_id, &stream_id);
+                    }
+                }
+            }
+        }
+
         let remote_frame = self
             .screen_share_session
             .as_ref()
@@ -939,11 +1087,15 @@ impl ClientUi {
                 .saturating_mul(frame.height as usize)
                 .saturating_mul(4);
             if frame.width > 0 && frame.height > 0 && frame.rgba.len() == expected_bytes {
-                let texture_started = Instant::now();
+                let conversion_started = Instant::now();
                 let image = egui::ColorImage::from_rgba_unmultiplied(
                     [frame.width as usize, frame.height as usize],
                     &frame.rgba,
                 );
+                if let Some(session) = self.screen_share_session.as_ref() {
+                    session.record_ui_rgba_conversion_duration(conversion_started.elapsed());
+                }
+                let texture_started = Instant::now();
                 if let Some(texture) = self.remote_screen_texture.as_mut() {
                     texture.set(image, egui::TextureOptions::LINEAR);
                 } else {
@@ -955,7 +1107,7 @@ impl ClientUi {
                 }
                 if let Some(session) = self.screen_share_session.as_ref() {
                     session.record_ui_texture_update();
-                    session.record_ui_texture_duration(texture_started.elapsed());
+                    session.record_ui_texture_update_duration(texture_started.elapsed());
                 }
                 if self.remote_screen_sequence == 0 {
                     self.screen_share_status =

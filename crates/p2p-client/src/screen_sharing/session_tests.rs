@@ -286,6 +286,13 @@ fn regression_dropping_screen_session_releases_its_worker_socket() {
         metrics: Arc::new(SharedMetrics::default()),
         remote_audio_volume: RemoteAudioVolume::default(),
         encoder_bitrate_bps: Arc::new(AtomicU32::new(0)),
+        encoder_profile: Arc::new(AtomicU32::new(0)),
+        adaptive_quality: Mutex::new(SessionQualityFeedback {
+            controller: AdaptiveQualityController::new(Instant::now()),
+            last_received: 0,
+            last_published: 0,
+            last_queue_drops: 0,
+        }),
         worker: Some(worker),
     };
     drop(session);
