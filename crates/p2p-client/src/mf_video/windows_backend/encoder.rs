@@ -4,9 +4,11 @@ pub struct HardwareEncoder {
     performance: Option<Arc<VideoPerformance>>,
     _device: Option<ID3D11Device>,
     _device_manager: Option<IMFDXGIDeviceManager>,
+    readback_staging: Option<ID3D11Texture2D>,
     transform: Transform,
     width: u32,
     height: u32,
+    bitrate: u32,
     frame_rate: u32,
     next_time_hns: i64,
     name: String,
@@ -44,9 +46,11 @@ impl HardwareEncoder {
             _apartment: apartment,
             _device: None,
             _device_manager: None,
+            readback_staging: None,
             transform,
             width,
             height,
+            bitrate,
             frame_rate,
             next_time_hns: 0,
             name,
@@ -91,9 +95,11 @@ impl HardwareEncoder {
             _apartment: apartment,
             _device: Some(device.clone()),
             _device_manager: Some(device_manager),
+            readback_staging: None,
             transform,
             width,
             height,
+            bitrate,
             frame_rate,
             next_time_hns: 0,
             name,
@@ -115,6 +121,29 @@ impl HardwareEncoder {
 
     pub(crate) fn set_performance(&mut self, performance: Arc<VideoPerformance>) {
         self.performance = Some(performance);
+    }
+
+    fn switch_to_cpu_input(&mut self) -> Result<(), String> {
+        self.gpu_surface_input_enabled = false;
+        if self._device_manager.is_some() {
+            let (transform, name) = activate_hardware_transform(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFVideoFormat_NV12,
+                MFVideoFormat_H264,
+                self.width,
+                self.height,
+                None,
+                self.bitrate,
+                self.frame_rate,
+            )?;
+            self.transform = transform;
+            self.name = name;
+            self._device = None;
+            self._device_manager = None;
+            self.next_time_hns = 0;
+            self.force_keyframe_available = None;
+        }
+        Ok(())
     }
 
     pub fn force_keyframe(&mut self) -> Result<bool, String> {
@@ -268,7 +297,7 @@ impl HardwareEncoder {
     }
 
     fn resolve_cpu_nv12<'a>(
-        &self,
+        &mut self,
         frame: Option<&'a GpuNv12Surface>,
         cpu_nv12: Option<&'a CpuNv12Frame>,
         rgba: &[u8],
@@ -282,7 +311,7 @@ impl HardwareEncoder {
             frame.and_then(|surface| {
                 let _timer =
                     StageTimer::optional(self.performance.as_ref(), Stage::EncoderReadback);
-                let result = surface.readback_nv12().ok();
+                let result = surface.readback_nv12_into(&mut self.readback_staging).ok();
                 if let (Some(performance), Some((bytes, _))) = (&self.performance, &result) {
                     performance.record_readback(Readback::Encoder, bytes.len());
                 }
@@ -315,7 +344,7 @@ impl HardwareEncoder {
         }
         let Some(frame) = frame else {
             if self.gpu_surface_input_enabled {
-                self.gpu_surface_input_enabled = false;
+                self.switch_to_cpu_input()?;
                 let effective_nv12 = self.resolve_cpu_nv12(None, cpu_nv12, rgba, &mut storage);
                 return self.encode_cpu_input(effective_nv12, rgba).map(|bytes| {
                     (
@@ -333,7 +362,11 @@ impl HardwareEncoder {
         match self.encode_gpu(frame) {
             Ok(bytes) => Ok((bytes, true, None)),
             Err(gpu_error) => {
-                self.gpu_surface_input_enabled = false;
+                self.switch_to_cpu_input().map_err(|reinit_error| {
+                    format!(
+                        "A entrada D3D11 falhou ({gpu_error}) e não foi possível reconfigurar o MFT para CPU: {reinit_error}"
+                    )
+                })?;
                 let effective_nv12 =
                     self.resolve_cpu_nv12(Some(frame), cpu_nv12, rgba, &mut storage);
                 match self.encode_cpu_input(effective_nv12, rgba) {
@@ -396,5 +429,47 @@ impl HardwareEncoder {
             return Ok(Vec::new());
         }
         Ok(normalize_annex_b(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_encoder_recreates_cpu_transform_cleanly_when_falling_back_to_cpu_input() {
+        let _apartment = match ComApartment::enter() {
+            Ok(apartment) => apartment,
+            Err(_) => return,
+        };
+        let Ok((device, _context, _manager)) = create_d3d11_device_manager() else {
+            return;
+        };
+        let (width, height) = (320u32, 240u32);
+        let Ok(mut encoder) = HardwareEncoder::new_gpu_with_bitrate_and_frame_rate(
+            width, height, &device, 2_000_000, 30,
+        ) else {
+            return;
+        };
+        assert!(encoder.gpu_surface_input_enabled);
+        assert!(encoder._device_manager.is_some());
+
+        let rgba = vec![128u8; (width * height * 4) as usize];
+        let mut produced_output = false;
+        for frame_index in 0..30 {
+            let (bytes, used_gpu, fallback) = encoder
+                .encode_gpu_or_nv12_or_rgba(None, None, &rgba)
+                .expect("CPU fallback after D3D11 init should not hang or fail");
+            assert!(!used_gpu);
+            if frame_index == 0 {
+                assert!(fallback.is_some());
+            }
+            assert!(!encoder.gpu_surface_input_enabled);
+            assert!(encoder._device_manager.is_none());
+            if !bytes.is_empty() {
+                produced_output = true;
+            }
+        }
+        assert!(produced_output, "recreated CPU MFT should emit H.264 bytes");
     }
 }

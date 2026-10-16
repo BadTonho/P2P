@@ -1,8 +1,15 @@
 use super::*;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_BIND_RENDER_TARGET, D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
 };
+use windows::core::Interface;
 
 #[derive(Clone, Debug)]
 struct DxgiCursorShape {
@@ -11,6 +18,16 @@ struct DxgiCursorShape {
     pitch: u32,
     kind: i32,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CursorPatchRect {
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+    local_cursor_x: i32,
+    local_cursor_y: i32,
 }
 
 #[derive(Default)]
@@ -102,17 +119,7 @@ impl DxgiCursorState {
     }
 }
 
-fn composite_cursor_bgra(
-    bgra: &mut [u8],
-    width: u32,
-    height: u32,
-    cursor_x: i32,
-    cursor_y: i32,
-    shape: &DxgiCursorShape,
-) -> bool {
-    if width == 0 || height == 0 || bgra.len() < width as usize * height as usize * 4 {
-        return false;
-    }
+fn validate_cursor_shape(shape: &DxgiCursorShape) -> Option<(bool, u32)> {
     let kind = shape.kind;
     let monochrome = kind == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0;
     let visual_height = if monochrome {
@@ -130,14 +137,64 @@ fn composite_cursor_bgra(
         || (shape.pitch as usize) < min_pitch
         || shape.bytes.len() < shape.pitch as usize * shape.height as usize
     {
-        return false;
+        return None;
     }
     if !monochrome
         && kind != DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0
         && kind != DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0
     {
+        return None;
+    }
+    Some((monochrome, visual_height))
+}
+
+fn cursor_patch_rect(
+    width: u32,
+    height: u32,
+    cursor_x: i32,
+    cursor_y: i32,
+    shape: &DxgiCursorShape,
+) -> Option<CursorPatchRect> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let (_, visual_height) = validate_cursor_shape(shape)?;
+    let frame_w = i64::from(width);
+    let frame_h = i64::from(height);
+    let cx = i64::from(cursor_x);
+    let cy = i64::from(cursor_y);
+    let left = cx.clamp(0, frame_w);
+    let top = cy.clamp(0, frame_h);
+    let right = (cx + i64::from(shape.width)).clamp(0, frame_w);
+    let bottom = (cy + i64::from(visual_height)).clamp(0, frame_h);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(CursorPatchRect {
+        left: left as u32,
+        top: top as u32,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+        local_cursor_x: (cx - left) as i32,
+        local_cursor_y: (cy - top) as i32,
+    })
+}
+
+fn composite_cursor_bgra(
+    bgra: &mut [u8],
+    width: u32,
+    height: u32,
+    cursor_x: i32,
+    cursor_y: i32,
+    shape: &DxgiCursorShape,
+) -> bool {
+    if width == 0 || height == 0 || bgra.len() < width as usize * height as usize * 4 {
         return false;
     }
+    let Some((monochrome, visual_height)) = validate_cursor_shape(shape) else {
+        return false;
+    };
+    let kind = shape.kind;
 
     for source_y in 0..visual_height {
         let target_y = cursor_y + source_y as i32;
@@ -189,6 +246,179 @@ fn composite_cursor_bgra(
     true
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps reusable GPU canvas and staging textures explicit.
+fn composite_cursor_on_gpu_texture<'a>(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    source_texture: &'a ID3D11Texture2D,
+    width: u32,
+    height: u32,
+    cursor: &DxgiCursorState,
+    gpu_canvas: &'a mut Option<ID3D11Texture2D>,
+    patch_staging: &mut Option<ID3D11Texture2D>,
+) -> Result<&'a ID3D11Texture2D, String> {
+    if !cursor.needs_cpu_composition() {
+        return Ok(source_texture);
+    }
+    let (Some((cursor_x, cursor_y)), Some(shape)) = (cursor.position, cursor.shape.as_ref()) else {
+        return Ok(source_texture);
+    };
+    let Some(patch) = cursor_patch_rect(width, height, cursor_x, cursor_y, shape) else {
+        return Ok(source_texture);
+    };
+
+    let needs_new_canvas = match gpu_canvas.as_ref() {
+        Some(existing) => {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { existing.GetDesc(&mut desc) };
+            desc.Width != width
+                || desc.Height != height
+                || desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+        }
+        None => true,
+    };
+    if needs_new_canvas {
+        let canvas_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut created = None;
+        unsafe {
+            device
+                .CreateTexture2D(&canvas_desc, None, Some(&mut created))
+                .map_err(|error| {
+                    format!("Não foi possível criar textura GPU para o cursor DXGI: {error}")
+                })?;
+        }
+        *gpu_canvas = created;
+    }
+
+    let needs_new_staging = match patch_staging.as_ref() {
+        Some(existing) => {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { existing.GetDesc(&mut desc) };
+            desc.Width < patch.width
+                || desc.Height < patch.height
+                || desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+        }
+        None => true,
+    };
+    if needs_new_staging {
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: patch.width.max(64),
+            Height: patch.height.max(64),
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut created = None;
+        unsafe {
+            device
+                .CreateTexture2D(&staging_desc, None, Some(&mut created))
+                .map_err(|error| {
+                    format!("Não foi possível criar staging do cursor DXGI: {error}")
+                })?;
+        }
+        *patch_staging = created;
+    }
+
+    let canvas_ref = gpu_canvas
+        .as_ref()
+        .ok_or_else(|| "Textura GPU do cursor DXGI ausente.".to_owned())?;
+    let staging_ref = patch_staging
+        .as_ref()
+        .ok_or_else(|| "Textura staging do cursor DXGI ausente.".to_owned())?;
+    let source_res: ID3D11Resource = source_texture
+        .cast()
+        .map_err(|error| format!("Não foi possível acessar textura de origem DXGI: {error}"))?;
+    let canvas_res: ID3D11Resource = canvas_ref
+        .cast()
+        .map_err(|error| format!("Não foi possível acessar textura destino do cursor: {error}"))?;
+    let staging_res: ID3D11Resource = staging_ref
+        .cast()
+        .map_err(|error| format!("Não foi possível acessar staging do cursor: {error}"))?;
+
+    let region = D3D11_BOX {
+        left: patch.left,
+        top: patch.top,
+        front: 0,
+        right: patch.left + patch.width,
+        bottom: patch.top + patch.height,
+        back: 1,
+    };
+
+    unsafe {
+        context.CopyResource(&canvas_res, &source_res);
+        context.CopySubresourceRegion(&staging_res, 0, 0, 0, 0, &source_res, 0, Some(&region));
+    }
+
+    let row_bytes = patch.width as usize * 4;
+    let mut patch_bgra = vec![0u8; row_bytes * patch.height as usize];
+    let mut mapped = Default::default();
+    unsafe {
+        context
+            .Map(staging_ref, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .map_err(|error| format!("Não foi possível mapear região do cursor DXGI: {error}"))?;
+        let copy_result = (|| {
+            let pitch = mapped.RowPitch as usize;
+            if mapped.pData.is_null() || pitch < row_bytes {
+                return Err("Leitura inválida da região do cursor DXGI.".to_owned());
+            }
+            let base = mapped.pData.cast::<u8>();
+            for row in 0..patch.height as usize {
+                let src_row = std::slice::from_raw_parts(base.add(row * pitch), row_bytes);
+                let dst_start = row * row_bytes;
+                patch_bgra[dst_start..dst_start + row_bytes].copy_from_slice(src_row);
+            }
+            Ok(())
+        })();
+        context.Unmap(staging_ref, 0);
+        copy_result?;
+    }
+
+    if !composite_cursor_bgra(
+        &mut patch_bgra,
+        patch.width,
+        patch.height,
+        patch.local_cursor_x,
+        patch.local_cursor_y,
+        shape,
+    ) {
+        return Ok(source_texture);
+    }
+
+    unsafe {
+        context.UpdateSubresource(
+            &canvas_res,
+            0,
+            Some(&region),
+            patch_bgra.as_ptr().cast(),
+            patch.width * 4,
+            0,
+        );
+    }
+    Ok(canvas_ref)
+}
+
 #[allow(clippy::too_many_arguments)] // Capture owns the independent preview, shutdown and quality controls.
 pub(super) fn capture_dxgi_monitor(
     monitor: Monitor,
@@ -201,7 +431,7 @@ pub(super) fn capture_dxgi_monitor(
     quality: ScreenShareQuality,
 ) -> Result<(), String> {
     let mut duplication = DxgiDuplicationApi::new_options(monitor, &[DxgiDuplicationFormat::Bgra8])
-        .map_err(|error| format!("DXGI Desktop Duplication nÃ£o iniciou: {error}"))?;
+        .map_err(|error| format!("DXGI Desktop Duplication não iniciou: {error}"))?;
     let mut sequence = 0u64;
     let mut limiter = FrameRateLimiter::new(quality);
     let mut scratch = Vec::new();
@@ -210,6 +440,8 @@ pub(super) fn capture_dxgi_monitor(
     let mut gpu_fallback_logged = false;
     let mut gpu_preview_fallback_logged = false;
     let mut staging_texture = None;
+    let mut cursor_gpu_canvas = None;
+    let mut cursor_patch_staging = None;
     let mut cursor = DxgiCursorState::default();
     let mut last_color_path = None;
 
@@ -222,6 +454,8 @@ pub(super) fn capture_dxgi_monitor(
                 gpu_processor = None;
                 gpu_processor_attempted = None;
                 staging_texture = None;
+                cursor_gpu_canvas = None;
+                cursor_patch_staging = None;
                 cursor = DxgiCursorState::default();
                 *fallback_reason
                     .lock()
@@ -229,7 +463,7 @@ pub(super) fn capture_dxgi_monitor(
                 duplication = duplication
                     .recreate_options(&[DxgiDuplicationFormat::Bgra8])
                     .map_err(|error| {
-                        format!("DXGI nÃ£o recriou a captura apÃ³s mudanÃ§a de tela: {error}")
+                        format!("DXGI não recriou a captura após mudança de tela: {error}")
                     })?;
                 limiter = FrameRateLimiter::new(quality);
                 continue;
@@ -250,16 +484,7 @@ pub(super) fn capture_dxgi_monitor(
         }
         let (out_width, out_height) = scaled_dimensions(width, height, quality);
         let dimensions = (width, height, out_width, out_height);
-        if compose_cursor {
-            gpu_processor = None;
-            gpu_processor_attempted = None;
-            if !cursor.cpu_fallback_logged {
-                tracing::warn!(
-                    "O DXGI informou um cursor separado; usando composição de cursor no caminho de captura CPU"
-                );
-                cursor.cpu_fallback_logged = true;
-            }
-        } else if gpu_processor_attempted != Some(dimensions) {
+        if gpu_processor_attempted != Some(dimensions) {
             gpu_processor_attempted = Some(dimensions);
             match crate::mf_video::GpuNv12Processor::new(
                 frame.device(),
@@ -295,18 +520,25 @@ pub(super) fn capture_dxgi_monitor(
             }
         }
         let gpu_convert_started_at = Instant::now();
-        let gpu_result = (!compose_cursor)
-            .then(|| gpu_processor.as_mut())
-            .flatten()
-            .map(|(processor, _)| {
-                performance
-                    .pipeline
-                    .record_path(crate::video_performance::FramePath::CaptureGpuNv12);
-                let _timer = performance
-                    .pipeline
-                    .timer(crate::video_performance::Stage::CaptureGpuConvert);
-                processor.process(frame.texture())
-            });
+        let gpu_result = gpu_processor.as_mut().map(|(processor, _)| {
+            performance
+                .pipeline
+                .record_path(crate::video_performance::FramePath::CaptureGpuNv12);
+            let _timer = performance
+                .pipeline
+                .timer(crate::video_performance::Stage::CaptureGpuConvert);
+            let source_texture = composite_cursor_on_gpu_texture(
+                frame.device(),
+                frame.device_context(),
+                frame.texture(),
+                width,
+                height,
+                &cursor,
+                &mut cursor_gpu_canvas,
+                &mut cursor_patch_staging,
+            )?;
+            processor.process(source_texture)
+        });
         performance.gpu_convert_nanos.fetch_add(
             gpu_convert_started_at.elapsed().as_nanos() as u64,
             Ordering::Relaxed,
@@ -314,7 +546,13 @@ pub(super) fn capture_dxgi_monitor(
         let gpu_surface = match gpu_result {
             Some(Ok(surface)) => Some(Arc::new(surface)),
             Some(Err(error)) => {
-                if !gpu_fallback_logged {
+                if compose_cursor && !cursor.cpu_fallback_logged {
+                    tracing::warn!(
+                        error = %error,
+                        "O DXGI informou um cursor separado e a composição GPU falhou; usando composição de cursor no caminho de captura CPU"
+                    );
+                    cursor.cpu_fallback_logged = true;
+                } else if !gpu_fallback_logged {
                     tracing::warn!(error = %error, "Falha no processamento GPU do quadro DXGI; voltando ao caminho de CPU");
                     gpu_fallback_logged = true;
                 }
@@ -683,6 +921,167 @@ mod cursor_tests {
         let mut hidden_frame = vec![0, 0, 0, 255];
         assert!(!cursor.composite(&mut hidden_frame, 1, 1));
         assert_eq!(hidden_frame, vec![0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn cursor_patch_composition_matches_full_frame_composition_across_clipping_cases() {
+        let shape = DxgiCursorShape {
+            width: 2,
+            height: 2,
+            pitch: 8,
+            kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0,
+            bytes: vec![
+                10, 20, 200, 255, 30, 40, 210, 128, 50, 60, 220, 64, 70, 80, 230, 255,
+            ],
+        };
+        let (width, height) = (4u32, 4u32);
+        let base_frame = (0..(width * height * 4))
+            .map(|i| if i % 4 == 3 { 255 } else { (i * 7) as u8 })
+            .collect::<Vec<_>>();
+
+        for (cx, cy) in [(-1, -1), (0, 0), (1, 2), (3, 3), (-2, 0), (4, 4)] {
+            let mut full_frame = base_frame.clone();
+            assert!(composite_cursor_bgra(
+                &mut full_frame,
+                width,
+                height,
+                cx,
+                cy,
+                &shape
+            ));
+
+            let mut patched_frame = base_frame.clone();
+            if let Some(patch) = super::cursor_patch_rect(width, height, cx, cy, &shape) {
+                let row_bytes = patch.width as usize * 4;
+                let mut patch_bgra = Vec::with_capacity(row_bytes * patch.height as usize);
+                for py in 0..patch.height {
+                    let frame_y = (patch.top + py) as usize;
+                    let start = (frame_y * width as usize + patch.left as usize) * 4;
+                    patch_bgra.extend_from_slice(&patched_frame[start..start + row_bytes]);
+                }
+                assert!(composite_cursor_bgra(
+                    &mut patch_bgra,
+                    patch.width,
+                    patch.height,
+                    patch.local_cursor_x,
+                    patch.local_cursor_y,
+                    &shape,
+                ));
+                for py in 0..patch.height {
+                    let frame_y = (patch.top + py) as usize;
+                    let dst_start = (frame_y * width as usize + patch.left as usize) * 4;
+                    let src_start = py as usize * row_bytes;
+                    patched_frame[dst_start..dst_start + row_bytes]
+                        .copy_from_slice(&patch_bgra[src_start..src_start + row_bytes]);
+                }
+            }
+            assert_eq!(
+                patched_frame, full_frame,
+                "cursor patch composition diverged at ({cx}, {cy})"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_cursor_composition_updates_d3d11_texture_and_preserves_gpu_nv12_path() {
+        use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_BIND_RENDER_TARGET, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+            D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+
+        let mut device = None;
+        let mut context = None;
+        let mut level = D3D_FEATURE_LEVEL(0);
+        let created = unsafe {
+            D3D11CreateDevice(
+                None::<&windows::Win32::Graphics::Dxgi::IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                Default::default(),
+                D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                Some(&mut level),
+                Some(&mut context),
+            )
+        };
+        let (Ok(()), Some(device), Some(context)) = (created, device, context) else {
+            return;
+        };
+
+        let (width, height) = (64u32, 64u32);
+        let bgra = [30u8, 60, 90, 255].repeat((width * height) as usize);
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            ..Default::default()
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: bgra.as_ptr().cast(),
+            SysMemPitch: width * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut source_texture = None;
+        unsafe {
+            device
+                .CreateTexture2D(&desc, Some(&init), Some(&mut source_texture))
+                .unwrap();
+        }
+        let source_texture = source_texture.unwrap();
+        let cursor = DxgiCursorState {
+            position: Some((8, 8)),
+            visible: true,
+            shape: Some(DxgiCursorShape {
+                width: 8,
+                height: 8,
+                pitch: 32,
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0,
+                bytes: [0u8, 0, 255, 255].repeat(64),
+            }),
+            ..Default::default()
+        };
+        let mut gpu_canvas = None;
+        let mut patch_staging = None;
+        let composited_tex = super::composite_cursor_on_gpu_texture(
+            &device,
+            &context,
+            &source_texture,
+            width,
+            height,
+            &cursor,
+            &mut gpu_canvas,
+            &mut patch_staging,
+        )
+        .unwrap();
+        if let Ok(mut processor) = crate::mf_video::GpuNv12Processor::new(
+            &device, &context, width, height, width, height, 30,
+        ) {
+            let surface = processor.process(composited_tex).unwrap();
+            let (nv12, stride) = surface.readback_nv12().unwrap();
+            let rgba = surface.to_rgba(&nv12, stride).unwrap();
+            let cursor_pixel =
+                &rgba[(10 * width as usize + 10) * 4..(10 * width as usize + 10) * 4 + 4];
+            let bg_pixel =
+                &rgba[(40 * width as usize + 40) * 4..(40 * width as usize + 40) * 4 + 4];
+            assert!(
+                cursor_pixel[0] > bg_pixel[0] + 80,
+                "expected red cursor in GPU NV12 output, got cursor={cursor_pixel:?} bg={bg_pixel:?}"
+            );
+        }
+        assert!(gpu_canvas.is_some());
     }
 }
 
