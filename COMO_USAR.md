@@ -49,11 +49,13 @@ As taxas abaixo são alvos configurados para o vídeo de saída. Em uma transmis
 | 720p60 ou 1080p30 | 6 Mbps | 12 Mbps |
 | 1080p60 | 8 Mbps | 16 Mbps |
 
-Por exemplo, em 1080p60 com quatro espectadores, o orçamento total de 16 Mbps permite até cerca de 4 Mbps por espectador. Esses valores não são consumo fixo nem garantia de qualidade: o tráfego real depende do que aparece na tela e inclui dados adicionais de rede. O aplicativo não reduz o perfil automaticamente quando a conexão fica instável; escolha um perfil mais leve se isso acontecer. Em grupo, o custo de codificação também cresce com o número de espectadores.
+Por exemplo, em 1080p60 com quatro espectadores, o orçamento total de 16 Mbps permite até cerca de 4 Mbps por espectador. Esses valores não são consumo fixo nem garantia de qualidade: o tráfego real depende do que aparece na tela e inclui dados adicionais de rede. Durante a sessão, o aplicativo pode reduzir temporariamente bitrate, resolução e FPS quando a rede ou o receptor não acompanham. Em grupo, esse ajuste é individual por espectador, e o custo de codificação cresce com o número de espectadores.
+
+Quando as medições estabilizam, a qualidade volta em etapas, respeitando a configuração escolhida pelo transmissor. O controle de rede tenta subir uma etapa após oito segundos de condições estáveis; o receptor avalia intervalos de três segundos e exige pelo menos dez segundos saudáveis antes de pedir uma etapa maior. A recuperação de rede continua respeitando um limite menor solicitado pelo receptor. Novas falhas adiam o aumento e podem reduzir a qualidade outra vez. A preferência salva permanece como limite máximo da transmissão.
 
 O perfil define a cadência desejada, mas não garante que o computador consiga codificar todos os quadros. Em uma máquina sem capacidade para 60 FPS, a transmissão pode entregar menos quadros sem alterar a preferência salva. A aceleração de hardware e o fallback por CPU podem ter desempenhos diferentes.
 
-O perfil escolhido ainda não é negociado com cada receptor. Versões antigas podem ter limites diferentes de decodificação ou aceleração; ao testar computadores com versões distintas, comece em 720p30 e atualize os clientes antes de avaliar os perfis maiores.
+Receptores compatíveis podem pedir um perfil menor para sua própria sessão. Versões antigas podem ter limites diferentes de decodificação ou aceleração; ao testar computadores com versões distintas, comece em 720p30 e atualize os clientes antes de avaliar os perfis maiores. A recuperação corrigida precisa do executável atualizado nos dois computadores.
 
 Na preferência de decodificação, **Automático** começa com DXVA e pode mudar para **CPU (OpenH264)** quando o decoder não acompanha os quadros recebidos, incluindo congestionamento persistente da fila. **Preferir DXVA** mantém a GPU mesmo com FPS baixo, usando CPU se DXVA estiver indisponível ou falhar. A escolha vale na próxima sessão de compartilhamento. Uma recuperação por fila cheia mantém o decoder ativo e aguarda um quadro completo de recuperação; a avaliação de desempenho continua entre essas recuperações.
 

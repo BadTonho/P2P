@@ -225,10 +225,12 @@ struct SenderCongestionDecision {
     scale_percent: u32,
     force_keyframe: bool,
     step_down_profile: bool,
+    step_up_profile: bool,
 }
 
 struct SenderCongestionController {
     scale_percent: u32,
+    profile_limit: AdaptiveVideoProfile,
     last_evaluated_at: Instant,
     healthy_elapsed: Duration,
     last_pli: u64,
@@ -241,6 +243,7 @@ impl SenderCongestionController {
     fn new(now: Instant) -> Self {
         Self {
             scale_percent: 100,
+            profile_limit: AdaptiveVideoProfile::P1080Fps60,
             last_evaluated_at: now,
             healthy_elapsed: Duration::ZERO,
             last_pli: 0,
@@ -260,11 +263,21 @@ impl SenderCongestionController {
         ((u64::from(base_bitrate_bps) * u64::from(self.scale_percent)) / 100).max(250_000) as u32
     }
 
+    fn effective_profile(
+        &self,
+        receiver_profile: AdaptiveVideoProfile,
+        maximum: ScreenShareQuality,
+    ) -> AdaptiveVideoProfile {
+        AdaptiveVideoProfile::from_index(self.profile_limit.index().max(receiver_profile.index()))
+            .cap_to_quality(maximum)
+    }
+
     fn observe(
         &mut self,
         now: Instant,
         total_pli: u64,
         total_nack: u64,
+        receiver_profile: AdaptiveVideoProfile,
     ) -> Option<SenderCongestionDecision> {
         let mut force_keyframe = false;
         let mut changed = false;
@@ -293,6 +306,7 @@ impl SenderCongestionController {
                 scale_percent: self.scale_percent,
                 force_keyframe,
                 step_down_profile: false,
+                step_up_profile: false,
             });
         }
 
@@ -303,6 +317,7 @@ impl SenderCongestionController {
         self.last_nack = total_nack;
 
         let mut step_down_profile = false;
+        let mut step_up_profile = false;
         if pli_delta >= CONGESTION_PLI_THRESHOLD || nack_delta >= CONGESTION_NACK_THRESHOLD {
             self.healthy_elapsed = Duration::ZERO;
             let was_already_reduced = self.scale_percent <= 50;
@@ -319,14 +334,27 @@ impl SenderCongestionController {
                 && (pli_delta >= CONGESTION_PLI_THRESHOLD
                     || nack_delta >= SEVERE_CONGESTION_NACK_THRESHOLD)
             {
-                step_down_profile = true;
-                changed = true;
+                let current_index = self.profile_limit.index().max(receiver_profile.index());
+                let next_limit = AdaptiveVideoProfile::from_index(current_index + 1);
+                if next_limit != self.profile_limit {
+                    self.profile_limit = next_limit;
+                    step_down_profile = true;
+                    changed = true;
+                }
             }
-        } else if pli_delta == 0 && nack_delta <= 2 && self.scale_percent < 100 {
+        } else if pli_delta == 0
+            && nack_delta <= 2
+            && (self.scale_percent < 100 || self.profile_limit.index() > 0)
+        {
             self.healthy_elapsed = self.healthy_elapsed.saturating_add(elapsed);
             if self.healthy_elapsed >= SENDER_RECOVERY_WINDOW {
                 self.healthy_elapsed = Duration::ZERO;
                 self.scale_percent = (self.scale_percent + 15).min(100);
+                if self.profile_limit.index() > 0 {
+                    self.profile_limit =
+                        AdaptiveVideoProfile::from_index(self.profile_limit.index() - 1);
+                    step_up_profile = true;
+                }
                 changed = true;
             }
         } else {
@@ -337,6 +365,7 @@ impl SenderCongestionController {
             scale_percent: self.scale_percent,
             force_keyframe,
             step_down_profile,
+            step_up_profile,
         })
     }
 }
@@ -351,7 +380,7 @@ pub(super) fn encode_latest_frames(
     bitrate_bps: u32,
     quality: ScreenShareQuality,
     bitrate_target: Arc<AtomicU32>,
-    profile_target: Arc<AtomicU32>,
+    receiver_profile_target: Arc<AtomicU32>,
 ) -> Result<(), String> {
     let mut encoder: Option<ActiveH264Encoder> = None;
     let mut active_bitrate_bps = bitrate_bps;
@@ -360,29 +389,32 @@ pub(super) fn encode_latest_frames(
     let mut pacer = LatestFramePacer::new(quality);
     let mut congestion = SenderCongestionController::new(Instant::now());
     let mut active_profile =
-        AdaptiveVideoProfile::from_index(profile_target.load(Ordering::Relaxed) as usize)
+        AdaptiveVideoProfile::from_index(receiver_profile_target.load(Ordering::Relaxed) as usize)
             .cap_to_quality(quality);
     let mut observed_generation = source.generation();
 
     while !stop.load(Ordering::Relaxed) {
+        let receiver_profile = AdaptiveVideoProfile::from_index(
+            receiver_profile_target.load(Ordering::Relaxed) as usize,
+        )
+        .cap_to_quality(quality);
         if metrics.p2p_connected.load(Ordering::Relaxed) {
             let (total_pli, total_nack) = metrics.sender_feedback_counters();
-            if let Some(decision) = congestion.observe(Instant::now(), total_pli, total_nack) {
-                if decision.step_down_profile {
-                    let current_idx = profile_target.load(Ordering::Relaxed) as usize;
-                    let next_profile = AdaptiveVideoProfile::from_index((current_idx + 1).min(3))
-                        .cap_to_quality(quality);
-                    if next_profile.index() != current_idx {
-                        profile_target.store(next_profile.index() as u32, Ordering::Relaxed);
-                        tracing::info!(
-                            screen_share_session = metrics.session_id,
-                            profile = ?next_profile,
-                            scale_percent = decision.scale_percent,
-                            total_pli,
-                            total_nack,
-                            "Congestionamento RTP detectado no emissor; reduzindo perfil de vídeo"
-                        );
-                    }
+            if let Some(decision) =
+                congestion.observe(Instant::now(), total_pli, total_nack, receiver_profile)
+            {
+                if decision.step_down_profile || decision.step_up_profile {
+                    tracing::info!(
+                        screen_share_session = metrics.session_id,
+                        profile = ?congestion.effective_profile(receiver_profile, quality),
+                        network_profile_limit = ?congestion.profile_limit,
+                        receiver_profile = ?receiver_profile,
+                        recovering = decision.step_up_profile,
+                        scale_percent = decision.scale_percent,
+                        total_pli,
+                        total_nack,
+                        "Limite de qualidade por congestionamento atualizado no emissor"
+                    );
                 }
                 if decision.force_keyframe {
                     force_keyframe.store(true, Ordering::Relaxed);
@@ -397,9 +429,9 @@ pub(super) fn encode_latest_frames(
             }
         }
 
-        let requested_profile =
-            AdaptiveVideoProfile::from_index(profile_target.load(Ordering::Relaxed) as usize)
-                .cap_to_quality(quality);
+        // Network recovery must not overwrite a receiver's decoder limit. The
+        // shared target belongs to receiver feedback; congestion is local state.
+        let requested_profile = congestion.effective_profile(receiver_profile, quality);
         if requested_profile != active_profile {
             active_profile = requested_profile;
             pacer.set_profile(active_profile);
@@ -1479,17 +1511,28 @@ mod tests {
 
         // Single NACK (e.g. normal minor packet loss) does not trigger startup IDR reinforcement.
         assert_eq!(
-            controller.observe(start + Duration::from_millis(900), 0, 1),
+            controller.observe(
+                start + Duration::from_millis(900),
+                0,
+                1,
+                AdaptiveVideoProfile::P1080Fps60
+            ),
             None
         );
 
         // Early NACK burst (>= 4) within [800ms, 3s] after initial IDR triggers reinforcement IDR at 70% bitrate.
         assert_eq!(
-            controller.observe(start + Duration::from_millis(1000), 0, 5),
+            controller.observe(
+                start + Duration::from_millis(1000),
+                0,
+                5,
+                AdaptiveVideoProfile::P1080Fps60
+            ),
             Some(SenderCongestionDecision {
                 scale_percent: 70,
                 force_keyframe: true,
                 step_down_profile: false,
+                step_up_profile: false,
             })
         );
         assert_eq!(controller.scale_bitrate(8_000_000), 5_600_000);
@@ -1497,38 +1540,204 @@ mod tests {
         // Sustained NACK/PLI bursts across 2s windows reduce bitrate scale to 50%, then 35% + step_down_profile.
         let t1 = start + SENDER_CONGESTION_WINDOW;
         assert_eq!(
-            controller.observe(t1, 2, 30),
+            controller.observe(t1, 2, 30, AdaptiveVideoProfile::P1080Fps60),
             Some(SenderCongestionDecision {
                 scale_percent: 50,
                 force_keyframe: false,
                 step_down_profile: false,
+                step_up_profile: false,
             })
         );
         let t2 = t1 + SENDER_CONGESTION_WINDOW;
         assert_eq!(
-            controller.observe(t2, 4, 80),
+            controller.observe(t2, 4, 80, AdaptiveVideoProfile::P1080Fps60),
             Some(SenderCongestionDecision {
                 scale_percent: 35,
                 force_keyframe: false,
                 step_down_profile: true,
+                step_up_profile: false,
             })
         );
 
         // 8 seconds of healthy transmission steps bitrate scale back up by +15%.
         for step in 1..=3 {
             assert_eq!(
-                controller.observe(t2 + SENDER_CONGESTION_WINDOW * step, 4, 80),
+                controller.observe(
+                    t2 + SENDER_CONGESTION_WINDOW * step,
+                    4,
+                    80,
+                    AdaptiveVideoProfile::P1080Fps60
+                ),
                 None
             );
         }
         assert_eq!(
-            controller.observe(t2 + SENDER_CONGESTION_WINDOW * 4, 4, 81),
+            controller.observe(
+                t2 + SENDER_CONGESTION_WINDOW * 4,
+                4,
+                81,
+                AdaptiveVideoProfile::P1080Fps60
+            ),
             Some(SenderCongestionDecision {
                 scale_percent: 50,
                 force_keyframe: false,
                 step_down_profile: false,
+                step_up_profile: true,
             })
         );
+    }
+
+    #[test]
+    fn adaptive_recovery_requests_profile_upgrades_after_sender_congestion_ends() {
+        let start = Instant::now();
+        let mut controller = SenderCongestionController::new(start);
+        for step in 1..=5_u64 {
+            controller.observe(
+                start + Duration::from_secs(step * 2),
+                step * 2,
+                step * 50,
+                AdaptiveVideoProfile::P1080Fps60,
+            );
+        }
+        let mut upgrades = 0;
+        // Simulate an hour without network feedback errors, without wall-clock waits.
+        for step in 1..=1_800_u64 {
+            if let Some(decision) = controller.observe(
+                start + Duration::from_secs(10 + step * 2),
+                10,
+                250,
+                AdaptiveVideoProfile::P1080Fps60,
+            ) {
+                upgrades += usize::from(decision.step_up_profile);
+            }
+        }
+        assert_eq!(
+            upgrades, 3,
+            "profile reductions must be recovered as well as bitrate"
+        );
+        assert_eq!(controller.scale_percent, 100);
+    }
+
+    #[test]
+    fn adaptive_recovery_after_hours_of_loss_returns_to_selected_1080p30() {
+        let start = Instant::now();
+        let mut controller = SenderCongestionController::new(start);
+        let maximum = ScreenShareQuality {
+            resolution: crate::screen_quality::ScreenShareResolution::P1080,
+            frame_rate: crate::screen_quality::ScreenShareFrameRate::Fps30,
+        };
+        let receiver = AdaptiveVideoProfile::P1080Fps30;
+        for step in 1..=3_600_u64 {
+            controller.observe(
+                start + Duration::from_secs(step * 2),
+                step * 2,
+                step * 50,
+                receiver,
+            );
+        }
+        assert_eq!(
+            controller.effective_profile(receiver, maximum),
+            AdaptiveVideoProfile::P720Fps15
+        );
+        let mut profiles = Vec::new();
+        for step in 1..=20_u64 {
+            if let Some(decision) = controller.observe(
+                start + Duration::from_secs(7_200 + step * 2),
+                7_200,
+                180_000,
+                receiver,
+            ) && decision.step_up_profile
+            {
+                profiles.push(controller.effective_profile(receiver, maximum));
+            }
+            assert!(
+                controller
+                    .effective_profile(receiver, maximum)
+                    .frames_per_second()
+                    <= 30
+            );
+        }
+        assert_eq!(
+            profiles,
+            vec![
+                AdaptiveVideoProfile::P720Fps30,
+                AdaptiveVideoProfile::P1080Fps30,
+                AdaptiveVideoProfile::P1080Fps30,
+            ]
+        );
+        assert_eq!(controller.scale_percent, 100);
+    }
+
+    #[test]
+    fn adaptive_recovery_keeps_the_receivers_limit_after_network_recovery() {
+        let start = Instant::now();
+        let mut controller = SenderCongestionController::new(start);
+        let maximum = ScreenShareQuality {
+            resolution: crate::screen_quality::ScreenShareResolution::P1080,
+            frame_rate: crate::screen_quality::ScreenShareFrameRate::Fps60,
+        };
+        for step in 1..=5_u64 {
+            controller.observe(
+                start + Duration::from_secs(step * 2),
+                step * 2,
+                step * 50,
+                AdaptiveVideoProfile::P1080Fps60,
+            );
+        }
+        for step in 1..=20_u64 {
+            controller.observe(
+                start + Duration::from_secs(10 + step * 2),
+                10,
+                250,
+                AdaptiveVideoProfile::P720Fps15,
+            );
+            assert_eq!(
+                controller.effective_profile(AdaptiveVideoProfile::P720Fps15, maximum),
+                AdaptiveVideoProfile::P720Fps15,
+            );
+        }
+        assert_eq!(controller.profile_limit, AdaptiveVideoProfile::P1080Fps60);
+        assert_eq!(
+            controller.effective_profile(AdaptiveVideoProfile::P1080Fps60, maximum),
+            AdaptiveVideoProfile::P1080Fps60
+        );
+        assert_eq!(
+            controller.effective_profile(
+                AdaptiveVideoProfile::P1080Fps60,
+                ScreenShareQuality::default()
+            ),
+            AdaptiveVideoProfile::P720Fps30
+        );
+    }
+
+    #[test]
+    fn adaptive_recovery_failed_probe_can_step_back_down() {
+        let start = Instant::now();
+        let mut controller = SenderCongestionController::new(start);
+        let receiver = AdaptiveVideoProfile::P1080Fps60;
+        for step in 1..=5_u64 {
+            controller.observe(
+                start + Duration::from_secs(step * 2),
+                step * 2,
+                step * 50,
+                receiver,
+            );
+        }
+        for step in 1..=4_u64 {
+            controller.observe(
+                start + Duration::from_secs(10 + step * 2),
+                10,
+                250,
+                receiver,
+            );
+        }
+        assert_eq!(controller.profile_limit, AdaptiveVideoProfile::P720Fps30);
+        let decision = controller
+            .observe(start + Duration::from_secs(20), 12, 300, receiver)
+            .unwrap();
+        assert!(decision.step_down_profile);
+        assert!(!decision.step_up_profile);
+        assert_eq!(controller.profile_limit, AdaptiveVideoProfile::P720Fps15);
     }
 
     #[cfg(windows)]

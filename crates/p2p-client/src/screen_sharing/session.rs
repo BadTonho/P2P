@@ -233,6 +233,28 @@ struct SessionQualityFeedback {
     last_recovery_gate_drops: u64,
 }
 
+impl SessionQualityFeedback {
+    fn observe(&mut self, now: Instant, counters: (u64, u64, u64, u64)) -> Option<QualityDecision> {
+        // UI refreshes can be much faster than video delivery. Keep the counter
+        // baseline until the controller consumes a complete measurement window.
+        if !self.controller.window_complete(now) {
+            return None;
+        }
+        let (received, published, queue_drops, recovery_gate_drops) = counters;
+        let window = QualityWindow {
+            received: received.saturating_sub(self.last_received),
+            published: published.saturating_sub(self.last_published),
+            queue_drops: queue_drops.saturating_sub(self.last_queue_drops),
+            recovery_gate_drops: recovery_gate_drops.saturating_sub(self.last_recovery_gate_drops),
+        };
+        self.last_received = received;
+        self.last_published = published;
+        self.last_queue_drops = queue_drops;
+        self.last_recovery_gate_drops = recovery_gate_drops;
+        self.controller.observe(now, window)
+    }
+}
+
 #[allow(dead_code)]
 impl ScreenShareSession {
     #[cfg(test)]
@@ -674,23 +696,12 @@ impl ScreenShareSession {
     }
 
     pub(crate) fn observe_quality_feedback(&self) -> Option<QualityDecision> {
-        let (received, published, queue_drops, recovery_gate_drops) =
-            self.metrics.adaptive_quality_counters();
+        let counters = self.metrics.adaptive_quality_counters();
         let mut state = self
             .adaptive_quality
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let window = QualityWindow {
-            received: received.saturating_sub(state.last_received),
-            published: published.saturating_sub(state.last_published),
-            queue_drops: queue_drops.saturating_sub(state.last_queue_drops),
-            recovery_gate_drops: recovery_gate_drops.saturating_sub(state.last_recovery_gate_drops),
-        };
-        state.last_received = received;
-        state.last_published = published;
-        state.last_queue_drops = queue_drops;
-        state.last_recovery_gate_drops = recovery_gate_drops;
-        state.controller.observe(Instant::now(), window)
+        state.observe(Instant::now(), counters)
     }
 
     pub fn try_recv(&self) -> Option<ScreenShareEvent> {

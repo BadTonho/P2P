@@ -146,13 +146,17 @@ impl AdaptiveQualityController {
         }
     }
 
+    pub(crate) fn window_complete(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_evaluated_at) >= CONTROL_WINDOW
+    }
+
     pub(crate) fn observe(
         &mut self,
         now: Instant,
         window: QualityWindow,
     ) -> Option<QualityDecision> {
         let elapsed = now.saturating_duration_since(self.last_evaluated_at);
-        if elapsed < CONTROL_WINDOW {
+        if !self.window_complete(now) {
             return None;
         }
         self.last_evaluated_at = now;

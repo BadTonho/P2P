@@ -1,5 +1,93 @@
 use super::*;
 
+fn adaptive_feedback_state(start: Instant) -> SessionQualityFeedback {
+    SessionQualityFeedback {
+        controller: AdaptiveQualityController::new(start),
+        last_received: 0,
+        last_published: 0,
+        last_queue_drops: 0,
+        last_recovery_gate_drops: 0,
+    }
+}
+
+#[test]
+fn adaptive_recovery_uses_complete_windows_when_ui_polls_faster_than_video() {
+    let start = Instant::now();
+    let mut state = adaptive_feedback_state(start);
+    for step in 1..=3_u64 {
+        state.observe(
+            start + Duration::from_secs(step * 3),
+            (step * 60, step * 47, step * 2, 0),
+        );
+    }
+    assert_eq!(state.controller.profile(), AdaptiveVideoProfile::P720Fps15);
+    let mut recoveries = Vec::new();
+    // UI polls at 100 Hz, video arrives at 15 FPS, publication lags one poll.
+    // Decisions must use the full three seconds, not the last 10 ms sample.
+    for tick in 1..=3_600_u64 {
+        let received = tick * 15 / 100;
+        let published = (tick * 15).saturating_sub(1) / 100;
+        if let Some(QualityDecision::Changed { feedback, .. }) = state.observe(
+            start + Duration::from_secs(9) + Duration::from_millis(tick * 10),
+            (180 + received, 141 + published, 6, 0),
+        ) {
+            assert_eq!(
+                feedback.reason,
+                adaptive_quality::QualityFeedbackReason::Recovered
+            );
+            recoveries.push(feedback.profile);
+        }
+    }
+    assert_eq!(
+        recoveries,
+        vec![
+            AdaptiveVideoProfile::P720Fps30,
+            AdaptiveVideoProfile::P1080Fps30,
+            AdaptiveVideoProfile::P1080Fps60,
+        ]
+    );
+}
+
+#[test]
+fn adaptive_recovery_preserves_drop_evidence_between_ui_polls() {
+    let start = Instant::now();
+    let mut state = adaptive_feedback_state(start);
+    let mut decision = None;
+    for tick in 1..=300_u64 {
+        let drops = u64::from(tick >= 25) + u64::from(tick >= 180);
+        decision = state.observe(
+            start + Duration::from_millis(tick * 10),
+            (tick / 5, tick * 47 / 300, drops, 0),
+        );
+    }
+    assert!(matches!(
+        decision,
+        Some(QualityDecision::Changed {
+            feedback: QualityFeedback {
+                profile: AdaptiveVideoProfile::P1080Fps30,
+                ..
+            },
+            overload_evidence: Some(QualityOverloadEvidence { queue_drops: 2, .. }),
+        })
+    ));
+}
+
+#[test]
+fn adaptive_recovery_does_not_treat_an_empty_stream_as_healthy() {
+    let start = Instant::now();
+    let mut state = adaptive_feedback_state(start);
+    let counters = (60, 47, 2, 0);
+    state.observe(start + Duration::from_secs(3), counters);
+    assert_eq!(state.controller.profile(), AdaptiveVideoProfile::P1080Fps30);
+    for step in 2..=100_u64 {
+        assert_eq!(
+            state.observe(start + Duration::from_secs(step * 3), counters),
+            None
+        );
+    }
+    assert_eq!(state.controller.profile(), AdaptiveVideoProfile::P1080Fps30);
+}
+
 #[test]
 fn ice_diagnostics_resolve_raw_and_prefixed_ids_without_guessing_another_candidate() {
     use rtc::statistics::stats::ice_candidate::RTCIceCandidateStats;
