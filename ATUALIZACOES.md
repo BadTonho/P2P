@@ -2,6 +2,10 @@
 
 O app consulta o último [GitHub Release público](https://github.com/BadTonho/P2P/releases/latest) pela API pública do repositório. Não precisa de login, chave de API ou `update-manifest.json`.
 
+A próxima versão preparada é **1.2.8**, com a correção do ciclo de atualização do vídeo. Publique os dois executáveis em um release estável com a tag **`v1.2.8`**, mantendo os nomes indicados abaixo. A versão 1.2.7 já foi publicada; a nova numeração permite que esses clientes reconheçam a atualização.
+
+Os caminhos, tamanhos, hashes e resultados da preparação estão em [PREPARACAO_RELEASE_1.2.8.md](analises/PREPARACAO_RELEASE_1.2.8.md).
+
 ## Preparar uma versão
 
 1. Atualize `[workspace.package].version` em `Cargo.toml` para uma versão maior no formato `MAJOR.MINOR.PATCH`.
