@@ -1,4 +1,5 @@
 use super::*;
+use windows::Win32::Foundation::E_ACCESSDENIED;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, ID3D11Device,
@@ -6,10 +7,61 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
+    DXGI_ERROR_ACCESS_DENIED, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_SESSION_DISCONNECTED,
+    DXGI_ERROR_UNSUPPORTED, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
 };
 use windows::core::Interface;
+use windows_capture::dxgi_duplication_api::Error as DxgiCaptureError;
+
+const DXGI_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+fn is_transient_desktop_error(error: &DxgiCaptureError) -> bool {
+    let code = match error {
+        DxgiCaptureError::AccessLost => return true,
+        DxgiCaptureError::WindowsError(error)
+        | DxgiCaptureError::DirectXError(windows_capture::d3d11::Error::WindowsError(error)) => {
+            error.code()
+        }
+        _ => return false,
+    };
+    matches!(
+        code,
+        E_ACCESSDENIED
+            | DXGI_ERROR_ACCESS_DENIED
+            | DXGI_ERROR_ACCESS_LOST
+            | DXGI_ERROR_SESSION_DISCONNECTED
+            | DXGI_ERROR_UNSUPPORTED
+    )
+}
+
+fn retry_dxgi_recreation<T>(
+    stop: &AtomicBool,
+    mut recreate: impl FnMut() -> Result<T, DxgiCaptureError>,
+    mut wait: impl FnMut(),
+) -> Result<Option<T>, DxgiCaptureError> {
+    // UAC can keep the secure desktop active for an arbitrary amount of time.
+    // A transient denial must not finish the capture worker and tear down WebRTC.
+    while !stop.load(Ordering::Relaxed) {
+        match recreate() {
+            Ok(duplication) => return Ok(Some(duplication)),
+            Err(error) if is_transient_desktop_error(&error) => wait(),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+fn wait_for_dxgi_recovery(stop: &AtomicBool) {
+    let deadline = Instant::now() + DXGI_RECOVERY_RETRY_INTERVAL;
+    while !stop.load(Ordering::Relaxed) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
+}
 
 #[derive(Clone, Debug)]
 struct DxgiCursorShape {
@@ -430,8 +482,15 @@ pub(super) fn capture_dxgi_monitor(
     preview_enabled: Arc<AtomicBool>,
     quality: ScreenShareQuality,
 ) -> Result<(), String> {
-    let mut duplication = DxgiDuplicationApi::new_options(monitor, &[DxgiDuplicationFormat::Bgra8])
-        .map_err(|error| format!("DXGI Desktop Duplication não iniciou: {error}"))?;
+    let Some(mut duplication) = retry_dxgi_recreation(
+        &stop,
+        || DxgiDuplicationApi::new_options(monitor, &[DxgiDuplicationFormat::Bgra8]),
+        || wait_for_dxgi_recovery(&stop),
+    )
+    .map_err(|error| format!("DXGI Desktop Duplication não iniciou: {error}"))?
+    else {
+        return Ok(());
+    };
     let mut sequence = 0u64;
     let mut limiter = FrameRateLimiter::new(quality);
     let mut scratch = Vec::new();
@@ -449,8 +508,8 @@ pub(super) fn capture_dxgi_monitor(
         let mut frame = match duplication.acquire_next_frame(100) {
             Ok(frame) => frame,
             Err(windows_capture::dxgi_duplication_api::Error::Timeout) => continue,
-            Err(windows_capture::dxgi_duplication_api::Error::AccessLost) => {
-                tracing::warn!("DXGI perdeu acesso ao monitor; recriando a duplicação");
+            Err(error) if is_transient_desktop_error(&error) => {
+                tracing::warn!(error = %error, "Captura DXGI pausada pelo Windows; aguardando acesso à área de trabalho sem encerrar o compartilhamento");
                 gpu_processor = None;
                 gpu_processor_attempted = None;
                 staging_texture = None;
@@ -460,12 +519,33 @@ pub(super) fn capture_dxgi_monitor(
                 *fallback_reason
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                duplication = duplication
-                    .recreate_options(&[DxgiDuplicationFormat::Bgra8])
-                    .map_err(|error| {
-                        format!("DXGI não recriou a captura após mudança de tela: {error}")
-                    })?;
+                // recreate_options consumes the old interface even on failure.
+                // Keep its device when the first attempt succeeds; otherwise a
+                // fresh factory allows retrying after the protected desktop closes.
+                let mut previous = Some(duplication);
+                let replacement = retry_dxgi_recreation(
+                    &stop,
+                    || match previous.take() {
+                        Some(previous) => {
+                            previous.recreate_options(&[DxgiDuplicationFormat::Bgra8])
+                        }
+                        None => DxgiDuplicationApi::new_options(
+                            monitor,
+                            &[DxgiDuplicationFormat::Bgra8],
+                        ),
+                    },
+                    || wait_for_dxgi_recovery(&stop),
+                )
+                .map_err(|error| {
+                    format!("DXGI não recriou a captura após mudança de tela: {error}")
+                })?;
+                let Some(replacement) = replacement else {
+                    return Ok(());
+                };
+                duplication = replacement;
                 limiter = FrameRateLimiter::new(quality);
+                tracing::info!("Captura DXGI retomada após mudança da área de trabalho");
+                context.request_repaint();
                 continue;
             }
             Err(error) => return Err(format!("Falha ao capturar monitor via DXGI: {error}")),
@@ -776,6 +856,10 @@ fn downsample_bgra(
         cpu_nv12: None,
     }
 }
+
+#[cfg(test)]
+#[path = "dxgi_recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod cursor_tests {

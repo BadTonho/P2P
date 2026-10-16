@@ -119,6 +119,12 @@ Para medir o vídeo, escolha **Detalhados** e marque **Registrar métricas peri�
 
 As medições do vídeo também distinguem entrada direta da GPU, entrada pela CPU em um codificador de hardware e OpenH264. Registram chamadas de captura, conversão de cores, codificação, decodificação, espera na fila e preparação da imagem, além do tempo e dos bytes copiados da GPU para a CPU. Os tempos são durações das chamadas do aplicativo, incluindo esperas, e algumas etapas se sobrepõem; não representam tempo exclusivo de execução da GPU ou percentual de CPU. Os percentuais dos motores pertencem ao processo inteiro, incluindo interface e outras telas compartilhadas, e não devem ser somados como um percentual total da placa.
 
+### Permissão de administrador do Windows
+
+Quando o Windows mostra uma confirmação de administrador em uma área protegida, a imagem compartilhada pode ficar temporariamente parada no último quadro. Na captura de monitor, o aplicativo aguarda o acesso voltar e tenta retomar automaticamente depois de aceitar ou cancelar a mensagem, mantendo o compartilhamento ativo. O botão de parar continua cancelando essa espera.
+
+A recuperação foi testada com falhas de acesso simuladas. A confirmação de administrador real e a retomada nos dois computadores ainda precisam de validação manual com o executável de desenvolvimento atualizado.
+
 ### Brilho ao clicar ou segurar o mouse
 
 A captura de desktop e a apresentação do vídeo usam opacidade total; o canal alpha do DXGI/WGC e o estilo de interação da interface não devem diminuir o brilho dos pixels. O conversor GPU declara entrada RGB completa (0–255) e saída NV12 BT.601 limitada (16–235), conforme o conversor CPU e o shader. Logs detalhados registram o contrato de cor ao criar o conversor e as mudanças entre caminhos GPU e CPU, incluindo composição do cursor, sem salvar imagens.
