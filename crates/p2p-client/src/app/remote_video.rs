@@ -55,8 +55,12 @@ pub(super) struct RemoteVideoRenderer {
 }
 
 impl RemoteVideoRenderer {
+    pub fn set_available(&mut self, available: bool) {
+        self.available = available;
+    }
+
     pub fn begin_frame(&mut self, gl: Option<&glow::Context>) {
-        self.available = gl.is_some();
+        self.set_available(gl.is_some());
         if let Some(gl) = gl {
             self.resources
                 .lock()

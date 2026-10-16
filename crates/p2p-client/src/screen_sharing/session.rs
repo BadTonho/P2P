@@ -235,6 +235,32 @@ struct SessionQualityFeedback {
 
 #[allow(dead_code)]
 impl ScreenShareSession {
+    #[cfg(test)]
+    pub(crate) fn synthetic_video_receiver() -> (Self, RemoteFrameStore) {
+        let (commands, _) = mpsc::unbounded_channel();
+        let (_, events) = std_mpsc::channel();
+        let remote_frame = Arc::new(Mutex::new(None));
+        let session = Self {
+            commands,
+            events,
+            remote_frame: Arc::clone(&remote_frame),
+            remote_track: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(SharedMetrics::default()),
+            remote_audio_volume: RemoteAudioVolume::default(),
+            encoder_bitrate_bps: Arc::new(AtomicU32::new(0)),
+            encoder_profile: Arc::new(AtomicU32::new(0)),
+            adaptive_quality: Mutex::new(SessionQualityFeedback {
+                controller: AdaptiveQualityController::new(Instant::now()),
+                last_received: 0,
+                last_published: 0,
+                last_queue_drops: 0,
+                last_recovery_gate_drops: 0,
+            }),
+            worker: None,
+        };
+        (session, remote_frame)
+    }
+
     pub fn new(
         context: egui::Context,
         bind_ipv4: Ipv4Addr,

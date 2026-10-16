@@ -45,6 +45,9 @@ mod group_sharing;
 #[path = "app/hosts.rs"]
 mod hosts;
 pub(crate) use hosts::{generate_random_room_code, is_valid_room_code, sanitize_room_code};
+#[cfg(test)]
+#[path = "app/realtime_tests.rs"]
+mod realtime_tests;
 #[path = "app/room_lifecycle.rs"]
 mod room_lifecycle;
 #[path = "app/room_participants.rs"]
@@ -626,33 +629,46 @@ impl ClientUi {
         self.set_fullscreen(context, !self.fullscreen_video);
     }
 
-    fn show(&mut self, ui: &mut egui::Ui) {
-        Self::apply_monochrome_style(ui);
-        let context = ui.ctx().clone();
-        if context.input(|i| i.key_pressed(egui::Key::F11)) {
-            self.toggle_fullscreen(&context);
-        }
-        if self.fullscreen_video && context.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.set_fullscreen(&context, false);
-        }
-        let preferences_before_frame = self.preferences_snapshot();
+    fn refresh_background_state(&mut self, context: &egui::Context) {
+        // eframe 0.36 skips App::ui for hidden/minimized windows. Network
+        // negotiation and incoming video must keep advancing in App::logic.
         if self
             .code_copied_until
             .is_some_and(|expires_at| Instant::now() >= expires_at)
         {
             self.code_copied_until = None;
         }
-        if self.microphone.is_some()
-            || (self.screen_capture.is_some()
-                && self.show_local_preview
-                && (self.group_share.local_sharing
-                    || matches!(&self.screen_share_role, ScreenShareRole::Sending { .. })))
-            || self.screen_picker.is_some()
+        self.refresh_microphone();
+        self.refresh_monitors(false);
+        self.refresh_screen(context);
+        self.refresh_signaling(context);
+        self.refresh_turn_state();
+        self.refresh_gpu_telemetry(context);
+        self.refresh_screen_share(context);
+        self.refresh_control_mesh(context);
+        self.refresh_discovery(context);
+        self.refresh_updates(context);
+        self.handle_window_close(context);
+        self.schedule_background_refresh(context);
+    }
+
+    fn schedule_background_refresh(&self, context: &egui::Context) {
+        let video_active = self.screen_capture.is_some()
             || self.screen_share_session.is_some()
             || !self.group_share.inbound_sessions.is_empty()
-            || !self.group_share.outbound_sessions.is_empty()
+            || !self.group_share.outbound_sessions.is_empty();
+        if video_active {
+            // Frame producers also wake egui directly. Keep a video-rate fallback
+            // so a delayed/coalesced notification never leaves the image idle
+            // until a mouse event, or limits presentation to ten frames/second.
+            context.request_repaint_after(Duration::from_secs_f64(1.0 / 60.0));
+            return;
+        }
+        if self.microphone.is_some()
+            || self.screen_picker.is_some()
             || self.connecting
             || self.signaling.is_some()
+            || self.pending_signaling.is_some()
             || self.control_mesh.is_some()
             || matches!(
                 &self.update_status,
@@ -665,17 +681,18 @@ impl ClientUi {
         {
             context.request_repaint_after(Duration::from_millis(100));
         }
-        self.refresh_microphone();
-        self.refresh_monitors(false);
-        self.refresh_screen(&context);
-        self.refresh_signaling(&context);
-        self.refresh_turn_state();
-        self.refresh_gpu_telemetry(&context);
-        self.refresh_screen_share(&context);
-        self.refresh_control_mesh(&context);
-        self.refresh_discovery(&context);
-        self.refresh_updates(&context);
-        self.handle_window_close(&context);
+    }
+
+    fn show(&mut self, ui: &mut egui::Ui) {
+        Self::apply_monochrome_style(ui);
+        let context = ui.ctx().clone();
+        if context.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.toggle_fullscreen(&context);
+        }
+        if self.fullscreen_video && context.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.set_fullscreen(&context, false);
+        }
+        let preferences_before_frame = self.preferences_snapshot();
 
         let mut open_settings = false;
         let mut close_settings = false;
@@ -1297,10 +1314,21 @@ pub(super) fn run() -> eframe::Result {
 }
 
 impl eframe::App for ClientUi {
+    fn logic(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
+        // Availability is metadata; GL work stays in ui/on_exit, where eframe
+        // makes the graphics context current. This also avoids selecting the
+        // CPU fallback when the first video frame arrives before App::ui.
+        self.remote_video_renderer
+            .set_available(frame.gl().is_some());
+        self.refresh_background_state(context);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.remote_video_renderer
             .begin_frame(frame.gl().map(Arc::as_ref));
         self.show(ui);
+        // A button can start a task after App::logic has already run.
+        self.schedule_background_refresh(ui.ctx());
     }
 
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
