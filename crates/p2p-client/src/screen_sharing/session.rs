@@ -2137,10 +2137,21 @@ async fn send_system_audio(
     let mut last_encoded_bytes = 0_u64;
     let mut last_written_samples = 0_u64;
     let mut last_write_failures = 0_u64;
+    const MAX_AUDIO_FRAMES_PER_TICK: usize = 8;
     let mut last_audio_state = String::new();
+    let mut last_tick_at: Option<Instant> = None;
 
-    loop {
+    'audio_loop: loop {
         interval.tick().await;
+        let now = Instant::now();
+        let due_frames = last_tick_at
+            .map(|prev| {
+                let elapsed_ms = now.saturating_duration_since(prev).as_millis() as usize;
+                (elapsed_ms / 20).clamp(1, MAX_AUDIO_FRAMES_PER_TICK)
+            })
+            .unwrap_or(1);
+        last_tick_at = Some(now);
+
         if let Some((kind, error)) = capture.take_error() {
             tracing::error!(
                 screen_share_session = session_id,
@@ -2160,13 +2171,43 @@ async fn send_system_audio(
         if !metrics.p2p_connected.load(Ordering::Relaxed) {
             // Enquanto o handshake DTLS/ICE não for concluído, descarta amostras
             // capturadas para não acumular atraso nem tentar envio SRTP antes da chave.
-            let _ = capture.read_samples(&mut pcm);
+            let drain_limit = if capture.available_samples().is_some() {
+                MAX_AUDIO_FRAMES_PER_TICK
+            } else {
+                1
+            };
+            for _ in 0..drain_limit {
+                if capture.available_samples().is_some_and(|avail| avail == 0) {
+                    break;
+                }
+                if capture.read_samples(&mut pcm) < frame_len {
+                    break;
+                }
+            }
             filled = 0;
             continue;
         }
 
-        filled += capture.read_samples(&mut pcm[filled..]);
-        if filled == frame_len {
+        let mut frames_drained_this_tick = 0_usize;
+        while frames_drained_this_tick < MAX_AUDIO_FRAMES_PER_TICK {
+            if frames_drained_this_tick > 0 {
+                let has_buffered_frame = capture
+                    .available_samples()
+                    .is_some_and(|avail| filled + avail >= frame_len);
+                let has_wallclock_catchup =
+                    capture.available_samples().is_none() && frames_drained_this_tick < due_frames;
+                if !has_buffered_frame && !has_wallclock_catchup {
+                    break;
+                }
+            }
+
+            let newly_read = capture.read_samples(&mut pcm[filled..]);
+            filled += newly_read;
+            if filled < frame_len {
+                break;
+            }
+            frames_drained_this_tick += 1;
+
             let encoded_len = match encoder.encode_float(&pcm, &mut encoded) {
                 Ok(length) if length > 0 => length,
                 Ok(_) => {
@@ -2189,7 +2230,7 @@ async fn send_system_audio(
                         "Encoder de áudio falhou"
                     );
                     let _ = events.send(ScreenShareEvent::AudioError(detail));
-                    break;
+                    break 'audio_loop;
                 }
             };
             encoded_frames = encoded_frames.saturating_add(1);
@@ -2217,7 +2258,7 @@ async fn send_system_audio(
                         "Falha ao enviar áudio pela faixa WebRTC"
                     );
                     let _ = events.send(ScreenShareEvent::AudioError(detail));
-                    break;
+                    break 'audio_loop;
                 }
             }
             filled = 0;

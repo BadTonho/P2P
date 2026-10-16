@@ -19,7 +19,7 @@ use super::{
 pub(crate) const OPUS_SAMPLE_RATE: u32 = 48_000;
 pub(crate) const OPUS_CHANNELS: usize = 2;
 pub(crate) const OPUS_FRAME_SAMPLES_PER_CHANNEL: usize = 960;
-pub(super) const CAPTURE_QUEUE_MILLIS: usize = 250;
+pub(super) const CAPTURE_QUEUE_MILLIS: usize = 500;
 const PLAYBACK_QUEUE_MILLIS: usize = 250;
 const PLAYBACK_PRIME_MILLIS: usize = 40;
 
@@ -459,6 +459,26 @@ impl SystemAudioCapture {
         0
     }
 
+    pub(crate) fn available_samples(&self) -> Option<usize> {
+        if let Some(consumer) = self.consumer.as_ref() {
+            return Some(consumer.slots());
+        }
+        #[cfg(windows)]
+        {
+            Some(
+                self.multi_streams
+                    .iter()
+                    .map(|s| s.consumer.slots())
+                    .max()
+                    .unwrap_or(0),
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            Some(0)
+        }
+    }
+
     pub(crate) fn captured_frames(&self) -> u64 {
         self.diagnostics.captured_frames.load(Ordering::Relaxed)
     }
@@ -570,6 +590,10 @@ impl AudioSampleSource for SystemAudioCapture {
 
     fn read_samples(&mut self, output: &mut [f32]) -> usize {
         SystemAudioCapture::read_samples(self, output)
+    }
+
+    fn available_samples(&self) -> Option<usize> {
+        SystemAudioCapture::available_samples(self)
     }
 
     fn callbacks(&self) -> u64 {

@@ -1043,3 +1043,103 @@ fn selected_media_route_diagnostics_distinguish_direct_turn_and_missing_stats() 
     assert_eq!(unavailable.route, None);
     assert!(unavailable.selected_pair_summary.contains("desconhecido"));
 }
+
+#[test]
+fn buffered_system_audio_source_drains_burst_backlog_without_queue_drops() {
+    struct BurstBufferedAudioSource {
+        consumer: rtrb::Consumer<f32>,
+        reads: Arc<AtomicU64>,
+    }
+
+    impl AudioSampleSource for BurstBufferedAudioSource {
+        fn input_format(&self) -> (u32, usize) {
+            (OPUS_SAMPLE_RATE, OPUS_CHANNELS)
+        }
+
+        fn read_samples(&mut self, output: &mut [f32]) -> usize {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let mut count = 0;
+            while count < output.len() {
+                match self.consumer.pop() {
+                    Ok(sample) => {
+                        output[count] = sample;
+                        count += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            count
+        }
+
+        fn available_samples(&self) -> Option<usize> {
+            Some(self.consumer.slots())
+        }
+
+        fn callbacks(&self) -> u64 {
+            1
+        }
+        fn input_frames(&self) -> u64 {
+            0
+        }
+        fn non_silent_samples(&self) -> u64 {
+            0
+        }
+        fn captured_frames(&self) -> u64 {
+            0
+        }
+        fn dropped_frames(&self) -> u64 {
+            0
+        }
+        fn xruns(&self) -> u64 {
+            0
+        }
+        fn device_changes(&self) -> u64 {
+            0
+        }
+        fn realtime_denied(&self) -> u64 {
+            0
+        }
+        fn take_error(&self) -> Option<(Option<cpal::ErrorKind>, String)> {
+            None
+        }
+    }
+
+    let frame_len = OPUS_FRAME_SAMPLES_PER_CHANNEL * OPUS_CHANNELS;
+    let burst_frames = 5_usize;
+    let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(frame_len * 8);
+    for i in 0..(frame_len * burst_frames) {
+        let phase = TAU * 440.0 * (i / OPUS_CHANNELS) as f32 / OPUS_SAMPLE_RATE as f32;
+        producer.push(phase.sin() * 0.25).unwrap();
+    }
+
+    let reads = Arc::new(AtomicU64::new(0));
+    let mut source = BurstBufferedAudioSource {
+        consumer,
+        reads: Arc::clone(&reads),
+    };
+    assert_eq!(source.available_samples(), Some(frame_len * burst_frames));
+
+    // Simulate the drain loop inside send_system_audio for a single 20ms tick.
+    let mut pcm = vec![0.0_f32; frame_len];
+    let mut filled = 0_usize;
+    let mut drained_frames = 0_usize;
+    while drained_frames < 8 {
+        if drained_frames > 0
+            && !source
+                .available_samples()
+                .is_some_and(|avail| filled + avail >= frame_len)
+        {
+            break;
+        }
+        filled += source.read_samples(&mut pcm[filled..]);
+        if filled < frame_len {
+            break;
+        }
+        drained_frames += 1;
+        filled = 0;
+    }
+
+    assert_eq!(drained_frames, burst_frames);
+    assert_eq!(source.available_samples(), Some(0));
+    assert_eq!(reads.load(Ordering::Relaxed), burst_frames as u64);
+}

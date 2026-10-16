@@ -62,6 +62,9 @@ pub(crate) fn scale_remote_audio_sample(sample: f32, gain: f32) -> f32 {
 pub(crate) trait AudioSampleSource: Send {
     fn input_format(&self) -> (u32, usize);
     fn read_samples(&mut self, output: &mut [f32]) -> usize;
+    fn available_samples(&self) -> Option<usize> {
+        None
+    }
     fn callbacks(&self) -> u64;
     fn input_frames(&self) -> u64;
     fn non_silent_samples(&self) -> u64;
