@@ -211,6 +211,136 @@ fn access_unit_with_parameter_sets(nals: &[&[u8]], sps: &[u8], pps: &[u8]) -> Ve
     output
 }
 
+const SENDER_CONGESTION_WINDOW: Duration = Duration::from_secs(2);
+const SENDER_RECOVERY_WINDOW: Duration = Duration::from_secs(8);
+const STARTUP_IDR_REINFORCEMENT_MIN_DELAY: Duration = Duration::from_millis(800);
+const STARTUP_IDR_REINFORCEMENT_MAX_DELAY: Duration = Duration::from_secs(3);
+const STARTUP_REINFORCEMENT_NACK_THRESHOLD: u64 = 4;
+const CONGESTION_PLI_THRESHOLD: u64 = 2;
+const CONGESTION_NACK_THRESHOLD: u64 = 20;
+const SEVERE_CONGESTION_NACK_THRESHOLD: u64 = 40;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SenderCongestionDecision {
+    scale_percent: u32,
+    force_keyframe: bool,
+    step_down_profile: bool,
+}
+
+struct SenderCongestionController {
+    scale_percent: u32,
+    last_evaluated_at: Instant,
+    healthy_elapsed: Duration,
+    last_pli: u64,
+    last_nack: u64,
+    initial_idr_sent_at: Option<Instant>,
+    startup_reinforcement_sent: bool,
+}
+
+impl SenderCongestionController {
+    fn new(now: Instant) -> Self {
+        Self {
+            scale_percent: 100,
+            last_evaluated_at: now,
+            healthy_elapsed: Duration::ZERO,
+            last_pli: 0,
+            last_nack: 0,
+            initial_idr_sent_at: None,
+            startup_reinforcement_sent: false,
+        }
+    }
+
+    fn record_initial_idr_sent(&mut self, now: Instant) {
+        if self.initial_idr_sent_at.is_none() {
+            self.initial_idr_sent_at = Some(now);
+        }
+    }
+
+    fn scale_bitrate(&self, base_bitrate_bps: u32) -> u32 {
+        ((u64::from(base_bitrate_bps) * u64::from(self.scale_percent)) / 100).max(250_000) as u32
+    }
+
+    fn observe(
+        &mut self,
+        now: Instant,
+        total_pli: u64,
+        total_nack: u64,
+    ) -> Option<SenderCongestionDecision> {
+        let mut force_keyframe = false;
+        let mut changed = false;
+
+        if !self.startup_reinforcement_sent
+            && let Some(initial_idr_at) = self.initial_idr_sent_at
+        {
+            let since_idr = now.saturating_duration_since(initial_idr_at);
+            if since_idr >= STARTUP_IDR_REINFORCEMENT_MIN_DELAY
+                && since_idr <= STARTUP_IDR_REINFORCEMENT_MAX_DELAY
+                && (total_nack >= STARTUP_REINFORCEMENT_NACK_THRESHOLD
+                    || total_pli >= CONGESTION_PLI_THRESHOLD)
+            {
+                self.startup_reinforcement_sent = true;
+                if self.scale_percent > 70 {
+                    self.scale_percent = 70;
+                }
+                force_keyframe = true;
+                changed = true;
+            }
+        }
+
+        let elapsed = now.saturating_duration_since(self.last_evaluated_at);
+        if elapsed < SENDER_CONGESTION_WINDOW {
+            return changed.then_some(SenderCongestionDecision {
+                scale_percent: self.scale_percent,
+                force_keyframe,
+                step_down_profile: false,
+            });
+        }
+
+        self.last_evaluated_at = now;
+        let pli_delta = total_pli.saturating_sub(self.last_pli);
+        let nack_delta = total_nack.saturating_sub(self.last_nack);
+        self.last_pli = total_pli;
+        self.last_nack = total_nack;
+
+        let mut step_down_profile = false;
+        if pli_delta >= CONGESTION_PLI_THRESHOLD || nack_delta >= CONGESTION_NACK_THRESHOLD {
+            self.healthy_elapsed = Duration::ZERO;
+            let was_already_reduced = self.scale_percent <= 50;
+            let next_scale = match self.scale_percent {
+                85..=100 => 70,
+                55..=84 => 50,
+                _ => 35,
+            };
+            if next_scale != self.scale_percent {
+                self.scale_percent = next_scale;
+                changed = true;
+            }
+            if was_already_reduced
+                && (pli_delta >= CONGESTION_PLI_THRESHOLD
+                    || nack_delta >= SEVERE_CONGESTION_NACK_THRESHOLD)
+            {
+                step_down_profile = true;
+                changed = true;
+            }
+        } else if pli_delta == 0 && nack_delta <= 2 && self.scale_percent < 100 {
+            self.healthy_elapsed = self.healthy_elapsed.saturating_add(elapsed);
+            if self.healthy_elapsed >= SENDER_RECOVERY_WINDOW {
+                self.healthy_elapsed = Duration::ZERO;
+                self.scale_percent = (self.scale_percent + 15).min(100);
+                changed = true;
+            }
+        } else {
+            self.healthy_elapsed = Duration::ZERO;
+        }
+
+        changed.then_some(SenderCongestionDecision {
+            scale_percent: self.scale_percent,
+            force_keyframe,
+            step_down_profile,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // The worker receives independent stop, keyframe and bitrate controls.
 pub(super) fn encode_latest_frames(
     source: LatestFrame,
@@ -228,12 +358,45 @@ pub(super) fn encode_latest_frames(
     let mut hardware_warmup_frames = 0u32;
     let mut forwarding_gate = H264ForwardingGate::default();
     let mut pacer = LatestFramePacer::new(quality);
+    let mut congestion = SenderCongestionController::new(Instant::now());
     let mut active_profile =
         AdaptiveVideoProfile::from_index(profile_target.load(Ordering::Relaxed) as usize)
             .cap_to_quality(quality);
     let mut observed_generation = source.generation();
 
     while !stop.load(Ordering::Relaxed) {
+        if metrics.p2p_connected.load(Ordering::Relaxed) {
+            let (total_pli, total_nack) = metrics.sender_feedback_counters();
+            if let Some(decision) = congestion.observe(Instant::now(), total_pli, total_nack) {
+                if decision.step_down_profile {
+                    let current_idx = profile_target.load(Ordering::Relaxed) as usize;
+                    let next_profile = AdaptiveVideoProfile::from_index((current_idx + 1).min(3))
+                        .cap_to_quality(quality);
+                    if next_profile.index() != current_idx {
+                        profile_target.store(next_profile.index() as u32, Ordering::Relaxed);
+                        tracing::info!(
+                            screen_share_session = metrics.session_id,
+                            profile = ?next_profile,
+                            scale_percent = decision.scale_percent,
+                            total_pli,
+                            total_nack,
+                            "Congestionamento RTP detectado no emissor; reduzindo perfil de vídeo"
+                        );
+                    }
+                }
+                if decision.force_keyframe {
+                    force_keyframe.store(true, Ordering::Relaxed);
+                    tracing::info!(
+                        screen_share_session = metrics.session_id,
+                        scale_percent = decision.scale_percent,
+                        total_pli,
+                        total_nack,
+                        "Perda precoce após IDR inicial detectada; solicitando IDR de reforço com bitrate reduzido"
+                    );
+                }
+            }
+        }
+
         let requested_profile =
             AdaptiveVideoProfile::from_index(profile_target.load(Ordering::Relaxed) as usize)
                 .cap_to_quality(quality);
@@ -254,19 +417,49 @@ pub(super) fn encode_latest_frames(
                 "Perfil adaptativo de vídeo aplicado sem interromper a sessão"
             );
         }
-        let requested_bitrate_bps = bitrate_target
+        let base_bitrate_bps = bitrate_target
             .load(Ordering::Relaxed)
+            .clamp(250_000, quality.individual_bitrate_bps())
+            .min(active_profile.suggested_bitrate_bps());
+        let requested_bitrate_bps = congestion
+            .scale_bitrate(base_bitrate_bps)
             .clamp(250_000, quality.individual_bitrate_bps())
             .min(active_profile.suggested_bitrate_bps());
         if requested_bitrate_bps != active_bitrate_bps {
             active_bitrate_bps = requested_bitrate_bps;
-            if encoder.take().is_some() {
+            let updated_in_place = match encoder.as_mut() {
+                #[cfg(windows)]
+                Some(ActiveH264Encoder::MediaFoundation(hardware)) => {
+                    match hardware.set_bitrate(active_bitrate_bps) {
+                        Ok(()) => {
+                            tracing::info!(
+                                screen_share_session = metrics.session_id,
+                                target_bitrate_bps = active_bitrate_bps,
+                                scale_percent = congestion.scale_percent,
+                                "Bitrate do codificador de hardware atualizado dinamicamente sem recriar o MFT"
+                            );
+                            true
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                screen_share_session = metrics.session_id,
+                                target_bitrate_bps = active_bitrate_bps,
+                                error = %error,
+                                "Codificador de hardware não aceitou ajuste in-place de bitrate; recriando"
+                            );
+                            false
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if !updated_in_place && encoder.take().is_some() {
                 forwarding_gate.reset();
                 hardware_warmup_frames = 0;
                 force_keyframe.store(true, Ordering::Relaxed);
                 tracing::info!(
                     target_bitrate_bps = active_bitrate_bps,
-                    "Recriando o encoder para aplicar a nova divisão de banda do grupo"
+                    "Recriando o encoder para aplicar o novo bitrate alvo"
                 );
             }
         }
@@ -433,6 +626,9 @@ pub(super) fn encode_latest_frames(
                 metrics.record_encode_duration(encode_started_at.elapsed());
                 let encoded = encoded_result?;
                 forward_encoded_access_unit(&encoded, &samples, &metrics, &mut forwarding_gate)?;
+                if !forwarding_gate.waiting_for_initial_idr() {
+                    congestion.record_initial_idr_sent(Instant::now());
+                }
                 None
             }
             #[cfg(windows)]
@@ -466,8 +662,11 @@ pub(super) fn encode_latest_frames(
                             &metrics,
                             &mut forwarding_gate,
                         )?;
-                        if was_waiting_for_idr && !forwarding_gate.waiting_for_initial_idr() {
-                            hardware_warmup_frames = 0;
+                        if !forwarding_gate.waiting_for_initial_idr() {
+                            congestion.record_initial_idr_sent(Instant::now());
+                            if was_waiting_for_idr {
+                                hardware_warmup_frames = 0;
+                            }
                         }
                         if forwarding_gate.waiting_for_initial_idr() && hardware_warmup_frames > 90
                         {
@@ -501,6 +700,9 @@ pub(super) fn encode_latest_frames(
             metrics.record_encode_duration(encode_started_at.elapsed());
             let encoded = encoded_result?;
             forward_encoded_access_unit(&encoded, &samples, &metrics, &mut forwarding_gate)?;
+            if !forwarding_gate.waiting_for_initial_idr() {
+                congestion.record_initial_idr_sent(Instant::now());
+            }
             encoder = Some(ActiveH264Encoder::OpenH264(Box::new(cpu)));
         }
     }
@@ -1266,5 +1468,78 @@ mod tests {
             gate.prepare(&annex_b_access_unit(&[&sps, &pps])),
             H264ForwardDecision::DropWithoutPicture
         ));
+    }
+
+    #[test]
+    fn sender_congestion_controller_reinforces_initial_idr_and_scales_bitrate_under_loss() {
+        let start = Instant::now();
+        let mut controller = SenderCongestionController::new(start);
+        controller.record_initial_idr_sent(start);
+        assert_eq!(controller.scale_bitrate(8_000_000), 8_000_000);
+
+        // Single NACK (e.g. normal minor packet loss) does not trigger startup IDR reinforcement.
+        assert_eq!(
+            controller.observe(start + Duration::from_millis(900), 0, 1),
+            None
+        );
+
+        // Early NACK burst (>= 4) within [800ms, 3s] after initial IDR triggers reinforcement IDR at 70% bitrate.
+        assert_eq!(
+            controller.observe(start + Duration::from_millis(1000), 0, 5),
+            Some(SenderCongestionDecision {
+                scale_percent: 70,
+                force_keyframe: true,
+                step_down_profile: false,
+            })
+        );
+        assert_eq!(controller.scale_bitrate(8_000_000), 5_600_000);
+
+        // Sustained NACK/PLI bursts across 2s windows reduce bitrate scale to 50%, then 35% + step_down_profile.
+        let t1 = start + SENDER_CONGESTION_WINDOW;
+        assert_eq!(
+            controller.observe(t1, 2, 30),
+            Some(SenderCongestionDecision {
+                scale_percent: 50,
+                force_keyframe: false,
+                step_down_profile: false,
+            })
+        );
+        let t2 = t1 + SENDER_CONGESTION_WINDOW;
+        assert_eq!(
+            controller.observe(t2, 4, 80),
+            Some(SenderCongestionDecision {
+                scale_percent: 35,
+                force_keyframe: false,
+                step_down_profile: true,
+            })
+        );
+
+        // 8 seconds of healthy transmission steps bitrate scale back up by +15%.
+        for step in 1..=3 {
+            assert_eq!(
+                controller.observe(t2 + SENDER_CONGESTION_WINDOW * step, 4, 80),
+                None
+            );
+        }
+        assert_eq!(
+            controller.observe(t2 + SENDER_CONGESTION_WINDOW * 4, 4, 81),
+            Some(SenderCongestionDecision {
+                scale_percent: 50,
+                force_keyframe: false,
+                step_down_profile: false,
+            })
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardware_encoder_supports_dynamic_bitrate_or_reports_clean_error() {
+        let mut encoder = match mf_video::HardwareEncoder::new(320, 240) {
+            Ok(encoder) => encoder,
+            Err(_) => return,
+        };
+        let _ = encoder.set_bitrate(2_000_000);
+        let rgba = vec![120u8; 320 * 240 * 4];
+        assert!(encoder.encode_rgba(&rgba).is_ok());
     }
 }

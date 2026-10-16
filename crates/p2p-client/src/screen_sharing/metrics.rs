@@ -226,6 +226,16 @@ impl SharedMetrics {
         )
     }
 
+    pub(super) fn sender_feedback_counters(&self) -> (u64, u64) {
+        let pli = self
+            .h264_flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pli_requests_received;
+        let nack = self.nack_packets_received_observed.load(Ordering::Relaxed);
+        (pli, nack)
+    }
+
     pub(super) fn snapshot(&self) -> ScreenShareMetrics {
         let h264_flow = self
             .h264_flow

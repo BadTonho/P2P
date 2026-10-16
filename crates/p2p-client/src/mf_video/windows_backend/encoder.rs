@@ -123,6 +123,21 @@ impl HardwareEncoder {
         self.performance = Some(performance);
     }
 
+    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
+        let codec_api = self
+            .transform
+            .transform
+            .cast::<ICodecAPI>()
+            .map_err(|error| {
+                format!("O encoder não expõe controle dinâmico de bitrate: {error}")
+            })?;
+        let value = codec_u32_variant(bitrate);
+        unsafe { codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &value) }
+            .map_err(|error| format!("O encoder recusou a atualização de bitrate: {error}"))?;
+        self.bitrate = bitrate;
+        Ok(())
+    }
+
     fn switch_to_cpu_input(&mut self) -> Result<(), String> {
         self.gpu_surface_input_enabled = false;
         if self._device_manager.is_some() {
