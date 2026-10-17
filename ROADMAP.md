@@ -2,7 +2,7 @@
 
 ## Estado atual — 16/10/2026
 
-O workspace está na versão 1.2.8, preparada para publicação por solicitação do mantenedor. O código inclui salas locais/Radmin, modo Internet de teste com TURN integrado opcional, compartilhamento de tela em grupo e atualização pelo GitHub Releases. O guia de uso está em `COMO_USAR.md`; o processo de publicação está em `ATUALIZACOES.md`.
+O workspace está na versão 1.2.9, preparada para publicação por solicitação do mantenedor. O código inclui salas locais/Radmin, modo Internet de teste com TURN integrado opcional, compartilhamento de tela em grupo e atualização pelo GitHub Releases. O guia de uso está em `COMO_USAR.md`; o processo de publicação está em `ATUALIZACOES.md`.
 
 **Qualidade de transmissão atual:** no modal de compartilhamento, cada pessoa escolhe 720p ou 1080p e 30 ou 60 FPS. Os quatro perfis são permitidos e a escolha é local, salva no computador; instalações novas e configurações antigas usam 720p30 por padrão. A captura preserva a proporção e não amplia fontes menores. O orçamento-alvo do encoder é 4 Mbps por espectador e 8 Mbps no total para 720p30; 6 e 12 Mbps para 720p60 ou 1080p30; e 8 e 16 Mbps para 1080p60. Em grupo, o total é dividido entre os espectadores e cada um continua limitado pela taxa individual do perfil. A taxa real varia conforme a imagem e tem custo adicional de rede. A adaptação pode reduzir bitrate, resolução e FPS temporariamente e recuperá-los em etapas, respeitando os limites do transmissor e de cada receptor. Se o hardware não acompanhar 60 FPS, a transmissão pode entregar menos quadros sem mudar o perfil salvo. Em grupo, o custo de codificação aumenta com o número de espectadores.
 
@@ -153,7 +153,7 @@ Tratar encerramento do compartilhamento, desconexões, acesso às salas e estado
 
 **Instalador e preferências:** o setup por usuário instala em `%LOCALAPPDATA%\Programs\P2P-Voz-e-tela`, sem exigir administrador. O aplicativo salva preferências em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json`; atualizações preservam o arquivo e a desinstalação o remove. Códigos de sala e credenciais temporárias não são persistidos. O script `scripts/build-installer.ps1` compila o `.exe` e o instalador Inno Setup localmente.
 
-**Versão registrada nesta revisão:** workspace 1.2.8. A publicação inicial 1.0.0 é histórica; confira `Cargo.toml` e `ATUALIZACOES.md` para preparar a próxima versão. A validação de desempenho do compartilhamento em grupo com vários espectadores continua pendente.
+**Versão registrada nesta revisão:** workspace 1.2.9. A publicação inicial 1.0.0 é histórica; confira `Cargo.toml` e `ATUALIZACOES.md` para preparar a próxima versão. A validação de desempenho do compartilhamento em grupo com vários espectadores continua pendente.
 
 **Falta validar:** instalar o setup, conferir a persistência das preferências e a remoção na desinstalação. Publicar os dois assets (`p2p-client.exe` e `P2P-Voz-e-tela-Setup.exe`) em um GitHub Release e validar uma atualização futura e a recuperação após falha. Também falta validar manualmente os cenários de rede da Etapa 7 entre duas casas, incluindo a rota TURN.
 
