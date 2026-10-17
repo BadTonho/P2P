@@ -342,20 +342,20 @@ impl SenderCongestionController {
                     changed = true;
                 }
             }
-        } else if pli_delta == 0
-            && nack_delta <= 2
+        } else if pli_delta < CONGESTION_PLI_THRESHOLD
+            && nack_delta < CONGESTION_NACK_THRESHOLD
             && (self.scale_percent < 100 || self.profile_limit.index() > 0)
         {
             self.healthy_elapsed = self.healthy_elapsed.saturating_add(elapsed);
             if self.healthy_elapsed >= SENDER_RECOVERY_WINDOW {
                 self.healthy_elapsed = Duration::ZERO;
-                self.scale_percent = (self.scale_percent + 15).min(100);
+                let recovering = self.scale_percent < 100 || self.profile_limit.index() > 0;
+                self.scale_percent = 100;
                 if self.profile_limit.index() > 0 {
-                    self.profile_limit =
-                        AdaptiveVideoProfile::from_index(self.profile_limit.index() - 1);
+                    self.profile_limit = AdaptiveVideoProfile::P1080Fps60;
                     step_up_profile = true;
                 }
-                changed = true;
+                changed |= recovering;
             }
         } else {
             self.healthy_elapsed = Duration::ZERO;
@@ -1559,13 +1559,14 @@ mod tests {
             })
         );
 
-        // 8 seconds of healthy transmission steps bitrate scale back up by +15%.
+        // Sub-threshold retransmissions do not block recovery; after 8 healthy
+        // seconds the sender restores its maximum profile and bitrate.
         for step in 1..=3 {
             assert_eq!(
                 controller.observe(
                     t2 + SENDER_CONGESTION_WINDOW * step,
                     4,
-                    80,
+                    80 + u64::from(step),
                     AdaptiveVideoProfile::P1080Fps60
                 ),
                 None
@@ -1575,11 +1576,11 @@ mod tests {
             controller.observe(
                 t2 + SENDER_CONGESTION_WINDOW * 4,
                 4,
-                81,
+                84,
                 AdaptiveVideoProfile::P1080Fps60
             ),
             Some(SenderCongestionDecision {
-                scale_percent: 50,
+                scale_percent: 100,
                 force_keyframe: false,
                 step_down_profile: false,
                 step_up_profile: true,
@@ -1588,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_recovery_requests_profile_upgrades_after_sender_congestion_ends() {
+    fn adaptive_recovery_restores_maximum_after_sender_congestion_ends() {
         let start = Instant::now();
         let mut controller = SenderCongestionController::new(start);
         for step in 1..=5_u64 {
@@ -1612,8 +1613,8 @@ mod tests {
             }
         }
         assert_eq!(
-            upgrades, 3,
-            "profile reductions must be recovered as well as bitrate"
+            upgrades, 1,
+            "recovery should restore the maximum profile directly"
         );
         assert_eq!(controller.scale_percent, 100);
     }
@@ -1657,14 +1658,7 @@ mod tests {
                     <= 30
             );
         }
-        assert_eq!(
-            profiles,
-            vec![
-                AdaptiveVideoProfile::P720Fps30,
-                AdaptiveVideoProfile::P1080Fps30,
-                AdaptiveVideoProfile::P1080Fps30,
-            ]
-        );
+        assert_eq!(profiles, vec![AdaptiveVideoProfile::P1080Fps30]);
         assert_eq!(controller.scale_percent, 100);
     }
 
@@ -1731,13 +1725,15 @@ mod tests {
                 receiver,
             );
         }
-        assert_eq!(controller.profile_limit, AdaptiveVideoProfile::P720Fps30);
+        assert_eq!(controller.profile_limit, AdaptiveVideoProfile::P1080Fps60);
+        controller.observe(start + Duration::from_secs(20), 12, 300, receiver);
+        controller.observe(start + Duration::from_secs(22), 14, 350, receiver);
         let decision = controller
-            .observe(start + Duration::from_secs(20), 12, 300, receiver)
+            .observe(start + Duration::from_secs(24), 16, 400, receiver)
             .unwrap();
         assert!(decision.step_down_profile);
         assert!(!decision.step_up_profile);
-        assert_eq!(controller.profile_limit, AdaptiveVideoProfile::P720Fps15);
+        assert_eq!(controller.profile_limit, AdaptiveVideoProfile::P1080Fps30);
     }
 
     #[cfg(windows)]

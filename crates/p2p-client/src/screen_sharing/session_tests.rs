@@ -38,14 +38,7 @@ fn adaptive_recovery_uses_complete_windows_when_ui_polls_faster_than_video() {
             recoveries.push(feedback.profile);
         }
     }
-    assert_eq!(
-        recoveries,
-        vec![
-            AdaptiveVideoProfile::P720Fps30,
-            AdaptiveVideoProfile::P1080Fps30,
-            AdaptiveVideoProfile::P1080Fps60,
-        ]
-    );
+    assert_eq!(recoveries, vec![AdaptiveVideoProfile::P1080Fps60]);
 }
 
 #[test]

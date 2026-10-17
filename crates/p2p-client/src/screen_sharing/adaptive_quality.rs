@@ -195,7 +195,9 @@ impl AdaptiveQualityController {
         if recovered {
             self.recovery_elapsed = self.recovery_elapsed.saturating_add(elapsed);
             if self.recovery_elapsed >= RECOVERY_WINDOW && self.profile.index() > 0 {
-                self.profile = AdaptiveVideoProfile::from_index(self.profile.index() - 1);
+                // Once the receiver has stayed healthy, request its best supported
+                // profile. The sender still caps this at the transmitter's choice.
+                self.profile = AdaptiveVideoProfile::P1080Fps60;
                 self.recovery_elapsed = Duration::ZERO;
                 self.minimum_warning_sent = false;
                 return Some(QualityDecision::Changed {
@@ -369,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_requires_ten_healthy_seconds_then_steps_up_once() {
+    fn recovery_requires_ten_healthy_seconds_then_requests_maximum_profile() {
         let start = Instant::now();
         let mut controller = AdaptiveQualityController::new(start);
         for step in 1..=3 {
@@ -399,7 +401,7 @@ mod tests {
             Some(QualityDecision::Changed {
                 feedback: QualityFeedback {
                     version: 1,
-                    profile: AdaptiveVideoProfile::P720Fps30,
+                    profile: AdaptiveVideoProfile::P1080Fps60,
                     reason: QualityFeedbackReason::Recovered,
                 },
                 overload_evidence: None,
