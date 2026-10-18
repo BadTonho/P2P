@@ -21,6 +21,16 @@ const DISCORD_BLURPLE: Color32 = Color32::from_rgb(88, 101, 242);
 const DISCORD_CARD_BG: Color32 = Color32::from_rgb(43, 45, 49);
 const DISCORD_CARD_BG_SELECTED: Color32 = Color32::from_rgb(30, 31, 34);
 const DISCORD_BORDER_NORMAL: Color32 = Color32::from_rgb(60, 64, 72);
+const SHARE_CARD_WIDTH: f32 = 175.0;
+const SHARE_CARD_HORIZONTAL_OVERHEAD: f32 = 20.0;
+const SHARE_CARD_SPACING: f32 = 8.0;
+
+fn share_card_columns(available_width: f32) -> usize {
+    ((available_width + SHARE_CARD_SPACING)
+        / (SHARE_CARD_WIDTH + SHARE_CARD_HORIZONTAL_OVERHEAD + SHARE_CARD_SPACING))
+        .floor()
+        .max(1.0) as usize
+}
 
 impl ClientUi {
     pub(in crate::app::ui) fn show_screen_share_modal(&mut self, ctx: &egui::Context) {
@@ -35,11 +45,17 @@ impl ClientUi {
         let mut cancel_clicked = false;
         let mut quality_changed = false;
 
-        let modal = egui::Modal::new(egui::Id::new("screen_share_modal_dialog"))
+        let modal_id = egui::Id::new("screen_share_modal_dialog");
+        let content_rect = ctx.content_rect();
+        let modal_bounds = content_rect.shrink(16.0);
+        let modal_width = (modal_bounds.width() - 24.0).clamp(120.0, 620.0);
+        let modal_body_height = (modal_bounds.height() - 230.0).max(80.0);
+        let modal = egui::Modal::new(modal_id)
+            .area(egui::Modal::default_area(modal_id).constrain_to(modal_bounds))
             .backdrop_color(Color32::from_black_alpha(175));
 
         let modal_response = modal.show(ctx, |ui| {
-            ui.set_width(620.0);
+            ui.set_width(modal_width);
             ui.vertical(|ui| {
                 ui.add_space(4.0);
                 ui.heading("Transmitir sua tela");
@@ -90,98 +106,108 @@ impl ClientUi {
                 ui.separator();
                 ui.add_space(6.0);
 
-                // Conteúdo da Aba
-                match self.screen_share_modal_tab {
-                    ScreenShareModalTab::Screens => {
-                        self.render_screens_tab(ui);
-                    }
-                    ScreenShareModalTab::Windows => {
-                        should_open_picker = self.render_windows_tab(ui);
-                    }
-                }
+                egui::ScrollArea::vertical()
+                    .id_salt("screen-share-modal-body")
+                    .max_width(modal_width)
+                    .max_height(modal_body_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(modal_width);
+                        ui.vertical(|ui| {
+                            match self.screen_share_modal_tab {
+                                ScreenShareModalTab::Screens => {
+                                    self.render_screens_tab(ui);
+                                }
+                                ScreenShareModalTab::Windows => {
+                                    should_open_picker = self.render_windows_tab(ui);
+                                }
+                            }
 
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label("Resolução");
-                    egui::ComboBox::from_id_salt("screen-share-resolution")
-                        .selected_text(self.screen_share_quality.resolution.label())
-                        .show_ui(ui, |ui| {
-                            quality_changed |= ui
-                                .selectable_value(
-                                    &mut self.screen_share_quality.resolution,
-                                    ScreenShareResolution::P720,
-                                    "720p",
-                                )
-                                .changed();
-                            quality_changed |= ui
-                                .selectable_value(
-                                    &mut self.screen_share_quality.resolution,
-                                    ScreenShareResolution::P1080,
-                                    "1080p",
-                                )
-                                .changed();
+                            ui.add_space(8.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Resolução");
+                                egui::ComboBox::from_id_salt("screen-share-resolution")
+                                    .selected_text(self.screen_share_quality.resolution.label())
+                                    .show_ui(ui, |ui| {
+                                        quality_changed |= ui
+                                            .selectable_value(
+                                                &mut self.screen_share_quality.resolution,
+                                                ScreenShareResolution::P720,
+                                                "720p",
+                                            )
+                                            .changed();
+                                        quality_changed |= ui
+                                            .selectable_value(
+                                                &mut self.screen_share_quality.resolution,
+                                                ScreenShareResolution::P1080,
+                                                "1080p",
+                                            )
+                                            .changed();
+                                    });
+                                ui.add_space(12.0);
+                                ui.label("Taxa de quadros");
+                                egui::ComboBox::from_id_salt("screen-share-frame-rate")
+                                    .selected_text(self.screen_share_quality.frame_rate.label())
+                                    .show_ui(ui, |ui| {
+                                        quality_changed |= ui
+                                            .selectable_value(
+                                                &mut self.screen_share_quality.frame_rate,
+                                                ScreenShareFrameRate::Fps30,
+                                                "30 FPS",
+                                            )
+                                            .changed();
+                                        quality_changed |= ui
+                                            .selectable_value(
+                                                &mut self.screen_share_quality.frame_rate,
+                                                ScreenShareFrameRate::Fps60,
+                                                "60 FPS",
+                                            )
+                                            .changed();
+                                    });
+                            });
+                            ui.label(format!(
+                                "Alvo do encoder: até {} Mbps por espectador; em grupo, até {} Mbps no total, divididos entre eles. O tráfego real varia com a imagem e inclui dados extras de rede. Em grupo, o custo de codificação cresce com o número de espectadores; o computador pode entregar menos FPS se não acompanhar. Se ficar instável, escolha um perfil mais leve.",
+                                self.screen_share_quality.individual_bitrate_bps() / 1_000_000,
+                                self.screen_share_quality.group_aggregate_bitrate_bps() / 1_000_000,
+                            ));
+                            if quality_changed {
+                                self.save_preferences();
+                                tracing::info!(
+                                    resolution = self.screen_share_quality.resolution.label(),
+                                    frame_rate = self.screen_share_quality.frames_per_second(),
+                                    "Perfil de qualidade da transmissão de tela alterado"
+                                );
+                            }
+
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+
+                            ui.horizontal_wrapped(|ui| {
+                                let audio_changed = ui
+                                    .checkbox(
+                                        &mut self.include_system_audio,
+                                        "Compartilhar áudio do computador",
+                                    )
+                                    .changed();
+                                if audio_changed {
+                                    self.save_preferences();
+                                    tracing::info!(
+                                        include_system_audio = self.include_system_audio,
+                                        "Preferência de áudio do sistema alterada no modal"
+                                    );
+                                }
+                                ui.small(
+                                    "Transmite os sons de jogos, vídeos e músicas reproduzidos no PC.",
+                                );
+                            });
                         });
-                    ui.add_space(12.0);
-                    ui.label("Taxa de quadros");
-                    egui::ComboBox::from_id_salt("screen-share-frame-rate")
-                        .selected_text(self.screen_share_quality.frame_rate.label())
-                        .show_ui(ui, |ui| {
-                            quality_changed |= ui
-                                .selectable_value(
-                                    &mut self.screen_share_quality.frame_rate,
-                                    ScreenShareFrameRate::Fps30,
-                                    "30 FPS",
-                                )
-                                .changed();
-                            quality_changed |= ui
-                                .selectable_value(
-                                    &mut self.screen_share_quality.frame_rate,
-                                    ScreenShareFrameRate::Fps60,
-                                    "60 FPS",
-                                )
-                                .changed();
-                        });
-                });
-                ui.small(format!(
-                    "Alvo do encoder: até {} Mbps por espectador; em grupo, até {} Mbps no total, divididos entre eles. O tráfego real varia com a imagem e inclui dados extras de rede. Em grupo, o custo de codificação cresce com o número de espectadores; o computador pode entregar menos FPS se não acompanhar. Se ficar instável, escolha um perfil mais leve.",
-                    self.screen_share_quality.individual_bitrate_bps() / 1_000_000,
-                    self.screen_share_quality.group_aggregate_bitrate_bps() / 1_000_000,
-                ));
-                if quality_changed {
-                    self.save_preferences();
-                    tracing::info!(
-                        resolution = self.screen_share_quality.resolution.label(),
-                        frame_rate = self.screen_share_quality.frames_per_second(),
-                        "Perfil de qualidade da transmissão de tela alterado"
-                    );
-                }
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
-
-                // Opção de Áudio Integrada no Modal
-                ui.horizontal(|ui| {
-                    let audio_changed = ui
-                        .checkbox(
-                            &mut self.include_system_audio,
-                            "Compartilhar áudio do computador",
-                        )
-                        .changed();
-                    if audio_changed {
-                        self.save_preferences();
-                        tracing::info!(
-                            include_system_audio = self.include_system_audio,
-                            "Preferência de áudio do sistema alterada no modal"
-                        );
-                    }
-                    ui.small("Transmite os sons de jogos, vídeos e músicas reproduzidos no PC.");
-                });
+                    });
 
                 ui.add_space(8.0);
 
                 // Rodapé de Ações
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Cancelar").clicked() {
                         cancel_clicked = true;
                     }
@@ -254,35 +280,37 @@ impl ClientUi {
         }
 
         let monitors = self.available_monitors.clone();
-        egui::ScrollArea::vertical()
-            .id_salt("screens_scroll")
-            .max_height(260.0)
+        let columns = share_card_columns(ui.available_width());
+        egui::Grid::new("screen-share-monitor-grid")
+            .num_columns(columns)
+            .spacing([SHARE_CARD_SPACING, SHARE_CARD_SPACING])
             .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for (index, monitor) in monitors.iter().enumerate() {
-                        let is_selected = matches!(
-                            &self.selected_share_source,
-                            Some(ShareSourceSelection::Monitor(id)) if id == &monitor.device_id
-                        );
+                for (index, monitor) in monitors.iter().enumerate() {
+                    let is_selected = matches!(
+                        &self.selected_share_source,
+                        Some(ShareSourceSelection::Monitor(id)) if id == &monitor.device_id
+                    );
 
-                        if render_monitor_card(ui, index + 1, monitor, is_selected) {
-                            self.selected_share_source =
-                                Some(ShareSourceSelection::Monitor(monitor.device_id.clone()));
-                        }
-                        ui.add_space(8.0);
+                    if render_monitor_card(ui, index + 1, monitor, is_selected) {
+                        self.selected_share_source =
+                            Some(ShareSourceSelection::Monitor(monitor.device_id.clone()));
                     }
-                });
+                    if index % columns == columns - 1 {
+                        ui.end_row();
+                    }
+                }
             });
     }
 
     fn render_windows_tab(&mut self, ui: &mut egui::Ui) -> bool {
         let mut open_picker = false;
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            let search_width = (ui.available_width() - 140.0).clamp(120.0, 260.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.window_search_query)
                     .hint_text("Buscar janela ou aplicativo…")
-                    .desired_width(260.0),
+                    .desired_width(search_width),
             );
             if ui.button("Atualizar janelas").clicked() {
                 self.refresh_windows();
@@ -327,23 +355,24 @@ impl ClientUi {
             return open_picker;
         }
 
-        egui::ScrollArea::vertical()
-            .id_salt("windows_scroll")
-            .max_height(240.0)
+        let columns = share_card_columns(ui.available_width());
+        egui::Grid::new("screen-share-window-grid")
+            .num_columns(columns)
+            .spacing([SHARE_CARD_SPACING, SHARE_CARD_SPACING])
             .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for win in &filtered_windows {
-                        let is_selected = matches!(
-                            &self.selected_share_source,
-                            Some(ShareSourceSelection::Window(id)) if *id == win.id
-                        );
+                for (index, win) in filtered_windows.iter().enumerate() {
+                    let is_selected = matches!(
+                        &self.selected_share_source,
+                        Some(ShareSourceSelection::Window(id)) if *id == win.id
+                    );
 
-                        if render_window_card(ui, win, is_selected) {
-                            self.selected_share_source = Some(ShareSourceSelection::Window(win.id));
-                        }
-                        ui.add_space(8.0);
+                    if render_window_card(ui, win, is_selected) {
+                        self.selected_share_source = Some(ShareSourceSelection::Window(win.id));
                     }
-                });
+                    if index % columns == columns - 1 {
+                        ui.end_row();
+                    }
+                }
             });
 
         ui.add_space(6.0);
@@ -365,7 +394,7 @@ fn render_monitor_card(
     monitor: &MonitorOption,
     is_selected: bool,
 ) -> bool {
-    let card_width = 175.0;
+    let card_width = SHARE_CARD_WIDTH;
     let card_height = 145.0;
 
     let frame = Frame::new()
@@ -462,7 +491,7 @@ fn render_monitor_card(
 
 /// Renderiza o cartão visual de uma Janela de aplicativo (estilo Discord)
 fn render_window_card(ui: &mut egui::Ui, win: &WindowOption, is_selected: bool) -> bool {
-    let card_width = 175.0;
+    let card_width = SHARE_CARD_WIDTH;
     let card_height = 145.0;
 
     let frame = Frame::new()
@@ -660,5 +689,59 @@ mod tests {
         output.textures_delta.clear();
 
         assert!(app.screen_share_modal_open);
+    }
+
+    #[test]
+    fn test_window_picker_modal_stays_inside_varied_viewports_with_many_windows() {
+        for (width, height) in [
+            (1920.0, 1080.0),
+            (1366.0, 768.0),
+            (960.0, 540.0),
+            (640.0, 480.0),
+        ] {
+            let context = egui::Context::default();
+            let mut app = ClientUi::default();
+            app.screen_share_modal_open = true;
+            app.screen_share_modal_tab = ScreenShareModalTab::Windows;
+            app.windows_loaded = true;
+            app.available_windows = (0..24)
+                .map(|index| WindowOption {
+                    id: index,
+                    title: format!("Window {index} - long application title"),
+                    process_name: format!("application-{index}.exe"),
+                    width: 1920,
+                    height: 1080,
+                })
+                .collect();
+
+            let screen_rect =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    ..Default::default()
+                },
+                |ui| app.show_screen_share_modal(ui.ctx()),
+            );
+            output.textures_delta.clear();
+
+            let modal_rect = context
+                .memory(|memory| memory.area_rect(egui::Id::new("screen_share_modal_dialog")))
+                .expect("modal area should be present after rendering");
+            let safe_rect = screen_rect.shrink(16.0);
+            assert!(
+                modal_rect.left() >= safe_rect.left() - 1.0
+                    && modal_rect.top() >= safe_rect.top() - 1.0
+                    && modal_rect.right() <= safe_rect.right() + 1.0
+                    && modal_rect.bottom() <= safe_rect.bottom() + 1.0,
+                "modal {modal_rect:?} must stay inside {safe_rect:?} for viewport {width}x{height}"
+            );
+            assert!(
+                modal_rect.width() <= 644.0,
+                "modal width should remain bounded, got {} for viewport {width}x{height}",
+                modal_rect.width()
+            );
+            assert!(app.screen_share_modal_open);
+        }
     }
 }
