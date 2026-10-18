@@ -211,8 +211,9 @@ fn access_unit_with_parameter_sets(nals: &[&[u8]], sps: &[u8], pps: &[u8]) -> Ve
     output
 }
 
-const SENDER_CONGESTION_WINDOW: Duration = Duration::from_secs(2);
+const SENDER_CONGESTION_WINDOW: Duration = Duration::from_secs(1);
 const SENDER_RECOVERY_WINDOW: Duration = Duration::from_secs(8);
+const PROFILE_DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(5);
 const STARTUP_IDR_REINFORCEMENT_MIN_DELAY: Duration = Duration::from_millis(800);
 const STARTUP_IDR_REINFORCEMENT_MAX_DELAY: Duration = Duration::from_secs(3);
 const STARTUP_REINFORCEMENT_NACK_THRESHOLD: u64 = 4;
@@ -233,6 +234,7 @@ struct SenderCongestionController {
     profile_limit: AdaptiveVideoProfile,
     last_evaluated_at: Instant,
     healthy_elapsed: Duration,
+    last_profile_downgrade_at: Option<Instant>,
     last_pli: u64,
     last_nack: u64,
     initial_idr_sent_at: Option<Instant>,
@@ -246,6 +248,7 @@ impl SenderCongestionController {
             profile_limit: AdaptiveVideoProfile::P1080Fps60,
             last_evaluated_at: now,
             healthy_elapsed: Duration::ZERO,
+            last_profile_downgrade_at: None,
             last_pli: 0,
             last_nack: 0,
             initial_idr_sent_at: None,
@@ -320,24 +323,32 @@ impl SenderCongestionController {
         let mut step_up_profile = false;
         if pli_delta >= CONGESTION_PLI_THRESHOLD || nack_delta >= CONGESTION_NACK_THRESHOLD {
             self.healthy_elapsed = Duration::ZERO;
+            let severe_loss = nack_delta >= SEVERE_CONGESTION_NACK_THRESHOLD;
             let was_already_reduced = self.scale_percent <= 50;
-            let next_scale = match self.scale_percent {
-                85..=100 => 70,
-                55..=84 => 50,
-                _ => 35,
+            let can_downgrade_profile = self.last_profile_downgrade_at.is_none_or(|last| {
+                now.saturating_duration_since(last) >= PROFILE_DOWNGRADE_COOLDOWN
+            });
+            let next_scale = if severe_loss {
+                35
+            } else {
+                match self.scale_percent {
+                    85..=100 => 70,
+                    55..=84 => 50,
+                    _ => 35,
+                }
             };
             if next_scale != self.scale_percent {
                 self.scale_percent = next_scale;
                 changed = true;
             }
-            if was_already_reduced
-                && (pli_delta >= CONGESTION_PLI_THRESHOLD
-                    || nack_delta >= SEVERE_CONGESTION_NACK_THRESHOLD)
+            if can_downgrade_profile
+                && (severe_loss || (was_already_reduced && pli_delta >= CONGESTION_PLI_THRESHOLD))
             {
                 let current_index = self.profile_limit.index().max(receiver_profile.index());
                 let next_limit = AdaptiveVideoProfile::from_index(current_index + 1);
                 if next_limit != self.profile_limit {
                     self.profile_limit = next_limit;
+                    self.last_profile_downgrade_at = Some(now);
                     step_down_profile = true;
                     changed = true;
                 }
@@ -353,6 +364,7 @@ impl SenderCongestionController {
                 self.scale_percent = 100;
                 if self.profile_limit.index() > 0 {
                     self.profile_limit = AdaptiveVideoProfile::P1080Fps60;
+                    self.last_profile_downgrade_at = None;
                     step_up_profile = true;
                 }
                 changed |= recovering;
@@ -1537,8 +1549,8 @@ mod tests {
         );
         assert_eq!(controller.scale_bitrate(8_000_000), 5_600_000);
 
-        // Sustained NACK/PLI bursts across 2s windows reduce bitrate scale to 50%, then 35% + step_down_profile.
-        let t1 = start + SENDER_CONGESTION_WINDOW;
+        // Sustained NACK/PLI bursts across one-second windows reduce bitrate scale to 50%, then 35% + step_down_profile.
+        let t1 = start + SENDER_CONGESTION_WINDOW * 2;
         assert_eq!(
             controller.observe(t1, 2, 30, AdaptiveVideoProfile::P1080Fps60),
             Some(SenderCongestionDecision {
@@ -1561,7 +1573,7 @@ mod tests {
 
         // Sub-threshold retransmissions do not block recovery; after 8 healthy
         // seconds the sender restores its maximum profile and bitrate.
-        for step in 1..=3 {
+        for step in 1..=7 {
             assert_eq!(
                 controller.observe(
                     t2 + SENDER_CONGESTION_WINDOW * step,
@@ -1574,7 +1586,7 @@ mod tests {
         }
         assert_eq!(
             controller.observe(
-                t2 + SENDER_CONGESTION_WINDOW * 4,
+                t2 + SENDER_CONGESTION_WINDOW * 8,
                 4,
                 84,
                 AdaptiveVideoProfile::P1080Fps60
@@ -1617,6 +1629,29 @@ mod tests {
             "recovery should restore the maximum profile directly"
         );
         assert_eq!(controller.scale_percent, 100);
+    }
+
+    #[test]
+    fn severe_nack_burst_drops_profile_and_bitrate_in_one_window() {
+        let start = Instant::now();
+        let mut controller = SenderCongestionController::new(start);
+
+        assert_eq!(
+            controller.observe(
+                start + SENDER_CONGESTION_WINDOW,
+                0,
+                SEVERE_CONGESTION_NACK_THRESHOLD,
+                AdaptiveVideoProfile::P1080Fps60,
+            ),
+            Some(SenderCongestionDecision {
+                scale_percent: 35,
+                force_keyframe: false,
+                step_down_profile: true,
+                step_up_profile: false,
+            })
+        );
+        assert_eq!(controller.profile_limit, AdaptiveVideoProfile::P1080Fps30);
+        assert_eq!(controller.scale_bitrate(8_000_000), 2_800_000);
     }
 
     #[test]
@@ -1728,12 +1763,17 @@ mod tests {
         assert_eq!(controller.profile_limit, AdaptiveVideoProfile::P1080Fps60);
         controller.observe(start + Duration::from_secs(20), 12, 300, receiver);
         controller.observe(start + Duration::from_secs(22), 14, 350, receiver);
+        assert_eq!(
+            controller.observe(start + Duration::from_secs(24), 16, 400, receiver),
+            None,
+            "profile changes stay spaced out while severe loss continues"
+        );
         let decision = controller
-            .observe(start + Duration::from_secs(24), 16, 400, receiver)
+            .observe(start + Duration::from_secs(26), 18, 450, receiver)
             .unwrap();
         assert!(decision.step_down_profile);
         assert!(!decision.step_up_profile);
-        assert_eq!(controller.profile_limit, AdaptiveVideoProfile::P1080Fps30);
+        assert_eq!(controller.profile_limit, AdaptiveVideoProfile::P720Fps30);
     }
 
     #[cfg(windows)]
