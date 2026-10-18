@@ -1,4 +1,5 @@
 use super::*;
+use crate::screen_quality::{ScreenShareFrameRate, ScreenShareResolution};
 
 fn adaptive_feedback_state(start: Instant) -> SessionQualityFeedback {
     SessionQualityFeedback {
@@ -348,39 +349,20 @@ fn test_frame(sequence: u64, value: u8) -> PreviewFrame {
     }
 }
 
-fn diagnostic_base_frame() -> Vec<u8> {
-    let mut rgba = vec![0; 1280 * 720 * 4];
-    for y in 0..720_usize {
-        for x in 0..1280_usize {
-            let value = if (x / 16 + y / 16).is_multiple_of(2) {
-                72
-            } else {
-                176
-            };
-            let offset = (y * 1280 + x) * 4;
-            rgba[offset..offset + 4].copy_from_slice(&[value, value, value, 255]);
-        }
-    }
-    rgba
-}
-
-fn diagnostic_frame(sequence: u64, base: &[u8]) -> PreviewFrame {
-    let mut rgba = base.to_vec();
-    let block_x = (sequence as usize * 37) % (1280 - 160);
-    let block_y = (sequence as usize * 19) % (720 - 96);
-    for y in block_y..block_y + 96 {
-        for x in block_x..block_x + 160 {
-            let offset = (y * 1280 + x) * 4;
-            rgba[offset..offset + 4].copy_from_slice(&[32, 160, 240, 255]);
-        }
-    }
+fn diagnostic_frame(
+    sequence: u64,
+    quality: ScreenShareQuality,
+    surface: Arc<mf_video::GpuNv12Surface>,
+) -> PreviewFrame {
+    let (width, height) = quality.max_dimensions();
     PreviewFrame {
         sequence,
-        width: 1280,
-        height: 720,
-        rgba,
+        width,
+        height,
+        // This path intentionally supplies a D3D11 NV12 surface and no RGBA input.
+        rgba: Vec::new(),
         #[cfg(windows)]
-        gpu_nv12: None,
+        gpu_nv12: Some(surface),
         #[cfg(windows)]
         cpu_nv12: None,
     }
@@ -498,18 +480,59 @@ fn diagnostic_peer_json(
     })
 }
 
-fn run_loopback_diagnostic_scenario(loss_percent: u8, base_frame: &[u8]) -> serde_json::Value {
+fn run_loopback_diagnostic_scenario(
+    quality: ScreenShareQuality,
+    loss_percent: u8,
+) -> serde_json::Value {
     const MEASURE_FOR: Duration = Duration::from_secs(10);
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+    #[cfg(windows)]
+    let surface = match mf_video::DiagnosticGpuSource::new(
+        quality.max_dimensions().0,
+        quality.max_dimensions().1,
+        quality.frames_per_second(),
+    )
+    .and_then(|mut source| source.make_surface(1))
+    {
+        Ok(surface) => Arc::new(surface),
+        Err(error) => {
+            return serde_json::json!({
+                "scenario": {
+                    "resolution": quality.resolution.label(),
+                    "frame_rate_fps": quality.frames_per_second(),
+                    "rtp_loss_percent": loss_percent,
+                    "status": "gpu_unavailable",
+                    "gpu_error": error,
+                    "hardware_gpu_required": true,
+                }
+            });
+        }
+    };
+    #[cfg(not(windows))]
+    let surface: Arc<mf_video::GpuNv12Surface> = {
+        return serde_json::json!({
+            "scenario": {
+                "resolution": quality.resolution.label(),
+                "frame_rate_fps": quality.frames_per_second(),
+                "rtp_loss_percent": loss_percent,
+                "status": "gpu_diagnostic_windows_only",
+                "hardware_gpu_required": true,
+            }
+        });
+    };
+
     let context = egui::Context::default();
     let sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
-    let receiver = ScreenShareSession::new_loopback(context).unwrap();
+    let receiver = ScreenShareSession::new_loopback_with_decoder_preference(
+        context,
+        VideoDecoderPreference::PreferDxva,
+    )
+    .unwrap();
     sender.set_outbound_rtp_loss_percent_for_test(loss_percent);
 
     let source = LatestFrame::default();
-    source.publish(diagnostic_frame(1, base_frame));
-    let quality = ScreenShareQuality::default();
+    source.publish(diagnostic_frame(1, quality, Arc::clone(&surface)));
     sender
         .start_sending_with_quality_and_options_and_exclusion(
             source.clone(),
@@ -539,7 +562,7 @@ fn run_loopback_diagnostic_scenario(loss_percent: u8, base_frame: &[u8]) -> serd
         receiver.take_performance_snapshot();
         let deadline = started_at + MEASURE_FOR;
         let source_worker = source.clone();
-        let source_base = base_frame.to_vec();
+        let source_surface = Arc::clone(&surface);
         let producer = thread::spawn(move || {
             let mut sequence = 1_u64;
             let mut published_frames = 0_u64;
@@ -554,7 +577,11 @@ fn run_loopback_diagnostic_scenario(loss_percent: u8, base_frame: &[u8]) -> serd
                 }
                 sequence = sequence.saturating_add(1);
                 let build_started_at = Instant::now();
-                source_worker.publish(diagnostic_frame(sequence, &source_base));
+                source_worker.publish(diagnostic_frame(
+                    sequence,
+                    quality,
+                    Arc::clone(&source_surface),
+                ));
                 let build_nanos = build_started_at
                     .elapsed()
                     .as_nanos()
@@ -562,10 +589,10 @@ fn run_loopback_diagnostic_scenario(loss_percent: u8, base_frame: &[u8]) -> serd
                 published_frames = published_frames.saturating_add(1);
                 build_total_nanos = build_total_nanos.saturating_add(build_nanos);
                 build_max_nanos = build_max_nanos.max(build_nanos);
-                next_frame += FRAME_DURATION;
+                next_frame += quality.frame_duration();
                 let now = Instant::now();
                 while next_frame <= now {
-                    next_frame += FRAME_DURATION;
+                    next_frame += quality.frame_duration();
                 }
             }
             (published_frames, build_total_nanos, build_max_nanos)
@@ -588,6 +615,16 @@ fn run_loopback_diagnostic_scenario(loss_percent: u8, base_frame: &[u8]) -> serd
     let receiver_performance = receiver.take_performance_snapshot();
     let sender_metrics = sender.metrics();
     let receiver_metrics = receiver.metrics();
+    let encoder_gpu_surface_frames = sender_performance
+        .video_performance
+        .path_count(crate::video_performance::FramePath::EncoderGpuSurface);
+    let decoder_dxva_frames = receiver_performance
+        .video_performance
+        .path_count(crate::video_performance::FramePath::DecoderDxva);
+    let hardware_gpu_valid = encoder_gpu_surface_frames > 0
+        && decoder_dxva_frames > 0
+        && sender_metrics.encoder_backend.contains("GPU")
+        && receiver_metrics.decoder_backend.contains("DXVA");
     let packet_count = sender
         .metrics
         .test_outbound_rtp_seen
@@ -605,8 +642,28 @@ fn run_loopback_diagnostic_scenario(loss_percent: u8, base_frame: &[u8]) -> serd
     };
     let result = serde_json::json!({
         "scenario": {
+            "resolution": quality.resolution.label(),
+            "frame_rate_fps": quality.frames_per_second(),
+            "individual_bitrate_bps": quality.individual_bitrate_bps(),
             "rtp_loss_percent": loss_percent,
-            "status": status,
+            "status": if connected_at.is_none() {
+                status
+            } else if hardware_gpu_valid {
+                "ok_gpu"
+            } else {
+                "gpu_fallback_or_unverified"
+            },
+            "connection_status": status,
+            "hardware_gpu_required": true,
+            "hardware_gpu_valid": hardware_gpu_valid,
+            "gpu_paths": {
+                "encoder_gpu_surface_frames": encoder_gpu_surface_frames,
+                "decoder_dxva_frames": decoder_dxva_frames,
+            },
+            "gpu_fallback_reason": {
+                "encoder": sender_metrics.encoder_fallback_reason,
+                "decoder": receiver_metrics.decoder_fallback_reason,
+            },
             "measurement_seconds": duration_seconds,
             "injected_rtp_packets_seen": packet_count,
             "injected_rtp_packets_dropped": dropped_packet_count,
@@ -1371,22 +1428,42 @@ fn deterministic_rtp_loss_injector_matches_configured_percentages() {
 }
 
 #[test]
-#[ignore = "diagnóstico manual: executa quatro janelas WebRTC de 10 segundos e grava JSON em target/diagnostics"]
+#[ignore = "diagnóstico manual: executa 16 janelas WebRTC de 10 segundos, exige GPU e grava JSON em target/diagnostics"]
 fn screen_share_loopback_diagnostic() {
     let created_at_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let base_frame = diagnostic_base_frame();
-    let scenarios = [0_u8, 1, 4, 8]
+    let quality_profiles = [
+        ScreenShareQuality::default(),
+        ScreenShareQuality {
+            resolution: ScreenShareResolution::P720,
+            frame_rate: ScreenShareFrameRate::Fps60,
+        },
+        ScreenShareQuality {
+            resolution: ScreenShareResolution::P1080,
+            frame_rate: ScreenShareFrameRate::Fps30,
+        },
+        ScreenShareQuality {
+            resolution: ScreenShareResolution::P1080,
+            frame_rate: ScreenShareFrameRate::Fps60,
+        },
+    ];
+    let scenarios = quality_profiles
         .into_iter()
-        .map(|loss_percent| run_loopback_diagnostic_scenario(loss_percent, &base_frame))
+        .flat_map(|quality| {
+            [0_u8, 1, 4, 8]
+                .into_iter()
+                .map(move |loss_percent| run_loopback_diagnostic_scenario(quality, loss_percent))
+        })
         .collect::<Vec<_>>();
     let report = serde_json::json!({
         "schema_version": 1,
         "created_at_unix_ms": created_at_unix_ms,
         "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
-        "source": "synthetic_1280x720_rgba_30fps",
+        "source": "synthetic_d3d11_nv12_gpu_surface",
+        "quality_profiles": ["720p30", "720p60", "1080p30", "1080p60"],
+        "rtp_loss_profiles_percent": [0, 1, 4, 8],
         "measurement_seconds_per_scenario": 10,
         "scenarios": scenarios,
         "limitations": [
@@ -1394,17 +1471,18 @@ fn screen_share_loopback_diagnostic() {
             "desktop capture WGC/DXGI is not measured",
             "application UI texture upload and drawing are not measured",
             "timings are wall-clock call durations and not exclusive GPU execution time",
+            "synthetic input reuses a GPU NV12 surface; desktop capture and changing source pixels are not measured",
         ],
     });
     let report_bytes = serde_json::to_vec_pretty(&report).unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&report_bytes).unwrap();
-    assert_eq!(parsed["scenarios"].as_array().unwrap().len(), 4);
+    assert_eq!(parsed["scenarios"].as_array().unwrap().len(), 16);
 
     let report_directory =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/diagnostics");
     std::fs::create_dir_all(&report_directory).unwrap();
     let report_path = report_directory.join(format!(
-        "screen-share-loopback-{}-{}.json",
+        "screen-share-loopback-gpu-{}-{}.json",
         created_at_unix_ms,
         std::process::id()
     ));

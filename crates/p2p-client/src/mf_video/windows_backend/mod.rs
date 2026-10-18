@@ -11,6 +11,8 @@ use crate::video_performance::{FramePath, Readback, Stage, StageTimer, VideoPerf
 use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
+#[cfg(test)]
+use windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
     D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
@@ -952,6 +954,8 @@ mod h264;
 
 pub use decoder::HardwareDecoder;
 pub use encoder::HardwareEncoder;
+#[cfg(test)]
+pub(crate) use gpu_nv12::DiagnosticGpuSource;
 pub(crate) use gpu_nv12::validate_color_conversion;
 pub use gpu_nv12::{GpuNv12Processor, GpuNv12Surface};
 use h264::normalize_annex_b;

@@ -101,6 +101,83 @@ pub struct GpuNv12Processor {
     output_height: u32,
 }
 
+/// GPU input generator for the ignored loopback performance diagnostic.
+#[cfg(test)]
+pub(crate) struct DiagnosticGpuSource {
+    device: ID3D11Device,
+    processor: GpuNv12Processor,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(test)]
+impl DiagnosticGpuSource {
+    pub(crate) fn new(width: u32, height: u32, frame_rate: u32) -> Result<Self, String> {
+        let _apartment = ComApartment::enter()?;
+        let (device, context, _manager) = create_d3d11_device_manager()?;
+        let processor =
+            GpuNv12Processor::new(&device, &context, width, height, width, height, frame_rate)?;
+        Ok(Self {
+            device,
+            processor,
+            width,
+            height,
+        })
+    }
+
+    pub(crate) fn make_surface(&mut self, sequence: u64) -> Result<GpuNv12Surface, String> {
+        let mut bgra = vec![0_u8; self.width as usize * self.height as usize * 4];
+        for y in 0..self.height as usize {
+            for x in 0..self.width as usize {
+                let checker = (x / 16 + y / 16).is_multiple_of(2);
+                let (r, g, b) = if checker {
+                    (72, 72, 72)
+                } else {
+                    (176, 176, 176)
+                };
+                let block_x = (sequence as usize * 37) % (self.width as usize - 160);
+                let block_y = (sequence as usize * 19) % (self.height as usize - 96);
+                let (r, g, b) = if (block_x..block_x + 160).contains(&x)
+                    && (block_y..block_y + 96).contains(&y)
+                {
+                    (32, 160, 240)
+                } else {
+                    (r, g, b)
+                };
+                let offset = (y * self.width as usize + x) * 4;
+                bgra[offset..offset + 4].copy_from_slice(&[b, g, r, 255]);
+            }
+        }
+        let description = D3D11_TEXTURE2D_DESC {
+            Width: self.width,
+            Height: self.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            ..Default::default()
+        };
+        let data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: bgra.as_ptr().cast(),
+            SysMemPitch: self.width * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut texture = None;
+        unsafe {
+            self.device
+                .CreateTexture2D(&description, Some(&data), Some(&mut texture))
+        }
+        .map_err(|error| format!("D3D11 diagnostic source texture unavailable: {error}"))?;
+        self.processor
+            .process(&texture.ok_or_else(|| "D3D11 did not return diagnostic texture.".to_owned())?)
+    }
+}
+
 impl GpuNv12Processor {
     pub fn new(
         device: &ID3D11Device,

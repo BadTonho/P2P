@@ -6,6 +6,8 @@
 
 #[cfg(windows)]
 mod windows_backend;
+#[cfg(all(windows, test))]
+pub(crate) use windows_backend::DiagnosticGpuSource;
 #[cfg(windows)]
 pub(crate) use windows_backend::{
     GpuNv12Processor, GpuNv12Surface, HardwareDecoder, HardwareEncoder, cpu_nv12_to_rgba,
