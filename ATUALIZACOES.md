@@ -2,9 +2,9 @@
 
 O app consulta o último [GitHub Release público](https://github.com/BadTonho/P2P/releases/latest) pela API pública do repositório. Não precisa de login, chave de API ou `update-manifest.json`.
 
-A próxima versão preparada é **1.2.9**, com as melhorias recentes na recuperação da qualidade adaptativa e da captura após UAC. Publique os dois executáveis em um release estável com a tag **`v1.2.9`**, mantendo os nomes indicados abaixo. A versão anterior preparada foi 1.2.8; a nova numeração permite que esses clientes reconheçam a atualização.
+A próxima versão preparada é **1.2.10**, para distribuir a compilação atual e comparar a transmissão entre redes diferentes. Publique os dois executáveis em um release estável com a tag **`v1.2.10`**, mantendo os nomes indicados abaixo. A versão anterior publicada/preparada foi 1.2.9; a nova numeração permite que esses clientes reconheçam a atualização.
 
-Os caminhos, tamanhos, hashes e resultados desta preparação estão em [PREPARACAO_RELEASE_1.2.9.md](analises/PREPARACAO_RELEASE_1.2.9.md). O relatório anterior, 1.2.8, permanece em [PREPARACAO_RELEASE_1.2.8.md](analises/PREPARACAO_RELEASE_1.2.8.md).
+Os caminhos, tamanhos, hashes e resultados desta preparação estão em [PREPARACAO_RELEASE_1.2.10.md](analises/PREPARACAO_RELEASE_1.2.10.md). O relatório anterior, 1.2.9, permanece em [PREPARACAO_RELEASE_1.2.9.md](analises/PREPARACAO_RELEASE_1.2.9.md).
 
 ## Preparar uma versão
 
