@@ -1152,16 +1152,34 @@ async fn run_session(
                             .remote_video_track_seen
                             .load(Ordering::Relaxed);
                         let snapshot = peer.metrics.snapshot();
+                        let pipeline_stage = if !video_track_seen {
+                            "video_track"
+                        } else if packets == 0 {
+                            "rtp_receive"
+                        } else if snapshot.assembled_access_units == 0 {
+                            "rtp_h264_assembly"
+                        } else if snapshot.decoder_input_frames == 0 {
+                            "recovery_gate_or_decoder_queue"
+                        } else if snapshot.decoded_frames == 0 {
+                            "h264_decoder"
+                        } else if snapshot.published_frames == 0 {
+                            "frame_publication"
+                        } else {
+                            "unknown"
+                        };
                         tracing::warn!(
                             screen_share_session = peer.metrics.session_id,
                             stage = "first_video_timeout",
+                            pipeline_stage,
                             video_track_seen,
                             received_rtp_packets = packets,
-                            assembled_access_units = snapshot.received_delta_frames,
+                            assembled_access_units = snapshot.assembled_access_units,
+                            decoder_backend = %snapshot.decoder_backend,
                             decoder_inputs = snapshot.decoder_input_frames,
                             decoded_frames = snapshot.decoded_frames,
                             published_frames = snapshot.published_frames,
                             decode_errors,
+                            h264_diagnostics = %snapshot.h264_diagnostics,
                             "Sessão conectada sem publicar vídeo antes do timeout"
                         );
                         let message = if packets == 0 {

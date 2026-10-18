@@ -317,6 +317,75 @@ fn keyframe_requests_are_rate_limited() {
 }
 
 #[test]
+fn recovery_pli_is_retried_after_a_lost_request_and_stops_after_recovery_idr() {
+    let start = Instant::now();
+    let mut retry = KeyframeRecoveryRetry::default();
+    retry.start(PliReason::AssemblyError, start);
+
+    assert_eq!(
+        retry.due_reason(start + KEYFRAME_REQUEST_MIN_INTERVAL - Duration::from_nanos(1)),
+        None
+    );
+    let retry_at = start + KEYFRAME_REQUEST_MIN_INTERVAL;
+    assert!(matches!(
+        retry.due_reason(retry_at),
+        Some(PliReason::AssemblyError)
+    ));
+    retry.mark_requested(retry_at);
+    assert_eq!(
+        retry.due_reason(retry_at + KEYFRAME_REQUEST_MIN_INTERVAL - Duration::from_nanos(1)),
+        None,
+        "a lost retry must not cause the next request to be sent early"
+    );
+    assert!(
+        retry
+            .due_reason(retry_at + KEYFRAME_REQUEST_MIN_INTERVAL)
+            .is_some()
+    );
+
+    let mut assembler = H264AccessUnitAssembler::default();
+    let recovery = assembler.push_ordered(
+        rtp_packet(
+            1,
+            1,
+            true,
+            &[
+                24, 0, 4, 0x67, 0x64, 0, 0x1f, 0, 2, 0x68, 0, 0, 2, 0x65, 0x88,
+            ],
+        ),
+        retry_at + KEYFRAME_REQUEST_MIN_INTERVAL,
+    );
+    let recovery_idr = recovery
+        .into_iter()
+        .find_map(Result::ok)
+        .expect("SPS/PPS/IDR completo deve sair do montador");
+    assert!(is_recovery_idr(&recovery_idr));
+
+    retry.complete();
+    assert!(!retry.is_active());
+    assert_eq!(retry.due_reason(retry_at + Duration::from_secs(10)), None);
+}
+
+#[test]
+fn incomplete_marker_and_fu_a_frames_are_never_released_as_h264() {
+    let start = Instant::now();
+    let mut without_marker = H264AccessUnitAssembler::default();
+    assert!(
+        without_marker
+            .push_ordered(rtp_packet(10, 10, false, &[0x41, 0x99]), start)
+            .is_empty()
+    );
+    let expired = without_marker.take_ready(start + MAX_RTP_FRAME_AGE + Duration::from_millis(1));
+    assert!(matches!(expired.as_slice(), [Err(error)] if error.contains("sem marcador")));
+
+    let mut incomplete_fu_a = H264AccessUnitAssembler::default();
+    let malformed =
+        incomplete_fu_a.push_ordered(rtp_packet(11, 11, true, &[28, 0x85, 0x88, 0x84]), start);
+    assert!(matches!(malformed.as_slice(), [Err(error)] if error.contains("fragmento FU-A")));
+    assert!(incomplete_fu_a.frames.is_empty());
+}
+
+#[test]
 fn decoder_preferences_choose_hardware_cpu_and_adaptive_policy() {
     assert!(should_try_hardware_decoder(
         VideoDecoderPreference::Automatic,

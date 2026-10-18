@@ -291,12 +291,13 @@ impl RtpSequenceTracker {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PliReason {
     SequenceGap,
     AssemblyError,
     DecodeError,
     DecoderQueueFull,
+    FirstVideoTimeout,
     #[cfg(test)]
     Explicit,
 }
@@ -334,6 +335,41 @@ impl KeyframeRequestLimiter {
         }
         self.last_request = Some(now);
         true
+    }
+}
+
+#[derive(Default)]
+struct KeyframeRecoveryRetry {
+    reason: Option<PliReason>,
+    last_requested_at: Option<Instant>,
+}
+
+impl KeyframeRecoveryRetry {
+    fn start(&mut self, reason: PliReason, now: Instant) {
+        self.reason = Some(reason);
+        self.last_requested_at = Some(now);
+    }
+
+    fn due_reason(&self, now: Instant) -> Option<PliReason> {
+        let reason = self.reason?;
+        let elapsed = self
+            .last_requested_at
+            .map(|last| now.saturating_duration_since(last))
+            .unwrap_or(KEYFRAME_REQUEST_MIN_INTERVAL);
+        (elapsed >= KEYFRAME_REQUEST_MIN_INTERVAL).then_some(reason)
+    }
+
+    fn mark_requested(&mut self, now: Instant) {
+        self.last_requested_at = Some(now);
+    }
+
+    fn complete(&mut self) {
+        self.reason = None;
+        self.last_requested_at = None;
+    }
+
+    fn is_active(&self) -> bool {
+        self.reason.is_some()
     }
 }
 
@@ -569,6 +605,11 @@ fn assemble_h264_access_unit(mut packets: Vec<RtpPacket>) -> Result<Vec<u8>, Str
         return Err("quadro RTP não produziu dados H.264".to_owned());
     }
     Ok(output)
+}
+
+fn is_recovery_idr(access_unit: &[u8]) -> bool {
+    let nal_types = annex_b_nal_types(access_unit);
+    nal_types.contains(&5) && nal_types.contains(&7) && nal_types.contains(&8)
 }
 
 fn validate_stap_a(payload: &[u8]) -> Result<(), String> {
@@ -1674,7 +1715,10 @@ impl PeerEvents {
             metrics
                 .record_rtp_reorder_window(reorder_window.delay(), reorder_window.sample_count());
             let mut keyframe_request_limiter = KeyframeRequestLimiter::default();
+            let mut keyframe_recovery_retry = KeyframeRecoveryRetry::default();
             let mut awaiting_sequence_recovery = false;
+            let mut observed_decoder_generation = decoder_generation.load(Ordering::Relaxed);
+            let receiver_started_at = Instant::now();
             let mut reorder_overflow_count = 0_u64;
             let mut flush_pending = tokio::time::interval(Duration::from_millis(10));
             flush_pending.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1687,6 +1731,43 @@ impl PeerEvents {
                 tokio::select! {
                     _ = flush_pending.tick() => {
                         let now = Instant::now();
+                        let current_generation = decoder_generation.load(Ordering::Relaxed);
+                        if current_generation != observed_decoder_generation {
+                            observed_decoder_generation = current_generation;
+                            if !keyframe_recovery_retry.is_active() {
+                                awaiting_sequence_recovery = true;
+                                keyframe_recovery_retry.start(PliReason::DecodeError, now);
+                            }
+                        }
+                        if !awaiting_sequence_recovery
+                            && metrics.decoded_frames.load(Ordering::Relaxed) == 0
+                            && now.saturating_duration_since(receiver_started_at)
+                                >= FIRST_VIDEO_FRAME_TIMEOUT
+                        {
+                            begin_stream_resync(
+                                &decoder_generation,
+                                &metrics,
+                                &keyframe_request_tx,
+                                PliReason::FirstVideoTimeout,
+                            );
+                            awaiting_sequence_recovery = true;
+                            keyframe_recovery_retry.start(PliReason::FirstVideoTimeout, now);
+                            tracing::warn!(
+                                screen_share_session = metrics.session_id,
+                                stage = "first_video_timeout_recovery",
+                                "Nenhum quadro de vÃ­deo foi decodificado; solicitando IDR e iniciando tentativas de recuperaÃ§Ã£o"
+                            );
+                        }
+                        if let Some(reason) = keyframe_recovery_retry.due_reason(now)
+                            && keyframe_request_tx.try_send(reason).is_ok()
+                        {
+                            keyframe_recovery_retry.mark_requested(now);
+                            tracing::debug!(
+                                screen_share_session = metrics.session_id,
+                                ?reason,
+                                "Repetindo pedido PLI enquanto aguarda IDR de recuperaÃ§Ã£o"
+                            );
+                        }
                         let expired = sequence_tracker.expire(now, current_reorder_delay);
                         if expired.confirmed_missing_packets > 0 {
                             metrics.record_sequence_update(expired);
@@ -1703,6 +1784,9 @@ impl PeerEvents {
                                 &mut keyframe_request_limiter,
                                 reason,
                             ).await;
+                            if keyframe_recovery_retry.is_active() {
+                                keyframe_recovery_retry.mark_requested(Instant::now());
+                            }
                         }
                     }
                     event = track.poll() => {
@@ -1751,6 +1835,7 @@ impl PeerEvents {
                             PliReason::SequenceGap,
                         );
                         awaiting_sequence_recovery = true;
+                        keyframe_recovery_retry.start(PliReason::SequenceGap, Instant::now());
                     }
                     context.request_repaint();
                 }
@@ -1784,10 +1869,7 @@ impl PeerEvents {
                     match result {
                         Ok(access_unit) => {
                             metrics.record_assembled_access_unit(&access_unit);
-                            let nal_types = annex_b_nal_types(&access_unit);
-                            let is_valid_recovery_idr = nal_types.contains(&5)
-                                && nal_types.contains(&7)
-                                && nal_types.contains(&8);
+                            let is_valid_recovery_idr = is_recovery_idr(&access_unit);
                             // After a confirmed gap, P frames still depend on the damaged
                             // reference chain. Keep them out of the decoder until a complete
                             // IDR with parameter sets is accepted by its bounded queue.
@@ -1804,6 +1886,7 @@ impl PeerEvents {
                                     metrics.record_decoder_queue_accepted();
                                     if is_valid_recovery_idr {
                                         awaiting_sequence_recovery = false;
+                                        keyframe_recovery_retry.complete();
                                     }
                                 }
                                 Err(std_mpsc::TrySendError::Full(_)) => {
@@ -1816,6 +1899,8 @@ impl PeerEvents {
                                             PliReason::DecoderQueueFull,
                                         );
                                         awaiting_sequence_recovery = true;
+                                        keyframe_recovery_retry
+                                            .start(PliReason::DecoderQueueFull, Instant::now());
                                     }
                                     context.request_repaint();
                                 }
@@ -1838,6 +1923,8 @@ impl PeerEvents {
                                     PliReason::AssemblyError,
                                 );
                                 awaiting_sequence_recovery = true;
+                                keyframe_recovery_retry
+                                    .start(PliReason::AssemblyError, Instant::now());
                             }
                             context.request_repaint();
                         }

@@ -385,6 +385,7 @@ struct H264FlowDiagnostics {
     pli_assembly_error: u64,
     pli_decode_error: u64,
     pli_queue_overflow: u64,
+    pli_first_video_timeout: u64,
     pli_explicit: u64,
     keyframe_resyncs: u64,
     dropped_while_waiting_for_idr: u64,
