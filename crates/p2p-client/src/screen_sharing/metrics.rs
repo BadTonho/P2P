@@ -469,6 +469,176 @@ impl SharedMetrics {
         crate::logging::register_srtp_track_context(ssrc, self.session_id, None, None);
     }
 
+    pub(super) fn set_outbound_video_ssrc(&self, ssrc: u32) {
+        self.outbound_video_ssrc
+            .store(u64::from(ssrc), Ordering::Relaxed);
+    }
+
+    pub(super) fn begin_outbound_frame_trace_sample(&self) -> u64 {
+        let sample_id = self
+            .next_frame_trace_sample_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        self.active_frame_trace_sample_id
+            .store(sample_id, Ordering::Release);
+        sample_id
+    }
+
+    pub(super) fn finish_outbound_frame_trace_sample(&self, sample_id: u64, accepted: bool) {
+        let _ = self.active_frame_trace_sample_id.compare_exchange(
+            sample_id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        self.frame_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outbound_sample_write(sample_id, accepted, Instant::now());
+    }
+
+    pub(super) fn trace_outbound_rtp_packet(
+        &self,
+        packet: &rtc::rtp::packet::Packet,
+        retransmission: bool,
+    ) {
+        let video_ssrc = self.outbound_video_ssrc.load(Ordering::Relaxed);
+        if video_ssrc == 0 || packet.header.ssrc != video_ssrc as u32 {
+            return;
+        }
+        let sample_id = match self.active_frame_trace_sample_id.load(Ordering::Acquire) {
+            0 => None,
+            sample_id => Some(sample_id),
+        };
+        self.frame_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outbound_packet(
+                frame_trace::FrameTraceKey {
+                    ssrc: packet.header.ssrc,
+                    rtp_timestamp: packet.header.timestamp,
+                },
+                sample_id,
+                packet.header.sequence_number,
+                packet.header.marker,
+                retransmission,
+            );
+    }
+
+    pub(super) fn trace_inbound_rtp_packet(
+        &self,
+        packet: &rtc::rtp::packet::Packet,
+        observation: frame_trace::SequenceObservation,
+    ) {
+        self.frame_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .inbound_packet(
+                frame_trace::FrameTraceKey {
+                    ssrc: packet.header.ssrc,
+                    rtp_timestamp: packet.header.timestamp,
+                },
+                packet.header.sequence_number,
+                packet.header.marker,
+                observation,
+            );
+    }
+
+    pub(super) fn trace_frame_assembly(
+        &self,
+        ssrc: u32,
+        rtp_timestamp: u32,
+        result: Result<(), String>,
+    ) {
+        self.frame_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .assembly(
+                frame_trace::FrameTraceKey {
+                    ssrc,
+                    rtp_timestamp,
+                },
+                result,
+            );
+    }
+
+    pub(super) fn trace_decoder_queue(&self, ssrc: u32, rtp_timestamp: u32, status: &'static str) {
+        self.frame_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .decoder_queue(
+                frame_trace::FrameTraceKey {
+                    ssrc,
+                    rtp_timestamp,
+                },
+                status,
+            );
+    }
+
+    pub(super) fn trace_decoder_input(&self, ssrc: u32, rtp_timestamp: u32) {
+        self.frame_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .decoder_input(frame_trace::FrameTraceKey {
+                ssrc,
+                rtp_timestamp,
+            });
+    }
+
+    pub(super) fn trace_decoder_result(
+        &self,
+        ssrc: u32,
+        rtp_timestamp: u32,
+        result: &'static str,
+        output_attribution: Option<&'static str>,
+        output_available: bool,
+        published: bool,
+    ) {
+        self.frame_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .decoder_result(
+                frame_trace::FrameTraceKey {
+                    ssrc,
+                    rtp_timestamp,
+                },
+                result,
+                output_attribution,
+                output_available,
+                published,
+                Instant::now(),
+            );
+    }
+
+    pub(super) fn trace_unattributed_publication(&self) {
+        self.frame_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unattributed_publication(Instant::now());
+    }
+
+    pub(super) fn take_video_frame_stall_trace(
+        &self,
+        now: Instant,
+        connected_for: Duration,
+        initial_timeout_due: bool,
+    ) -> Option<frame_trace::StallTraceReport> {
+        self.frame_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stall_report(now, connected_for, initial_timeout_due)
+    }
+
+    pub(super) fn take_outbound_video_stall_trace(
+        &self,
+        now: Instant,
+    ) -> Option<frame_trace::StallTraceReport> {
+        self.frame_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outbound_stall_report(now)
+    }
+
     pub(super) fn update_transport_diagnostics(
         &self,
         snapshot: PeerStatsSnapshot,

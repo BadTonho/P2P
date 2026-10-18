@@ -167,6 +167,7 @@ fn retained_decoder_recovers_real_h264_after_discarded_frames() {
                 &remote_frame,
                 &sequence,
                 &metrics,
+                None,
             )
             .is_none()
         );
@@ -184,6 +185,7 @@ fn retained_decoder_recovers_real_h264_after_discarded_frames() {
                 &remote_frame,
                 &sequence,
                 &metrics,
+                None,
             )
             .is_none()
         );
@@ -248,7 +250,7 @@ fn regression_ordered_frames_do_not_wait_for_a_second_reorder_window() {
             1,
             "an ordered complete frame must be released immediately, including bursts"
         );
-        assert!(ready[0].is_ok());
+        assert!(ready[0].result.is_ok());
     }
 }
 
@@ -357,7 +359,7 @@ fn recovery_pli_is_retried_after_a_lost_request_and_stops_after_recovery_idr() {
     );
     let recovery_idr = recovery
         .into_iter()
-        .find_map(Result::ok)
+        .find_map(|frame| frame.result.ok())
         .expect("SPS/PPS/IDR completo deve sair do montador");
     assert!(is_recovery_idr(&recovery_idr));
 
@@ -369,6 +371,7 @@ fn recovery_pli_is_retried_after_a_lost_request_and_stops_after_recovery_idr() {
 #[test]
 fn incomplete_marker_and_fu_a_frames_are_never_released_as_h264() {
     let start = Instant::now();
+    let metrics = SharedMetrics::default();
     let mut without_marker = H264AccessUnitAssembler::default();
     assert!(
         without_marker
@@ -376,13 +379,42 @@ fn incomplete_marker_and_fu_a_frames_are_never_released_as_h264() {
             .is_empty()
     );
     let expired = without_marker.take_ready(start + MAX_RTP_FRAME_AGE + Duration::from_millis(1));
-    assert!(matches!(expired.as_slice(), [Err(error)] if error.contains("sem marcador")));
+    assert!(
+        matches!(expired.as_slice(), [frame] if frame.rtp_timestamp == 10 && frame.result.as_ref().is_err_and(|error| error.contains("sem marcador")))
+    );
+    let marker_error = expired[0].result.as_ref().unwrap_err().clone();
+    metrics.trace_frame_assembly(42, expired[0].rtp_timestamp, Err(marker_error));
 
     let mut incomplete_fu_a = H264AccessUnitAssembler::default();
     let malformed =
         incomplete_fu_a.push_ordered(rtp_packet(11, 11, true, &[28, 0x85, 0x88, 0x84]), start);
-    assert!(matches!(malformed.as_slice(), [Err(error)] if error.contains("fragmento FU-A")));
+    assert!(
+        matches!(malformed.as_slice(), [frame] if frame.rtp_timestamp == 11 && frame.result.as_ref().is_err_and(|error| error.contains("fragmento FU-A")))
+    );
     assert!(incomplete_fu_a.frames.is_empty());
+    let fragment_error = malformed[0].result.as_ref().unwrap_err().clone();
+    metrics.trace_frame_assembly(42, malformed[0].rtp_timestamp, Err(fragment_error));
+
+    let report = metrics
+        .take_video_frame_stall_trace(start + Duration::from_secs(5), Duration::from_secs(5), true)
+        .expect("the initial timeout should include incomplete frame breadcrumbs");
+    let frames: serde_json::Value = serde_json::from_str(&report.frames_json).unwrap();
+    let marker = frames
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|frame| frame["rtp_timestamp"] == 10)
+        .unwrap();
+    let fu_a = frames
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|frame| frame["rtp_timestamp"] == 11)
+        .unwrap();
+    assert_eq!(marker["assembly_error"], "marker_missing_or_misplaced");
+    assert_eq!(fu_a["assembly_error"], "fu_a_incomplete_or_malformed");
+    assert_eq!(marker["decoder_input"], false);
+    assert_eq!(fu_a["decoder_input"], false);
 }
 
 #[test]
@@ -828,7 +860,7 @@ fn rtp_reorder_buffer_is_bounded_and_reorders_fu_a_before_assembly() {
     let ready = assembler.take_ready(start + Duration::from_millis(120));
     let frame = ready
         .into_iter()
-        .find_map(Result::ok)
+        .find_map(|frame| frame.result.ok())
         .expect("FU-A reordenado deve formar um access unit válido");
     assert_eq!(annex_b_nal_types(&frame), [5]);
 
@@ -886,7 +918,7 @@ fn ordered_burst_after_a_recovered_gap_does_not_overflow_the_frame_assembler() {
         ready.extend(assembler.push_ordered(packet, start + Duration::from_millis(20)));
     }
     assert_eq!(ready.len(), 21);
-    assert!(ready.iter().all(Result::is_ok));
+    assert!(ready.iter().all(|frame| frame.result.is_ok()));
     assert!(assembler.frames.is_empty());
 }
 
@@ -910,7 +942,7 @@ fn confirmed_loss_discards_damaged_fu_a_timestamp_and_accepts_next_idr() {
         INITIAL_RTP_REORDER_DELAY,
     );
     assert_eq!(loss.confirmed_missing_packets, 1);
-    assembler.discard_incomplete_after_loss(loss.resume_timestamp);
+    let _ = assembler.discard_incomplete_after_loss(loss.resume_timestamp);
     for packet in loss.ordered_packets {
         assembler.push(packet);
     }
@@ -932,6 +964,7 @@ fn confirmed_loss_discards_damaged_fu_a_timestamp_and_accepts_next_idr() {
             .take_ready(now + Duration::from_millis(100))
             .iter()
             .any(|unit| unit
+                .result
                 .as_ref()
                 .is_ok_and(|bytes| annex_b_nal_types(bytes).contains(&5)))
     );
@@ -976,6 +1009,7 @@ fn cpu_fallback_can_publish_the_cached_initial_idr_without_new_network_frames() 
         &remote_frame,
         &sequence,
         &metrics,
+        None,
     );
 
     assert!(

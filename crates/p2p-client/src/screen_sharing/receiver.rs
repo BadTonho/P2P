@@ -315,9 +315,16 @@ struct PendingRtpFrame {
 }
 
 struct QueuedAccessUnit {
+    ssrc: u32,
+    rtp_timestamp: u32,
     generation: u64,
     enqueued_at: Instant,
     bytes: Vec<u8>,
+}
+
+struct AssembledAccessUnitResult {
+    rtp_timestamp: u32,
+    result: Result<Vec<u8>, String>,
 }
 
 #[derive(Default)]
@@ -427,16 +434,19 @@ pub(super) fn begin_stream_resync(
 }
 
 impl H264AccessUnitAssembler {
-    fn push_ordered(&mut self, packet: RtpPacket, now: Instant) -> Vec<Result<Vec<u8>, String>> {
+    fn push_ordered(&mut self, packet: RtpPacket, now: Instant) -> Vec<AssembledAccessUnitResult> {
         let mut ready = Vec::new();
-        if let Some(error) = self.push(packet) {
-            ready.push(Err(error));
+        if let Some((rtp_timestamp, error)) = self.push(packet) {
+            ready.push(AssembledAccessUnitResult {
+                rtp_timestamp,
+                result: Err(error),
+            });
         }
         ready.extend(self.take_ready(now));
         ready
     }
 
-    fn push(&mut self, packet: RtpPacket) -> Option<String> {
+    fn push(&mut self, packet: RtpPacket) -> Option<(u32, String)> {
         let timestamp = packet.header.timestamp;
         if let Some(discard_timestamp) = self.discard_timestamp {
             if discard_timestamp == timestamp {
@@ -458,7 +468,10 @@ impl H264AccessUnitAssembler {
                 .map(|(timestamp, _)| *timestamp)
         {
             self.frames.remove(&oldest_timestamp);
-            evicted = Some("limite de quadros RTP pendentes excedido".to_owned());
+            evicted = Some((
+                oldest_timestamp,
+                "limite de quadros RTP pendentes excedido".to_owned(),
+            ));
         }
 
         let frame = self
@@ -474,12 +487,14 @@ impl H264AccessUnitAssembler {
         evicted
     }
 
-    fn discard_incomplete_after_loss(&mut self, resume_timestamp: Option<u32>) {
+    fn discard_incomplete_after_loss(&mut self, resume_timestamp: Option<u32>) -> Vec<u32> {
+        let discarded = self.frames.keys().copied().collect();
         self.frames.clear();
         self.discard_timestamp = resume_timestamp;
+        discarded
     }
 
-    fn take_ready(&mut self, now: Instant) -> Vec<Result<Vec<u8>, String>> {
+    fn take_ready(&mut self, now: Instant) -> Vec<AssembledAccessUnitResult> {
         let mut ready_timestamps = self
             .frames
             .iter()
@@ -502,12 +517,18 @@ impl H264AccessUnitAssembler {
 
         ready_timestamps
             .into_iter()
-            .filter_map(|timestamp| self.frames.remove(&timestamp))
-            .map(|frame| {
-                if !frame.marker_seen {
-                    return Err("quadro RTP expirou sem marcador de fim".to_owned());
-                }
-                assemble_h264_access_unit(frame.packets)
+            .filter_map(|timestamp| {
+                self.frames.remove(&timestamp).map(|frame| {
+                    let result = if !frame.marker_seen {
+                        Err("quadro RTP expirou sem marcador de fim".to_owned())
+                    } else {
+                        assemble_h264_access_unit(frame.packets)
+                    };
+                    AssembledAccessUnitResult {
+                        rtp_timestamp: timestamp,
+                        result,
+                    }
+                })
             })
             .collect()
     }
@@ -651,8 +672,14 @@ fn decode_h264_access_unit(
     remote_frame: &RemoteFrameStore,
     sequence: &AtomicU64,
     metrics: &SharedMetrics,
+    trace_key: Option<super::frame_trace::FrameTraceKey>,
 ) -> Option<DecodeFailure> {
     let _total_timer = metrics.video_performance.timer(Stage::DecodeTotal);
+    let output_attribution = match decoder {
+        ActiveH264Decoder::OpenH264(_) => "same_decode_call",
+        #[cfg(windows)]
+        ActiveH264Decoder::MediaFoundation(_) => "decode_call_only_frame_identity_unavailable",
+    };
     let nal_types = annex_b_nal_types(access_unit);
     let sample_diagnostics = describe_nal_types(&nal_types, access_unit.len());
     let decoded = match decoder {
@@ -709,6 +736,16 @@ fn decode_h264_access_unit(
     match decoded {
         Ok(Some((width, height, rgba, cpu_nv12))) => {
             if width == 0 || height == 0 {
+                if let Some(key) = trace_key {
+                    metrics.trace_decoder_result(
+                        key.ssrc,
+                        key.rtp_timestamp,
+                        "invalid_output",
+                        Some(output_attribution),
+                        true,
+                        false,
+                    );
+                }
                 return None;
             }
             metrics.decoded_frames.fetch_add(1, Ordering::Relaxed);
@@ -739,6 +776,16 @@ fn decode_h264_access_unit(
                 false
             };
             if width == 0 || height == 0 || (!valid_nv12 && rgba.len() != expected_bytes) {
+                if let Some(key) = trace_key {
+                    metrics.trace_decoder_result(
+                        key.ssrc,
+                        key.rtp_timestamp,
+                        "invalid_output",
+                        Some(output_attribution),
+                        true,
+                        false,
+                    );
+                }
                 tracing::warn!(
                     width,
                     height,
@@ -768,14 +815,46 @@ fn decode_h264_access_unit(
             if frame_kind == Some(H264FrameKind::Idr) {
                 metrics.record_idr_published();
             }
+            if let Some(key) = trace_key {
+                metrics.trace_decoder_result(
+                    key.ssrc,
+                    key.rtp_timestamp,
+                    "output",
+                    Some(output_attribution),
+                    true,
+                    true,
+                );
+            } else {
+                metrics.trace_unattributed_publication();
+            }
             context.request_repaint();
             None
         }
         Ok(None) => {
             metrics.record_decoder_no_output();
+            if let Some(key) = trace_key {
+                metrics.trace_decoder_result(
+                    key.ssrc,
+                    key.rtp_timestamp,
+                    "no_output",
+                    None,
+                    false,
+                    false,
+                );
+            }
             None
         }
         Err((detail, native_code)) => {
+            if let Some(key) = trace_key {
+                metrics.trace_decoder_result(
+                    key.ssrc,
+                    key.rtp_timestamp,
+                    "error",
+                    None,
+                    false,
+                    false,
+                );
+            }
             #[cfg(windows)]
             let hardware_decoder = matches!(&*decoder, ActiveH264Decoder::MediaFoundation(_));
             #[cfg(not(windows))]
@@ -1224,6 +1303,7 @@ impl PeerEvents {
                                                         &worker_remote_frame,
                                                         &worker_sequence,
                                                         &worker_metrics,
+                                                        None,
                                                     );
                                                     if let Some(failure) = failure {
                                                         tracing::warn!(error = %failure.detail, "OpenH264 não conseguiu publicar o IDR em cache; solicitando outro quadro-chave");
@@ -1266,6 +1346,11 @@ impl PeerEvents {
                         let generation_status = codec.synchronize(queued.generation, current_generation);
                         if generation_status == DecoderGenerationStatus::Stale {
                             worker_metrics.record_drop_stale_generation();
+                            worker_metrics.trace_decoder_queue(
+                                queued.ssrc,
+                                queued.rtp_timestamp,
+                                "dropped_stale_generation",
+                            );
                             continue;
                         }
                         if generation_status == DecoderGenerationStatus::Recover {
@@ -1274,6 +1359,8 @@ impl PeerEvents {
                             last_hardware_input_at = None;
                             cached_gop.invalidate_delta_chain();
                         }
+                        let frame_ssrc = queued.ssrc;
+                        let frame_rtp_timestamp = queued.rtp_timestamp;
                         let access_unit = queued.bytes;
                         if let Some(idr) = update_cached_idr(
                             &access_unit,
@@ -1452,6 +1539,11 @@ impl PeerEvents {
 
                         if !should_decode_access_unit(&mut cpu_waiting_for_idr, &access_unit) {
                             worker_metrics.record_drop_worker_waiting_for_idr();
+                            worker_metrics.trace_decoder_queue(
+                                frame_ssrc,
+                                frame_rtp_timestamp,
+                                "dropped_worker_waiting_for_idr",
+                            );
                             continue;
                         }
 
@@ -1461,6 +1553,7 @@ impl PeerEvents {
                                 ActiveH264Decoder::MediaFoundation(_)
                             );
                             worker_metrics.record_decoder_input_live();
+                            worker_metrics.trace_decoder_input(frame_ssrc, frame_rtp_timestamp);
                             let decoded_before =
                                 worker_metrics.decoded_frames.load(Ordering::Relaxed);
                             let hardware_error = decode_h264_access_unit(
@@ -1470,6 +1563,10 @@ impl PeerEvents {
                                 &worker_remote_frame,
                                 &worker_sequence,
                                 &worker_metrics,
+                                Some(super::frame_trace::FrameTraceKey {
+                                    ssrc: frame_ssrc,
+                                    rtp_timestamp: frame_rtp_timestamp,
+                                }),
                             );
                             let decode_failed = hardware_error.is_some();
                             let mut decoder_entered_resync = false;
@@ -1649,6 +1746,7 @@ impl PeerEvents {
                                                     &worker_remote_frame,
                                                     &worker_sequence,
                                                     &worker_metrics,
+                                                    None,
                                                 ) {
                                                     tracing::warn!(
                                                         error = %failure.detail,
@@ -1731,6 +1829,32 @@ impl PeerEvents {
                 tokio::select! {
                     _ = flush_pending.tick() => {
                         let now = Instant::now();
+                        let connected_for = now.saturating_duration_since(receiver_started_at);
+                        let initial_timeout_due = metrics.published_frames.load(Ordering::Relaxed) == 0
+                            && connected_for >= FIRST_VIDEO_FRAME_TIMEOUT;
+                        if let Some(trace) = metrics.take_video_frame_stall_trace(
+                            now,
+                            connected_for,
+                            initial_timeout_due,
+                        ) {
+                            tracing::warn!(
+                                screen_share_session = metrics.session_id,
+                                stage = "video_frame_trace_stall",
+                                trigger = trace.trigger,
+                                silence_ms = trace.silence_millis,
+                                correlation_key = "SSRC + RTP timestamp",
+                                outbound_observation = "custom RTP interceptor before network transport",
+                                inbound_observation = "TrackRemote RTP event after WebRTC transport processing",
+                                reorder_observation = "local sequence/reorder classifier; not proof of network loss",
+                                received_rtp_packets_total = metrics.received_packets.load(Ordering::Relaxed),
+                                assembled_access_units_total = metrics.total_assembled_access_units.load(Ordering::Relaxed),
+                                decoder_inputs_total = metrics.decoder_input_frames.load(Ordering::Relaxed),
+                                decoder_outputs_total = metrics.decoded_frames.load(Ordering::Relaxed),
+                                published_frames_total = metrics.published_frames.load(Ordering::Relaxed),
+                                frames_json = %trace.frames_json,
+                                "Janela recente de quadros capturada após timeout de publicação de vídeo"
+                            );
+                        }
                         let current_generation = decoder_generation.load(Ordering::Relaxed);
                         if current_generation != observed_decoder_generation {
                             observed_decoder_generation = current_generation;
@@ -1805,6 +1929,16 @@ impl PeerEvents {
                                 );
                                 reorder_delay_sample = sequence_update.reorder_delay_sample;
                                 metrics.record_sequence_update(sequence_update);
+                                metrics.trace_inbound_rtp_packet(
+                                    &packet,
+                                    super::frame_trace::SequenceObservation {
+                                        gaps_observed: sequence_update.observed_gap_packets,
+                                        reordered_recovered: sequence_update.recovered_reordered_packets,
+                                        missing_confirmed: sequence_update.confirmed_missing_packets,
+                                        late_after_confirmed: sequence_update.late_after_confirmed_packets,
+                                        duplicates: sequence_update.duplicate_packets,
+                                    },
+                                );
                                 metrics.record_received_packet(&packet);
                                 if sequence_update.confirmed_missing_packets > 0 {
                                     reorder_update.append(
@@ -1826,7 +1960,15 @@ impl PeerEvents {
 
                 if confirmed_sequence_loss || reorder_update.confirmed_missing_packets > 0 {
                     metrics.record_sequence_gap_resync();
-                    assembler.discard_incomplete_after_loss(reorder_update.resume_timestamp);
+                    for timestamp in
+                        assembler.discard_incomplete_after_loss(reorder_update.resume_timestamp)
+                    {
+                        metrics.trace_frame_assembly(
+                            metrics.track_ssrc.load(Ordering::Relaxed) as u32,
+                            timestamp,
+                            Err("quadro parcial descartado após lacuna confirmada".to_owned()),
+                        );
+                    }
                     if !awaiting_sequence_recovery {
                         begin_stream_resync(
                             &decoder_generation,
@@ -1862,12 +2004,22 @@ impl PeerEvents {
                 for packet in reorder_update.ordered_packets {
                     // A recovered gap may release many complete frames at once.
                     // Drain each marker before the next frame can fill the assembler.
+                    if assembler.discard_timestamp == Some(packet.header.timestamp) {
+                        metrics.trace_frame_assembly(
+                            packet.header.ssrc,
+                            packet.header.timestamp,
+                            Err("timestamp descartado durante recuperação após perda".to_owned()),
+                        );
+                    }
                     ready_units.extend(assembler.push_ordered(packet, Instant::now()));
                 }
                 ready_units.extend(assembler.take_ready(Instant::now()));
-                for result in ready_units {
-                    match result {
+                for assembled in ready_units {
+                    let rtp_timestamp = assembled.rtp_timestamp;
+                    let inbound_ssrc = metrics.track_ssrc.load(Ordering::Relaxed) as u32;
+                    match assembled.result {
                         Ok(access_unit) => {
+                            metrics.trace_frame_assembly(inbound_ssrc, rtp_timestamp, Ok(()));
                             metrics.record_assembled_access_unit(&access_unit);
                             let is_valid_recovery_idr = is_recovery_idr(&access_unit);
                             // After a confirmed gap, P frames still depend on the damaged
@@ -1875,15 +2027,27 @@ impl PeerEvents {
                             // IDR with parameter sets is accepted by its bounded queue.
                             if awaiting_sequence_recovery && !is_valid_recovery_idr {
                                 metrics.record_drop_recovery_gate_waiting_for_idr();
+                                metrics.trace_decoder_queue(
+                                    inbound_ssrc,
+                                    rtp_timestamp,
+                                    "dropped_waiting_for_recovery_idr",
+                                );
                                 continue;
                             }
                             match decoder_tx.try_send(QueuedAccessUnit {
+                                ssrc: inbound_ssrc,
+                                rtp_timestamp,
                                 enqueued_at: Instant::now(),
                                 generation: decoder_generation.load(Ordering::Relaxed),
                                 bytes: access_unit,
                             }) {
                                 Ok(()) => {
                                     metrics.record_decoder_queue_accepted();
+                                    metrics.trace_decoder_queue(
+                                        inbound_ssrc,
+                                        rtp_timestamp,
+                                        "accepted",
+                                    );
                                     if is_valid_recovery_idr {
                                         awaiting_sequence_recovery = false;
                                         keyframe_recovery_retry.complete();
@@ -1891,6 +2055,11 @@ impl PeerEvents {
                                 }
                                 Err(std_mpsc::TrySendError::Full(_)) => {
                                     metrics.record_decoder_queue_drop();
+                                    metrics.trace_decoder_queue(
+                                        inbound_ssrc,
+                                        rtp_timestamp,
+                                        "dropped_full",
+                                    );
                                     if !awaiting_sequence_recovery {
                                         begin_stream_resync(
                                             &decoder_generation,
@@ -1906,6 +2075,11 @@ impl PeerEvents {
                                 }
                                 Err(std_mpsc::TrySendError::Disconnected(_)) => {
                                     metrics.record_decoder_queue_disconnected();
+                                    metrics.trace_decoder_queue(
+                                        inbound_ssrc,
+                                        rtp_timestamp,
+                                        "dropped_disconnected",
+                                    );
                                     let _ = events.send(ScreenShareEvent::Error(
                                         "O worker do decodificador H.264 foi encerrado.".to_owned(),
                                     ));
@@ -1914,6 +2088,11 @@ impl PeerEvents {
                             }
                         }
                         Err(error) => {
+                            metrics.trace_frame_assembly(
+                                inbound_ssrc,
+                                rtp_timestamp,
+                                Err(error.clone()),
+                            );
                             metrics.record_assembly_error(error);
                             if !awaiting_sequence_recovery {
                                 begin_stream_resync(

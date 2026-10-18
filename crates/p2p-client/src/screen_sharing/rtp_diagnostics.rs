@@ -82,12 +82,12 @@ impl sansio::Protocol<TaggedPacket, TaggedPacket, ()> for RtpWireDiagnostics {
     }
     fn handle_write(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
         if let InterceptorPacket::Rtp(packet) = &message.message.packet {
-            match self.observe_at(
+            let retransmission = match self.observe_at(
                 packet.header.ssrc,
                 packet.header.sequence_number,
                 message.now,
             ) {
-                OutboundRtpDecision::Initial => {}
+                OutboundRtpDecision::Initial => false,
                 OutboundRtpDecision::Retransmit => {
                     if let Some(metrics) = &self.metrics {
                         let count = metrics
@@ -104,6 +104,7 @@ impl sansio::Protocol<TaggedPacket, TaggedPacket, ()> for RtpWireDiagnostics {
                             );
                         }
                     }
+                    true
                 }
                 OutboundRtpDecision::SuppressDuplicateRetransmit => {
                     self.suppressed_repeats = self.suppressed_repeats.saturating_add(1);
@@ -119,6 +120,9 @@ impl sansio::Protocol<TaggedPacket, TaggedPacket, ()> for RtpWireDiagnostics {
                     }
                     return Ok(());
                 }
+            };
+            if let Some(metrics) = &self.metrics {
+                metrics.trace_outbound_rtp_packet(packet, retransmission);
             }
         }
         self.write_queue.push_back(message);

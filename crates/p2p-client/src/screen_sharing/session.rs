@@ -1916,6 +1916,7 @@ async fn create_sender(
         }],
     };
     let ssrc = unique_ssrc();
+    metrics.set_outbound_video_ssrc(ssrc);
     let track = Arc::new(
         TrackLocalStaticSample::new(
             Instant::now(),
@@ -2062,7 +2063,35 @@ async fn create_sender(
             "Faixa RTP de vídeo local identificada"
         );
         let mut sample_rx = sample_rx;
-        while let Some(encoded_frame) = sample_rx.recv().await {
+        let mut trace_watchdog = tokio::time::interval(Duration::from_millis(250));
+        trace_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let encoded_frame = tokio::select! {
+                frame = sample_rx.recv() => match frame {
+                    Some(frame) => frame,
+                    None => break,
+                },
+                _ = trace_watchdog.tick() => {
+                    if writer_metrics.p2p_connected.load(Ordering::Relaxed)
+                        && let Some(trace) = writer_metrics.take_outbound_video_stall_trace(Instant::now())
+                    {
+                        tracing::warn!(
+                            screen_share_session = writer_metrics.session_id,
+                            track_ssrc = ssrc,
+                            stage = "video_frame_trace_stall",
+                            trigger = trace.trigger,
+                            silence_ms = trace.silence_millis,
+                            correlation_key = "SSRC + RTP timestamp",
+                            outbound_observation = "custom RTP interceptor before network transport",
+                            sample_write_observation = "TrackLocalStaticSample::write_sample result",
+                            sent_frames_total = writer_metrics.sent_frames.load(Ordering::Relaxed),
+                            frames_json = %trace.frames_json,
+                            "Janela recente de envio de quadros capturada após pausa RTP"
+                        );
+                    }
+                    continue;
+                }
+            };
             if !writer_metrics.p2p_connected.load(Ordering::Relaxed) {
                 continue;
             }
@@ -2074,10 +2103,13 @@ async fn create_sender(
                 ..Sample::new(Instant::now())
             };
             let write_started_at = Instant::now();
+            let frame_trace_sample_id = writer_metrics.begin_outbound_frame_trace_sample();
             let write_result = writer_track
                 .sample_writer(ssrc, VIDEO_PAYLOAD_TYPE)
                 .write_sample(&sample)
                 .await;
+            writer_metrics
+                .finish_outbound_frame_trace_sample(frame_trace_sample_id, write_result.is_ok());
             writer_metrics.interval_write_sample_nanos.fetch_add(
                 write_started_at.elapsed().as_nanos() as u64,
                 Ordering::Relaxed,

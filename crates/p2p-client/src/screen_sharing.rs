@@ -66,6 +66,8 @@ use crate::turn_relay::TurnCredentials;
 
 #[path = "screen_sharing/adaptive_quality.rs"]
 mod adaptive_quality;
+#[path = "screen_sharing/frame_trace.rs"]
+mod frame_trace;
 #[path = "screen_sharing/h264.rs"]
 mod h264;
 #[path = "screen_sharing/metrics.rs"]
@@ -200,6 +202,10 @@ struct SharedMetrics {
     video_performance: Arc<crate::video_performance::VideoPerformance>,
     session_id: u64,
     track_ssrc: AtomicU64,
+    outbound_video_ssrc: AtomicU64,
+    next_frame_trace_sample_id: AtomicU64,
+    active_frame_trace_sample_id: AtomicU64,
+    frame_trace: Mutex<frame_trace::FrameTraceBuffer>,
     remote_video_track_seen: AtomicBool,
     p2p_connected: AtomicBool,
     route: AtomicU64,
