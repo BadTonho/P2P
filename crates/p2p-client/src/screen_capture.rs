@@ -871,6 +871,27 @@ impl FrameRateLimiter {
     }
 }
 
+const LOCAL_PREVIEW_FRAME_INTERVAL: Duration = Duration::from_millis(66);
+
+#[derive(Default)]
+struct LocalPreviewLimiter {
+    next_deadline: Option<Instant>,
+}
+
+impl LocalPreviewLimiter {
+    fn should_update(&mut self, enabled: bool, now: Instant) -> bool {
+        if !enabled {
+            self.next_deadline = None;
+            return false;
+        }
+        if self.next_deadline.is_some_and(|deadline| now < deadline) {
+            return false;
+        }
+        self.next_deadline = Some(now + LOCAL_PREVIEW_FRAME_INTERVAL);
+        true
+    }
+}
+
 impl Default for FrameRateLimiter {
     fn default() -> Self {
         Self::new(ScreenShareQuality::default())
@@ -950,8 +971,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        FrameRateLimiter, MonitorOption, PreviewFrame, border_setting_for_access,
-        cursor_setting_for_support, same_preview_pixels, scaled_dimensions,
+        FrameRateLimiter, LocalPreviewLimiter, MonitorOption, PreviewFrame,
+        border_setting_for_access, cursor_setting_for_support, same_preview_pixels,
+        scaled_dimensions,
     };
     use crate::screen_quality::{ScreenShareFrameRate, ScreenShareQuality, ScreenShareResolution};
     use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
@@ -1075,6 +1097,17 @@ mod tests {
             (178..=180).contains(&accepted_60),
             "accepted {accepted_60} frames at 60 FPS"
         );
+    }
+
+    #[test]
+    fn local_preview_is_throttled_independently_and_resumes_immediately() {
+        let start = Instant::now();
+        let mut limiter = LocalPreviewLimiter::default();
+        assert!(limiter.should_update(true, start));
+        assert!(!limiter.should_update(true, start + Duration::from_millis(16)));
+        assert!(limiter.should_update(true, start + Duration::from_millis(66)));
+        assert!(!limiter.should_update(false, start + Duration::from_millis(70)));
+        assert!(limiter.should_update(true, start + Duration::from_millis(71)));
     }
 
     #[test]

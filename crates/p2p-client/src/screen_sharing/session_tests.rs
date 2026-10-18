@@ -1646,6 +1646,7 @@ impl Drop for LiveCaptureStimulus {
 fn run_live_capture_diagnostic_scenario(
     quality: ScreenShareQuality,
     monitor_device_id: &str,
+    preview_enabled: bool,
 ) -> serde_json::Value {
     use crate::screen_capture::ScreenCapture;
 
@@ -1655,7 +1656,7 @@ fn run_live_capture_diagnostic_scenario(
     let mut capture = match ScreenCapture::start_monitor(
         monitor_device_id,
         context.clone(),
-        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(preview_enabled)),
         quality,
     ) {
         Ok(capture) => capture,
@@ -1676,8 +1677,16 @@ fn run_live_capture_diagnostic_scenario(
         let error = capture
             .fallback_reason()
             .unwrap_or_else(|| "DXGI não publicou um quadro inicial".to_owned());
+        let performance = capture.take_performance_snapshot();
+        let counters = serde_json::json!({
+            "received_frames": performance.received_frames,
+            "processed_frames": performance.processed_frames,
+            "unchanged_frames": performance.unchanged_frames,
+            "skipped_frames": performance.skipped_frames,
+            "gpu_convert_total_ms": performance.gpu_convert_nanos as f64 / 1_000_000.0,
+        });
         let _ = capture.stop();
-        return serde_json::json!({"quality": quality, "status": "capture_timeout", "error": error});
+        return serde_json::json!({"quality": quality, "local_preview_enabled": preview_enabled, "status": "capture_timeout", "error": error, "capture": counters});
     };
     let input_gpu = first_frame.gpu_nv12.is_some();
     let input_cpu_nv12 = first_frame.cpu_nv12.is_some();
@@ -1772,6 +1781,7 @@ fn run_live_capture_diagnostic_scenario(
     let report = serde_json::json!({
         "scenario": {
             "quality": format!("{}{}", quality.resolution.label(), quality.frames_per_second()),
+            "local_preview_enabled": preview_enabled,
             "status": if connected_at.is_none() { "connection_timeout" } else if gpu_valid { "ok_live_capture_gpu" } else { "gpu_fallback_or_unverified" },
             "measurement_seconds": seconds,
             "capture_backend": capture.backend_name(),
@@ -1819,7 +1829,7 @@ fn screen_share_live_capture_loopback_diagnostic() {
         Ok(stimulus) => (Some(stimulus), "visible_motion_window_started".to_owned()),
         Err(error) => (None, format!("stimulus_unavailable: {error}")),
     };
-    let profiles = [
+    let all_profiles = [
         ScreenShareQuality::default(),
         ScreenShareQuality {
             resolution: ScreenShareResolution::P720,
@@ -1834,6 +1844,22 @@ fn screen_share_live_capture_loopback_diagnostic() {
             frame_rate: ScreenShareFrameRate::Fps60,
         },
     ];
+    let profiles = if std::env::var_os("P2P_SCREEN_DIAGNOSTIC_SMOKE").is_some() {
+        vec![ScreenShareQuality::default()]
+    } else {
+        all_profiles.to_vec()
+    };
+    let quality_profile_labels: Vec<_> = profiles
+        .iter()
+        .map(|quality| {
+            format!(
+                "{}p{}",
+                quality.resolution.label(),
+                quality.frames_per_second()
+            )
+        })
+        .collect();
+    let smoke_mode = profiles.len() == 1;
     let setup = match ScreenCapture::monitors() {
         Ok(monitors) => match monitors
             .iter()
@@ -1843,7 +1869,8 @@ fn screen_share_live_capture_loopback_diagnostic() {
             Some(monitor) => serde_json::json!({
                 "monitor_dimensions": [monitor.width, monitor.height],
                 "scenarios": profiles.into_iter()
-                    .map(|quality| run_live_capture_diagnostic_scenario(quality, &monitor.device_id))
+                    .flat_map(|quality| [true, false].into_iter().map(move |preview_enabled| (quality, preview_enabled)))
+                    .map(|(quality, preview_enabled)| run_live_capture_diagnostic_scenario(quality, &monitor.device_id, preview_enabled))
                     .collect::<Vec<_>>(),
             }),
             None => {
@@ -1860,7 +1887,9 @@ fn screen_share_live_capture_loopback_diagnostic() {
         "transport": "two_local_webrtc_peers_over_loopback",
         "visual_stimulus": stimulus_status,
         "measurement_seconds_per_scenario": 10,
-        "quality_profiles": ["720p30", "720p60", "1080p30", "1080p60"],
+        "local_preview_modes": ["enabled", "disabled"],
+        "smoke_mode": smoke_mode,
+        "quality_profiles": quality_profile_labels,
         "setup": setup,
         "privacy": "pixels are streamed only to the local loopback peer and are not stored in this report",
         "limitations": [

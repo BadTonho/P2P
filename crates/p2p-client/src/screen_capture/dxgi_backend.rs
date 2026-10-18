@@ -88,7 +88,6 @@ struct DxgiCursorState {
     visible: bool,
     shape: Option<DxgiCursorShape>,
     shape_error_logged: bool,
-    cpu_fallback_logged: bool,
 }
 
 impl DxgiCursorState {
@@ -493,10 +492,10 @@ pub(super) fn capture_dxgi_monitor(
     };
     let mut sequence = 0u64;
     let mut limiter = FrameRateLimiter::new(quality);
+    let mut local_preview_limiter = LocalPreviewLimiter::default();
     let mut scratch = Vec::new();
     let mut gpu_processor: Option<(crate::mf_video::GpuNv12Processor, (u32, u32, u32, u32))> = None;
     let mut gpu_processor_attempted: Option<(u32, u32, u32, u32)> = None;
-    let mut gpu_fallback_logged = false;
     let mut gpu_preview_fallback_logged = false;
     let mut staging_texture = None;
     let mut cursor_gpu_canvas = None;
@@ -550,9 +549,17 @@ pub(super) fn capture_dxgi_monitor(
             }
             Err(error) => return Err(format!("Falha ao capturar monitor via DXGI: {error}")),
         };
+        let frame_info = *frame.frame_info();
         cursor.update(&frame);
         let compose_cursor = cursor.needs_cpu_composition();
         performance.received_frames.fetch_add(1, Ordering::Relaxed);
+        // Desktop Duplication can return a frame at the monitor refresh rate
+        // even when neither desktop pixels nor cursor changed. Avoid GPU
+        // conversion, texture allocation, readback, and encoding in that case.
+        if sequence != 0 && frame_info.LastPresentTime == 0 && frame_info.LastMouseUpdateTime == 0 {
+            performance.unchanged_frames.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         if !limiter.should_process(Instant::now()) {
             performance.skipped_frames.fetch_add(1, Ordering::Relaxed);
             continue;
@@ -584,18 +591,17 @@ pub(super) fn capture_dxgi_monitor(
                         "Conversor DXGI GPU para NV12 ativado"
                     );
                     gpu_processor = Some((processor, dimensions));
-                    gpu_fallback_logged = false;
                     *fallback_reason
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 }
                 Err(error) => {
-                    tracing::warn!(error = %error, "Conversão DXGI para NV12 na GPU indisponível; encoder usará o caminho atual por CPU");
-                    gpu_processor = None;
-                    gpu_fallback_logged = true;
                     *fallback_reason
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.clone());
+                    return Err(format!(
+                        "Inicialização do conversor DXGI/NV12 na GPU falhou; fallback por CPU está desativado: {error}"
+                    ));
                 }
             }
         }
@@ -626,26 +632,26 @@ pub(super) fn capture_dxgi_monitor(
         let gpu_surface = match gpu_result {
             Some(Ok(surface)) => Some(Arc::new(surface)),
             Some(Err(error)) => {
-                if compose_cursor && !cursor.cpu_fallback_logged {
+                if compose_cursor {
                     tracing::warn!(
                         error = %error,
-                        "O DXGI informou um cursor separado e a composição GPU falhou; usando composição de cursor no caminho de captura CPU"
+                        "A composição GPU do cursor falhou; a captura GPU será interrompida"
                     );
-                    cursor.cpu_fallback_logged = true;
-                } else if !gpu_fallback_logged {
-                    tracing::warn!(error = %error, "Falha no processamento GPU do quadro DXGI; voltando ao caminho de CPU");
-                    gpu_fallback_logged = true;
+                } else {
+                    tracing::warn!(error = %error, "O processamento GPU do quadro DXGI falhou; a captura será interrompida");
                 }
-                gpu_processor = None;
                 *fallback_reason
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
-                None
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.clone());
+                return Err(format!(
+                    "Conversão DXGI/NV12 na GPU falhou; fallback de captura por CPU está desativado: {error}"
+                ));
             }
             None => None,
         };
         let next_sequence = sequence.wrapping_add(1);
-        let wants_preview = preview_enabled.load(Ordering::Relaxed);
+        let wants_preview = local_preview_limiter
+            .should_update(preview_enabled.load(Ordering::Relaxed), Instant::now());
         let mut readback_nanos = 0;
         let mut resize_nanos = 0;
         let (preview_rgba, cpu_nv12) = if let Some(surface) = gpu_surface.as_ref() {

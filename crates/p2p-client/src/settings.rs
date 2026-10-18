@@ -37,8 +37,8 @@ pub enum NetworkSelection {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoDecoderPreference {
-    #[default]
     Automatic,
+    #[default]
     PreferDxva,
     Cpu,
 }
@@ -196,9 +196,9 @@ impl Default for AppSettings {
             control_ipv4: None,
             network_selection: NetworkSelection::Automatic,
             announce_local_room: default_announce_local_room(),
-            video_decoder_preference: VideoDecoderPreference::Automatic,
+            video_decoder_preference: VideoDecoderPreference::PreferDxva,
             screen_share_quality: ScreenShareQuality::default(),
-            show_local_preview: true,
+            show_local_preview: false,
             include_system_audio: false,
             exclude_self_audio: default_exclude_self_audio(),
             excluded_audio_applications: Vec::new(),
@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_without_decoder_preference_default_to_automatic() {
+    fn settings_without_decoder_preference_default_to_dxva() {
         let mut stored =
             serde_json::to_value(AppSettings::default()).expect("settings should serialize");
         stored
@@ -546,7 +546,7 @@ mod tests {
             serde_json::from_value(stored).expect("older settings files should remain compatible");
         assert_eq!(
             loaded.video_decoder_preference,
-            VideoDecoderPreference::Automatic
+            VideoDecoderPreference::PreferDxva
         );
     }
 
@@ -635,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn older_settings_default_local_preview_to_enabled() {
+    fn older_settings_default_local_preview_to_disabled_for_stream_performance() {
         let mut stored =
             serde_json::to_value(AppSettings::default()).expect("settings should serialize");
         stored
@@ -645,7 +645,7 @@ mod tests {
 
         let loaded: AppSettings =
             serde_json::from_value(stored).expect("older settings files should remain compatible");
-        assert!(loaded.show_local_preview);
+        assert!(!loaded.show_local_preview);
     }
 
     #[test]

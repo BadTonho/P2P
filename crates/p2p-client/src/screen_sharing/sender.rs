@@ -567,24 +567,9 @@ pub(super) fn encode_latest_frames(
                         active_profile.frames_per_second(),
                     ) {
                         Ok(hardware) => Ok((hardware, true, None)),
-                        Err(gpu_error) => mf_video::HardwareEncoder::new_with_bitrate_and_frame_rate(
-                            frame.width,
-                            frame.height,
-                            active_bitrate_bps,
-                            active_profile.frames_per_second(),
-                        )
-                            .map(|hardware| {
-                                (
-                                    hardware,
-                                    false,
-                                    Some(format!("Entrada por superfície D3D11 indisponível: {gpu_error}")),
-                                )
-                            })
-                            .map_err(|cpu_error| {
-                                format!(
-                                    "Superfície D3D11: {gpu_error}; entrada do Media Foundation pela CPU: {cpu_error}"
-                                )
-                            }),
+                        Err(gpu_error) => Err(format!(
+                            "GPU/D3D11 encoder unavailable; CPU fallback disabled: {gpu_error}"
+                        )),
                     }
                 } else {
                     mf_video::HardwareEncoder::new_with_bitrate_and_frame_rate(
@@ -613,6 +598,15 @@ pub(super) fn encode_latest_frames(
                     Err(error) => {
                         let reason =
                             format!("Media Foundation H.264 de hardware indisponível: {error}");
+                        if frame.gpu_nv12.is_some() {
+                            metrics.set_encoder_backend(
+                                "GPU unavailable — transmission stopped".to_owned(),
+                                Some(reason.clone()),
+                            );
+                            return Err(format!(
+                                "GPU capture is active but hardware encoding failed; CPU fallback disabled: {reason}"
+                            ));
+                        }
                         tracing::warn!(fallback_reason = %reason, "Usando codificador H.264 OpenH264 na CPU");
                         metrics.set_encoder_backend("CPU — OpenH264".to_owned(), Some(reason));
                         encoder = Some(ActiveH264Encoder::OpenH264(Box::new(
