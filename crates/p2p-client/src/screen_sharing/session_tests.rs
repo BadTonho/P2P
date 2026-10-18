@@ -348,6 +348,285 @@ fn test_frame(sequence: u64, value: u8) -> PreviewFrame {
     }
 }
 
+fn diagnostic_base_frame() -> Vec<u8> {
+    let mut rgba = vec![0; 1280 * 720 * 4];
+    for y in 0..720_usize {
+        for x in 0..1280_usize {
+            let value = if (x / 16 + y / 16).is_multiple_of(2) {
+                72
+            } else {
+                176
+            };
+            let offset = (y * 1280 + x) * 4;
+            rgba[offset..offset + 4].copy_from_slice(&[value, value, value, 255]);
+        }
+    }
+    rgba
+}
+
+fn diagnostic_frame(sequence: u64, base: &[u8]) -> PreviewFrame {
+    let mut rgba = base.to_vec();
+    let block_x = (sequence as usize * 37) % (1280 - 160);
+    let block_y = (sequence as usize * 19) % (720 - 96);
+    for y in block_y..block_y + 96 {
+        for x in block_x..block_x + 160 {
+            let offset = (y * 1280 + x) * 4;
+            rgba[offset..offset + 4].copy_from_slice(&[32, 160, 240, 255]);
+        }
+    }
+    PreviewFrame {
+        sequence,
+        width: 1280,
+        height: 720,
+        rgba,
+        #[cfg(windows)]
+        gpu_nv12: None,
+        #[cfg(windows)]
+        cpu_nv12: None,
+    }
+}
+
+fn pump_diagnostic_signals(
+    from: &ScreenShareSession,
+    to: &ScreenShareSession,
+    label: &str,
+    errors: &mut Vec<String>,
+) {
+    for event in std::iter::from_fn(|| from.try_recv()) {
+        match event {
+            ScreenShareEvent::Signal { kind, payload } => {
+                if let Err(error) = to.handle_signal(kind, payload) {
+                    errors.push(format!("{label} signal: {error}"));
+                }
+            }
+            ScreenShareEvent::Error(error) => errors.push(format!("{label}: {error}")),
+            ScreenShareEvent::AudioError(error) => {
+                errors.push(format!("{label} audio: {error}"));
+            }
+            ScreenShareEvent::ConnectionClosed => {
+                errors.push(format!("{label}: connection closed"));
+            }
+            ScreenShareEvent::State(_) | ScreenShareEvent::AudioState(_) => {}
+        }
+    }
+}
+
+fn diagnostic_peer_json(
+    role: &str,
+    metrics: ScreenShareMetrics,
+    performance: ScreenSharePerformanceSnapshot,
+    duration_seconds: f64,
+) -> serde_json::Value {
+    let fps = |frames: u64| {
+        if duration_seconds > 0.0 {
+            frames as f64 / duration_seconds
+        } else {
+            0.0
+        }
+    };
+    serde_json::json!({
+        "role": role,
+        "connected": metrics.p2p_connected,
+        "route": match metrics.route {
+            Some(MediaRoute::Direct) => "direct_loopback",
+            Some(MediaRoute::Turn) => "relay",
+            None => "unknown",
+        },
+        "backend": if role == "sender" {
+            metrics.encoder_backend
+        } else {
+            metrics.decoder_backend
+        },
+        "decoder_preference": metrics.decoder_preference,
+        "fps": {
+            "encoded": fps(performance.encoded_frames),
+            "sent": fps(performance.sent_frames),
+            "decoded": fps(performance.decoded_frames),
+            "published": fps(performance.published_frames),
+        },
+        "frames": {
+            "new_capture": performance.new_capture_frames,
+            "repeated_capture": performance.repeated_capture_frames,
+            "encoder_worker_late": performance.encoder_worker_late_frames,
+            "skipped_capture_sequences": performance.skipped_capture_sequences,
+            "encoder_input": performance.encoder_input_frames,
+            "encoded": performance.encoded_frames,
+            "sent": performance.sent_frames,
+            "sent_idr": performance.sent_idr_frames,
+            "sent_delta": performance.sent_delta_frames,
+            "assembled_access_units": performance.assembled_access_units,
+            "decoder_input": performance.decoder_input_frames,
+            "decoder_no_output": performance.decoder_no_output_frames,
+            "decoded": performance.decoded_frames,
+            "published": performance.published_frames,
+            "ui_texture_updates": performance.ui_texture_updates,
+        },
+        "rtp": {
+            "packets": if role == "sender" {
+                performance.outbound_rtp_packets
+            } else {
+                performance.inbound_rtp_packets
+            },
+            "bytes": if role == "sender" {
+                performance.outbound_rtp_bytes
+            } else {
+                performance.inbound_rtp_bytes
+            },
+            "observed_sequence_gaps": performance.observed_sequence_gaps,
+            "recovered_reordered_packets": performance.recovered_reordered_packets,
+            "unmatched_out_of_order_packets": performance.unmatched_out_of_order_packets,
+            "duplicates": performance.duplicate_packets,
+            "confirmed_missing_packets": performance.confirmed_missing_packets,
+            "late_after_confirmed_packets": performance.late_after_confirmed_packets,
+            "sequence_gap_resyncs": performance.sequence_gap_resyncs,
+            "nack_sent": performance.nack_packets_sent,
+            "nack_received": performance.nack_packets_received,
+            "nack_received_observed": performance.nack_packets_received_observed,
+            "pli_sent": performance.pli_requests_sent,
+            "pli_received": performance.pli_requests_received,
+            "retransmitted_packets_sent": performance.retransmitted_packets_sent,
+            "retransmitted_packets_received": performance.retransmitted_packets_received,
+        },
+        "h264_decoder": {
+            "assembly_errors": performance.assembly_errors,
+            "decode_errors": performance.decode_errors,
+            "decoder_queue_drops": performance.decoder_queue_drops,
+            "decoder_queue_accepted": performance.decoder_queue_accepted,
+            "dropped_waiting_for_idr": performance.dropped_recovery_gate_waiting_for_idr,
+        },
+        "timings": performance.video_performance.diagnostic_json(),
+    })
+}
+
+fn run_loopback_diagnostic_scenario(loss_percent: u8, base_frame: &[u8]) -> serde_json::Value {
+    const MEASURE_FOR: Duration = Duration::from_secs(10);
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+    let context = egui::Context::default();
+    let sender = ScreenShareSession::new_loopback(context.clone()).unwrap();
+    let receiver = ScreenShareSession::new_loopback(context).unwrap();
+    sender.set_outbound_rtp_loss_percent_for_test(loss_percent);
+
+    let source = LatestFrame::default();
+    source.publish(diagnostic_frame(1, base_frame));
+    let quality = ScreenShareQuality::default();
+    sender
+        .start_sending_with_quality_and_options_and_exclusion(
+            source.clone(),
+            quality,
+            quality.individual_bitrate_bps(),
+            false,
+            AudioExclusionConfig::default(),
+        )
+        .unwrap();
+
+    let mut errors = Vec::new();
+    let connect_deadline = Instant::now() + CONNECT_TIMEOUT;
+    let mut connected_at = None;
+    while Instant::now() < connect_deadline {
+        pump_diagnostic_signals(&sender, &receiver, "sender", &mut errors);
+        pump_diagnostic_signals(&receiver, &sender, "receiver", &mut errors);
+        if sender.metrics().p2p_connected && receiver.metrics().p2p_connected {
+            connected_at = Some(Instant::now());
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let (duration, source_stats) = if let Some(started_at) = connected_at {
+        // Clear connection and startup measurements so the report covers only the fixed window.
+        sender.take_performance_snapshot();
+        receiver.take_performance_snapshot();
+        let deadline = started_at + MEASURE_FOR;
+        let source_worker = source.clone();
+        let source_base = base_frame.to_vec();
+        let producer = thread::spawn(move || {
+            let mut sequence = 1_u64;
+            let mut published_frames = 0_u64;
+            let mut build_total_nanos = 0_u64;
+            let mut build_max_nanos = 0_u64;
+            let mut next_frame = Instant::now();
+            while Instant::now() < deadline {
+                let now = Instant::now();
+                if now < next_frame {
+                    thread::sleep(next_frame.saturating_duration_since(now));
+                    continue;
+                }
+                sequence = sequence.saturating_add(1);
+                let build_started_at = Instant::now();
+                source_worker.publish(diagnostic_frame(sequence, &source_base));
+                let build_nanos = build_started_at
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64;
+                published_frames = published_frames.saturating_add(1);
+                build_total_nanos = build_total_nanos.saturating_add(build_nanos);
+                build_max_nanos = build_max_nanos.max(build_nanos);
+                next_frame += FRAME_DURATION;
+                let now = Instant::now();
+                while next_frame <= now {
+                    next_frame += FRAME_DURATION;
+                }
+            }
+            (published_frames, build_total_nanos, build_max_nanos)
+        });
+        while Instant::now() < deadline {
+            pump_diagnostic_signals(&sender, &receiver, "sender", &mut errors);
+            pump_diagnostic_signals(&receiver, &sender, "receiver", &mut errors);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let source_stats = producer.join().unwrap();
+        (started_at.elapsed().min(MEASURE_FOR), source_stats)
+    } else {
+        errors.push("loopback connection timed out".to_owned());
+        (Duration::ZERO, (0, 0, 0))
+    };
+
+    pump_diagnostic_signals(&sender, &receiver, "sender", &mut errors);
+    pump_diagnostic_signals(&receiver, &sender, "receiver", &mut errors);
+    let sender_performance = sender.take_performance_snapshot();
+    let receiver_performance = receiver.take_performance_snapshot();
+    let sender_metrics = sender.metrics();
+    let receiver_metrics = receiver.metrics();
+    let packet_count = sender
+        .metrics
+        .test_outbound_rtp_seen
+        .load(Ordering::Relaxed);
+    let dropped_packet_count = sender
+        .metrics
+        .test_dropped_outbound_rtp
+        .load(Ordering::Relaxed);
+    let duration_seconds = duration.as_secs_f64();
+    let (source_frames, source_build_total_nanos, source_build_max_nanos) = source_stats;
+    let status = if connected_at.is_some() {
+        "connected"
+    } else {
+        "connection_timeout"
+    };
+    let result = serde_json::json!({
+        "scenario": {
+            "rtp_loss_percent": loss_percent,
+            "status": status,
+            "measurement_seconds": duration_seconds,
+            "injected_rtp_packets_seen": packet_count,
+            "injected_rtp_packets_dropped": dropped_packet_count,
+        },
+        "synthetic_source": {
+            "frames_published": source_frames,
+            "fps": if duration_seconds > 0.0 { source_frames as f64 / duration_seconds } else { 0.0 },
+            "frame_build_total_ms": source_build_total_nanos as f64 / 1_000_000.0,
+            "frame_build_mean_ms": if source_frames > 0 { source_build_total_nanos as f64 / source_frames as f64 / 1_000_000.0 } else { 0.0 },
+            "frame_build_max_ms": source_build_max_nanos as f64 / 1_000_000.0,
+        },
+        "sender": diagnostic_peer_json("sender", sender_metrics, sender_performance, duration_seconds),
+        "receiver": diagnostic_peer_json("receiver", receiver_metrics, receiver_performance, duration_seconds),
+        "errors": errors,
+    });
+    receiver.stop();
+    sender.stop();
+    result
+}
+
 #[test]
 fn regression_dropping_screen_session_releases_its_worker_socket() {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1077,6 +1356,60 @@ fn loopback_controlled_rtp_loss_correlates_nack_and_retransmits_the_missing_pack
     // assume the negotiated retransmission behavior.
     assert!(sender_metrics.retransmitted_packets_sent.is_some());
     assert!(receiver_metrics.retransmitted_packets_received.is_some());
+}
+
+#[test]
+fn deterministic_rtp_loss_injector_matches_configured_percentages() {
+    for loss_percent in [0, 1, 4, 8, 100, u8::MAX] {
+        let expected = u64::from(loss_percent.min(100));
+        let dropped = (1..=100)
+            .filter(|packet_index| deterministic_rtp_loss_at(*packet_index, loss_percent))
+            .count() as u64;
+        assert_eq!(dropped, expected, "loss rate {loss_percent}%");
+    }
+    assert!(!deterministic_rtp_loss_at(0, 100));
+}
+
+#[test]
+#[ignore = "diagnóstico manual: executa quatro janelas WebRTC de 10 segundos e grava JSON em target/diagnostics"]
+fn screen_share_loopback_diagnostic() {
+    let created_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let base_frame = diagnostic_base_frame();
+    let scenarios = [0_u8, 1, 4, 8]
+        .into_iter()
+        .map(|loss_percent| run_loopback_diagnostic_scenario(loss_percent, &base_frame))
+        .collect::<Vec<_>>();
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "created_at_unix_ms": created_at_unix_ms,
+        "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "source": "synthetic_1280x720_rgba_30fps",
+        "measurement_seconds_per_scenario": 10,
+        "scenarios": scenarios,
+        "limitations": [
+            "sender and receiver run on the same machine",
+            "desktop capture WGC/DXGI is not measured",
+            "application UI texture upload and drawing are not measured",
+            "timings are wall-clock call durations and not exclusive GPU execution time",
+        ],
+    });
+    let report_bytes = serde_json::to_vec_pretty(&report).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&report_bytes).unwrap();
+    assert_eq!(parsed["scenarios"].as_array().unwrap().len(), 4);
+
+    let report_directory =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/diagnostics");
+    std::fs::create_dir_all(&report_directory).unwrap();
+    let report_path = report_directory.join(format!(
+        "screen-share-loopback-{}-{}.json",
+        created_at_unix_ms,
+        std::process::id()
+    ));
+    std::fs::write(&report_path, report_bytes).unwrap();
+    println!("Relatório de diagnóstico: {}", report_path.display());
 }
 
 #[test]

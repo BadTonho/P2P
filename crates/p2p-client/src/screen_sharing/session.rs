@@ -66,6 +66,17 @@ struct TestRtpLossInjector {
     write_queue: VecDeque<TaggedPacket>,
     metrics: Option<Arc<SharedMetrics>>,
     dropped_packet: Option<(u32, u16)>,
+    outbound_rtp_seen: u64,
+}
+
+#[cfg(test)]
+fn deterministic_rtp_loss_at(packet_index: u64, loss_percent: u8) -> bool {
+    if packet_index == 0 || loss_percent == 0 {
+        return false;
+    }
+    let current_drops = u128::from(packet_index) * u128::from(loss_percent.min(100)) / 100;
+    let previous_drops = u128::from(packet_index - 1) * u128::from(loss_percent.min(100)) / 100;
+    current_drops > previous_drops
 }
 
 #[cfg(test)]
@@ -87,6 +98,7 @@ impl sansio::Protocol<TaggedPacket, TaggedPacket, ()> for TestRtpLossInjector {
 
     fn handle_write(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
         if let InterceptorPacket::Rtp(packet) = &message.message.packet {
+            self.outbound_rtp_seen = self.outbound_rtp_seen.saturating_add(1);
             let identity = (packet.header.ssrc, packet.header.sequence_number);
             if self.dropped_packet == Some(identity) {
                 if let Some(metrics) = &self.metrics {
@@ -95,6 +107,25 @@ impl sansio::Protocol<TaggedPacket, TaggedPacket, ()> for TestRtpLossInjector {
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 self.dropped_packet = None;
+            }
+
+            let should_drop_for_rate = self.metrics.as_ref().is_some_and(|metrics| {
+                metrics
+                    .test_outbound_rtp_seen
+                    .fetch_add(1, Ordering::Relaxed);
+                deterministic_rtp_loss_at(
+                    self.outbound_rtp_seen,
+                    metrics.test_rtp_loss_percent.load(Ordering::Relaxed) as u8,
+                )
+            });
+            if should_drop_for_rate {
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .test_dropped_outbound_rtp
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.dropped_packet = Some(identity);
+                return Ok(());
             }
         }
         if matches!(&message.message.packet, InterceptorPacket::Rtp(_))
@@ -664,6 +695,13 @@ impl ScreenShareSession {
         self.metrics
             .test_drop_next_outbound_rtp
             .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn set_outbound_rtp_loss_percent_for_test(&self, loss_percent: u8) {
+        self.metrics
+            .test_rtp_loss_percent
+            .store(u64::from(loss_percent.min(100)), Ordering::Relaxed);
     }
 
     pub fn handle_signal(&self, kind: SignalKind, payload: String) -> Result<(), String> {

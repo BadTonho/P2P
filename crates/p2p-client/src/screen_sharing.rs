@@ -297,6 +297,10 @@ struct SharedMetrics {
     #[cfg(test)]
     test_drop_next_outbound_rtp: AtomicBool,
     #[cfg(test)]
+    test_rtp_loss_percent: AtomicU64,
+    #[cfg(test)]
+    test_outbound_rtp_seen: AtomicU64,
+    #[cfg(test)]
     test_dropped_outbound_rtp: AtomicU64,
     #[cfg(test)]
     test_retransmitted_outbound_rtp: AtomicU64,

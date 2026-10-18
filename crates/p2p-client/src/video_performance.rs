@@ -130,6 +130,40 @@ impl VideoPerformanceSnapshot {
         self.readback_bytes[kind as usize]
     }
 
+    #[cfg(test)]
+    pub(crate) fn diagnostic_json(self) -> serde_json::Value {
+        let timings = STAGES.iter().filter_map(|(stage, name)| {
+            let timing = self.timing(*stage);
+            (timing.samples > 0).then(|| {
+                (
+                    (*name).to_owned(),
+                    serde_json::json!({
+                        "samples": timing.samples,
+                        "mean_ms": timing.mean_ms(),
+                        "max_ms": timing.max_nanos as f64 / 1_000_000.0,
+                        "total_ms": timing.total_nanos as f64 / 1_000_000.0,
+                    }),
+                )
+            })
+        });
+        let paths = PATHS.iter().filter_map(|(path, name)| {
+            let count = self.path_count(*path);
+            (count > 0).then_some((*name, count))
+        });
+        serde_json::json!({
+            "timings": serde_json::Map::from_iter(timings),
+            "frame_paths": serde_json::Map::from_iter(paths.map(|(name, count)| {
+                (name.to_owned(), serde_json::Value::from(count))
+            })),
+            "readback_bytes": {
+                "capture": self.readback_bytes(Readback::Capture),
+                "encoder": self.readback_bytes(Readback::Encoder),
+                "decoder": self.readback_bytes(Readback::Decoder),
+            },
+            "timing_note": "wall-clock call durations; GPU execution time is not measured",
+        })
+    }
+
     pub fn label(&self) -> String {
         let timings = STAGES.iter().filter_map(|(stage, name)| {
             let timing = self.timing(*stage);
