@@ -1490,6 +1490,401 @@ fn screen_share_loopback_diagnostic() {
     println!("Relatório de diagnóstico: {}", report_path.display());
 }
 
+#[cfg(windows)]
+struct LiveCaptureStimulus {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl LiveCaptureStimulus {
+    fn start() -> Result<Self, String> {
+        struct StimulusApp {
+            stop: Arc<AtomicBool>,
+            ready: Option<std_mpsc::SyncSender<()>>,
+            started_at: Instant,
+        }
+
+        impl eframe::App for StimulusApp {
+            fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+                if let Some(ready) = self.ready.take() {
+                    let _ = ready.send(());
+                }
+                let bounds = ui.max_rect();
+                let painter = ui.painter();
+                let elapsed = self.started_at.elapsed().as_secs_f32();
+                let frame_index = (elapsed * 60.0) as usize;
+                let background = (frame_index.wrapping_mul(13) % 128) as u8;
+                painter.rect_filled(
+                    bounds,
+                    0.0,
+                    egui::Color32::from_rgb(
+                        8 + background / 4,
+                        12 + background / 3,
+                        32 + background / 2,
+                    ),
+                );
+                let tile_width = bounds.width() / 8.0;
+                let tile_height = bounds.height() / 4.0;
+                for tile in 0..32_usize {
+                    let column = tile % 8;
+                    let row = tile / 8;
+                    let value = ((tile * 37 + frame_index * 11) % 240) as u8;
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(
+                                bounds.left() + column as f32 * tile_width,
+                                bounds.top() + row as f32 * tile_height,
+                            ),
+                            egui::vec2(tile_width - 2.0, tile_height - 2.0),
+                        ),
+                        0.0,
+                        egui::Color32::from_rgb(value, value.wrapping_mul(3), 255 - value),
+                    );
+                }
+                let band_width = (bounds.width() / 12.0).max(1.0);
+                for index in 0..12 {
+                    let phase = (elapsed * (0.7 + index as f32 * 0.09) + index as f32 * 0.43).sin();
+                    let height = bounds.height() * (0.18 + 0.36 * (phase + 1.0) * 0.5);
+                    let x = bounds.left() + band_width * index as f32;
+                    let hue = ((index * 31 + elapsed as usize * 17) % 255) as u8;
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(x, bounds.bottom() - height),
+                            egui::vec2(band_width - 2.0, height),
+                        ),
+                        0.0,
+                        egui::Color32::from_rgb(hue, 220_u8.saturating_sub(hue / 2), 96),
+                    );
+                }
+                let x = bounds.left() + (elapsed * 170.0) % bounds.width().max(1.0);
+                painter.circle_filled(
+                    egui::pos2(x, bounds.center().y),
+                    44.0,
+                    egui::Color32::from_rgb(255, 240, 80),
+                );
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+                if self.stop.load(Ordering::Relaxed) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+        let (error_tx, error_rx) = std_mpsc::sync_channel(1);
+        let window_thread = thread::Builder::new()
+            .name("screen-share-live-diagnostic-stimulus".to_owned())
+            .spawn(move || {
+                let result = eframe::run_native(
+                    "P2P Screen Share Diagnostic — moving GPU stimulus",
+                    eframe::NativeOptions {
+                        renderer: eframe::Renderer::Glow,
+                        event_loop_builder: Some(Box::new(|builder| {
+                            use winit::platform::windows::EventLoopBuilderExtWindows;
+                            builder.with_any_thread(true);
+                        })),
+                        viewport: egui::ViewportBuilder::default()
+                            .with_inner_size([960.0, 540.0])
+                            .with_position([64.0, 64.0])
+                            .with_resizable(false)
+                            .with_always_on_top(),
+                        ..Default::default()
+                    },
+                    Box::new(move |_| {
+                        Ok(Box::new(StimulusApp {
+                            stop: thread_stop,
+                            ready: Some(ready_tx),
+                            started_at: Instant::now(),
+                        }))
+                    }),
+                );
+                if let Err(error) = result {
+                    let _ = error_tx.send(error.to_string());
+                }
+            })
+            .map_err(|error| format!("could not start moving stimulus window: {error}"))?;
+        match ready_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(()) => Ok(Self {
+                stop,
+                thread: Some(window_thread),
+            }),
+            Err(_) => {
+                let reason = error_rx
+                    .try_recv()
+                    .unwrap_or_else(|_| "stimulus window did not become ready".to_owned());
+                stop.store(true, Ordering::Relaxed);
+                drop(window_thread);
+                Err(reason)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LiveCaptureStimulus {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !thread.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            } else {
+                // The viewport close is processed on the event loop. Don't hang test cleanup
+                // indefinitely if a display driver wedges its window thread.
+                let _ = thread;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_live_capture_diagnostic_scenario(
+    quality: ScreenShareQuality,
+    monitor_device_id: &str,
+) -> serde_json::Value {
+    use crate::screen_capture::ScreenCapture;
+
+    const MEASURE_FOR: Duration = Duration::from_secs(10);
+    const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+    let context = egui::Context::default();
+    let mut capture = match ScreenCapture::start_monitor(
+        monitor_device_id,
+        context.clone(),
+        Arc::new(AtomicBool::new(true)),
+        quality,
+    ) {
+        Ok(capture) => capture,
+        Err(error) => {
+            return serde_json::json!({"quality": quality, "status": "capture_unavailable", "error": error});
+        }
+    };
+    let source = capture.frame_source();
+    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
+    while source.latest().is_none() && Instant::now() < setup_deadline {
+        if let Some(Err(error)) = capture.poll_finished() {
+            let _ = capture.stop();
+            return serde_json::json!({"quality": quality, "status": "capture_failed", "error": error});
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let Some(first_frame) = source.latest() else {
+        let error = capture
+            .fallback_reason()
+            .unwrap_or_else(|| "DXGI não publicou um quadro inicial".to_owned());
+        let _ = capture.stop();
+        return serde_json::json!({"quality": quality, "status": "capture_timeout", "error": error});
+    };
+    let input_gpu = first_frame.gpu_nv12.is_some();
+    let input_cpu_nv12 = first_frame.cpu_nv12.is_some();
+    drop(first_frame);
+    capture.take_performance_snapshot();
+
+    let sender = match ScreenShareSession::new_loopback(context.clone()) {
+        Ok(sender) => sender,
+        Err(error) => {
+            let _ = capture.stop();
+            return serde_json::json!({"quality": quality, "status": "sender_setup_failed", "error": error});
+        }
+    };
+    let receiver = match ScreenShareSession::new_loopback_with_decoder_preference(
+        context,
+        VideoDecoderPreference::PreferDxva,
+    ) {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            sender.stop();
+            let _ = capture.stop();
+            return serde_json::json!({"quality": quality, "status": "receiver_setup_failed", "error": error});
+        }
+    };
+    if let Err(error) = sender.start_sending_with_quality_and_options_and_exclusion(
+        source,
+        quality,
+        quality.individual_bitrate_bps(),
+        false,
+        AudioExclusionConfig::default(),
+    ) {
+        receiver.stop();
+        sender.stop();
+        let _ = capture.stop();
+        return serde_json::json!({"quality": quality, "status": "sender_start_failed", "error": error});
+    }
+
+    let mut errors = Vec::new();
+    let connect_deadline = Instant::now() + SETUP_TIMEOUT;
+    let mut connected_at = None;
+    while Instant::now() < connect_deadline {
+        pump_diagnostic_signals(&sender, &receiver, "sender", &mut errors);
+        pump_diagnostic_signals(&receiver, &sender, "receiver", &mut errors);
+        if sender.metrics().p2p_connected && receiver.metrics().p2p_connected {
+            connected_at = Some(Instant::now());
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let duration = if let Some(started) = connected_at {
+        sender.take_performance_snapshot();
+        receiver.take_performance_snapshot();
+        let deadline = started + MEASURE_FOR;
+        println!(
+            "Perfil {}{}: janela animada de carga na GPU por 10 segundos.",
+            quality.resolution.label(),
+            quality.frames_per_second()
+        );
+        while Instant::now() < deadline {
+            pump_diagnostic_signals(&sender, &receiver, "sender", &mut errors);
+            pump_diagnostic_signals(&receiver, &sender, "receiver", &mut errors);
+            if let Some(Err(error)) = capture.poll_finished() {
+                errors.push(format!("capture: {error}"));
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        started.elapsed().min(MEASURE_FOR)
+    } else {
+        errors.push("loopback connection timed out".to_owned());
+        Duration::ZERO
+    };
+
+    pump_diagnostic_signals(&sender, &receiver, "sender", &mut errors);
+    pump_diagnostic_signals(&receiver, &sender, "receiver", &mut errors);
+    let sender_performance = sender.take_performance_snapshot();
+    let receiver_performance = receiver.take_performance_snapshot();
+    let capture_performance = capture.take_performance_snapshot();
+    let sender_metrics = sender.metrics();
+    let receiver_metrics = receiver.metrics();
+    let capture_gpu = capture_performance
+        .pipeline
+        .path_count(crate::video_performance::FramePath::CaptureGpuNv12);
+    let encoder_gpu = sender_performance
+        .video_performance
+        .path_count(crate::video_performance::FramePath::EncoderGpuSurface);
+    let decoder_gpu = receiver_performance
+        .video_performance
+        .path_count(crate::video_performance::FramePath::DecoderDxva);
+    let gpu_valid = input_gpu && capture_gpu > 0 && encoder_gpu > 0 && decoder_gpu > 0;
+    let seconds = duration.as_secs_f64();
+    let report = serde_json::json!({
+        "scenario": {
+            "quality": format!("{}{}", quality.resolution.label(), quality.frames_per_second()),
+            "status": if connected_at.is_none() { "connection_timeout" } else if gpu_valid { "ok_live_capture_gpu" } else { "gpu_fallback_or_unverified" },
+            "measurement_seconds": seconds,
+            "capture_backend": capture.backend_name(),
+            "capture_fallback_reason": capture.fallback_reason(),
+            "input_gpu_surface": input_gpu,
+            "input_cpu_nv12_copy": input_cpu_nv12,
+            "encoder_backend": sender_metrics.encoder_backend,
+            "encoder_fallback_reason": sender_metrics.encoder_fallback_reason,
+            "decoder_backend": receiver_metrics.decoder_backend,
+            "decoder_fallback_reason": receiver_metrics.decoder_fallback_reason,
+            "gpu_paths": {"capture_nv12": capture_gpu, "encoder_surface": encoder_gpu, "decoder_dxva": decoder_gpu},
+            "hardware_gpu_valid": gpu_valid,
+        },
+        "capture": {
+            "received_frames": capture_performance.received_frames,
+            "processed_frames": capture_performance.processed_frames,
+            "unchanged_frames": capture_performance.unchanged_frames,
+            "skipped_frames": capture_performance.skipped_frames,
+            "gpu_convert_total_ms": capture_performance.gpu_convert_nanos as f64 / 1_000_000.0,
+            "readback_total_ms": capture_performance.readback_nanos as f64 / 1_000_000.0,
+            "resize_total_ms": capture_performance.resize_nanos as f64 / 1_000_000.0,
+            "timings": capture_performance.pipeline.diagnostic_json(),
+        },
+        "sender": diagnostic_peer_json("sender", sender_metrics, sender_performance, seconds),
+        "receiver": diagnostic_peer_json("receiver", receiver_metrics, receiver_performance, seconds),
+        "errors": errors,
+    });
+    receiver.stop();
+    sender.stop();
+    let _ = capture.stop();
+    report
+}
+
+#[test]
+#[cfg(windows)]
+#[ignore = "diagnóstico manual: usa captura real DXGI do monitor principal; abre uma janela animada e captura o monitor real"]
+fn screen_share_live_capture_loopback_diagnostic() {
+    use crate::screen_capture::ScreenCapture;
+
+    let created_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let (stimulus, stimulus_status) = match LiveCaptureStimulus::start() {
+        Ok(stimulus) => (Some(stimulus), "visible_motion_window_started".to_owned()),
+        Err(error) => (None, format!("stimulus_unavailable: {error}")),
+    };
+    let profiles = [
+        ScreenShareQuality::default(),
+        ScreenShareQuality {
+            resolution: ScreenShareResolution::P720,
+            frame_rate: ScreenShareFrameRate::Fps60,
+        },
+        ScreenShareQuality {
+            resolution: ScreenShareResolution::P1080,
+            frame_rate: ScreenShareFrameRate::Fps30,
+        },
+        ScreenShareQuality {
+            resolution: ScreenShareResolution::P1080,
+            frame_rate: ScreenShareFrameRate::Fps60,
+        },
+    ];
+    let setup = match ScreenCapture::monitors() {
+        Ok(monitors) => match monitors
+            .iter()
+            .find(|m| m.is_primary)
+            .or_else(|| monitors.first())
+        {
+            Some(monitor) => serde_json::json!({
+                "monitor_dimensions": [monitor.width, monitor.height],
+                "scenarios": profiles.into_iter()
+                    .map(|quality| run_live_capture_diagnostic_scenario(quality, &monitor.device_id))
+                    .collect::<Vec<_>>(),
+            }),
+            None => {
+                serde_json::json!({"setup_error": "nenhum monitor disponível", "scenarios": []})
+            }
+        },
+        Err(error) => serde_json::json!({"setup_error": error, "scenarios": []}),
+    };
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "created_at_unix_ms": created_at_unix_ms,
+        "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "source": "live_primary_monitor_dxgi_desktop_duplication",
+        "transport": "two_local_webrtc_peers_over_loopback",
+        "visual_stimulus": stimulus_status,
+        "measurement_seconds_per_scenario": 10,
+        "quality_profiles": ["720p30", "720p60", "1080p30", "1080p60"],
+        "setup": setup,
+        "privacy": "pixels are streamed only to the local loopback peer and are not stored in this report",
+        "limitations": [
+            "requires an unlocked interactive Windows desktop and DXGI access",
+            "the animated window supplies visual motion during each measurement",
+            "does not exercise signaling between separate PCs",
+            "GPU utilization and physical display scanout are not measured",
+        ],
+    });
+    let bytes = serde_json::to_vec_pretty(&report).unwrap();
+    let _: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let directory =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/diagnostics");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!(
+        "screen-share-live-capture-{}-{}.json",
+        created_at_unix_ms,
+        std::process::id()
+    ));
+    std::fs::write(&path, bytes).unwrap();
+    println!("Live capture diagnostic: {}", path.display());
+    drop(stimulus);
+}
+
 #[test]
 fn rtp_jitter_ticks_are_converted_to_milliseconds() {
     assert!((rtp_jitter_ticks_to_ms(317.0, 90_000.0) - 3.522_222_2).abs() < 0.001);

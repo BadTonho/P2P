@@ -25,3 +25,5 @@ Antes de preparar uma versão, consulte `ATUALIZACOES.md`. Não publique nem cri
 - Mantenha os testes determinísticos e independentes de dispositivos físicos sempre que possível. Para áudio, vídeo, rede ou hardware, use fontes e sinks sintéticos, mocks ou loopback; não declare validado um caminho de ponta a ponta que esses testes não exercitam.
 - Se a plataforma, o dispositivo ou a rede real não puderem ser reproduzidos automaticamente, registre essa limitação e diferencie claramente testes unitários, loopback e validação manual. Nunca afirme que testes passaram se não foram executados com sucesso.
 - Ao concluir, informe os comandos executados, o resultado e as lacunas de cobertura relevantes. Mantenha a CI alinhada aos comandos de validação do workspace.
+
+-nunca simplifique só pq é mais facil

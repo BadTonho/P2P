@@ -60,3 +60,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Ole",
     "Win32_System_Variant",
 ] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+winit = "0.30.13"
