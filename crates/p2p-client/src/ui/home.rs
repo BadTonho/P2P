@@ -732,15 +732,9 @@ impl ClientUi {
                             && self.saved_hosts.len() < MAX_SAVED_HOSTS
                             && ui.small_button("+ Salvar anfitrião").clicked()
                         {
-                            let room_code = if self.join_code.trim().is_empty() {
-                                None
-                            } else {
-                                Some(sanitize_room_code(&self.join_code))
-                            };
                             self.saved_hosts.push(SavedHostProfile {
                                 name: format!("Anfitrião {}", self.saved_hosts.len() + 1),
                                 address: self.server_url.trim().to_owned(),
-                                room_code,
                             });
                             self.selected_host_index = Some(self.saved_hosts.len() - 1);
                         }

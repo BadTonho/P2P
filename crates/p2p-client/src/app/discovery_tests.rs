@@ -205,7 +205,6 @@ async fn discovery_loopback_selection_joins_existing_signaling_and_never_changes
     app.saved_hosts = vec![SavedHostProfile {
         name: "Saved".to_owned(),
         address: "192.168.1.11".to_owned(),
-        room_code: None,
     }];
     app.selected_host_index = Some(0);
     let preferences_before = app.preferences_snapshot();

@@ -2791,7 +2791,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_address: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
         let (server_stream, _address) = listener.accept().await.unwrap();

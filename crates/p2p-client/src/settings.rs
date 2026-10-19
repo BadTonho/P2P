@@ -22,8 +22,6 @@ fn legacy_public_server_url() -> Option<String> {
 pub struct SavedHostProfile {
     pub name: String,
     pub address: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub room_code: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,8 +117,6 @@ pub struct AppSettings {
     pub use_fixed_room: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_room_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_manual_join_code: Option<String>,
 }
 
 pub const fn default_exclude_self_audio() -> bool {
@@ -210,7 +206,6 @@ impl Default for AppSettings {
             log_errors_file: default_log_errors_file(),
             use_fixed_room: false,
             fixed_room_code: None,
-            last_manual_join_code: None,
         }
     }
 }
@@ -327,7 +322,6 @@ fn load_from(path: &Path) -> (AppSettings, Option<String>) {
         settings.saved_hosts.push(SavedHostProfile {
             name: "Endereço anterior".to_owned(),
             address: settings.server_url.clone(),
-            room_code: None,
         });
         settings.selected_host_index = Some(0);
         migration_warnings.push("O endereço antigo foi criado como primeiro anfitrião salvo.");
@@ -478,7 +472,6 @@ mod tests {
             saved_hosts: vec![SavedHostProfile {
                 name: "Friend".to_owned(),
                 address: "192.168.1.20".to_owned(),
-                room_code: None,
             }],
             selected_host_index: Some(0),
             monitor_gain_db: 12.0,
@@ -792,7 +785,6 @@ mod tests {
             vec![SavedHostProfile {
                 name: "Endereço anterior".to_owned(),
                 address: "friend.example.net".to_owned(),
-                room_code: None,
             }]
         );
         assert_eq!(loaded.selected_host_index, Some(0));
@@ -809,7 +801,6 @@ mod tests {
                 .map(|index| SavedHostProfile {
                     name: format!("Host {index}"),
                     address: "192.168.1.20".to_owned(),
-                    room_code: None,
                 })
                 .collect(),
             ..AppSettings::default()
@@ -819,10 +810,44 @@ mod tests {
     }
 
     #[test]
-    fn settings_do_not_serialize_room_codes_or_turn_credentials() {
-        let serialized =
-            serde_json::to_string(&AppSettings::default()).expect("settings should serialize");
-        assert!(!serialized.contains("room_code"));
+    fn settings_do_not_serialize_transient_room_codes_or_credentials() {
+        let settings = AppSettings {
+            use_fixed_room: true,
+            // A sala fixa é a única exceção documentada: preferência declarada
+            // pelo usuário em Configurações.
+            fixed_room_code: Some("MINHA-SALA-01".to_owned()),
+            saved_hosts: vec![SavedHostProfile {
+                name: "Host Amigo".to_owned(),
+                address: "192.168.1.50".to_owned(),
+            }],
+            ..AppSettings::default()
+        };
+        let serialized = serde_json::to_string(&settings).expect("settings should serialize");
+        let object: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&serialized).expect("settings should serialize as an object");
+
+        // Códigos usados apenas ao entrar (manual e por anfitrião salvo) não
+        // podem existir no arquivo de preferências.
+        assert!(
+            !object.contains_key("last_manual_join_code"),
+            "código da última entrada manual não pode ser gravado"
+        );
+        for host in object
+            .get("saved_hosts")
+            .and_then(|hosts| hosts.as_array())
+            .into_iter()
+            .flatten()
+        {
+            assert!(
+                !host.get("room_code").is_some(),
+                "código da sala de anfitrião salvo não pode ser gravado: {host}"
+            );
+        }
+        // Exceção declarada: a sala fixa escolhida em Configurações persiste.
+        assert_eq!(
+            object.get("fixed_room_code").and_then(|code| code.as_str()),
+            Some("MINHA-SALA-01")
+        );
         assert!(!serialized.contains("turn_credentials"));
         assert!(!serialized.contains("password"));
     }
@@ -835,36 +860,31 @@ mod tests {
         assert!(settings.log_errors_file);
         assert!(!settings.use_fixed_room);
         assert!(settings.fixed_room_code.is_none());
-        assert!(settings.last_manual_join_code.is_none());
     }
 
     #[test]
-    fn settings_round_trip_with_fixed_room_and_saved_host_codes() {
+    fn settings_round_trip_keeps_fixed_room_and_host_address_without_transient_codes() {
         let directory = temporary_directory();
         let path = directory.join(SETTINGS_FILE);
         let settings = AppSettings {
             use_fixed_room: true,
             fixed_room_code: Some("MINHA-SALA-01".to_owned()),
-            last_manual_join_code: Some("MANUAL-123".to_owned()),
             saved_hosts: vec![SavedHostProfile {
                 name: "Host Amigo".to_owned(),
                 address: "192.168.1.50".to_owned(),
-                room_code: Some("SALA-AMIGO".to_owned()),
             }],
             ..AppSettings::default()
         };
 
-        save_to(&path, &settings).expect("settings with room codes should save");
+        save_to(&path, &settings).expect("settings with fixed room should save");
         let (loaded, warning) = load_from(&path);
         assert!(warning.is_none());
         assert_eq!(loaded, settings);
         assert!(loaded.use_fixed_room);
         assert_eq!(loaded.fixed_room_code.as_deref(), Some("MINHA-SALA-01"));
-        assert_eq!(loaded.last_manual_join_code.as_deref(), Some("MANUAL-123"));
-        assert_eq!(
-            loaded.saved_hosts[0].room_code.as_deref(),
-            Some("SALA-AMIGO")
-        );
+        assert_eq!(loaded.saved_hosts.len(), 1);
+        assert_eq!(loaded.saved_hosts[0].address, "192.168.1.50");
+        assert_eq!(loaded.saved_hosts[0].name, "Host Amigo");
         fs::remove_dir_all(directory).expect("test directory should be removed");
     }
 

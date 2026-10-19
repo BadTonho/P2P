@@ -22,7 +22,7 @@ O app encontra atualizações prioritariamente pelo instalador `P2P-Voz-e-tela-S
 
 O instalador é por usuário, não exige administrador e instala em `%LOCALAPPDATA%\Programs\P2P-Voz-e-tela`. Ele cria um atalho no menu Iniciar. O atualizador integrado executa o instalador em modo silencioso (`/SILENT /CLOSEAPPLICATIONS`); as preferências ficam separadas em `%LOCALAPPDATA%\P2P-Voz-e-tela\settings.json` e sobrevivem às atualizações.
 
-Ao desinstalar, o instalador remove o arquivo de preferências e a foto opcional do perfil (`profile-avatar.jpg`). O aplicativo não grava códigos de sala nem credenciais temporárias nesse arquivo. Os logs ficam na pasta `logs` e não são apagados junto com as preferências.
+Ao desinstalar, o instalador remove o arquivo de preferências e a foto opcional do perfil (`profile-avatar.jpg`). O aplicativo não grava nesse arquivo credenciais temporárias, os códigos das salas usadas com anfitriões salvos nem o último código de entrada manual — esses códigos são digitados a cada sessão. A única exceção é o código da sala fixa escolhido explicitamente em Configurações, que é uma preferência declarada do usuário. Os logs ficam na pasta `logs` e não são apagados junto com as preferências.
 
 ## Validação e segurança
 

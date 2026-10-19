@@ -517,46 +517,41 @@ fn fixed_room_card_controls_and_validation() {
 }
 
 #[test]
-fn join_room_card_swaps_and_persists_codes_per_host_and_manual() {
+fn join_room_card_swaps_codes_per_host_and_manual_without_persisting_them() {
     let mut ui_state = ClientUi::default();
     ui_state.last_manual_join_code = Some("MANUAL123".to_owned());
     ui_state.saved_hosts = vec![
         SavedHostProfile {
             name: "Amigo 1".to_owned(),
             address: "192.168.1.10".to_owned(),
-            room_code: Some("SALA1".to_owned()),
         },
         SavedHostProfile {
             name: "Amigo 2".to_owned(),
             address: "192.168.1.20".to_owned(),
-            room_code: None,
         },
     ];
 
-    // Começa em manual
+    // Começa em manual e lembra o código digitado nesta sessão.
     ui_state.select_host(None);
     assert_eq!(ui_state.join_code, "MANUAL123");
 
-    // Seleciona Amigo 1
+    // Seleciona Amigo 1: anfitrião salvo não carrega código de sala.
     ui_state.select_host(Some(0));
-    assert_eq!(ui_state.join_code, "SALA1");
+    assert_eq!(ui_state.join_code, "");
 
-    // Altera o código do Amigo 1
+    // Digitar um código com anfitrião selecionado só preenche o campo.
     ui_state.set_join_code("SALA1-NOVA");
-    assert_eq!(
-        ui_state.saved_hosts[0].room_code.as_deref(),
-        Some("SALA1-NOVA")
-    );
+    assert_eq!(ui_state.join_code, "SALA1-NOVA");
 
-    // Seleciona Amigo 2 (que não tem código salvo)
+    // Seleciona Amigo 2 (cada sessão começa o campo do anfitrião vazio).
     ui_state.select_host(Some(1));
     assert_eq!(ui_state.join_code, "");
 
-    // Volta para manual
+    // Volta para manual: recupera o código manual da sessão.
     ui_state.select_host(None);
     assert_eq!(ui_state.join_code, "MANUAL123");
 
-    // Altera código manual
+    // Altera código manual (apenas em memória, nunca gravado em disco).
     ui_state.set_join_code("NOVO-MANUAL");
     assert_eq!(
         ui_state.last_manual_join_code.as_deref(),

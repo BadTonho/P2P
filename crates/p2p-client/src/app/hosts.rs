@@ -83,11 +83,11 @@ impl ClientUi {
 
     pub(crate) fn select_host(&mut self, index: Option<usize>) {
         self.selected_host_index = index;
-        self.join_code = if let Some(index) = self.selected_host_index {
-            self.saved_hosts
-                .get(index)
-                .and_then(|p| p.room_code.clone())
-                .unwrap_or_default()
+        // Anfitriões salvos guardam apenas nome e endereço; o código da sala
+        // é digitado a cada sessão. Voltando para o manual, recupera o código
+        // digitado nesta sessão (nunca gravado em disco).
+        self.join_code = if self.selected_host_index.is_some() {
+            String::new()
         } else {
             self.last_manual_join_code.clone().unwrap_or_default()
         };
@@ -96,15 +96,7 @@ impl ClientUi {
     pub(crate) fn set_join_code(&mut self, code: &str) {
         let sanitized = sanitize_room_code(code);
         self.join_code = sanitized.clone();
-        if let Some(index) = self.selected_host_index {
-            if let Some(profile) = self.saved_hosts.get_mut(index) {
-                profile.room_code = if sanitized.is_empty() {
-                    None
-                } else {
-                    Some(sanitized)
-                };
-            }
-        } else {
+        if self.selected_host_index.is_none() {
             self.last_manual_join_code = if sanitized.is_empty() {
                 None
             } else {
@@ -420,14 +412,6 @@ pub(crate) fn validate_saved_host_profile(profile: &SavedHostProfile) -> Result<
     if address.len() > 512 {
         return Err("O endereço excede 512 caracteres.".to_owned());
     }
-    if let Some(code) = &profile.room_code {
-        let trimmed = code.trim();
-        if !trimmed.is_empty() && !is_valid_room_code(trimmed) {
-            return Err(
-                "O código da sala deve ter entre 4 e 32 caracteres alfanuméricos.".to_owned(),
-            );
-        }
-    }
     signaling_ws_url(address).map(|_| ())
 }
 
@@ -445,7 +429,6 @@ pub(crate) fn validate_new_host_profile(
     validate_saved_host_profile(&SavedHostProfile {
         name: name.trim().to_owned(),
         address: address.trim().to_owned(),
-        room_code: None,
     })
 }
 
@@ -567,25 +550,8 @@ mod tests {
             validate_saved_host_profile(&SavedHostProfile {
                 name: "Friend".to_owned(),
                 address: "ws://friend.example.net:9000".to_owned(),
-                room_code: None,
             })
             .is_ok()
-        );
-        assert!(
-            validate_saved_host_profile(&SavedHostProfile {
-                name: "Friend".to_owned(),
-                address: "ws://friend.example.net:9000".to_owned(),
-                room_code: Some("VALID-CODE".to_owned()),
-            })
-            .is_ok()
-        );
-        assert!(
-            validate_saved_host_profile(&SavedHostProfile {
-                name: "Friend".to_owned(),
-                address: "ws://friend.example.net:9000".to_owned(),
-                room_code: Some("BAD CODE WITH SPACES".to_owned()),
-            })
-            .is_err()
         );
     }
 
@@ -597,7 +563,6 @@ mod tests {
         ui.saved_hosts = vec![SavedHostProfile {
             name: "Friend".to_owned(),
             address: "friend.example.net".to_owned(),
-            room_code: None,
         }];
         ui.selected_host_index = Some(0);
 

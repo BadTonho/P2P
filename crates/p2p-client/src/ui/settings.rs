@@ -1,5 +1,5 @@
 use super::super::{
-    ClientUi, SettingsCategory, UpdateStatus, format_bytes, sanitize_room_code, signaling_ws_url,
+    ClientUi, SettingsCategory, UpdateStatus, format_bytes, signaling_ws_url,
     validate_new_host_profile, validate_saved_host_profile,
 };
 use crate::audio_capture::available_audio_applications;
@@ -261,20 +261,6 @@ impl ClientUi {
                             .hint_text("IPv4 ou nome DDNS")
                             .desired_width(180.0),
                     );
-                    let mut code = profile.room_code.clone().unwrap_or_default();
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut code)
-                            .hint_text("Código da sala (opcional)")
-                            .desired_width(140.0),
-                    );
-                    if response.changed() {
-                        let sanitized = sanitize_room_code(&code);
-                        profile.room_code = if sanitized.is_empty() {
-                            None
-                        } else {
-                            Some(sanitized)
-                        };
-                    }
                 });
                 let validation = validate_saved_host_profile(profile);
                 ui.horizontal_wrapped(|ui| {
@@ -329,11 +315,6 @@ impl ClientUi {
                         .hint_text("IPv4 ou nome DDNS")
                         .desired_width(180.0),
                 );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_host_room_code)
-                        .hint_text("Código da sala (opcional)")
-                        .desired_width(130.0),
-                );
                 if ui
                     .add_enabled(
                         self.saved_hosts.len() < MAX_SAVED_HOSTS,
@@ -347,23 +328,13 @@ impl ClientUi {
                         self.saved_hosts.len(),
                     ) {
                         Ok(()) => {
-                            let room_code = {
-                                let sanitized = sanitize_room_code(&self.new_host_room_code);
-                                if sanitized.is_empty() {
-                                    None
-                                } else {
-                                    Some(sanitized)
-                                }
-                            };
                             self.saved_hosts.push(SavedHostProfile {
                                 name: self.new_host_name.trim().to_owned(),
                                 address: self.new_host_address.trim().to_owned(),
-                                room_code,
                             });
                             self.selected_host_index = Some(self.saved_hosts.len() - 1);
                             self.new_host_name.clear();
                             self.new_host_address.clear();
-                            self.new_host_room_code.clear();
                             self.saved_host_error = None;
                         }
                         Err(error) => self.saved_host_error = Some(error),

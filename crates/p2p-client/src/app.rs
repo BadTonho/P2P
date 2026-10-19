@@ -196,7 +196,6 @@ struct ClientUi {
     selected_host_index: Option<usize>,
     new_host_name: String,
     new_host_address: String,
-    new_host_room_code: String,
     saved_host_error: Option<String>,
     use_fixed_room: bool,
     fixed_room_code: String,
@@ -464,7 +463,6 @@ impl ClientUi {
             } else {
                 Some(self.fixed_room_code.clone())
             },
-            last_manual_join_code: self.last_manual_join_code.clone(),
             ..Default::default()
         }
     }
@@ -501,15 +499,10 @@ impl ClientUi {
         self.announce_local_room = preferences.announce_local_room;
         self.use_fixed_room = preferences.use_fixed_room;
         self.fixed_room_code = preferences.fixed_room_code.unwrap_or_default();
-        self.last_manual_join_code = preferences.last_manual_join_code;
-        self.join_code = if let Some(index) = self.selected_host_index {
-            self.saved_hosts
-                .get(index)
-                .and_then(|p| p.room_code.clone())
-                .unwrap_or_default()
-        } else {
-            self.last_manual_join_code.clone().unwrap_or_default()
-        };
+        // Códigos usados apenas ao entrar não são persistidos: o campo começa
+        // vazio em cada sessão e o anfitrião salvo guarda só nome e endereço.
+        self.last_manual_join_code = None;
+        self.join_code = String::new();
     }
 
     pub(crate) fn audio_exclusion_config(&self) -> AudioExclusionConfig {

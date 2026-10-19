@@ -856,11 +856,8 @@ impl ClientUi {
         self.pending_election_reconnect = false;
         self.leave_after_handoff = false;
         self.ending_room_explicitly = false;
-        self.join_code = if let Some(index) = self.selected_host_index {
-            self.saved_hosts
-                .get(index)
-                .and_then(|p| p.room_code.clone())
-                .unwrap_or_default()
+        self.join_code = if self.selected_host_index.is_some() {
+            String::new()
         } else {
             self.last_manual_join_code.clone().unwrap_or_default()
         };
