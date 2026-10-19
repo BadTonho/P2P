@@ -36,9 +36,12 @@ const MAX_CONSECUTIVE_LOSSES: u32 = 8;
 const HANDSHAKE_TIMEOUT_SECS_DEFAULT: u64 = 10;
 const CONTROL_MAX_HANDSHAKES_IN_FLIGHT: usize = 32;
 const CONTROL_MAX_HANDSHAKES_PER_ADDRESS: usize = 4;
+const MESH_MAX_QUEUED_OUTBOUND: usize = 1024;
+const MESH_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 static HANDSHAKE_TIMEOUT_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(HANDSHAKE_TIMEOUT_SECS_DEFAULT);
+static LINK_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn handshake_timeout() -> Duration {
     Duration::from_secs(HANDSHAKE_TIMEOUT_SECS.load(Ordering::Relaxed))
@@ -250,7 +253,10 @@ impl Drop for ControlMesh {
 
 #[derive(Clone)]
 struct PeerLink {
-    sender: mpsc::UnboundedSender<ControlMessage>,
+    /// Identidade da sessão de conexão: reconexões geram links novos; a
+    /// limpeza de um link antigo nunca apaga o registro do link recente.
+    link_id: u64,
+    sender: mpsc::Sender<ControlMessage>,
     stats: std::sync::Arc<Mutex<PeerStats>>,
     last_seen: Instant,
 }
@@ -276,6 +282,53 @@ struct Metrics {
     latency_ms: f32,
     samples: usize,
     consecutive_losses: u32,
+}
+
+/// Coloca uma mensagem de controle na fila limitada do link; fila cheia
+/// descarta a mensagem e registra, em vez de crescer sem limites quando um
+/// par fica lento ou travado.
+fn enqueue_control(
+    sender: &mpsc::Sender<ControlMessage>,
+    message: ControlMessage,
+    purpose: &'static str,
+) {
+    if let Err(error) = sender.try_send(message) {
+        match error {
+            mpsc::error::TrySendError::Full(_) => {
+                tracing::warn!(
+                    purpose,
+                    "Fila de saída da malha cheia; mensagem de controle descartada"
+                );
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                tracing::debug!(
+                    purpose,
+                    "Fila de saída da malha fechada; mensagem descartada"
+                );
+            }
+        }
+    }
+}
+
+/// Remove o registro do link próprio no fim da sessão; um link antigo nunca
+/// apaga a contabilidade do link mais recente que o substituiu (corrida de
+/// reconexão observada com dupla conexão dos lados).
+async fn forget_mesh_link(state: &SharedState, remote_id: &str, link_id: u64) {
+    let mut state = state.lock().await;
+    if state.links.get(remote_id).map(|link| link.link_id) == Some(link_id) {
+        state.links.remove(remote_id);
+        state
+            .link_lost_since
+            .insert(remote_id.to_owned(), Instant::now());
+        if state.remote_status.remove(remote_id).is_some() {
+            state.eligibility_revision = state.eligibility_revision.wrapping_add(1);
+        }
+    } else {
+        tracing::debug!(
+            remote_id = %remote_id,
+            "Sessão substituída por conexão mais recente; registros do link atual preservados"
+        );
+    }
 }
 
 impl PeerStats {
@@ -506,9 +559,7 @@ async fn run_mesh(
                         }
                     }
                     Some(Command::LeaveNormally) => {
-                        tracing::info!("Iniciando sucessão por saída normal do anfitrião");
-                        let local_id = state.lock().await.local.id.clone();
-                        initiate_election(&state, &events, true, true, Some(local_id)).await;
+                        handle_leave_normally(&state, &events).await;
                     }
                     Some(Command::PublishLeader { address, epoch }) => {
                         tracing::info!(epoch, address = %address, "Publicando endereço do novo anfitrião");
@@ -627,14 +678,6 @@ fn handshake_governor() -> &'static std::sync::Mutex<HandshakeGovernor> {
     static GOVERNOR: std::sync::OnceLock<std::sync::Mutex<HandshakeGovernor>> =
         std::sync::OnceLock::new();
     GOVERNOR.get_or_init(|| std::sync::Mutex::new(HandshakeGovernor::default()))
-}
-
-#[cfg(test)]
-fn handshake_governor_in_flight() -> usize {
-    handshake_governor()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .in_flight
 }
 
 #[cfg(test)]
@@ -909,7 +952,8 @@ where
     }
 
     let (mut writer, mut reader) = websocket.split();
-    let (sender, mut outgoing) = mpsc::unbounded_channel::<ControlMessage>();
+    let (sender, mut outgoing) = mpsc::channel::<ControlMessage>(MESH_MAX_QUEUED_OUTBOUND);
+    let link_id = LINK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let stats = std::sync::Arc::new(Mutex::new(PeerStats::default()));
     {
         let mut state = state.lock().await;
@@ -923,14 +967,18 @@ where
         state.connecting.remove(&remote.id);
         state.connected_once.insert(remote.id.clone());
         state.link_lost_since.remove(&remote.id);
-        state.links.insert(
+        let replaced = state.links.insert(
             remote.id.clone(),
             PeerLink {
+                link_id,
                 sender: sender.clone(),
                 stats: stats.clone(),
                 last_seen: Instant::now(),
             },
         );
+        // Solta a fila do link antigo para a sessão substituída se encerrar
+        // logo; a sessão antiga detecta a substituição pelo link_id.
+        drop(replaced);
     }
     loop {
         tokio::select! {
@@ -942,7 +990,7 @@ where
                 let mut should_broadcast_canonical = None;
                 match message {
                     ControlMessage::Ping { sequence, epoch } => {
-                        let _ = sender.send(ControlMessage::Pong { sequence, epoch });
+                        enqueue_control(&sender, ControlMessage::Pong { sequence, epoch }, "resposta de ping");
                     }
                     ControlMessage::Pong { sequence, .. } => {
                         stats.lock().await.record_pong(sequence, now);
@@ -1127,6 +1175,13 @@ where
                     }).await;
                 }
                 let mut state = state.lock().await;
+                if state.links.get(&remote.id).map(|link| link.link_id) != Some(link_id) {
+                    tracing::debug!(
+                        remote_id = %remote.id,
+                        "Sessão de controle substituída por conexão mais recente; encerrando esta"
+                    );
+                    break;
+                }
                 if let Some(link) = state.links.get_mut(&remote.id) {
                     link.last_seen = now;
                 }
@@ -1138,18 +1193,21 @@ where
             outgoing_message = outgoing.recv() => {
                 let Some(message) = outgoing_message else { break };
                 let text = serde_json::to_string(&message).map_err(|error| error.to_string())?;
-                if writer.send(WebSocketMessage::Text(text.into())).await.is_err() { break; }
+                match timeout(MESH_WRITE_TIMEOUT, writer.send(WebSocketMessage::Text(text.into()))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(remote_id = %remote.id, error = %error, "Falha ao enviar mensagem de controle; encerrando o link");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!(remote_id = %remote.id, "Envio de controle excedeu o prazo; encerrando o link");
+                        break;
+                    }
+                }
             }
         }
     }
-    let mut state = state.lock().await;
-    state.links.remove(&remote.id);
-    state
-        .link_lost_since
-        .insert(remote.id.clone(), Instant::now());
-    if state.remote_status.remove(&remote.id).is_some() {
-        state.eligibility_revision = state.eligibility_revision.wrapping_add(1);
-    }
+    forget_mesh_link(&state, &remote.id, link_id).await;
     Ok(())
 }
 
@@ -1312,7 +1370,7 @@ async fn tick_mesh(state: &SharedState, events: &std_mpsc::Sender<ControlEvent>)
                 .count(),
         });
         for (_, sender) in &links {
-            let _ = sender.send(status.clone());
+            let _ = enqueue_control(&sender, status.clone(), "status");
         }
         if unstable
             && leader_id == state.local.id
@@ -1341,7 +1399,7 @@ async fn tick_mesh(state: &SharedState, events: &std_mpsc::Sender<ControlEvent>)
         state.sequence
     };
     for (_, sender) in &senders {
-        let _ = sender.send(ControlMessage::Ping { sequence, epoch });
+        let _ = enqueue_control(&sender, ControlMessage::Ping { sequence, epoch }, "ping");
     }
     for (id, address) in connectors {
         let task_state = state.clone();
@@ -1813,6 +1871,23 @@ async fn fail_current_candidate(
     }
 }
 
+/// Saída ordenada de um participante: só quem é o anfitrião atual inicia a
+/// eleição de sucessão; convidados apenas saem, sem broadcast de HostLeaving
+/// com identidade que não é a sua.
+async fn handle_leave_normally(state: &SharedState, events: &std_mpsc::Sender<ControlEvent>) {
+    let (local_id, is_leader) = {
+        let state = state.lock().await;
+        (state.local.id.clone(), state.leader_id == state.local.id)
+    };
+    if is_leader {
+        tracing::info!("Iniciando sucessão por saída normal do anfitrião");
+        initiate_election(state, events, true, true, Some(local_id)).await;
+    } else {
+        tracing::info!("Participante não é o anfitrião atual; saída não inicia sucessão");
+    }
+}
+
+/// Publica, no papel de novo anfitrião, o endereço de sinalização eleito.
 async fn publish_leader(
     state: &SharedState,
     events: &std_mpsc::Sender<ControlEvent>,
@@ -1820,7 +1895,7 @@ async fn publish_leader(
     epoch: u64,
 ) {
     tracing::info!(epoch, address = %address, "Novo anfitrião publicou endereço de sinalização");
-    let (local_id, order) = {
+    let (local_id, order, published_address) = {
         let mut state = state.lock().await;
         if epoch < state.epoch {
             return;
@@ -1831,21 +1906,23 @@ async fn publish_leader(
         state.leader_last_seen = Instant::now();
         state.leader_control_seen = true;
         state.election = None;
-        (state.local.id.clone(), state.local.order)
+        (state.local.id.clone(), state.local.order, address.clone())
     };
     broadcast(
         state,
         ControlMessage::LeaderElected {
-            participant_id: local_id,
-            address,
+            participant_id: local_id.clone(),
+            address: published_address.clone(),
             epoch,
             order,
         },
     )
     .await;
+    // O evento usa os valores capturados na única trava: duas travas em
+    // sequência podiam ler um estado já alterado por outra tarefa.
     let _ = events.send(ControlEvent::LeaderChanged {
-        participant_id: state.lock().await.local.id.clone(),
-        address: state.lock().await.leader_address.clone(),
+        participant_id: local_id,
+        address: published_address,
         epoch,
     });
 }
@@ -1859,7 +1936,7 @@ async fn broadcast(state: &SharedState, message: ControlMessage) {
         .map(|link| link.sender.clone())
         .collect::<Vec<_>>();
     for sender in senders {
-        let _ = sender.send(message.clone());
+        let _ = enqueue_control(&sender, message.clone(), "transmissão");
     }
 }
 
@@ -1883,13 +1960,15 @@ fn canonical_precedes(state: &MeshState, incoming_leader_id: &str) -> bool {
 mod tests {
     use super::{
         CONTROL_LINK_STARTUP_GRACE, CONTROL_MAX_HANDSHAKES_PER_ADDRESS, ControlEvent, ControlMesh,
-        EMPTY_ELECTION_RETRY_INTERVAL, Election, HANDSHAKE_TIMEOUT_SECS, HOST_TIMEOUT, MeshState,
-        Metrics, PeerLink, PeerStats, Probe, QueueEntry, accept_peer, acquire_handshake_slot,
-        bind_listener_with_retry, compare_queue_entries, control_link_timeout_elapsed,
-        fail_current_candidate, handshake_governor_active_for, initiate_election, ip_mismatch,
-        own_worst_metrics, parse_ip_from_address,
+        EMPTY_ELECTION_RETRY_INTERVAL, Election, HANDSHAKE_TIMEOUT_SECS, HOST_TIMEOUT,
+        MESH_MAX_QUEUED_OUTBOUND, MeshState, Metrics, PeerLink, PeerStats, Probe, QueueEntry,
+        accept_peer, acquire_handshake_slot, bind_listener_with_retry, compare_queue_entries,
+        control_link_timeout_elapsed, enqueue_control, fail_current_candidate, forget_mesh_link,
+        handle_leave_normally, handshake_governor_active_for, initiate_election, ip_mismatch,
+        own_worst_metrics, parse_ip_from_address, publish_leader,
     };
     use crate::mesh_identity::MeshIdentity;
+    use signaling_protocol::ControlMessage;
     use signaling_protocol::ParticipantInfo;
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::Arc;
@@ -1995,7 +2074,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let (link_tx, _link_rx) = mpsc::unbounded_channel();
+        let (link_tx, _link_rx) = mpsc::channel(MESH_MAX_QUEUED_OUTBOUND);
         let mut roster = vec![host.clone(), local.clone()];
         let mut remote_status = HashMap::new();
         if has_successor {
@@ -2031,6 +2110,7 @@ mod tests {
             links: HashMap::from([(
                 "host".to_owned(),
                 PeerLink {
+                    link_id: 1,
                     sender: link_tx,
                     stats: Arc::new(Mutex::new(stats)),
                     last_seen: now,
@@ -2830,5 +2910,192 @@ mod tests {
             "reserva precisa ser liberada no fim do accept com erro"
         );
         drop(client);
+    }
+
+    #[test]
+    fn bounded_mesh_queue_drops_newest_message_when_full() {
+        let (sender, mut receiver) = mpsc::channel::<ControlMessage>(1);
+        enqueue_control(
+            &sender,
+            ControlMessage::Ping {
+                sequence: 1,
+                epoch: 0,
+            },
+            "teste",
+        );
+        enqueue_control(
+            &sender,
+            ControlMessage::Ping {
+                sequence: 2,
+                epoch: 0,
+            },
+            "teste",
+        );
+        match receiver.try_recv() {
+            Ok(ControlMessage::Ping { sequence: 1, .. }) => {}
+            other => panic!("esperava o primeiro ping na fila: {other:?}"),
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "com a fila cheia, a mensagem nova deve ser descartada em vez de crescer sem limite"
+        );
+    }
+
+    #[tokio::test]
+    async fn replaced_link_survives_cleanup_of_older_session() {
+        let state = Arc::new(Mutex::new(test_state(participant("host", 1, false), false)));
+        const OLDER_LINK: u64 = 7001;
+        const NEWER_LINK: u64 = 7002;
+        {
+            let mut locked = state.lock().await;
+            let (old_tx, _old_rx) = mpsc::channel(8);
+            locked.links.insert(
+                "host".to_owned(),
+                PeerLink {
+                    link_id: OLDER_LINK,
+                    sender: old_tx,
+                    stats: Arc::new(Mutex::new(PeerStats::default())),
+                    last_seen: Instant::now(),
+                },
+            );
+            let (new_tx, _new_rx) = mpsc::channel(8);
+            locked.links.insert(
+                "host".to_owned(),
+                PeerLink {
+                    link_id: NEWER_LINK,
+                    sender: new_tx,
+                    stats: Arc::new(Mutex::new(PeerStats::default())),
+                    last_seen: Instant::now(),
+                },
+            );
+            locked.remote_status.insert(
+                "host".to_owned(),
+                (
+                    Metrics {
+                        loss_percent: 0.0,
+                        jitter_ms: 0.0,
+                        latency_ms: 0.0,
+                        samples: 1,
+                        consecutive_losses: 0,
+                    },
+                    true,
+                    Instant::now(),
+                ),
+            );
+        }
+
+        // A sessão antiga encerrando não pode apagar a contabilidade do link
+        // recente que a substituiu (corrida de reconexão).
+        forget_mesh_link(&state, "host", OLDER_LINK).await;
+        {
+            let locked = state.lock().await;
+            assert!(
+                locked.links.contains_key("host"),
+                "o link recente deve permanecer após a limpeza da sessão antiga"
+            );
+            assert!(
+                !locked.link_lost_since.contains_key("host"),
+                "o link recente não pode ser marcado como perdido pela sessão antiga"
+            );
+            assert!(
+                locked.remote_status.contains_key("host"),
+                "o status recente não pode ser apagado pela sessão antiga"
+            );
+        }
+
+        // O encerramento da sessão atual remove o registro dela.
+        forget_mesh_link(&state, "host", NEWER_LINK).await;
+        {
+            let locked = state.lock().await;
+            assert!(!locked.links.contains_key("host"));
+            assert!(locked.link_lost_since.contains_key("host"));
+            assert!(!locked.remote_status.contains_key("host"));
+        }
+    }
+
+    #[tokio::test]
+    async fn orderly_departure_of_host_starts_succession_election() {
+        let state = Arc::new(Mutex::new(test_state(
+            participant("leader-joao", 2, true),
+            true,
+        )));
+        {
+            let mut locked = state.lock().await;
+            locked.leader_id = "leader-joao".to_owned();
+        }
+        let (events, _event_receiver) = std_mpsc::channel();
+
+        handle_leave_normally(&state, &events).await;
+
+        let locked = state.lock().await;
+        let election = locked
+            .election
+            .as_ref()
+            .expect("a saída ordenada do anfitrião precisa iniciar a eleição de sucessão");
+        assert_eq!(
+            election.candidates,
+            vec!["candidate".to_owned()],
+            "o sucessor elegível precisa estar na fila da eleição"
+        );
+        assert_eq!(
+            election.departing_id.as_deref(),
+            Some("leader-joao"),
+            "a eleição precisa registrar quem está saindo"
+        );
+    }
+
+    #[tokio::test]
+    async fn orderly_departure_of_guest_does_not_start_succession() {
+        let state = Arc::new(Mutex::new(test_state(participant("guest", 3, false), true)));
+        let (events, event_receiver) = std_mpsc::channel();
+
+        handle_leave_normally(&state, &events).await;
+
+        let locked = state.lock().await;
+        assert!(
+            locked.election.is_none(),
+            "convidado não pode iniciar eleição de sucessão"
+        );
+        assert!(
+            event_receiver.try_recv().is_err(),
+            "convidado não pode sinalizar sucessão"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_leader_emits_one_event_with_published_address() {
+        let state = Arc::new(Mutex::new(test_state(
+            participant("leader-joao", 2, true),
+            false,
+        )));
+        let (events, event_receiver) = std_mpsc::channel();
+
+        publish_leader(&state, &events, "ws://10.0.0.5:9000".to_owned(), 7).await;
+
+        match event_receiver.try_recv() {
+            Ok(ControlEvent::LeaderChanged {
+                participant_id,
+                address,
+                epoch,
+            }) => {
+                assert_eq!(participant_id, "leader-joao");
+                assert_eq!(address, "ws://10.0.0.5:9000");
+                assert_eq!(epoch, 7);
+            }
+            other => panic!("esperava um único LeaderChanged: {other:?}"),
+        }
+        assert!(
+            event_receiver.try_recv().is_err(),
+            "publish_leader não pode emitir eventos duplicados"
+        );
+
+        // Época antiga é ignorada, sem evento.
+        publish_leader(&state, &events, "ws://10.0.0.9:9000".to_owned(), 6).await;
+        assert!(event_receiver.try_recv().is_err());
+
+        let locked = state.lock().await;
+        assert_eq!(locked.leader_id, "leader-joao");
+        assert_eq!(locked.leader_address, "ws://10.0.0.5:9000");
+        assert_eq!(locked.epoch, 7);
     }
 }
