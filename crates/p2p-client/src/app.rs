@@ -268,6 +268,7 @@ struct ClientUi {
     profile_window_open: bool,
     participant_avatar_textures: HashMap<String, (Option<String>, Option<egui::TextureHandle>)>,
     screen_capture: Option<ScreenCapture>,
+    active_share_source: Option<ShareSourceSelection>,
     screen_picker: Option<PendingScreenCapture>,
     pub(crate) screen_share_quality: ScreenShareQuality,
     available_monitors: Vec<MonitorOption>,
@@ -1040,7 +1041,22 @@ impl ClientUi {
         };
         self.dxgi_capture_error = None;
         self.screen_status = None;
-
+        if self.screen_capture.is_some() && self.screen_share_session_active() {
+            if screen_share::decide_share_capture_restart(
+                self.active_share_source.as_ref(),
+                &source,
+            ) == screen_share::ShareCaptureRestart::KeepRunning
+            {
+                tracing::info!(
+                    "Origem já está sendo transmitida; novo clique de compartilhamento ignorado"
+                );
+                self.screen_status = Some("Compartilhamento já ativo nesta origem.".to_owned());
+                self.screen_share_modal_open = false;
+                return;
+            }
+            self.stop_running_screen_capture();
+        }
+        let source_selection = source.clone();
         let capture_result = match source {
             ShareSourceSelection::Monitor(device_id) => {
                 tracing::info!(monitor_device_id = %device_id, "Iniciando captura de monitor pelo modal unificado");
@@ -1070,6 +1086,7 @@ impl ClientUi {
                 self.clear_local_preview();
                 let is_window = capture.backend_name().contains("Janela");
                 self.screen_capture = Some(capture);
+                self.active_share_source = Some(source_selection);
                 self.screen_status = Some(if is_window {
                     "Captura de janela ativa (Windows Graphics Capture).".to_owned()
                 } else {
@@ -1260,7 +1277,10 @@ impl Drop for ClientUi {
         self.stop_screen_share(true);
         self.screen_picker = None;
         if let Some(mut capture) = self.screen_capture.take() {
-            let _ = capture.stop();
+            self.active_share_source = None;
+            if let Err(error) = capture.stop() {
+                tracing::warn!(error = %error, "Falha ao parar a captura de tela durante o encerramento");
+            }
         }
         self.signaling = None;
     }

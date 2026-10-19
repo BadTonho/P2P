@@ -616,7 +616,10 @@ impl ClientUi {
             self.pending_signaling = None;
             self.screen_picker = None;
             if let Some(mut capture) = self.screen_capture.take() {
-                let _ = capture.stop();
+                self.active_share_source = None;
+                if let Err(error) = capture.stop() {
+                    tracing::warn!(error = %error, "Falha ao parar a captura de tela durante a desconexão");
+                }
             }
             self.clear_local_preview();
         }
@@ -837,7 +840,10 @@ impl ClientUi {
         self.turn_config_wait_started_at = None;
         self.screen_picker = None;
         if let Some(mut capture) = self.screen_capture.take() {
-            let _ = capture.stop();
+            self.active_share_source = None;
+            if let Err(error) = capture.stop() {
+                tracing::warn!(error = %error, "Falha ao parar a captura de tela ao sair da sala");
+            }
         }
         self.clear_local_preview();
         self.room_code = None;

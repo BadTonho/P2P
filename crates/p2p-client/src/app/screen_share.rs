@@ -164,6 +164,7 @@ impl ClientUi {
             self.screen_picker = None;
             match result {
                 Ok(Some(capture)) => {
+                    self.stop_running_screen_capture();
                     self.clear_local_preview();
                     self.screen_capture = Some(capture);
                     self.screen_status =
@@ -1208,5 +1209,81 @@ impl ClientUi {
 
     pub(super) fn stun_server_for_room(&self) -> Option<String> {
         (self.room_mode == RoomMode::InternetTest).then(|| self.stun_server_url.trim().to_owned())
+    }
+
+    /// Sessão de compartilhamento de tela do usuário está ativa: pedido em
+    /// andamento ou transmissão em curso (grupo ou peer direto).
+    pub(super) fn screen_share_session_active(&self) -> bool {
+        !matches!(&self.screen_share_role, ScreenShareRole::Idle) || self.group_share.local_sharing
+    }
+
+    /// Para a captura de tela ativa registrando a falha em vez de descartá-la
+    /// silenciosamente; garante que nada fique rodando ao trocar de origem.
+    pub(super) fn stop_running_screen_capture(&mut self) {
+        if let Some(mut capture) = self.screen_capture.take() {
+            self.active_share_source = None;
+            if let Err(error) = capture.stop() {
+                tracing::warn!(error = %error, "Falha ao parar a captura de tela que estava ativa");
+            }
+        }
+    }
+}
+
+/// Decisão sobre a captura quando o usuário pede nova transmissão com outra
+/// já em execução.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ShareCaptureRestart {
+    /// Origem idêntica à captura em execução: o clique é ignorado em vez de
+    /// reiniciar a captura, evitando fluxo duplo do compartilhamento.
+    KeepRunning,
+    /// Origem diferente, ou a origem da captura atual é desconhecida (caso do
+    /// seletor nativo do Windows): pare a captura anterior explicitamente.
+    ReplaceExisting,
+}
+
+pub(super) fn decide_share_capture_restart(
+    active: Option<&ShareSourceSelection>,
+    selected: &ShareSourceSelection,
+) -> ShareCaptureRestart {
+    if active.is_some_and(|active| active == selected) {
+        ShareCaptureRestart::KeepRunning
+    } else {
+        ShareCaptureRestart::ReplaceExisting
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FAKE_MONITOR_DEVICE_ID: &str =
+        r"\\?\DISPLAY#TESTE#0{00000000-0000-0000-0000-000000000000}";
+
+    #[test]
+    fn origem_igual_e_ativa_mantem_captura() {
+        let source = ShareSourceSelection::Monitor(FAKE_MONITOR_DEVICE_ID.to_owned());
+        assert_eq!(
+            decide_share_capture_restart(Some(&source), &source),
+            ShareCaptureRestart::KeepRunning
+        );
+    }
+
+    #[test]
+    fn origem_diferente_substitui_captura() {
+        let active = ShareSourceSelection::Monitor(FAKE_MONITOR_DEVICE_ID.to_owned());
+        let selected = ShareSourceSelection::Window(12345);
+        assert_eq!(
+            decide_share_capture_restart(Some(&active), &selected),
+            ShareCaptureRestart::ReplaceExisting
+        );
+    }
+
+    #[test]
+    fn origem_atual_desconhecida_substitui_captura() {
+        let selected = ShareSourceSelection::Monitor(FAKE_MONITOR_DEVICE_ID.to_owned());
+        assert_eq!(
+            decide_share_capture_restart(None, &selected),
+            ShareCaptureRestart::ReplaceExisting
+        );
     }
 }
