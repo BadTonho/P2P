@@ -33,6 +33,16 @@ const HEALTHY_LOSS_PERCENT: f32 = 15.0;
 const HEALTHY_REENTRY_TIME: Duration = Duration::from_secs(10);
 const MIN_HEALTH_SAMPLES: usize = 5;
 const MAX_CONSECUTIVE_LOSSES: u32 = 8;
+const HANDSHAKE_TIMEOUT_SECS_DEFAULT: u64 = 10;
+const CONTROL_MAX_HANDSHAKES_IN_FLIGHT: usize = 32;
+const CONTROL_MAX_HANDSHAKES_PER_ADDRESS: usize = 4;
+
+static HANDSHAKE_TIMEOUT_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(HANDSHAKE_TIMEOUT_SECS_DEFAULT);
+
+fn handshake_timeout() -> Duration {
+    Duration::from_secs(HANDSHAKE_TIMEOUT_SECS.load(Ordering::Relaxed))
+}
 
 #[derive(Clone, Debug)]
 pub struct QueueEntry {
@@ -605,14 +615,108 @@ fn parse_ip_from_address(addr: &str) -> Option<std::net::IpAddr> {
     trimmed.parse::<std::net::IpAddr>().ok()
 }
 
+/// Conta de handshakes da malha ainda não anexados, para limitar o custo de
+/// conexões TCP abertas sem completar o handshake (slowloris) no anfitrião.
+#[derive(Default)]
+struct HandshakeGovernor {
+    in_flight: usize,
+    per_address: HashMap<std::net::IpAddr, usize>,
+}
+
+fn handshake_governor() -> &'static std::sync::Mutex<HandshakeGovernor> {
+    static GOVERNOR: std::sync::OnceLock<std::sync::Mutex<HandshakeGovernor>> =
+        std::sync::OnceLock::new();
+    GOVERNOR.get_or_init(|| std::sync::Mutex::new(HandshakeGovernor::default()))
+}
+
+#[cfg(test)]
+fn handshake_governor_in_flight() -> usize {
+    handshake_governor()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .in_flight
+}
+
+#[cfg(test)]
+fn handshake_governor_active_for(address: std::net::IpAddr) -> Option<usize> {
+    handshake_governor()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .per_address
+        .get(&address)
+        .copied()
+}
+
+/// Reserva de handshake com liberação garantida no fim do accept, inclusive
+/// nos caminhos de erro.
+struct HandshakeSlot {
+    address: Option<std::net::IpAddr>,
+}
+
+impl Drop for HandshakeSlot {
+    fn drop(&mut self) {
+        let mut governor = handshake_governor()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        governor.in_flight = governor.in_flight.saturating_sub(1);
+        if let Some(address) = self.address.take() {
+            let count = governor
+                .per_address
+                .entry(address)
+                .and_modify(|count| *count = count.saturating_sub(1))
+                .or_default();
+            if *count == 0 {
+                governor.per_address.remove(&address);
+            }
+        }
+    }
+}
+
+fn acquire_handshake_slot(address: Option<std::net::IpAddr>) -> Option<HandshakeSlot> {
+    let mut governor = handshake_governor()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if governor.in_flight >= CONTROL_MAX_HANDSHAKES_IN_FLIGHT {
+        return None;
+    }
+    let slot_address = address;
+    if let Some(address) = slot_address {
+        let count = governor.per_address.entry(address).or_default();
+        if *count >= CONTROL_MAX_HANDSHAKES_PER_ADDRESS {
+            return None;
+        }
+        *count += 1;
+    }
+    governor.in_flight += 1;
+    Some(HandshakeSlot {
+        address: slot_address,
+    })
+}
+
 async fn accept_peer(
     stream: TcpStream,
     state: SharedState,
     events: std_mpsc::Sender<ControlEvent>,
 ) -> Result<(), String> {
     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
-    let websocket = accept_async(stream)
+    // Slowloris na porta 9001 não pode prender sockets e tarefas para sempre:
+    // prazo rígido no handshake e limite de handshakes simultâneos, global e
+    // por IP remoto.
+    let Some(_handshake_slot) = acquire_handshake_slot(peer_ip) else {
+        tracing::warn!(
+            peer = ?peer_ip,
+            "Handshake de controle recusado: limite de handshakes simultâneos atingido"
+        );
+        return Err("limite de handshakes simultâneos da malha de controle atingido".to_owned());
+    };
+    let websocket = timeout(handshake_timeout(), accept_async(stream))
         .await
+        .map_err(|_| {
+            format!(
+                "timeout de {} s no handshake de controle",
+                handshake_timeout().as_secs()
+            )
+        })?
         .map_err(|error| error.to_string())?;
     attach_socket(websocket, state, events, peer_ip).await
 }
@@ -1778,11 +1882,12 @@ fn canonical_precedes(state: &MeshState, incoming_leader_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_LINK_STARTUP_GRACE, ControlEvent, ControlMesh, EMPTY_ELECTION_RETRY_INTERVAL,
-        Election, HOST_TIMEOUT, MeshState, Metrics, PeerLink, PeerStats, Probe, QueueEntry,
+        CONTROL_LINK_STARTUP_GRACE, CONTROL_MAX_HANDSHAKES_PER_ADDRESS, ControlEvent, ControlMesh,
+        EMPTY_ELECTION_RETRY_INTERVAL, Election, HANDSHAKE_TIMEOUT_SECS, HOST_TIMEOUT, MeshState,
+        Metrics, PeerLink, PeerStats, Probe, QueueEntry, accept_peer, acquire_handshake_slot,
         bind_listener_with_retry, compare_queue_entries, control_link_timeout_elapsed,
-        fail_current_candidate, initiate_election, ip_mismatch, own_worst_metrics,
-        parse_ip_from_address,
+        fail_current_candidate, handshake_governor_active_for, initiate_election, ip_mismatch,
+        own_worst_metrics, parse_ip_from_address,
     };
     use crate::mesh_identity::MeshIdentity;
     use signaling_protocol::ParticipantInfo;
@@ -2597,5 +2702,133 @@ mod tests {
         let locked = state.lock().await;
         assert!(locked.election.is_none());
         assert!(locked.empty_election_retry.is_some());
+    }
+
+    /// Substitui o prazo do handshake de controle pela duração do teste.
+    struct HandshakeTimeoutOverride {
+        previous: u64,
+    }
+
+    impl HandshakeTimeoutOverride {
+        fn new(seconds: u64) -> Self {
+            let previous =
+                HANDSHAKE_TIMEOUT_SECS.swap(seconds, std::sync::atomic::Ordering::Relaxed);
+            Self { previous }
+        }
+    }
+
+    impl Drop for HandshakeTimeoutOverride {
+        fn drop(&mut self) {
+            HANDSHAKE_TIMEOUT_SECS.store(self.previous, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn limite_de_handshakes_recusa_acima_do_teto_e_libera_no_drop() {
+        let _lock = mesh_lock();
+        let first: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let second: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+
+        let mut slots = Vec::new();
+        for _ in 0..CONTROL_MAX_HANDSHAKES_PER_ADDRESS {
+            slots.push(
+                acquire_handshake_slot(Some(first))
+                    .expect("esperava admitir handshakes até o limite por IP"),
+            );
+        }
+        assert_eq!(
+            handshake_governor_active_for(first),
+            Some(CONTROL_MAX_HANDSHAKES_PER_ADDRESS),
+            "esperava o limite por IP ocupado"
+        );
+        assert!(
+            acquire_handshake_slot(Some(first)).is_none(),
+            "esperava recusar handshake acima do limite por IP"
+        );
+        assert_eq!(
+            handshake_governor_active_for(first),
+            Some(CONTROL_MAX_HANDSHAKES_PER_ADDRESS),
+            "a recusa não pode alterar o limite por IP"
+        );
+        assert_eq!(handshake_governor_active_for(second), None);
+        let second_slot = acquire_handshake_slot(Some(second))
+            .expect("esperava admitir handshake de outro IP mesmo com o primeiro no limite");
+        assert_eq!(
+            handshake_governor_active_for(second),
+            Some(1),
+            "a reserva de outro IP precisa ser contada"
+        );
+
+        drop(slots);
+        assert_eq!(
+            handshake_governor_active_for(first),
+            None,
+            "as reservas desprezadas precisam remover a contagem do IP"
+        );
+        assert_eq!(
+            handshake_governor_active_for(second),
+            Some(1),
+            "a reserva ainda viva precisa continuar contada"
+        );
+        drop(second_slot);
+        assert_eq!(
+            handshake_governor_active_for(second),
+            None,
+            "a reserva de outro IP também precisa ser liberada quando descartada"
+        );
+        // IP voltou a zero: a reemissão imediata precisa funcionar.
+        let reacquired = acquire_handshake_slot(Some(first))
+            .expect("esperava reemitir a reserva com o IP novamente livre");
+        assert_eq!(handshake_governor_active_for(first), Some(1));
+        drop(reacquired);
+        assert_eq!(handshake_governor_active_for(first), None);
+    }
+
+    #[tokio::test]
+    async fn handshake_incompleto_expira_no_prazo_sem_vazar_reserva() {
+        let _lock = mesh_lock();
+        let _override_timeout = HandshakeTimeoutOverride::new(1);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_address: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_stream, _address) = listener.accept().await.unwrap();
+        drop(listener);
+
+        let (events, _event_receiver) = std_mpsc::channel();
+        let started = Instant::now();
+        let result = accept_peer(
+            server_stream,
+            Arc::new(Mutex::new(test_state(participant("host", 1, true), false))),
+            events,
+        )
+        .await;
+        let failure = result.expect_err("handshake incompleto deve falhar");
+        assert!(
+            failure.contains("timeout"),
+            "erro inesperado ao expirar handshake: {failure}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "o prazo do handshake precisa ser respeitado antes de falhar"
+        );
+        // Uma reserva residual de um teste de malha encerrado logo antes pode
+        // ainda estar sendo liberada; aguarda com paciência antes de exigir.
+        let mut released = None;
+        for _ in 0..30 {
+            if handshake_governor_active_for(local_address).is_none() {
+                released = Some(true);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            released,
+            Some(true),
+            "reserva precisa ser liberada no fim do accept com erro"
+        );
+        drop(client);
     }
 }
