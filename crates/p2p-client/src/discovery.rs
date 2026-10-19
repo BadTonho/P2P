@@ -183,6 +183,7 @@ pub(crate) struct DiscoveryDiagnostics {
     pub announcements_received: u64,
     pub invalid_datagrams: u64,
     pub ignored_sources: u64,
+    pub receive_failures: u64,
 }
 
 pub(crate) struct DiscoveryService {
@@ -391,6 +392,7 @@ fn run_worker(
             Ok((length, SocketAddr::V4(source)))
                 if network.accepts(*source.ip(), allow_loopback) =>
             {
+                let length = length.min(buffer.len());
                 match decode(&buffer[..length]) {
                     Some(Message::Room { room }) => {
                         let mut shared = shared.lock().expect("discovery state poisoned");
@@ -433,10 +435,22 @@ fn run_worker(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) => {}
             Err(error) => {
-                tracing::warn!(error = %error, "Descoberta falhou ao receber; entrada manual continua disponível");
-                shared.lock().expect("discovery state poisoned").error =
-                    Some(format!("Falha ao receber descoberta: {error}"));
-                break;
+                // No Windows, enviar para um destino inalcançável gera
+                // WSAECONNRESET no recv_from seguinte: é transitório e o
+                // socket continua útil. Encerrar o worker deixaria a busca
+                // morta até a rede mudar ou uma busca manual ser feita. Em
+                // vez disso, registra a falha e segue tentando.
+                let mut shared = shared.lock().expect("discovery state poisoned");
+                shared.diagnostics.receive_failures += 1;
+                let message = format!("Falha ao receber descoberta: {error}");
+                if shared.error.as_deref() != Some(message.as_str()) {
+                    tracing::warn!(error = %error, "Falha ao receber descoberta; tentando novamente; entrada manual continua disponível");
+                }
+                shared.error = Some(message);
+                drop(shared);
+                // Evita girar em erros que retornam imediatamente; o próprio
+                // recv tem timeout, mas a falha pode voltar sem esperar.
+                thread::sleep(Duration::from_millis(200));
             }
         }
         if last_report.elapsed() >= Duration::from_secs(10) {

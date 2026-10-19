@@ -284,3 +284,58 @@ fn manual_search_queries_immediately_coalesces_clicks_and_preserves_cache() {
     assert!(!service.is_running());
     assert!(!service.request_refresh());
 }
+
+// A provocação de WSAECONNRESET (send UDP a porta fechada seguido de recv)
+// é um comportamento do Windows, onde o aplicativo roda.
+#[test]
+#[cfg(windows)]
+fn worker_survives_connection_reset_and_keeps_discovering() {
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let SocketAddr::V4(address) = receiver.local_addr().unwrap() else {
+        unreachable!()
+    };
+    // Provoca WSAECONNRESET: envio para uma porta sem destino deixa o erro
+    // pendente no socket; o primeiro recv do worker recebe esse erro em vez
+    // de um datagrama. Encostado no comportamento atual, isso encerraria o
+    // worker imediatamente.
+    let closed = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let closed_port = closed.local_addr().unwrap();
+    drop(closed);
+    let trigger = [0_u8; 8];
+    let _ = receiver.send_to(&trigger, closed_port);
+
+    let service = DiscoveryService::start_loopback(receiver, Vec::new());
+
+    // Sucessor falso: envia um anúncio válido depois que o errou já ocorreu;
+    // o worker precisa processá-lo normalmente. Envia de 127.0.0.2: accepts()
+    // rejeita fontes no próprio IP do serviço (127.0.0.1) para evitar eco.
+    let announcer = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
+    let payload = encode(Message::Room {
+        room: room("SALA-RESILIENTE", 2),
+    });
+    announcer.send_to(&payload, address).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let diagnostics = service.diagnostics();
+        if diagnostics.receive_failures >= 1 && diagnostics.announcements_received >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "contadores aguardando: {diagnostics:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        service.is_running(),
+        "o worker precisa continuar rodando após a falha de recepção"
+    );
+    assert!(
+        service
+            .snapshot()
+            .0
+            .iter()
+            .any(|discovered| discovered.advertisement.code == "SALA-RESILIENTE"),
+        "o anúncio enviado após o erro precisa ser processado normalmente"
+    );
+}
