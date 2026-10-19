@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::timeout;
@@ -799,15 +800,24 @@ async fn receive_server_message<S>(socket: &mut WebSocketStream<S>) -> ServerMes
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(Duration::from_secs(3), socket.next())
-        .await
-        .expect("server response timed out")
-        .expect("server closed the connection")
-        .expect("websocket read failed");
-    let WebSocketMessage::Text(text) = frame else {
-        panic!("expected a JSON text message")
-    };
-    serde_json::from_str(text.as_str()).unwrap()
+    // Quadros de conservação (Ping/Pong) do keepalive são ignorados: nenhum
+    // teste deve falhar por um ping chegar entre duas mensagens de protocolo.
+    loop {
+        let frame = timeout(Duration::from_secs(3), socket.next())
+            .await
+            .expect("server response timed out")
+            .expect("server closed the connection")
+            .expect("websocket read failed");
+        match frame {
+            WebSocketMessage::Text(text) => return serde_json::from_str(text.as_str()).unwrap(),
+            WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {
+                continue;
+            }
+            WebSocketMessage::Close(_) | WebSocketMessage::Binary(_) => {
+                panic!("expected a JSON text message")
+            }
+        }
+    }
 }
 
 async fn start_test_server(
@@ -1301,4 +1311,128 @@ async fn websocket_creates_and_joins_fixed_room_and_rejects_duplicates() {
     let _ = host.close(None).await;
     let _ = stop.send(());
     accept_task.abort();
+}
+
+#[tokio::test]
+async fn confirm_host_transfer_clears_participants_without_leaking_identity() {
+    let mut registry = RoomRegistry::default();
+    let (host_outgoing, _host_receiver) = test_outgoing_channel();
+    let code = registry
+        .create_room(1, host_outgoing)
+        .expect("sala deve ser criada");
+    let (peer_outgoing, _peer_receiver) = test_outgoing_channel();
+    registry
+        .join_room(2, &code, peer_outgoing)
+        .expect("participante deve entrar");
+    let transfer = registry
+        .request_host_transfer(1)
+        .expect("transferência deve ser pedida");
+
+    registry
+        .confirm_host_transfer(2, &code, &transfer.token)
+        .expect("sucessor confirmou a transferência");
+
+    assert!(
+        registry.rooms.is_empty(),
+        "a sala antiga é dissolvida no novo servidor"
+    );
+    assert!(
+        registry.connection_rooms.is_empty(),
+        "as duas conexões ficam sem sala"
+    );
+    assert!(
+        registry.participant_info.is_empty(),
+        "contexto de participante não pode sobrar como memória em conexões sem sala"
+    );
+}
+
+#[test]
+fn accept_errors_transient_continue_and_others_abort() {
+    assert!(super::websocket::is_transient_accept_error(
+        &std::io::Error::from(std::io::ErrorKind::ConnectionReset)
+    ));
+    assert!(super::websocket::is_transient_accept_error(
+        &std::io::Error::from(std::io::ErrorKind::ConnectionAborted)
+    ));
+    assert!(!super::websocket::is_transient_accept_error(
+        &std::io::Error::from(std::io::ErrorKind::AddrInUse)
+    ));
+    assert!(!super::websocket::is_transient_accept_error(
+        &std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+    ));
+}
+
+struct KeepaliveGuard;
+
+impl KeepaliveGuard {
+    fn with(seconds_ping: u64, seconds_idle: u64) -> Self {
+        super::override_keepalive_for_test(seconds_ping, seconds_idle);
+        Self
+    }
+}
+
+impl Drop for KeepaliveGuard {
+    fn drop(&mut self) {
+        super::override_keepalive_for_test(30, 65);
+    }
+}
+
+#[tokio::test]
+async fn idle_websocket_gets_ping_and_is_closed_without_inbound_traffic() {
+    // Guarda global, pois o keepalive é compartilhado entre os testes.
+    let _override = KeepaliveGuard::with(1, 3);
+    let (url, _stop, _server_task) = start_test_server(None).await;
+    let address = url.trim_start_matches("ws://").to_owned();
+
+    // Cliente WebSocket mínimo, feito à mão: completa o handshake e depois fica
+    // em silêncio (não responde pings). Precisamos de um peer realmente mudo —
+    // o protocol tokio-tungstenite responde Pong sozinho.
+    let mut stream = TcpStream::connect(&address).await.unwrap();
+    // Chave válida do RFC 6455: base64 de 16 bytes (24 caracteres).
+    let key = "AAAAAAAAAAAAAAAAAAAAAA==";
+    let handshake = format!(
+        "GET / HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream.write_all(handshake.as_bytes()).await.unwrap();
+    let mut response = [0_u8; 256];
+    let read = timeout(Duration::from_secs(3), stream.read(&mut response))
+        .await
+        .expect("handshake do servidor demorou")
+        .expect("sem leitura do handshake");
+    let response = String::from_utf8_lossy(&response[..read]).to_owned();
+    assert!(
+        response.starts_with("HTTP/1.1 101"),
+        "handshake WebSocket manual falhou: {response}"
+    );
+
+    // Sem nenhum Pong, o servidor precisa reconhecer a conexão idle e fechar
+    // a conexão dentro do prazo (erro/EOF), mas não instantaneamente.
+    let started = Instant::now();
+    let mut saw_end = false;
+    let mut buffer = [0_u8; 512];
+    loop {
+        match timeout(Duration::from_secs(10), stream.read(&mut buffer)).await {
+            Ok(Ok(0)) | Err(_) => {
+                saw_end = true;
+                break;
+            }
+            Ok(Ok(_amount)) => {
+                if started.elapsed() > Duration::from_secs(9) {
+                    break;
+                }
+            }
+            Ok(Err(_error)) => {
+                saw_end = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_end,
+        "servidor precisa encerrar a conexão ociosa dentro do prazo"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "a conexão precisa sobreviver aos primeiros pings antes do prazo"
+    );
 }

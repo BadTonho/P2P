@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -28,6 +29,29 @@ const MAX_TOTAL_CONNECTIONS: usize = 512;
 const MAX_CONNECTIONS_PER_IP: usize = 16;
 const FAILED_JOIN_WINDOW: Duration = Duration::from_secs(60);
 const MAX_FAILED_JOINS_PER_WINDOW: usize = 10;
+/// Intervalo entre pings de conservação para conexões sem tráfego; prateleira
+/// de encerramento caso nenhum retorno (Pong ou mensagem) chegue.
+const KEEPALIVE_PING_INTERVAL_SECS_DEFAULT: u64 = 30;
+const KEEPALIVE_MAX_IDLE_SECS_DEFAULT: u64 = 65;
+const TRANSIENT_ACCEPT_BACKOFF: Duration = Duration::from_millis(150);
+
+static KEEPALIVE_PING_INTERVAL_SECS: AtomicU64 =
+    AtomicU64::new(KEEPALIVE_PING_INTERVAL_SECS_DEFAULT);
+static KEEPALIVE_MAX_IDLE_SECS: AtomicU64 = AtomicU64::new(KEEPALIVE_MAX_IDLE_SECS_DEFAULT);
+
+fn keepalive_ping_interval() -> Duration {
+    Duration::from_secs(KEEPALIVE_PING_INTERVAL_SECS.load(Ordering::Relaxed).max(1))
+}
+
+fn keepalive_max_idle() -> Duration {
+    Duration::from_secs(KEEPALIVE_MAX_IDLE_SECS.load(Ordering::Relaxed).max(2))
+}
+
+#[cfg(test)]
+fn override_keepalive_for_test(ping_interval_secs: u64, max_idle_secs: u64) {
+    KEEPALIVE_PING_INTERVAL_SECS.store(ping_interval_secs, Ordering::Relaxed);
+    KEEPALIVE_MAX_IDLE_SECS.store(max_idle_secs, Ordering::Relaxed);
+}
 const TOO_MANY_JOIN_ATTEMPTS_MESSAGE: &str =
     "Muitas tentativas de entrada com codigos invalidos. Aguarde um minuto e tente novamente.";
 
@@ -602,6 +626,11 @@ impl RoomRegistry {
         self.rooms.remove(code);
         self.connection_rooms.remove(&host_id);
         self.connection_rooms.remove(&target_id);
+        // As duas conexões ficam sem sala ao confirmar a transferência; remove
+        // também o contexto de participante, senão a entrada permanece até o
+        // fechamento da conexão sobrando como memória.
+        self.participant_info.remove(&host_id);
+        self.participant_info.remove(&target_id);
         let completion = OutboundMessage::Protocol(ServerMessage::HostTransferComplete {
             code: code.to_owned(),
         });

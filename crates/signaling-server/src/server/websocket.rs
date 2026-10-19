@@ -32,6 +32,14 @@ pub async fn serve(
         };
         let (stream, address) = match accepted {
             Ok(accepted) => accepted,
+            Err(error) if is_transient_accept_error(&error) => {
+                tracing::error!(
+                    error = %error,
+                    "Listener de sinalização não pôde aceitar esta conexão; continuando o aceite"
+                );
+                sleep(TRANSIENT_ACCEPT_BACKOFF).await;
+                continue;
+            }
             Err(error) => {
                 tracing::error!(error = %error, "Listener de sinalização falhou ao aceitar conexão");
                 return Err(error);
@@ -42,6 +50,19 @@ pub async fn serve(
         let _ = spawn_admitted_connection(stream, connection_id, address, rooms).await;
     }
     Ok(())
+}
+
+/// Erros de accept transitórios (peers que fecham a conexão antes de o accept
+/// concluir, por exemplo) não podem derrubar todo o servidor de sinalização.
+pub(in crate::server) fn is_transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+    )
 }
 
 pub(super) async fn spawn_admitted_connection(
@@ -116,6 +137,13 @@ async fn serve_websocket(
     ));
     let mut writer_finished = false;
 
+    // Conservação da conexão: pings periódicos e encerramento quando nenhuma
+    // resposta (Pong ou qualquer quadro) volta dentro do prazo. Conexões
+    // meio-abertas (NAT, queda silenciosa) não ficam penduradas para sempre.
+    let mut ping_pending = false;
+    let mut last_inbound = tokio::time::Instant::now();
+    let mut next_ping_at = last_inbound + keepalive_ping_interval();
+
     loop {
         let frame = tokio::select! {
             frame = websocket_receiver.next() => frame,
@@ -123,12 +151,37 @@ async fn serve_websocket(
                 writer_finished = true;
                 break;
             }
+            _ = tokio::time::sleep_until(next_ping_at) => {
+                let now = tokio::time::Instant::now();
+                let idle = now.duration_since(last_inbound);
+                if idle > keepalive_max_idle() {
+                    tracing::info!(
+                        connection_id,
+                        idle_secs = idle.as_secs(),
+                        "Conexão ociosa sem resposta aos pings; encerrando"
+                    );
+                    send_error(&outgoing, "Conexão encerrada por inatividade.");
+                    break;
+                }
+                if !ping_pending {
+                    ping_pending = true;
+                    let _ = outgoing.send(OutboundMessage::Control(
+                        WebSocketMessage::Ping(Vec::new().into()),
+                    ));
+                }
+                next_ping_at = now + keepalive_ping_interval();
+                continue;
+            }
         };
         let Some(frame) = frame else {
             break;
         };
         let frame = match frame {
-            Ok(frame) => frame,
+            Ok(frame) => {
+                last_inbound = tokio::time::Instant::now();
+                ping_pending = false;
+                frame
+            }
             Err(error) => {
                 tracing::warn!(connection_id, error = %error, "Falha ao receber mensagem WebSocket");
                 break;
