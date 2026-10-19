@@ -22,6 +22,15 @@ const DIAGNOSTIC_PAYLOAD: &str = "diagnostic-ping-v1";
 const DIAGNOSTIC_ACK_PAYLOAD: &str = "diagnostic-pong-v1";
 const SERVER_BIND_ATTEMPTS: u32 = 25;
 const SERVER_BIND_RETRY_DELAY: Duration = Duration::from_millis(150);
+const CLIENT_KEEPALIVE_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Erros de desserialização por variante de protocolo desconhecida indicam um
+/// servidor mais novo que este cliente: a mensagem é descartada, mas a conexão
+/// continua, para que versões não se desconectem por causa de novidades.
+/// JSON sintaticamente quebrado continua fatal.
+fn is_unknown_protocol_variant_error(error: &serde_json::Error) -> bool {
+    error.to_string().starts_with("unknown variant")
+}
 
 fn default_participant() -> ParticipantInfo {
     let nonce = SystemTime::now()
@@ -463,6 +472,9 @@ async fn run_client(
     let mut failed = false;
     let mut transfer_complete = false;
     let mut intentional_leave = false;
+    let mut ping_schedule = tokio::time::interval(CLIENT_KEEPALIVE_PING_INTERVAL);
+    ping_schedule.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping_schedule.tick().await; // descarta o tick imediato da criação
     loop {
         tokio::select! {
             incoming = reader.next() => {
@@ -528,6 +540,13 @@ async fn run_client(
                                 let _ = events.send(SignalingEvent::ServerError(message));
                             }
                             Err(error) => {
+                                if is_unknown_protocol_variant_error(&error) {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "Mensagem do servidor com variante de protocolo desconhecida; descartada com a conexão mantida"
+                                    );
+                                    continue;
+                                }
                                 tracing::error!(error = %error, "Resposta JSON inválida do servidor");
                                 let _ = events.send(SignalingEvent::Error(format!(
                                     "Resposta invalida do servidor: {error}"
@@ -565,6 +584,19 @@ async fn run_client(
                         break;
                     }
                     Some(Ok(WebSocketMessage::Pong(_))) | Some(Ok(WebSocketMessage::Frame(_))) => {}
+                }
+            }
+            _ = ping_schedule.tick() => {
+                // Conservação ativa pelo cliente: um ping periódico revela um
+                // servidor morto mesmo sem tráfego da aplicação, e as
+                // respostas Pong mantêm o mapeamento NAT vivo.
+                if writer
+                    .send(WebSocketMessage::Ping(Vec::new().into()))
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("Falha ao enviar ping de conservação ao servidor de sinalização");
+                    break;
                 }
             }
             command = commands.recv() => {
@@ -948,6 +980,77 @@ mod tests {
         assert!(
             listener.is_ok(),
             "listener deve conseguir vincular após a porta ser liberada"
+        );
+    }
+
+    #[test]
+    fn unknown_protocol_variant_error_is_skipped_but_broken_json_is_not() {
+        use super::is_unknown_protocol_variant_error;
+        let unknown = serde_json::from_str::<signaling_protocol::ServerMessage>(
+            "{\"type\":\"RecursoFuturo\",\"campo\":1}",
+        )
+        .expect_err("variante inexistente deve falhar");
+        assert!(is_unknown_protocol_variant_error(&unknown));
+        let broken = serde_json::from_str::<signaling_protocol::ServerMessage>("{quebrado")
+            .expect_err("JSON quebrado deve falhar");
+        assert!(!is_unknown_protocol_variant_error(&broken));
+    }
+
+    #[tokio::test]
+    async fn unknown_server_variant_is_skipped_and_connection_survives() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = SignalingClient::start_worker(
+            format!("ws://{}", listener.local_addr().unwrap()),
+            signaling_protocol::ClientMessage::CreateRoom,
+            None,
+            "unused".to_owned(),
+            super::default_participant(),
+        )
+        .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        // Consome o pedido inicial do cliente.
+        let _ = socket.next().await.unwrap().unwrap();
+
+        // Servidor "mais novo": envia uma mensagem com variante desconhecida e
+        // depois uma mensagem conhecida. A conexão tem que sobreviver à
+        // desconhecida e seguir processando as demais.
+        socket
+            .send(Message::Text(
+                "{\"type\":\"RecursoFuturo\",\"campo\":1}".into(),
+            ))
+            .await
+            .unwrap();
+        let room_created = serde_json::to_string(&signaling_protocol::ServerMessage::RoomCreated {
+            code: "SALA-TESTE".to_owned(),
+        })
+        .unwrap();
+        socket
+            .send(Message::Text(room_created.into()))
+            .await
+            .unwrap();
+
+        let saw_created = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(event) = client.events.try_iter().find(|event| {
+                    matches!(event, super::SignalingEvent::RoomCreated(code) if code == "SALA-TESTE")
+                }) {
+                    return Some(event);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            saw_created,
+            "conexão precisa sobreviver à variante desconhecida e seguir o protocolo"
+        );
+        assert!(
+            !client.worker.as_ref().unwrap().is_finished(),
+            "worker não pode ter sido encerrado pela variante desconhecida"
         );
     }
 }
