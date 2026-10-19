@@ -755,7 +755,7 @@ pub(super) fn capture_dxgi_monitor(
                     .pipeline
                     .timer(crate::video_performance::Stage::CaptureReadback);
                 let buffer = frame.buffer().map_err(|error| {
-                    format!("DXGI nÃ£o conseguiu ler o quadro do monitor: {error}")
+                    format!("DXGI não conseguiu ler o quadro do monitor: {error}")
                 })?;
                 let bytes = buffer.as_nopadding_buffer(&mut scratch);
                 drop(reading);

@@ -1879,7 +1879,7 @@ impl PeerEvents {
                             tracing::warn!(
                                 screen_share_session = metrics.session_id,
                                 stage = "first_video_timeout_recovery",
-                                "Nenhum quadro de vÃ­deo foi decodificado; solicitando IDR e iniciando tentativas de recuperaÃ§Ã£o"
+                                "Nenhum quadro de vídeo foi decodificado; solicitando IDR e iniciando tentativas de recuperação"
                             );
                         }
                         if let Some(reason) = keyframe_recovery_retry.due_reason(now)
@@ -1889,7 +1889,7 @@ impl PeerEvents {
                             tracing::debug!(
                                 screen_share_session = metrics.session_id,
                                 ?reason,
-                                "Repetindo pedido PLI enquanto aguarda IDR de recuperaÃ§Ã£o"
+                                "Repetindo pedido PLI enquanto aguarda IDR de recuperação"
                             );
                         }
                         let expired = sequence_tracker.expire(now, current_reorder_delay);
@@ -1996,7 +1996,7 @@ impl PeerEvents {
                             track_ssrc = metrics.track_ssrc.load(Ordering::Relaxed),
                             overflow_count = reorder_overflow_count,
                             capacity_packets = MAX_BUFFERED_RTP_PACKETS,
-                            "Buffer de reordenaÃ§Ã£o RTP cheio; pacote futuro descartado"
+                            "Buffer de reordenação RTP cheio; pacote futuro descartado"
                         );
                     }
                 }

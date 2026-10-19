@@ -687,7 +687,7 @@ impl ScreenShareSession {
         }
         self.commands
             .send(Command::RequestKeyFrameForTest)
-            .map_err(|_| "A sessÃ£o WebRTC foi encerrada.".to_owned())
+            .map_err(|_| "A sessão WebRTC foi encerrada.".to_owned())
     }
 
     #[cfg(test)]

@@ -19,6 +19,10 @@ mod turn_relay;
 mod update;
 mod video_performance;
 
+#[cfg(test)]
+#[path = "source_hygiene.rs"]
+mod source_hygiene_tests;
+
 fn main() -> eframe::Result {
     app::run()
 }
